@@ -22,6 +22,8 @@ This project uses a Memory Bank system in `memory-bank/` for cross-session conte
 - Before committing, run the relevant verification for that checkpoint and mention it in the commit context.
 - Commit structured experiment reports when they document project progress or a known-good validation point.
 - Do not commit build outputs, transient logs, cache directories, or large binary artifacts unless explicitly requested.
+- After committing on `main`, push the commit to the configured remote.
+- Never use `git push --force`, `git push -f`, or any force-push variant. Force-push is prohibited for all branches and remotes unless the user explicitly changes this rule in writing.
 
 ### Sudo / System Changes:
 - If a fix requires `sudo`, root-owned paths, `/opt`, `/usr/local`, system linkers, launch services, or other machine-level changes, stop and ask the user to run the command manually.

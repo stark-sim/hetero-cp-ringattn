@@ -52,6 +52,7 @@
 - 对 remote smoke 继承 phase3 的路径解析、解释器 pinning、clean build、report layout 纪律。
 - 新核心代码优先 Rust + C++；Python 只作为辅助或历史对照。
 - Git 纪律：每个任务节点实现并验证后应单独提交，避免会话结束时形成一个过大的混合 commit。结构化实验 report 可以提交作为项目进展资产；build 产物、临时日志、cache、大型二进制不应默认提交。
+- Git push 纪律：在 `main` 分支完成 commit 后，可以 push 到配置好的远端；任何 `git push --force`、`git push -f` 或 force-push 变体都禁止使用。
 - sudo / 系统改动纪律：如果修复需要 `sudo`、root-owned path、`/opt`、系统 linker 或机器级配置，应停止并给用户最小命令让用户自己执行；不要为了绕过 sudo 擅自修改第三方二进制、install_name 或 vendor artifacts。
 
 ## 当前阻塞
