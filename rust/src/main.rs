@@ -527,6 +527,16 @@ fn torch_bridge_enabled_by_env() -> bool {
     env::var("HCP_ENABLE_TORCH").ok().as_deref() == Some("1")
 }
 
+fn compact_message(message: &str, max_chars: usize) -> String {
+    let one_line = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= max_chars {
+        return one_line;
+    }
+    let mut compact = one_line.chars().take(max_chars).collect::<String>();
+    compact.push_str("...");
+    compact
+}
+
 fn torch_bridge_report() -> TorchBridgeReport {
     let code = unsafe { hcp_ringattn_torch_smoke() };
     let message = unsafe {
@@ -634,6 +644,12 @@ fn main() -> Result<(), RingError> {
         report.torch_bridge.compiled,
         report_path
     );
+    if report.torch_bridge.status == "fail" && !report.torch_bridge.message.is_empty() {
+        println!(
+            "[rust-ringattn] torch_message={}",
+            compact_message(&report.torch_bridge.message, 360)
+        );
+    }
     if report.status == "pass" {
         Ok(())
     } else {

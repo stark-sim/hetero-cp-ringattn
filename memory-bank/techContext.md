@@ -94,6 +94,7 @@ HCP_ENABLE_TORCH=1 bash scripts/run_rust_ringattn_smoke.sh
 - `HCP_TORCH_DEVICE=cpu|mps|cuda|cuda:N`：选择 ATen smoke 设备；成功码分别为 CPU=1、MPS=2、CUDA=3。
 - 本机 Mac hardware smoke 使用 `HCP_TORCH_DEVICE=mps` 并越过普通沙箱；CPU smoke 只用于编译/链接 fallback。
 - 启用 `HCP_ENABLE_TORCH=1` 后，Rust smoke 要求 torch bridge 成功；CLI summary 中 `torch_status=pass` 且设备成功码匹配才算硬件 smoke 通过。
+- torch bridge 失败时 CLI summary 后会打印压缩 `torch_message`；完整信息写入 JSON report。
 
 ## 项目结构
 

@@ -78,6 +78,7 @@ CARGO_OFFLINE=0 HCP_ENABLE_TORCH=1 HCP_TORCH_DEVICE=cuda:0 bash scripts/run_rust
 - `HCP_TORCH_DEVICE=mps` 时 report 中 `torch_bridge.status_code=2`，这才表示实际跑到 MPS。
 - `HCP_TORCH_DEVICE=cuda` / `cuda:N` 时 report 中 `torch_bridge.status_code=3`，这才表示实际跑到 CUDA。
 - `HCP_ENABLE_TORCH=1` 时，torch bridge 不再只是附加信息；请求设备没有拿到对应成功码会使整体 smoke 失败，并在 CLI summary 中打印 `torch_status`、`torch_device`、`torch_code`。
+- torch bridge 失败时 CLI 会打印压缩后的 `torch_message`；完整异常仍保存在 `reports/<RUN_ID>/rust_ringattn_correctness.json`。
 - 因此短期推荐路线是 Rust -> C ABI -> C++ ATen/libtorch，而不是马上把完整 `torch/torch.h` 或 `tch-rs` 作为必需路径。
 - `torch.backends.mps.is_built()` 为 true；沙箱进程看不到 Metal device，非沙箱进程 MPS 可用。
 

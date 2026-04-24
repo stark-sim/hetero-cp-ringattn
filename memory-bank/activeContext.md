@@ -28,6 +28,7 @@
 - [2026-04-25] 远端 GPU 机器首次运行若 Cargo cache 缺 `serde_json` 等依赖，应先 `cd rust && cargo fetch --locked`，或用 `CARGO_OFFLINE=0` 跑一次 smoke。
 - [2026-04-25] 用户明确要求本机 libtorch smoke 直接使用非沙箱 MPS；CPU-only smoke 只算编译/链接 fallback，不作为本机硬件验证结论。
 - [2026-04-25] Rust smoke 已改为强校验 torch bridge：`HCP_ENABLE_TORCH=1` 且请求设备未返回对应成功码时整体 smoke 失败；CLI summary 会打印 `torch_status` / `torch_device` / `torch_code`。
+- [2026-04-25] 远端 CUDA smoke 返回 `torch_code=-2`，说明 C++ ATen bridge 抛异常；CLI 已补充失败时打印压缩 `torch_message`，完整异常保留在 JSON report。
 
 ## 活跃决策
 
@@ -62,6 +63,7 @@
 - sudo / 系统改动纪律：如果修复需要 `sudo`、root-owned path、`/opt`、系统 linker 或机器级配置，应停止并给用户最小命令让用户自己执行；不要为了绕过 sudo 擅自修改第三方二进制、install_name 或 vendor artifacts。
 - 本机硬件 smoke 纪律：Mac 本机 libtorch smoke 应使用 `HCP_TORCH_DEVICE=mps` 并在非沙箱/授权进程运行；CPU smoke 不代表本机加速器路径有效。
 - GPU hardware smoke 纪律：远端 `HCP_TORCH_DEVICE=cuda:0` 必须看到 `torch_status=pass`、`torch_code=3`，仅有 correctness `passed=3/3` 不足以证明 CUDA 路径有效。
+- 远端 GPU smoke 若 `torch_code=-2`，下一步先看 `torch_message` / JSON report message；优先排查是否链接到 CPU-only libtorch 或运行时 CUDA libtorch 库不可见。
 
 ## 当前阻塞
 
