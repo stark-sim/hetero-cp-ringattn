@@ -90,13 +90,14 @@ fn link_libtorch_cuda(cuda_libs_present: bool) {
 
     if env::var("CARGO_CFG_TARGET_OS").ok().as_deref() == Some("linux") {
         // CUDA kernels are registered by static initializers in libtorch_cuda.
-        // Keep the shared libraries even when the linker sees no direct symbols.
-        println!("cargo:rustc-link-arg=-Wl,--no-as-needed");
-    }
-    println!("cargo:rustc-link-lib=dylib=torch_cuda");
-    println!("cargo:rustc-link-lib=dylib=c10_cuda");
-    if env::var("CARGO_CFG_TARGET_OS").ok().as_deref() == Some("linux") {
-        println!("cargo:rustc-link-arg=-Wl,--as-needed");
+        // Keep the shared libraries even when the linker sees no direct symbols;
+        // pass the libraries in the same linker-arg group so rustc cannot reorder them.
+        println!(
+            "cargo:rustc-link-arg=-Wl,--push-state,--no-as-needed,-ltorch_cuda,-lc10_cuda,--pop-state"
+        );
+    } else {
+        println!("cargo:rustc-link-lib=dylib=torch_cuda");
+        println!("cargo:rustc-link-lib=dylib=c10_cuda");
     }
 }
 
