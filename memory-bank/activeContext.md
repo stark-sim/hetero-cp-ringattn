@@ -23,6 +23,9 @@
 - [2026-04-24] Rust build script 已改为优先使用独立 libtorch 环境变量；只有缺失时才 fallback 到 Python torch path discovery。
 - [2026-04-24] C++ ATen bridge 已支持 `HCP_TORCH_DEVICE=cpu|mps`；report 中 `status_code=1` 表示 CPU，`status_code=2` 表示 MPS。
 - [2026-04-24] 非沙箱运行 `HCP_ENABLE_TORCH=1 HCP_TORCH_DEVICE=mps bash scripts/run_rust_ringattn_smoke.sh` 已通过，report 显示 `requested_device=mps`、`status_code=2`、`message=ok`。
+- [2026-04-25] C++ ATen bridge 已增加 `HCP_TORCH_DEVICE=cuda|cuda:N` 解析；CUDA 成功时 report 使用 `status_code=3`。
+- [2026-04-25] Rust build script 会在 CUDA 版 libtorch 库目录中发现 `torch_cuda` / `c10_cuda` 时自动追加链接；CPU/MPS libtorch 不受影响。
+- [2026-04-25] 远端 GPU 机器首次运行若 Cargo cache 缺 `serde_json` 等依赖，应先 `cd rust && cargo fetch --locked`，或用 `CARGO_OFFLINE=0` 跑一次 smoke。
 
 ## 活跃决策
 
@@ -40,6 +43,7 @@
 - [ ] 扩展 correctness case，覆盖更大的 seq、更多 seed、float32 / mixed precision tolerance policy。
 - [ ] 必要时增加 `max_rel_err` 并明确 tolerance policy。
 - [ ] 将 Rust correctness model 继续拆分为 library + binary，便于后续 protocol / transport 复用。
+- [ ] 在 GPU 端使用 CUDA 版 libtorch 运行 `HCP_ENABLE_TORCH=1 HCP_TORCH_DEVICE=cuda:0 bash scripts/run_rust_ringattn_smoke.sh`，确认 `status_code=3`。
 - [ ] 在 cargo registry/network 可用后，增加 feature-gated `tch = 0.24.0` backend，并先实现 `tch_smoke`，再迁移 Ring Attention block update。
 - [ ] 在 cargo registry/network 可用后，引入 optional `tch = 0.24.0` 并实现 `tch_smoke`。
 - [ ] 为 `RingAttnMessage` 设计 serialization / deserialization。
@@ -62,3 +66,4 @@
 - [2026-04-24] 普通 `cargo check` 会尝试访问 `rsproxy.cn` 并因 DNS 失败；当前使用 `cargo --offline` 可正常构建缓存依赖。
 - [2026-04-24] PyTorch 2.11.0 在默认沙箱进程中 `mps_available=false`，原因是沙箱内 `MTLCopyAllDevices()` 返回 0；非沙箱进程可枚举 `Apple M1 Pro`，且 `torch.ones(..., device="mps")` 成功。
 - [2026-04-24] 后续所有 Metal/MPS 相关验证必须在非沙箱/授权进程中运行；默认沙箱结果不能作为 MPS 不可用结论。
+- [2026-04-25] GPU 端 `CARGO_OFFLINE=1` 失败且提示 `no matching package named serde_json found` 时，优先判定为 Cargo registry cache miss，不是 CUDA/libtorch 问题。

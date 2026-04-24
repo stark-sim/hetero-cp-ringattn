@@ -41,14 +41,28 @@ Rust 社区常用的 PyTorch 绑定是 `tch-rs`，它是 PyTorch C++ API/libtorc
 HCP_ENABLE_TORCH=1 bash scripts/run_rust_ringattn_smoke.sh
 ```
 
-CPU / MPS 选择：
+CPU / MPS / CUDA 选择：
 
 ```bash
 HCP_ENABLE_TORCH=1 HCP_TORCH_DEVICE=cpu bash scripts/run_rust_ringattn_smoke.sh
 HCP_ENABLE_TORCH=1 HCP_TORCH_DEVICE=mps bash scripts/run_rust_ringattn_smoke.sh
+HCP_ENABLE_TORCH=1 HCP_TORCH_DEVICE=cuda:0 bash scripts/run_rust_ringattn_smoke.sh
 ```
 
 `HCP_TORCH_DEVICE=mps` 必须在非沙箱/授权进程中运行，否则 Metal device 不可见。
+`HCP_TORCH_DEVICE=cuda` / `cuda:N` 必须使用 CUDA 版 libtorch；`rust/build.rs` 会在 libtorch 库目录中发现 `torch_cuda` / `c10_cuda` 时自动追加链接。
+
+远端 GPU 机器首次运行如果 Cargo cache 没有依赖，默认 `CARGO_OFFLINE=1` 会失败。先执行一次：
+
+```bash
+cd rust && cargo fetch --locked
+```
+
+或直接对 smoke 放开一次网络：
+
+```bash
+CARGO_OFFLINE=0 HCP_ENABLE_TORCH=1 HCP_TORCH_DEVICE=cuda:0 bash scripts/run_rust_ringattn_smoke.sh
+```
 
 当前本机验证结论：
 
@@ -61,6 +75,7 @@ HCP_ENABLE_TORCH=1 HCP_TORCH_DEVICE=mps bash scripts/run_rust_ringattn_smoke.sh
 - 改用更窄的 `<ATen/ATen.h>` 后，`HCP_ENABLE_TORCH=1` 可以编译并执行 C++ tensor smoke。
 - `HCP_TORCH_DEVICE=cpu` 时 report 中 `torch_bridge.status_code=1`。
 - `HCP_TORCH_DEVICE=mps` 时 report 中 `torch_bridge.status_code=2`，这才表示实际跑到 MPS。
+- `HCP_TORCH_DEVICE=cuda` / `cuda:N` 时 report 中 `torch_bridge.status_code=3`，这才表示实际跑到 CUDA。
 - 因此短期推荐路线是 Rust -> C ABI -> C++ ATen/libtorch，而不是马上把完整 `torch/torch.h` 或 `tch-rs` 作为必需路径。
 - `torch.backends.mps.is_built()` 为 true；沙箱进程看不到 Metal device，非沙箱进程 MPS 可用。
 

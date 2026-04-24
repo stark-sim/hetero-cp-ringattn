@@ -521,14 +521,26 @@ fn torch_bridge_report() -> TorchBridgeReport {
         }
     };
     let requested_device = env::var("HCP_TORCH_DEVICE").unwrap_or_else(|_| "cpu".to_string());
-    let note = match (cfg!(hcp_torch_enabled), requested_device.as_str(), code) {
-        (false, _, _) => {
+    let requested_is_cuda =
+        requested_device == "cuda" || requested_device.strip_prefix("cuda:").is_some();
+    let note = match (
+        cfg!(hcp_torch_enabled),
+        requested_device.as_str(),
+        requested_is_cuda,
+        code,
+    ) {
+        (false, _, _, _) => {
             "C++ libtorch bridge is disabled; build with HCP_ENABLE_TORCH=1".to_string()
         }
-        (true, "cpu", 1) => "C++ libtorch bridge executed on CPU".to_string(),
-        (true, "mps", 2) => "C++ libtorch bridge executed on MPS".to_string(),
-        (true, _, -4) => "Unsupported HCP_TORCH_DEVICE; expected cpu or mps".to_string(),
-        (true, _, _) => "C++ libtorch bridge failed or returned an unexpected status".to_string(),
+        (true, "cpu", _, 1) => "C++ libtorch bridge executed on CPU".to_string(),
+        (true, "mps", _, 2) => "C++ libtorch bridge executed on MPS".to_string(),
+        (true, _, true, 3) => "C++ libtorch bridge executed on CUDA".to_string(),
+        (true, _, _, -4) => {
+            "Unsupported HCP_TORCH_DEVICE; expected cpu, mps, cuda, or cuda:N".to_string()
+        }
+        (true, _, _, _) => {
+            "C++ libtorch bridge failed or returned an unexpected status".to_string()
+        }
     };
     TorchBridgeReport {
         compiled: cfg!(hcp_torch_enabled),

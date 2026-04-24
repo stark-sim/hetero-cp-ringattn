@@ -10,6 +10,53 @@
 
 namespace {
 std::string g_torch_smoke_message;
+
+#ifdef HCP_ENABLE_TORCH
+struct TorchDeviceSelection {
+  at::Device device;
+  int success_code;
+};
+
+bool ParseNonNegativeIndex(const std::string& value, int* index) {
+  if (value.empty()) {
+    return false;
+  }
+  int parsed = 0;
+  for (char ch : value) {
+    if (ch < '0' || ch > '9') {
+      return false;
+    }
+    parsed = parsed * 10 + (ch - '0');
+  }
+  *index = parsed;
+  return true;
+}
+
+bool SelectTorchDevice(const std::string& device_name, TorchDeviceSelection* selection) {
+  if (device_name == "cpu") {
+    *selection = {at::Device(at::kCPU), 1};
+    return true;
+  }
+  if (device_name == "mps") {
+    *selection = {at::Device(at::kMPS), 2};
+    return true;
+  }
+  if (device_name == "cuda") {
+    *selection = {at::Device(at::kCUDA), 3};
+    return true;
+  }
+  const std::string cuda_prefix = "cuda:";
+  if (device_name.rfind(cuda_prefix, 0) == 0) {
+    int index = 0;
+    if (!ParseNonNegativeIndex(device_name.substr(cuda_prefix.size()), &index)) {
+      return false;
+    }
+    *selection = {at::Device(at::kCUDA, index), 3};
+    return true;
+  }
+  return false;
+}
+#endif
 }
 
 extern "C" const char* hcp_ringattn_torch_smoke_message() {
@@ -61,23 +108,24 @@ extern "C" int hcp_ringattn_torch_smoke() {
     g_torch_smoke_message.clear();
     const char* requested = std::getenv("HCP_TORCH_DEVICE");
     std::string device_name = requested == nullptr ? "cpu" : requested;
-    at::Device device(at::kCPU);
-    int success_code = 1;
-    if (device_name == "mps") {
-      device = at::Device(at::kMPS);
-      success_code = 2;
-    } else if (device_name != "cpu") {
+    TorchDeviceSelection selection{at::Device(at::kCPU), 1};
+    if (!SelectTorchDevice(device_name, &selection)) {
+      g_torch_smoke_message =
+          "unsupported HCP_TORCH_DEVICE=" + device_name + "; expected cpu, mps, cuda, or cuda:N";
       return -4;
     }
 
-    auto options = at::TensorOptions().dtype(at::kFloat).device(device);
+    auto options = at::TensorOptions().dtype(at::kFloat).device(selection.device);
     auto a = at::ones({2, 2}, options);
     auto b = at::eye(2, options);
     auto c = at::matmul(a, b);
-    const bool expected_device = device_name == "mps" ? c.is_mps() : c.is_cpu();
+    const bool expected_device =
+        selection.device.is_cpu() ? c.is_cpu()
+        : selection.device.is_mps() ? c.is_mps()
+                                    : c.is_cuda();
     if (c.sizes()[0] == 2 && c.sizes()[1] == 2 && expected_device) {
       g_torch_smoke_message = "ok";
-      return success_code;
+      return selection.success_code;
     }
     g_torch_smoke_message = "unexpected tensor shape or device: " + c.device().str();
     return -1;

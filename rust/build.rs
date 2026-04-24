@@ -70,6 +70,19 @@ print("LIBS=" + "|".join(library_paths()))
     }
 }
 
+fn has_library(lib_dirs: &[String], name: &str) -> bool {
+    let candidates = [
+        format!("lib{name}.so"),
+        format!("lib{name}.dylib"),
+        format!("{name}.lib"),
+    ];
+    lib_dirs.iter().any(|dir| {
+        candidates
+            .iter()
+            .any(|file| Path::new(dir).join(file).exists())
+    })
+}
+
 fn main() {
     let root = repo_root();
     println!("cargo:rustc-check-cfg=cfg(hcp_torch_enabled)");
@@ -112,13 +125,19 @@ fn main() {
         for include in includes {
             build.include(include);
         }
-        for lib in libs {
+        for lib in &libs {
             println!("cargo:rustc-link-search=native={lib}");
             println!("cargo:rustc-link-arg=-Wl,-rpath,{lib}");
         }
         println!("cargo:rustc-link-lib=dylib=torch");
         println!("cargo:rustc-link-lib=dylib=torch_cpu");
         println!("cargo:rustc-link-lib=dylib=c10");
+        if has_library(&libs, "torch_cuda") {
+            println!("cargo:rustc-link-lib=dylib=torch_cuda");
+        }
+        if has_library(&libs, "c10_cuda") {
+            println!("cargo:rustc-link-lib=dylib=c10_cuda");
+        }
     }
 
     build.compile("hcp_ringattn_cxx_bridge");

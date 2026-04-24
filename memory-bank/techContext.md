@@ -10,7 +10,7 @@
 - Cargo
 - Python 3
 - NumPy，用于 Python correctness / kernel stub 原型
-- PyTorch / libtorch 2.11.0 可通过 Python 安装提供的 headers/libs 接入 C++ ATen bridge
+- PyTorch / libtorch 2.11.0 可通过独立 libtorch 或 Python 安装提供的 headers/libs 接入 C++ ATen bridge
 
 ### Styling
 
@@ -50,7 +50,8 @@
 - Rust / Cargo。
 - Python 3。
 - Python smoke 需要 NumPy。
-- 可选 PyTorch C++ bridge 需要 Python 环境中安装 `torch`，并能通过 `torch.utils.cpp_extension` 发现 include/lib path。
+- 可选 PyTorch C++ bridge 优先使用独立 libtorch：设置 `LIBTORCH`，或显式设置 `LIBTORCH_INCLUDE` / `LIBTORCH_LIB`。
+- 如果没有独立 libtorch，才 fallback 到 Python 环境中的 `torch.utils.cpp_extension` 发现 include/lib path。
 - 当前验证环境：`torch==2.11.0`、`torchvision==0.26.0`、`torchaudio==2.11.0`。
 
 ### 设置与验证命令
@@ -90,6 +91,7 @@ HCP_ENABLE_TORCH=1 bash scripts/run_rust_ringattn_smoke.sh
 - `RUN_PYTHON_CORRECTNESS=1`：显式运行 Python correctness 历史对照。
 - `CARGO_OFFLINE=1`：Rust smoke 默认离线构建，避免 cargo registry 网络依赖。
 - `HCP_ENABLE_TORCH=1`：启用 C++ ATen/libtorch bridge。
+- `HCP_TORCH_DEVICE=cpu|mps|cuda|cuda:N`：选择 ATen smoke 设备；成功码分别为 CPU=1、MPS=2、CUDA=3。
 
 ## 项目结构
 
