@@ -10,6 +10,7 @@
     "smoke_domains": 3
   },
   "torch_bridge": {
+    "status": "pass",
     "compiled": true,
     "requested_device": "mps",
     "status_code": 2,

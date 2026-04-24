@@ -98,6 +98,7 @@ struct CxxBridgeReport {
 
 #[derive(Serialize)]
 struct TorchBridgeReport {
+    status: &'static str,
     compiled: bool,
     requested_device: String,
     status_code: i32,
@@ -510,6 +511,22 @@ fn parse_report_path() -> String {
     report_path
 }
 
+fn torch_device_success_code(requested_device: &str) -> Option<i32> {
+    match requested_device {
+        "cpu" => Some(1),
+        "mps" => Some(2),
+        "cuda" => Some(3),
+        _ => requested_device
+            .strip_prefix("cuda:")
+            .filter(|index| !index.is_empty() && index.chars().all(|ch| ch.is_ascii_digit()))
+            .map(|_| 3),
+    }
+}
+
+fn torch_bridge_enabled_by_env() -> bool {
+    env::var("HCP_ENABLE_TORCH").ok().as_deref() == Some("1")
+}
+
 fn torch_bridge_report() -> TorchBridgeReport {
     let code = unsafe { hcp_ringattn_torch_smoke() };
     let message = unsafe {
@@ -521,8 +538,18 @@ fn torch_bridge_report() -> TorchBridgeReport {
         }
     };
     let requested_device = env::var("HCP_TORCH_DEVICE").unwrap_or_else(|_| "cpu".to_string());
-    let requested_is_cuda =
-        requested_device == "cuda" || requested_device.strip_prefix("cuda:").is_some();
+    let expected_code = torch_device_success_code(&requested_device);
+    let requested_is_cuda = expected_code == Some(3);
+    let status = match (
+        cfg!(hcp_torch_enabled),
+        torch_bridge_enabled_by_env(),
+        expected_code,
+    ) {
+        (false, false, _) => "skipped",
+        (false, true, _) => "fail",
+        (true, _, Some(expected)) if code == expected => "pass",
+        (true, _, _) => "fail",
+    };
     let note = match (
         cfg!(hcp_torch_enabled),
         requested_device.as_str(),
@@ -543,6 +570,7 @@ fn torch_bridge_report() -> TorchBridgeReport {
         }
     };
     TorchBridgeReport {
+        status,
         compiled: cfg!(hcp_torch_enabled),
         requested_device,
         status_code: code,
@@ -563,8 +591,14 @@ fn run() -> Result<Report, RingError> {
         .collect::<Result<Vec<_>, _>>()?;
     let passed = cases.iter().filter(|case| case.status == "pass").count();
     let failed = cases.len() - passed;
+    let torch_bridge = torch_bridge_report();
+    let status = if failed == 0 && torch_bridge.status != "fail" {
+        "pass"
+    } else {
+        "fail"
+    };
     Ok(Report {
-        status: if failed == 0 { "pass" } else { "fail" },
+        status,
         summary: Summary {
             cases: cases.len(),
             passed,
@@ -574,7 +608,7 @@ fn run() -> Result<Report, RingError> {
             status: "ok",
             smoke_domains: unsafe { hcp_ringattn_cxx_smoke_domain_count() },
         },
-        torch_bridge: torch_bridge_report(),
+        torch_bridge,
         cases,
     })
 }
@@ -589,11 +623,14 @@ fn main() -> Result<(), RingError> {
     }
     fs::write(&report_path, serde_json::to_string_pretty(&report)?)?;
     println!(
-        "[rust-ringattn] status={} passed={}/{} cxx_domains={} torch_compiled={} report={}",
+        "[rust-ringattn] status={} passed={}/{} cxx_domains={} torch_status={} torch_device={} torch_code={} torch_compiled={} report={}",
         report.status,
         report.summary.passed,
         report.summary.cases,
         report.cxx_bridge.smoke_domains,
+        report.torch_bridge.status,
+        report.torch_bridge.requested_device,
+        report.torch_bridge.status_code,
         report.torch_bridge.compiled,
         report_path
     );
