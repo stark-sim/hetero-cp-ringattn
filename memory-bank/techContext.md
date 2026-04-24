@@ -95,6 +95,7 @@ HCP_ENABLE_TORCH=1 bash scripts/run_rust_ringattn_smoke.sh
 - 本机 Mac hardware smoke 使用 `HCP_TORCH_DEVICE=mps` 并越过普通沙箱；CPU smoke 只用于编译/链接 fallback。
 - 启用 `HCP_ENABLE_TORCH=1` 后，Rust smoke 要求 torch bridge 成功；CLI summary 中 `torch_status=pass` 且设备成功码匹配才算硬件 smoke 通过。
 - torch bridge 失败时 CLI summary 后会打印压缩 `torch_message`；完整信息写入 JSON report。
+- CUDA 请求下 `torch_code=-5` 表示当前 libtorch 进程无 CUDA backend，通常是 CPU-only libtorch 或 `libtorch_cuda` / `c10_cuda` 没有被链接/加载。
 
 ## 项目结构
 

@@ -6,6 +6,7 @@
 
 #ifdef HCP_ENABLE_TORCH
 #include <ATen/ATen.h>
+#include <ATen/Context.h>
 #endif
 
 namespace {
@@ -113,6 +114,13 @@ extern "C" int hcp_ringattn_torch_smoke() {
       g_torch_smoke_message =
           "unsupported HCP_TORCH_DEVICE=" + device_name + "; expected cpu, mps, cuda, or cuda:N";
       return -4;
+    }
+    if (selection.device.is_cuda() && !at::hasCUDA()) {
+      g_torch_smoke_message =
+          "CUDA device name is valid, but CUDA backend is not available in the current libtorch "
+          "process. Verify LIBTORCH/LIBTORCH_LIB point to a CUDA-enabled libtorch build and that "
+          "libtorch_cuda and c10_cuda are linked/loaded.";
+      return -5;
     }
 
     auto options = at::TensorOptions().dtype(at::kFloat).device(selection.device);

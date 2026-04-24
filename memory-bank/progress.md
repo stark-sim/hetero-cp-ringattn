@@ -26,6 +26,7 @@
 - [x] [2026-04-25] 已记录本机 libtorch smoke 纪律：Mac 本机默认使用非沙箱 MPS；CPU-only smoke 只作为 fallback。
 - [x] [2026-04-25] Rust smoke summary 已增加 `torch_status` / `torch_device` / `torch_code`，并把 `HCP_ENABLE_TORCH=1` 下的 torch bridge 失败计入整体失败。
 - [x] [2026-04-25] Rust smoke 在 torch bridge 失败时会打印压缩 `torch_message`，避免远端 CUDA 失败只看到 `torch_code=-2`。
+- [x] [2026-04-25] C++ ATen bridge 已增加 `at::hasCUDA()` preflight；CUDA backend 不可用时返回 `torch_code=-5`，避免误判为设备名错误。
 
 ## 进行中
 

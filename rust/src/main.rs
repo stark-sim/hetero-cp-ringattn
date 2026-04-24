@@ -575,6 +575,9 @@ fn torch_bridge_report() -> TorchBridgeReport {
         (true, _, _, -4) => {
             "Unsupported HCP_TORCH_DEVICE; expected cpu, mps, cuda, or cuda:N".to_string()
         }
+        (true, _, true, -5) => {
+            "CUDA backend is unavailable in the current libtorch process".to_string()
+        }
         (true, _, _, _) => {
             "C++ libtorch bridge failed or returned an unexpected status".to_string()
         }
