@@ -1,0 +1,24 @@
+{
+  "global_seq_len": 1024,
+  "num_heads": 8,
+  "head_dim": 64,
+  "dtype": "float32",
+  "domains": [
+    {
+      "domain_id": "cuda-domain-0",
+      "host": "127.0.0.1",
+      "port": 26001,
+      "seq_chunk_len": 640,
+      "block_size": 128,
+      "device": "cuda:0"
+    },
+    {
+      "domain_id": "cpu-domain-1",
+      "host": "127.0.0.1",
+      "port": 26002,
+      "seq_chunk_len": 384,
+      "block_size": 64,
+      "device": "cpu"
+    }
+  ]
+}
