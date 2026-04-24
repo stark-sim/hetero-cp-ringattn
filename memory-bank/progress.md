@@ -27,6 +27,7 @@
 - [x] [2026-04-25] Rust smoke summary 已增加 `torch_status` / `torch_device` / `torch_code`，并把 `HCP_ENABLE_TORCH=1` 下的 torch bridge 失败计入整体失败。
 - [x] [2026-04-25] Rust smoke 在 torch bridge 失败时会打印压缩 `torch_message`，避免远端 CUDA 失败只看到 `torch_code=-2`。
 - [x] [2026-04-25] C++ ATen bridge 已增加 `at::hasCUDA()` preflight；CUDA backend 不可用时返回 `torch_code=-5`，避免误判为设备名错误。
+- [x] [2026-04-25] Rust build script 已在 Linux CUDA libtorch 下对 `libtorch_cuda` / `c10_cuda` 使用 `--no-as-needed`，防止 registration libraries 被链接器丢弃。
 
 ## 进行中
 

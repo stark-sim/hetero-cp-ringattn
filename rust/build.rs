@@ -83,6 +83,23 @@ fn has_library(lib_dirs: &[String], name: &str) -> bool {
     })
 }
 
+fn link_libtorch_cuda(cuda_libs_present: bool) {
+    if !cuda_libs_present {
+        return;
+    }
+
+    if env::var("CARGO_CFG_TARGET_OS").ok().as_deref() == Some("linux") {
+        // CUDA kernels are registered by static initializers in libtorch_cuda.
+        // Keep the shared libraries even when the linker sees no direct symbols.
+        println!("cargo:rustc-link-arg=-Wl,--no-as-needed");
+    }
+    println!("cargo:rustc-link-lib=dylib=torch_cuda");
+    println!("cargo:rustc-link-lib=dylib=c10_cuda");
+    if env::var("CARGO_CFG_TARGET_OS").ok().as_deref() == Some("linux") {
+        println!("cargo:rustc-link-arg=-Wl,--as-needed");
+    }
+}
+
 fn main() {
     let root = repo_root();
     println!("cargo:rustc-check-cfg=cfg(hcp_torch_enabled)");
@@ -132,12 +149,7 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=torch");
         println!("cargo:rustc-link-lib=dylib=torch_cpu");
         println!("cargo:rustc-link-lib=dylib=c10");
-        if has_library(&libs, "torch_cuda") {
-            println!("cargo:rustc-link-lib=dylib=torch_cuda");
-        }
-        if has_library(&libs, "c10_cuda") {
-            println!("cargo:rustc-link-lib=dylib=c10_cuda");
-        }
+        link_libtorch_cuda(has_library(&libs, "torch_cuda") && has_library(&libs, "c10_cuda"));
     }
 
     build.compile("hcp_ringattn_cxx_bridge");
