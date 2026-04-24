@@ -26,6 +26,7 @@
 - [2026-04-25] C++ ATen bridge 已增加 `HCP_TORCH_DEVICE=cuda|cuda:N` 解析；CUDA 成功时 report 使用 `status_code=3`。
 - [2026-04-25] Rust build script 会在 CUDA 版 libtorch 库目录中发现 `torch_cuda` / `c10_cuda` 时自动追加链接；CPU/MPS libtorch 不受影响。
 - [2026-04-25] 远端 GPU 机器首次运行若 Cargo cache 缺 `serde_json` 等依赖，应先 `cd rust && cargo fetch --locked`，或用 `CARGO_OFFLINE=0` 跑一次 smoke。
+- [2026-04-25] 用户明确要求本机 libtorch smoke 直接使用非沙箱 MPS；CPU-only smoke 只算编译/链接 fallback，不作为本机硬件验证结论。
 
 ## 活跃决策
 
@@ -58,6 +59,7 @@
 - Git 纪律：每个任务节点实现并验证后应单独提交，避免会话结束时形成一个过大的混合 commit。结构化实验 report 可以提交作为项目进展资产；build 产物、临时日志、cache、大型二进制不应默认提交。
 - Git push 纪律：在 `main` 分支完成 commit 后，可以 push 到配置好的远端；任何 `git push --force`、`git push -f` 或 force-push 变体都禁止使用。
 - sudo / 系统改动纪律：如果修复需要 `sudo`、root-owned path、`/opt`、系统 linker 或机器级配置，应停止并给用户最小命令让用户自己执行；不要为了绕过 sudo 擅自修改第三方二进制、install_name 或 vendor artifacts。
+- 本机硬件 smoke 纪律：Mac 本机 libtorch smoke 应使用 `HCP_TORCH_DEVICE=mps` 并在非沙箱/授权进程运行；CPU smoke 不代表本机加速器路径有效。
 
 ## 当前阻塞
 

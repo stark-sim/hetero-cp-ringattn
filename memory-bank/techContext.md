@@ -92,6 +92,7 @@ HCP_ENABLE_TORCH=1 bash scripts/run_rust_ringattn_smoke.sh
 - `CARGO_OFFLINE=1`：Rust smoke 默认离线构建，避免 cargo registry 网络依赖。
 - `HCP_ENABLE_TORCH=1`：启用 C++ ATen/libtorch bridge。
 - `HCP_TORCH_DEVICE=cpu|mps|cuda|cuda:N`：选择 ATen smoke 设备；成功码分别为 CPU=1、MPS=2、CUDA=3。
+- 本机 Mac hardware smoke 使用 `HCP_TORCH_DEVICE=mps` 并越过普通沙箱；CPU smoke 只用于编译/链接 fallback。
 
 ## 项目结构
 

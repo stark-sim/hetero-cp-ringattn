@@ -32,6 +32,11 @@ This project uses a Memory Bank system in `memory-bank/` for cross-session conte
 - After the user confirms the system-level fix is done, verify normally from the project.
 - For standalone libtorch on macOS, if `libtorch_cpu.dylib` requires `/opt/llvm-openmp/lib/libomp.dylib`, ask the user to create the `/opt/llvm-openmp/lib` symlink with sudo instead of modifying libtorch dylibs.
 
+### Local Hardware Smoke Discipline:
+- On the local Mac, libtorch hardware smoke should use MPS in a non-sandbox/escalated process: `HCP_ENABLE_TORCH=1 HCP_TORCH_DEVICE=mps bash scripts/run_rust_ringattn_smoke.sh`.
+- Do not treat CPU-only local libtorch smoke as a meaningful hardware validation result; CPU smoke is only a fallback for compile/link or no-accelerator checks.
+- The normal sandbox hides Metal devices, so sandbox MPS failures are not valid evidence that MPS is unavailable.
+
 ### Special Commands:
 - `memory bank update` / `memory bank güncelle` -> Review and update ALL memory bank files
 - `memory bank status` / `memory bank durumu` -> Show current status summary

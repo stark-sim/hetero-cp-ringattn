@@ -50,6 +50,7 @@ HCP_ENABLE_TORCH=1 HCP_TORCH_DEVICE=cuda:0 bash scripts/run_rust_ringattn_smoke.
 ```
 
 `HCP_TORCH_DEVICE=mps` 必须在非沙箱/授权进程中运行，否则 Metal device 不可见。
+本机 Mac 的 libtorch hardware smoke 应直接使用 MPS，并越过普通沙箱运行；CPU smoke 只作为编译/链接 fallback，不作为有意义的本机硬件验证结论。
 `HCP_TORCH_DEVICE=cuda` / `cuda:N` 必须使用 CUDA 版 libtorch；`rust/build.rs` 会在 libtorch 库目录中发现 `torch_cuda` / `c10_cuda` 时自动追加链接。
 
 远端 GPU 机器首次运行如果 Cargo cache 没有依赖，默认 `CARGO_OFFLINE=1` 会失败。先执行一次：
