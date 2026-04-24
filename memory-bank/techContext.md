@@ -1,0 +1,116 @@
+# 技术上下文
+
+## 技术栈
+
+### Core
+
+- C++17
+- CMake 3.16+
+- Rust 2021
+- Cargo
+- Python 3
+- NumPy，用于 Python correctness / kernel stub 原型
+- PyTorch / libtorch 2.11.0 可通过 Python 安装提供的 headers/libs 接入 C++ ATen bridge
+
+### Styling
+
+- 不适用。本项目不是前端 UI 仓库。
+
+### State & Data
+
+- C++ core 使用 `Status`、`TensorDType`、`BoundaryTensor`、`RingAttnConfig` 等轻量结构体。
+- Python 原型使用 NumPy array 表达 attention 输入和 online softmax state。
+- 实验输出写入 `reports/<RUN_ID>/`。
+
+### Testing
+
+- 当前主要验证入口是 smoke 脚本：
+  - C++ coordinator smoke
+  - Rust Ring Attention correctness smoke
+  - Rust -> C++ runtime bridge smoke
+  - 可选 Rust -> C++ ATen/libtorch smoke
+  - Python controller / worker placeholder smoke 仅作历史占位
+- 后续应增加 online softmax correctness script / report。
+
+### Dev Tools
+
+- `cmake`
+- `cmake --build`
+- `rustc`
+- `cargo`
+- `bash`
+- `python3`
+
+## 开发环境
+
+### 前置条件
+
+- C++17 编译器。
+- CMake >= 3.16。
+- Rust / Cargo。
+- Python 3。
+- Python smoke 需要 NumPy。
+- 可选 PyTorch C++ bridge 需要 Python 环境中安装 `torch`，并能通过 `torch.utils.cpp_extension` 发现 include/lib path。
+- 当前验证环境：`torch==2.11.0`、`torchvision==0.26.0`、`torchaudio==2.11.0`。
+
+### 设置与验证命令
+
+```bash
+cmake -S . -B build
+cmake --build build --target ringattn_coordinator_smoke -j4
+./build/ringattn_coordinator_smoke
+```
+
+```bash
+bash scripts/run_local_ringattn_smoke.sh
+```
+
+如果当前环境不允许本地端口绑定，或只想验证 C++ skeleton：
+
+```bash
+SKIP_PYTHON_SMOKE=1 bash scripts/run_local_ringattn_smoke.sh
+```
+
+Rust + C++ smoke：
+
+```bash
+bash scripts/run_rust_ringattn_smoke.sh
+```
+
+Rust + C++ + ATen/libtorch smoke：
+
+```bash
+HCP_ENABLE_TORCH=1 bash scripts/run_rust_ringattn_smoke.sh
+```
+
+### 环境变量
+
+- `RUN_ID`：覆盖 smoke report 目录名，默认 `hcp-ringattn-smoke-local`。
+- `SKIP_PYTHON_SMOKE=1`：跳过 Python worker/controller smoke。
+- `RUN_PYTHON_CORRECTNESS=1`：显式运行 Python correctness 历史对照。
+- `CARGO_OFFLINE=1`：Rust smoke 默认离线构建，避免 cargo registry 网络依赖。
+- `HCP_ENABLE_TORCH=1`：启用 C++ ATen/libtorch bridge。
+
+## 项目结构
+
+```text
+include/hcp_ringattn/core/  # 独立公共类型、协议、runtime 抽象
+src/                        # NoOp runtime 与 C++ coordinator smoke
+python/                     # controller、worker、online softmax 原型
+rust/                       # Rust correctness model、report、C++ bridge build
+config/                     # 最小 ring 配置
+scripts/                    # 本地 smoke 入口
+docs/                       # 设计、验证、路线图、产品论证
+reports/                    # 实验报告输出目录
+```
+
+## Import Aliases
+
+- 无 TypeScript / Python package alias 配置。
+- C++ include root 为仓库内 `include/`。
+
+## 构建与部署
+
+- 本地构建通过 CMake 完成。
+- 当前没有 CI/CD 或 Docker 配置。
+- `build/` 和 `reports/*` 被 `.gitignore` 忽略，`reports/.gitkeep` 保留目录。

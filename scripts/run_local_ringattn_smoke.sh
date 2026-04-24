@@ -20,6 +20,14 @@ cmake --build "${REPO_ROOT}/build" --target ringattn_coordinator_smoke -j4
 echo "[smoke] Running C++ coordinator smoke..."
 "${REPO_ROOT}/build/ringattn_coordinator_smoke" | tee "${REPORT_DIR}/cpp_smoke.log"
 
+if [ "${RUN_PYTHON_CORRECTNESS:-0}" = "1" ] && command -v python3 &> /dev/null && python3 -c "import numpy" >/dev/null 2>&1; then
+    echo "[smoke] Running Ring Attention correctness model..."
+    python3 "${REPO_ROOT}/python/ringattn_kernel_stub.py" \
+        --report-path "${REPORT_DIR}/ringattn_correctness.json" | tee "${REPORT_DIR}/ringattn_correctness.log"
+elif [ "${RUN_PYTHON_CORRECTNESS:-0}" = "1" ]; then
+    echo "[smoke] Skipping correctness model because python3 or numpy is unavailable"
+fi
+
 if [ "${SKIP_PYTHON_SMOKE:-0}" = "1" ]; then
     echo "[smoke] Skipping Python smoke because SKIP_PYTHON_SMOKE=1"
 elif command -v python3 &> /dev/null && python3 -c "import numpy" >/dev/null 2>&1; then

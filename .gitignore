@@ -1,7 +1,10 @@
 build/
+rust/target/
 reports/*
 !reports/.gitkeep
+!reports/**/
+!reports/**/*.json
+reports/**/*.log
 __pycache__/
 *.pyc
 .DS_Store
-
