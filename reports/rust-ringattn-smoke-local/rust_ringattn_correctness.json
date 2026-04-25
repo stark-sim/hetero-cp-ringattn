@@ -7,6 +7,7 @@
   },
   "protocol_smoke": {
     "status": "pass",
+    "transport": "local_p2p_queue",
     "schema_version": 1,
     "domains": 3,
     "source_blocks": 10,
@@ -19,6 +20,26 @@
       "bytes_sent": 10751,
       "bytes_received": 10751
     },
+    "links": [
+      {
+        "sender_domain": "domain-0",
+        "receiver_domain": "domain-1",
+        "sender_device": "mps",
+        "receiver_device": "cuda:0"
+      },
+      {
+        "sender_domain": "domain-1",
+        "receiver_domain": "domain-2",
+        "sender_device": "cuda:0",
+        "receiver_device": "cpu"
+      },
+      {
+        "sender_domain": "domain-2",
+        "receiver_domain": "domain-0",
+        "sender_device": "cpu",
+        "receiver_device": "mps"
+      }
+    ],
     "route_preview": [
       {
         "sequence_id": 1,

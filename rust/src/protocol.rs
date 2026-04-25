@@ -12,8 +12,8 @@ pub enum ProtocolError {
     EmptyDomains,
     #[error("domain {domain_id} has invalid seq_chunk_len or block_size")]
     InvalidDomain { domain_id: String },
-    #[error("transport has no inbox for domain={domain_id}")]
-    MissingInbox { domain_id: String },
+    #[error("transport has no peer for domain={domain_id}")]
+    MissingPeer { domain_id: String },
     #[error("transport inbox is empty for domain={domain_id}")]
     EmptyInbox { domain_id: String },
     #[error("message mismatch: {field} expected={expected} actual={actual}")]
@@ -84,10 +84,12 @@ struct RingAttnMessage {
 #[derive(Serialize)]
 pub struct ProtocolSmokeReport {
     pub status: &'static str,
+    transport: &'static str,
     schema_version: u16,
     domains: usize,
     source_blocks: usize,
     summary: ProtocolSummary,
+    links: Vec<LinkReport>,
     route_preview: Vec<RoutePreview>,
 }
 
@@ -109,6 +111,14 @@ struct ProtocolSummary {
 }
 
 #[derive(Clone, Serialize)]
+struct LinkReport {
+    sender_domain: String,
+    receiver_domain: String,
+    sender_device: String,
+    receiver_device: String,
+}
+
+#[derive(Clone, Serialize)]
 struct RoutePreview {
     sequence_id: u64,
     source_domain: String,
@@ -127,12 +137,17 @@ struct TransportMetrics {
     bytes_received: usize,
 }
 
-struct LocalRingTransport {
-    inboxes: BTreeMap<String, VecDeque<Vec<u8>>>,
+struct Envelope {
+    sender_domain: String,
+    frame: Vec<u8>,
+}
+
+struct LocalP2pTransport {
+    inboxes: BTreeMap<String, VecDeque<Envelope>>,
     metrics: TransportMetrics,
 }
 
-impl LocalRingTransport {
+impl LocalP2pTransport {
     fn new(domains: &[DomainSpec]) -> Self {
         let inboxes = domains
             .iter()
@@ -150,38 +165,56 @@ impl LocalRingTransport {
         receiver_domain: &str,
         frame: Vec<u8>,
     ) -> Result<(), ProtocolError> {
+        if !self.inboxes.contains_key(sender_domain) {
+            return Err(ProtocolError::MissingPeer {
+                domain_id: sender_domain.to_string(),
+            });
+        }
         let Some(inbox) = self.inboxes.get_mut(receiver_domain) else {
-            return Err(ProtocolError::MissingInbox {
+            return Err(ProtocolError::MissingPeer {
                 domain_id: receiver_domain.to_string(),
             });
         };
         self.metrics.messages_sent += 1;
         self.metrics.bytes_sent += frame.len();
-        inbox.push_back(frame);
-        let _ = sender_domain;
+        inbox.push_back(Envelope {
+            sender_domain: sender_domain.to_string(),
+            frame,
+        });
         Ok(())
     }
 
-    fn recv(&mut self, receiver_domain: &str) -> Result<Vec<u8>, ProtocolError> {
+    fn recv(
+        &mut self,
+        expected_sender: &str,
+        receiver_domain: &str,
+    ) -> Result<Vec<u8>, ProtocolError> {
         let Some(inbox) = self.inboxes.get_mut(receiver_domain) else {
-            return Err(ProtocolError::MissingInbox {
+            return Err(ProtocolError::MissingPeer {
                 domain_id: receiver_domain.to_string(),
             });
         };
-        let Some(frame) = inbox.pop_front() else {
+        let Some(envelope) = inbox.pop_front() else {
             return Err(ProtocolError::EmptyInbox {
                 domain_id: receiver_domain.to_string(),
             });
         };
+        if envelope.sender_domain != expected_sender {
+            return Err(ProtocolError::MessageMismatch {
+                field: "sender_domain",
+                expected: expected_sender.to_string(),
+                actual: envelope.sender_domain,
+            });
+        }
         self.metrics.messages_received += 1;
-        self.metrics.bytes_received += frame.len();
-        Ok(frame)
+        self.metrics.bytes_received += envelope.frame.len();
+        Ok(envelope.frame)
     }
 }
 
 pub fn run_protocol_smoke() -> Result<ProtocolSmokeReport, ProtocolError> {
     let domains = default_domains()?;
-    let mut transport = LocalRingTransport::new(&domains);
+    let mut transport = LocalP2pTransport::new(&domains);
     let mut route_preview = Vec::new();
     let mut sequence_id = 1_u64;
     let mut source_blocks = 0_usize;
@@ -204,7 +237,9 @@ pub fn run_protocol_smoke() -> Result<ProtocolSmokeReport, ProtocolError> {
                 );
                 let frame = serialize_message(&message)?;
                 transport.send(&message.sender_domain, &message.receiver_domain, frame)?;
-                let decoded = deserialize_message(&transport.recv(&message.receiver_domain)?)?;
+                let decoded = deserialize_message(
+                    &transport.recv(&message.sender_domain, &message.receiver_domain)?,
+                )?;
                 validate_message(&message, &decoded)?;
                 if route_preview.len() < 8 {
                     route_preview.push(RoutePreview {
@@ -245,6 +280,7 @@ pub fn run_protocol_smoke() -> Result<ProtocolSmokeReport, ProtocolError> {
 
     Ok(ProtocolSmokeReport {
         status: "pass",
+        transport: "local_p2p_queue",
         schema_version: SCHEMA_VERSION,
         domains: domains.len(),
         source_blocks,
@@ -257,6 +293,7 @@ pub fn run_protocol_smoke() -> Result<ProtocolSmokeReport, ProtocolError> {
             bytes_sent: transport.metrics.bytes_sent,
             bytes_received: transport.metrics.bytes_received,
         },
+        links: ring_links(&domains),
         route_preview,
     })
 }
@@ -291,6 +328,22 @@ fn default_domains() -> Result<Vec<DomainSpec>, ProtocolError> {
         return Err(ProtocolError::EmptyDomains);
     }
     Ok(domains)
+}
+
+fn ring_links(domains: &[DomainSpec]) -> Vec<LinkReport> {
+    domains
+        .iter()
+        .enumerate()
+        .map(|(index, sender)| {
+            let receiver = &domains[(index + 1) % domains.len()];
+            LinkReport {
+                sender_domain: sender.domain_id.clone(),
+                receiver_domain: receiver.domain_id.clone(),
+                sender_device: sender.device.clone(),
+                receiver_device: receiver.device.clone(),
+            }
+        })
+        .collect()
 }
 
 fn block_ranges(spec: &DomainSpec) -> impl Iterator<Item = (usize, usize)> + '_ {
@@ -339,7 +392,7 @@ fn kv_block_message(
 }
 
 fn send_control_message(
-    transport: &mut LocalRingTransport,
+    transport: &mut LocalP2pTransport,
     sequence_id: u64,
     message_kind: RingAttnMessageKind,
     payload_kind: PayloadKind,
@@ -369,7 +422,8 @@ fn send_control_message(
     };
     let frame = serialize_message(&message)?;
     transport.send(&message.sender_domain, &message.receiver_domain, frame)?;
-    let decoded = deserialize_message(&transport.recv(&message.receiver_domain)?)?;
+    let decoded =
+        deserialize_message(&transport.recv(&message.sender_domain, &message.receiver_domain)?)?;
     validate_message(&message, &decoded)?;
     Ok(1)
 }

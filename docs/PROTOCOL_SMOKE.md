@@ -4,7 +4,7 @@
 
 本阶段把 Ring Attention / Context Parallel 中“ring 内流动的东西”从内存内抽象推进成可序列化、可发送、可接收、可检查的协议单元。
 
-它不是性能实现，也不是最终网络 transport。当前目标是固定低边界协议语义：
+它不是性能实现。当前目标是固定低边界协议语义，并用本地 P2P 队列表达 point-to-point send / recv 语义：
 
 - 每个 source domain 按自己的 `block_size` 切出 K/V block。
 - K/V block 沿 ring 逐 hop 转发。
@@ -56,6 +56,21 @@ Rust 侧当前定义的最小 schema 包括：
 
 当前 wire format 使用 `serde_json`，因为本阶段优先可读性和可诊断性。后续如果需要性能，可以在 schema 稳定后替换成二进制格式。
 
+## P2P Transport 语义
+
+这里的 P2P 不是特指 IP/TCP。它表示跨 domain 只做点对点消息传递，不把 all-gather / reduce-scatter / all-to-all / all-reduce 作为主通信假设。
+
+当前 smoke 使用 `local_p2p_queue`：
+
+- 每个 domain 有独立 inbox。
+- send 必须指定 sender / receiver。
+- recv 会校验 expected sender。
+- frame 内容仍是完整序列化后的 `RingAttnMessage`。
+
+这一步先固定协议语义，不绑定到底层 IP/TCP。后续可以把同一个 `RingAttnMessage` 映射到 TCP、UCX/RDMA、NCCL send/recv、共享内存或自定义 GPU-direct transport。
+
+远端 NVIDIA GPU 当前在 `192.168.8.172`。代码变更只通过 git 同步：本地提交并 push，远端只执行 `git pull` 和 smoke 命令，不在远端直接编辑源码。
+
 ## Smoke Report
 
 运行：
@@ -81,6 +96,7 @@ JSON report 中新增 `protocol_smoke`：
 ```json
 {
   "status": "pass",
+  "transport": "local_p2p_queue",
   "schema_version": 1,
   "domains": 3,
   "source_blocks": 10,
@@ -98,4 +114,4 @@ JSON report 中新增 `protocol_smoke`：
 
 ## 后续
 
-下一步应把当前 `LocalRingTransport` 替换为最小 P2P transport，但保持 message schema 和 report 字段稳定。这样可以先验证 remote send/recv，再接入 CUDA / MPS runtime stub。
+下一步应为 `local_p2p_queue` 抽出明确 transport trait，再增加一个可选 remote transport 实现。remote 版本可以先用 TCP 做工程 smoke，但不应把 Ring Attention protocol 本身定义成 TCP。

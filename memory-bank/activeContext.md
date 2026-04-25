@@ -32,8 +32,9 @@
 - [2026-04-25] C++ ATen bridge 增加 CUDA backend preflight：请求 `cuda` / `cuda:N` 时 `at::hasCUDA()==false` 会返回 `torch_code=-5`，明确指向 CPU-only libtorch 或 `libtorch_cuda` / `c10_cuda` 未链接加载。
 - [2026-04-25] 远端已确认 `/home/stark/libtorch/lib` 存在 `libtorch_cuda.so` / `libc10_cuda.so`，但 `ldd rust/target/debug/hcp-ringattn-rust` 未显示它们；`rust/build.rs` 已在 Linux CUDA libtorch 下用同一个 linker group 传入 `--push-state,--no-as-needed,-ltorch_cuda,-lc10_cuda,--pop-state`，避免 rustc / linker 参数重排导致 registration libraries 被丢弃。
 - [2026-04-25] 远端 GPU smoke 已通过：`CARGO_OFFLINE=0 HCP_ENABLE_TORCH=1 HCP_TORCH_DEVICE=cuda:0 bash scripts/run_rust_ringattn_smoke.sh` 输出 `torch_status=pass torch_device=cuda:0 torch_code=3`，`ldd` 已显示 `libtorch_cuda.so` / `libc10_cuda.so`。
-- [2026-04-25] Rust 新增 protocol smoke：本地 in-memory ring transport 按 Context Parallel ring order 转发 K/V block，并覆盖 softmax state / terminate 消息；report 新增 `protocol_smoke`。
+- [2026-04-25] Rust 新增 protocol smoke：本地 P2P queue transport 按 Context Parallel ring order 转发 K/V block，并覆盖 softmax state / terminate 消息；report 新增 `protocol_smoke`。这里的 P2P 指 point-to-point message 语义，不绑定 IP/TCP。
 - [2026-04-25] 当前 protocol smoke 默认 3 domains、10 个 source blocks、20 条 K/V block messages、1 条 softmax state、1 条 terminate，总计 `protocol_messages=22`。
+- [2026-04-25] 远端 NVIDIA GPU host 为 `192.168.8.172`；不要直接编辑远端源码，代码变更必须本地 commit/push 后由远端 `git pull` 同步。
 
 ## 活跃决策
 
@@ -51,7 +52,7 @@
 - [ ] 扩展 correctness case，覆盖更大的 seq、更多 seed、float32 / mixed precision tolerance policy。
 - [ ] 必要时增加 `max_rel_err` 并明确 tolerance policy。
 - [ ] 将 Rust correctness model 继续拆分为 library + binary，便于后续 protocol / transport 复用。
-- [ ] 将 `LocalRingTransport` 替换为最小 P2P transport，保持当前 message schema / report 字段稳定。
+- [ ] 为 `local_p2p_queue` 抽出 transport trait，再增加可选双进程 / 双机器 remote transport，保持当前 message schema / report 字段稳定。
 - [ ] 在 cargo registry/network 可用后，增加 feature-gated `tch = 0.24.0` backend，并先实现 `tch_smoke`，再迁移 Ring Attention block update。
 - [ ] 在 cargo registry/network 可用后，引入 optional `tch = 0.24.0` 并实现 `tch_smoke`。
 - [ ] 为 `RingAttnMessage` 设计 serialization / deserialization。
@@ -70,6 +71,8 @@
 - GPU hardware smoke 纪律：远端 `HCP_TORCH_DEVICE=cuda:0` 必须看到 `torch_status=pass`、`torch_code=3`，仅有 correctness `passed=3/3` 不足以证明 CUDA 路径有效。
 - 远端 GPU smoke 排查经验：若 `torch_code=-2` 或 `torch_code=-5`，不要怀疑 `cuda:0` 设备名；优先看 `torch_message`，并检查 `LIBTORCH`、`LIBTORCH_LIB`、`LD_LIBRARY_PATH` / rpath、`ldd` 是否显示 `libtorch_cuda.so` / `libc10_cuda.so`。
 - Protocol smoke 纪律：`protocol_status=pass` 需要同时覆盖 K/V block、softmax state、terminate；K/V block message 数应等于 source blocks * (domain_count - 1)。
+- P2P 语义纪律：P2P 表示 point-to-point、非 collective；不要把 HCP protocol 本身等同于 IP/TCP。
+- Remote GPU 纪律：`192.168.8.172` 只通过 git 同步代码；不要在远端直接编辑源码。
 
 ## 当前阻塞
 

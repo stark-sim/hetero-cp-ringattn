@@ -70,7 +70,7 @@
 
 - `RingAttnMessage` 可以稳定编码、传输、解码
 
-当前 Rust smoke 已建立本地 in-memory ring transport，覆盖 K/V block、softmax state、terminate 三类消息，并在 JSON report 中输出 `protocol_smoke`。
+当前 Rust smoke 已建立本地 P2P queue transport，覆盖 K/V block、softmax state、terminate 三类消息，并在 JSON report 中输出 `protocol_smoke`。这里的 P2P 指 point-to-point message 语义，不绑定 IP/TCP。
 
 ## M4: 异构 runtime 闭环
 

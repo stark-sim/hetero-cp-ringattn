@@ -37,6 +37,11 @@ This project uses a Memory Bank system in `memory-bank/` for cross-session conte
 - Do not treat CPU-only local libtorch smoke as a meaningful hardware validation result; CPU smoke is only a fallback for compile/link or no-accelerator checks.
 - The normal sandbox hides Metal devices, so sandbox MPS failures are not valid evidence that MPS is unavailable.
 
+### Remote GPU Discipline:
+- The NVIDIA GPU host is `192.168.8.172`.
+- Do not directly edit source files on the remote GPU host. Make code changes locally, commit them, push to the configured remote, then sync on the GPU host with `git pull`.
+- Remote GPU smoke results can be recorded in reports/docs, but source-of-truth code changes must flow through git.
+
 ### Special Commands:
 - `memory bank update` / `memory bank güncelle` -> Review and update ALL memory bank files
 - `memory bank status` / `memory bank durumu` -> Show current status summary
