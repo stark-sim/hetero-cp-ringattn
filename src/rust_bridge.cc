@@ -1,8 +1,12 @@
 #include <algorithm>
-#include <cstdlib>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <string>
+#include <vector>
 
 #include "hcp_ringattn/core/ringattn_runtime.h"
 
@@ -15,6 +19,7 @@ namespace {
 std::string g_torch_smoke_message;
 std::string g_torch_attention_smoke_message;
 std::string g_torch_block_update_smoke_message;
+std::string g_torch_payload_block_smoke_message;
 
 #ifdef HCP_ENABLE_TORCH
 struct TorchDeviceSelection {
@@ -64,6 +69,15 @@ bool SelectTorchDevice(const std::string& device_name, TorchDeviceSelection* sel
 
 bool DeviceMatches(const at::Tensor& tensor, const at::Device& device) {
   return device.is_cpu() ? tensor.is_cpu() : device.is_mps() ? tensor.is_mps() : tensor.is_cuda();
+}
+
+at::Tensor PayloadAttention(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
+  const double scale = 1.0 / std::sqrt(static_cast<double>(q.sizes()[1]));
+  auto k_by_head = k.permute({1, 0, 2});
+  auto v_by_head = v.permute({1, 0, 2});
+  auto scores = at::bmm(k_by_head, q.unsqueeze(2)).squeeze(2) * scale;
+  auto weights = at::softmax(scores, -1);
+  return at::bmm(weights.unsqueeze(1), v_by_head).squeeze(1);
 }
 
 int RunTorchAttentionBlockUpdates(int block_updates, std::string* message) {
@@ -131,6 +145,95 @@ int RunTorchAttentionBlockUpdates(int block_updates, std::string* message) {
              " max_abs_err=" + std::to_string(max_abs_err);
   return -1;
 }
+
+int RunTorchPayloadBlockSmoke(const std::uint8_t* payload,
+                              std::size_t payload_len,
+                              int block_len,
+                              int num_heads,
+                              int head_dim,
+                              std::string* message) {
+  message->clear();
+  if (payload == nullptr) {
+    *message = "payload pointer is null";
+    return -6;
+  }
+  if (block_len <= 0 || num_heads <= 0 || head_dim <= 0) {
+    *message = "block_len, num_heads, and head_dim must be positive";
+    return -6;
+  }
+  const auto block = static_cast<std::size_t>(block_len);
+  const auto heads = static_cast<std::size_t>(num_heads);
+  const auto dim = static_cast<std::size_t>(head_dim);
+  const std::size_t values_per_tensor = block * heads * dim;
+  const std::size_t expected_values = values_per_tensor * 2;
+  const std::size_t expected_bytes = expected_values * sizeof(float);
+  if (payload_len != expected_bytes) {
+    *message = "payload byte size mismatch expected=" + std::to_string(expected_bytes) +
+               " actual=" + std::to_string(payload_len);
+    return -6;
+  }
+
+  const char* requested = std::getenv("HCP_TORCH_DEVICE");
+  std::string device_name = requested == nullptr ? "cpu" : requested;
+  TorchDeviceSelection selection{at::Device(at::kCPU), 1};
+  if (!SelectTorchDevice(device_name, &selection)) {
+    *message =
+        "unsupported HCP_TORCH_DEVICE=" + device_name + "; expected cpu, mps, cuda, or cuda:N";
+    return -4;
+  }
+  if (selection.device.is_cuda() && !at::hasCUDA()) {
+    *message =
+        "CUDA device name is valid, but CUDA backend is not available in the current libtorch "
+        "process. Verify LIBTORCH/LIBTORCH_LIB point to a CUDA-enabled libtorch build and that "
+        "libtorch_cuda and c10_cuda are linked/loaded.";
+    return -5;
+  }
+
+  std::vector<float> values(expected_values);
+  std::memcpy(values.data(), payload, expected_bytes);
+  auto cpu_options = at::TensorOptions().dtype(at::kFloat).device(at::kCPU);
+  auto kv_cpu =
+      at::from_blob(values.data(),
+                    {2, static_cast<std::int64_t>(block_len), static_cast<std::int64_t>(num_heads),
+                     static_cast<std::int64_t>(head_dim)},
+                    cpu_options)
+          .clone();
+  auto q_cpu = (at::arange(num_heads * head_dim, cpu_options)
+                    .reshape({static_cast<std::int64_t>(num_heads),
+                              static_cast<std::int64_t>(head_dim)}) /
+                31.0) +
+               0.125;
+  auto k_cpu = kv_cpu[0];
+  auto v_cpu = kv_cpu[1];
+  auto reference = PayloadAttention(q_cpu, k_cpu, v_cpu);
+
+  auto q = q_cpu.to(selection.device);
+  auto k = k_cpu.to(selection.device);
+  auto v = v_cpu.to(selection.device);
+  auto output = PayloadAttention(q, k, v);
+  if (!DeviceMatches(output, selection.device)) {
+    *message = "payload attention output landed on unexpected device: " + output.device().str();
+    return -1;
+  }
+  if (output.sizes()[0] != num_heads || output.sizes()[1] != head_dim) {
+    *message = "unexpected payload attention output shape";
+    return -1;
+  }
+  auto output_cpu = output.to(at::kCPU);
+  const float max_abs_err = at::abs(output_cpu - reference).max().item<float>();
+  const float checksum = output_cpu.sum().item<float>();
+  if (max_abs_err <= 1.0e-4F) {
+    *message = "ok block_len=" + std::to_string(block_len) +
+               " num_heads=" + std::to_string(num_heads) +
+               " head_dim=" + std::to_string(head_dim) +
+               " max_abs_err=" + std::to_string(max_abs_err) +
+               " checksum=" + std::to_string(checksum);
+    return selection.success_code;
+  }
+  *message = "payload attention mismatch block_len=" + std::to_string(block_len) +
+             " max_abs_err=" + std::to_string(max_abs_err);
+  return -1;
+}
 #endif
 }
 
@@ -144,6 +247,10 @@ extern "C" const char* hcp_ringattn_torch_attention_smoke_message() {
 
 extern "C" const char* hcp_ringattn_torch_block_update_smoke_message() {
   return g_torch_block_update_smoke_message.c_str();
+}
+
+extern "C" const char* hcp_ringattn_torch_payload_block_smoke_message() {
+  return g_torch_payload_block_smoke_message.c_str();
 }
 
 extern "C" int hcp_ringattn_cxx_smoke_domain_count() {
@@ -259,6 +366,33 @@ extern "C" int hcp_ringattn_torch_block_update_smoke(int block_updates) {
 #else
   (void)block_updates;
   g_torch_block_update_smoke_message = "HCP_ENABLE_TORCH is not enabled";
+  return 0;
+#endif
+}
+
+extern "C" int hcp_ringattn_torch_payload_block_smoke(const std::uint8_t* payload,
+                                                       std::size_t payload_len,
+                                                       int block_len,
+                                                       int num_heads,
+                                                       int head_dim) {
+#ifdef HCP_ENABLE_TORCH
+  try {
+    return RunTorchPayloadBlockSmoke(payload, payload_len, block_len, num_heads, head_dim,
+                                     &g_torch_payload_block_smoke_message);
+  } catch (const std::exception& exc) {
+    g_torch_payload_block_smoke_message = exc.what();
+    return -2;
+  } catch (...) {
+    g_torch_payload_block_smoke_message = "unknown exception";
+    return -3;
+  }
+#else
+  (void)payload;
+  (void)payload_len;
+  (void)block_len;
+  (void)num_heads;
+  (void)head_dim;
+  g_torch_payload_block_smoke_message = "HCP_ENABLE_TORCH is not enabled";
   return 0;
 #endif
 }

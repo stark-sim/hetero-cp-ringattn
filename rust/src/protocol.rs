@@ -17,6 +17,10 @@ const REMOTE_ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(200);
 const REMOTE_ACCEPT_ATTEMPTS: usize = 300;
 const REMOTE_CLIENT_DOMAIN: &str = "mac-mps";
 const REMOTE_SERVER_DOMAIN: &str = "gpu-cuda";
+const KV_NUM_HEADS: usize = 3;
+const KV_HEAD_DIM: usize = 24;
+const KV_TENSOR_COUNT: usize = 2;
+const FLOAT32_BYTES: usize = 4;
 
 #[derive(Debug, Error)]
 pub enum ProtocolError {
@@ -175,6 +179,8 @@ pub struct CpRingNodeSmokeReport {
     expected_kv_messages: usize,
     summary: CpRingNodeSummary,
     nodes: Vec<CpRingNodeReport>,
+    #[serde(skip_serializing)]
+    payload_blocks: Vec<CpPayloadBlock>,
 }
 
 impl CpRingNodeSmokeReport {
@@ -184,6 +190,10 @@ impl CpRingNodeSmokeReport {
 
     pub fn compute_updates(&self) -> usize {
         self.summary.compute_updates
+    }
+
+    pub fn payload_blocks(&self) -> &[CpPayloadBlock] {
+        &self.payload_blocks
     }
 }
 
@@ -242,6 +252,7 @@ struct RemoteCpNodeSummary {
 struct CpRingNodeSummary {
     node_threads: usize,
     source_blocks: usize,
+    payload_blocks_captured: usize,
     initial_messages_sent: usize,
     forwarded_messages_sent: usize,
     messages_sent: usize,
@@ -265,6 +276,8 @@ struct CpRingNodeReport {
     bytes_sent: usize,
     bytes_received: usize,
     first_routes: Vec<CpRingRoutePreview>,
+    #[serde(skip_serializing)]
+    payload_blocks: Vec<CpPayloadBlock>,
 }
 
 #[derive(Clone, Serialize)]
@@ -277,6 +290,37 @@ struct CpRingRoutePreview {
     block_start: usize,
     block_len: usize,
     ring_step: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct CpPayloadBlock {
+    sequence_id: u64,
+    block_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    payload: Vec<u8>,
+}
+
+impl CpPayloadBlock {
+    pub fn sequence_id(&self) -> u64 {
+        self.sequence_id
+    }
+
+    pub fn block_len(&self) -> usize {
+        self.block_len
+    }
+
+    pub fn num_heads(&self) -> usize {
+        self.num_heads
+    }
+
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
 }
 
 #[derive(Default, Serialize)]
@@ -554,10 +598,15 @@ pub fn run_cp_ring_node_smoke() -> Result<CpRingNodeSmokeReport, ProtocolError> 
         nodes.push(node);
     }
     nodes.sort_by(|lhs, rhs| lhs.domain_id.cmp(&rhs.domain_id));
+    let payload_blocks = nodes
+        .iter()
+        .flat_map(|node| node.payload_blocks.iter().cloned())
+        .collect::<Vec<_>>();
 
     let summary = CpRingNodeSummary {
         node_threads: nodes.len(),
         source_blocks: total_source_blocks,
+        payload_blocks_captured: payload_blocks.len(),
         initial_messages_sent: nodes.iter().map(|node| node.initial_messages_sent).sum(),
         forwarded_messages_sent: nodes.iter().map(|node| node.forwarded_messages_sent).sum(),
         messages_sent: nodes
@@ -575,6 +624,7 @@ pub fn run_cp_ring_node_smoke() -> Result<CpRingNodeSmokeReport, ProtocolError> 
         && summary.messages_sent == expected_kv_messages
         && summary.messages_received == expected_kv_messages
         && summary.compute_updates == expected_compute_updates
+        && summary.payload_blocks_captured == expected_compute_updates
     {
         "pass"
     } else {
@@ -590,6 +640,7 @@ pub fn run_cp_ring_node_smoke() -> Result<CpRingNodeSmokeReport, ProtocolError> 
         expected_kv_messages,
         summary,
         nodes,
+        payload_blocks,
     })
 }
 
@@ -846,6 +897,7 @@ fn run_cp_ring_node(
         bytes_sent: 0,
         bytes_received: 0,
         first_routes: Vec::new(),
+        payload_blocks: Vec::new(),
     };
 
     for (block_index, (block_start, block_stop)) in block_ranges(&domain).enumerate() {
@@ -861,6 +913,7 @@ fn run_cp_ring_node(
         send_cp_node_frame(&next_sender, &message, &mut report, true)?;
         report.source_blocks += 1;
         report.compute_updates += 1;
+        push_payload_block(&mut report.payload_blocks, &message);
         push_cp_route_preview(&mut report, &message, Some(&outbound_peer.domain_id));
     }
 
@@ -876,6 +929,7 @@ fn run_cp_ring_node(
         let message = deserialize_message(&frame)?;
         validate_cp_ring_message(domain_index, &domains, &message)?;
         report.compute_updates += 1;
+        push_payload_block(&mut report.payload_blocks, &message);
 
         let should_forward = message.ring_step < domain_count - 1;
         if should_forward {
@@ -950,6 +1004,22 @@ fn push_cp_route_preview(
         block_start: block.global_offset,
         block_len: block.block_len,
         ring_step: message.ring_step,
+    });
+}
+
+fn push_payload_block(payload_blocks: &mut Vec<CpPayloadBlock>, message: &RingAttnMessage) {
+    if message.message_kind != RingAttnMessageKind::KvBlock {
+        return;
+    }
+    let (Some(block), Some(tensor)) = (&message.block, &message.tensor) else {
+        return;
+    };
+    payload_blocks.push(CpPayloadBlock {
+        sequence_id: message.sequence_id,
+        block_len: block.block_len,
+        num_heads: tensor.num_heads,
+        head_dim: tensor.head_dim,
+        payload: message.payload.clone(),
     });
 }
 
@@ -1410,8 +1480,8 @@ fn kv_block_message(
         }),
         tensor: Some(TensorMetadata {
             dtype: "float32".to_string(),
-            num_heads: 3,
-            head_dim: 24,
+            num_heads: KV_NUM_HEADS,
+            head_dim: KV_HEAD_DIM,
             payload_bytes: payload.len(),
             checksum: checksum(&payload),
         }),
@@ -1465,8 +1535,8 @@ fn control_message(
         block: None,
         tensor: Some(TensorMetadata {
             dtype: "float32".to_string(),
-            num_heads: 3,
-            head_dim: 24,
+            num_heads: KV_NUM_HEADS,
+            head_dim: KV_HEAD_DIM,
             payload_bytes: payload.len(),
             checksum: checksum(&payload),
         }),
@@ -1480,21 +1550,53 @@ fn make_kv_payload(
     block_start: usize,
     block_len: usize,
 ) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&sequence_id.to_le_bytes());
-    payload.extend_from_slice(&(source.seq_offset as u64).to_le_bytes());
-    payload.extend_from_slice(&(block_start as u64).to_le_bytes());
-    payload.extend_from_slice(&(block_len as u64).to_le_bytes());
-    payload.extend_from_slice(source.domain_id.as_bytes());
-    payload.extend_from_slice(source.device.as_bytes());
+    let values = KV_TENSOR_COUNT * block_len * KV_NUM_HEADS * KV_HEAD_DIM;
+    let mut payload = Vec::with_capacity(values * FLOAT32_BYTES);
+    for tensor_index in 0..KV_TENSOR_COUNT {
+        for token_offset in 0..block_len {
+            let global_token = block_start + token_offset;
+            for head in 0..KV_NUM_HEADS {
+                for dim in 0..KV_HEAD_DIM {
+                    let value = kv_payload_value(
+                        sequence_id,
+                        source,
+                        tensor_index,
+                        global_token,
+                        head,
+                        dim,
+                    );
+                    payload.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+    }
     payload
+}
+
+fn kv_payload_value(
+    sequence_id: u64,
+    source: &DomainSpec,
+    tensor_index: usize,
+    global_token: usize,
+    head: usize,
+    dim: usize,
+) -> f32 {
+    let source_bias = (source.seq_offset as f32 + 1.0) * 0.0001;
+    let sequence_bias = (sequence_id % 97) as f32 * 0.00001;
+    let tensor_bias = tensor_index as f32 * 0.031;
+    (global_token as f32 + 1.0) * 0.013
+        + head as f32 * 0.017
+        + dim as f32 * 0.0019
+        + source_bias
+        + sequence_bias
+        + tensor_bias
 }
 
 fn make_softmax_state_payload(source: &DomainSpec) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&(source.seq_chunk_len as u64).to_le_bytes());
-    payload.extend_from_slice(&(3_u64).to_le_bytes());
-    payload.extend_from_slice(&(24_u64).to_le_bytes());
+    payload.extend_from_slice(&(KV_NUM_HEADS as u64).to_le_bytes());
+    payload.extend_from_slice(&(KV_HEAD_DIM as u64).to_le_bytes());
     payload.extend_from_slice(source.domain_id.as_bytes());
     payload
 }

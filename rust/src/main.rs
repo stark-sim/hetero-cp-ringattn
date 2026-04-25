@@ -90,6 +90,7 @@ struct Report {
     torch_bridge: TorchBridgeReport,
     torch_attention_bridge: TorchBridgeReport,
     torch_block_update_bridge: TorchBlockUpdateReport,
+    torch_payload_block_bridge: TorchPayloadBlockReport,
     cases: Vec<CaseReport>,
 }
 
@@ -122,6 +123,18 @@ struct TorchBlockUpdateReport {
     compiled: bool,
     requested_device: String,
     requested_updates: usize,
+    status_code: i32,
+    note: String,
+    message: String,
+}
+
+#[derive(Serialize)]
+struct TorchPayloadBlockReport {
+    status: &'static str,
+    compiled: bool,
+    requested_device: String,
+    requested_blocks: usize,
+    processed_blocks: usize,
     status_code: i32,
     note: String,
     message: String,
@@ -234,6 +247,14 @@ extern "C" {
     fn hcp_ringattn_torch_attention_smoke_message() -> *const std::os::raw::c_char;
     fn hcp_ringattn_torch_block_update_smoke(block_updates: i32) -> i32;
     fn hcp_ringattn_torch_block_update_smoke_message() -> *const std::os::raw::c_char;
+    fn hcp_ringattn_torch_payload_block_smoke(
+        payload: *const std::os::raw::c_uchar,
+        payload_len: usize,
+        block_len: i32,
+        num_heads: i32,
+        head_dim: i32,
+    ) -> i32;
+    fn hcp_ringattn_torch_payload_block_smoke_message() -> *const std::os::raw::c_char;
 }
 
 fn build_specs(config: &CaseConfig) -> Result<Vec<DomainSpec>, RingError> {
@@ -668,6 +689,90 @@ fn torch_block_update_bridge_report(requested_updates: usize) -> TorchBlockUpdat
     }
 }
 
+fn torch_payload_block_bridge_report(
+    blocks: &[protocol::CpPayloadBlock],
+) -> TorchPayloadBlockReport {
+    let requested_blocks = blocks.len();
+    if !cfg!(hcp_torch_enabled) {
+        let report = torch_report_from_code(
+            0,
+            "HCP_ENABLE_TORCH is not enabled".to_string(),
+            "C++ libtorch payload block smoke executed on CPU",
+            "C++ libtorch payload block smoke executed on MPS",
+            "C++ libtorch payload block smoke executed on CUDA",
+            "C++ libtorch payload block smoke is disabled; build with HCP_ENABLE_TORCH=1",
+            "C++ libtorch payload block smoke failed or returned an unexpected status",
+        );
+        return TorchPayloadBlockReport {
+            status: report.status,
+            compiled: report.compiled,
+            requested_device: report.requested_device,
+            requested_blocks,
+            processed_blocks: 0,
+            status_code: report.status_code,
+            note: report.note,
+            message: report.message,
+        };
+    }
+
+    let mut processed_blocks = 0_usize;
+    let mut code = -6;
+    let mut message = if blocks.is_empty() {
+        "no CP payload blocks captured".to_string()
+    } else {
+        String::new()
+    };
+    for block in blocks {
+        let block_len = i32::try_from(block.block_len()).unwrap_or(i32::MAX);
+        let num_heads = i32::try_from(block.num_heads()).unwrap_or(i32::MAX);
+        let head_dim = i32::try_from(block.head_dim()).unwrap_or(i32::MAX);
+        code = unsafe {
+            hcp_ringattn_torch_payload_block_smoke(
+                block.payload().as_ptr(),
+                block.payload().len(),
+                block_len,
+                num_heads,
+                head_dim,
+            )
+        };
+        message = c_string_from_ptr(unsafe { hcp_ringattn_torch_payload_block_smoke_message() });
+        let block_report = torch_report_from_code(
+            code,
+            message.clone(),
+            "C++ libtorch payload block smoke executed on CPU",
+            "C++ libtorch payload block smoke executed on MPS",
+            "C++ libtorch payload block smoke executed on CUDA",
+            "C++ libtorch payload block smoke is disabled; build with HCP_ENABLE_TORCH=1",
+            "C++ libtorch payload block smoke failed or returned an unexpected status",
+        );
+        if block_report.status == "fail" {
+            message = format!("sequence_id={} {}", block.sequence_id(), message);
+            break;
+        }
+        processed_blocks += 1;
+    }
+
+    let report = torch_report_from_code(
+        code,
+        message,
+        "C++ libtorch payload block smoke executed on CPU",
+        "C++ libtorch payload block smoke executed on MPS",
+        "C++ libtorch payload block smoke executed on CUDA",
+        "C++ libtorch payload block smoke is disabled; build with HCP_ENABLE_TORCH=1",
+        "C++ libtorch payload block smoke failed or returned an unexpected status",
+    );
+    TorchPayloadBlockReport {
+        status: report.status,
+        compiled: report.compiled,
+        requested_device: report.requested_device,
+        requested_blocks,
+        processed_blocks,
+        status_code: report.status_code,
+        note: report.note,
+        message: report.message,
+    }
+}
+
 fn torch_report_from_code(
     code: i32,
     message: String,
@@ -736,12 +841,15 @@ fn run() -> Result<Report, RingError> {
     let torch_attention_bridge = torch_attention_bridge_report();
     let torch_block_update_bridge =
         torch_block_update_bridge_report(cp_ring_smoke.compute_updates());
+    let torch_payload_block_bridge =
+        torch_payload_block_bridge_report(cp_ring_smoke.payload_blocks());
     let status = if failed == 0
         && protocol_smoke.status == "pass"
         && cp_ring_smoke.status == "pass"
         && torch_bridge.status != "fail"
         && torch_attention_bridge.status != "fail"
         && torch_block_update_bridge.status != "fail"
+        && torch_payload_block_bridge.status != "fail"
     {
         "pass"
     } else {
@@ -763,6 +871,7 @@ fn run() -> Result<Report, RingError> {
         torch_bridge,
         torch_attention_bridge,
         torch_block_update_bridge,
+        torch_payload_block_bridge,
         cases,
     })
 }
@@ -852,7 +961,7 @@ fn main() -> Result<(), RingError> {
     let report = run()?;
     write_json_report(&args.report_path, &report)?;
     println!(
-        "[rust-ringattn] status={} passed={}/{} protocol_status={} protocol_messages={} cp_ring_status={} cp_ring_messages={} cp_ring_compute_updates={} cxx_domains={} torch_status={} torch_device={} torch_code={} torch_attention_status={} torch_attention_code={} torch_block_update_status={} torch_block_update_code={} torch_block_updates={} torch_compiled={} report={}",
+        "[rust-ringattn] status={} passed={}/{} protocol_status={} protocol_messages={} cp_ring_status={} cp_ring_messages={} cp_ring_compute_updates={} cxx_domains={} torch_status={} torch_device={} torch_code={} torch_attention_status={} torch_attention_code={} torch_block_update_status={} torch_block_update_code={} torch_block_updates={} torch_payload_block_status={} torch_payload_block_code={} torch_payload_blocks={}/{} torch_compiled={} report={}",
         report.status,
         report.summary.passed,
         report.summary.cases,
@@ -870,6 +979,10 @@ fn main() -> Result<(), RingError> {
         report.torch_block_update_bridge.status,
         report.torch_block_update_bridge.status_code,
         report.torch_block_update_bridge.requested_updates,
+        report.torch_payload_block_bridge.status,
+        report.torch_payload_block_bridge.status_code,
+        report.torch_payload_block_bridge.processed_blocks,
+        report.torch_payload_block_bridge.requested_blocks,
         report.torch_bridge.compiled,
         args.report_path
     );
@@ -893,6 +1006,14 @@ fn main() -> Result<(), RingError> {
         println!(
             "[rust-ringattn] torch_block_update_message={}",
             compact_message(&report.torch_block_update_bridge.message, 360)
+        );
+    }
+    if report.torch_payload_block_bridge.status == "fail"
+        && !report.torch_payload_block_bridge.message.is_empty()
+    {
+        println!(
+            "[rust-ringattn] torch_payload_block_message={}",
+            compact_message(&report.torch_payload_block_bridge.message, 360)
         );
     }
     if report.status == "pass" {
