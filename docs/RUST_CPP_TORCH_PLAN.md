@@ -37,6 +37,7 @@ Rust 社区常用的 PyTorch 绑定是 `tch-rs`，它是 PyTorch C++ API/libtorc
 - `torch_bridge` 验证基础张量创建和 matmul 是否实际落在请求设备。
 - `torch_attention_bridge` 验证真实 attention block compute：C++ ATen 在请求设备上计算 `softmax(QK^T / sqrt(d))V`，再搬回 CPU 与 CPU reference 对比误差。
 - `torch_block_update_bridge` 将 `cp_ring_node_runtime` 统计出的 compute update 数量传入 C++ ATen bridge，并在请求设备上循环执行同等次数的 attention block compute。
+- `torch_payload_block_bridge` 将 `RingAttnMessage.payload` 中的 float32 K/V bytes 传入 C++ ATen bridge，在请求设备上对每个 captured CP block 执行 payload-backed attention compute。
 
 尝试方式：
 
@@ -82,16 +83,19 @@ CARGO_OFFLINE=0 HCP_ENABLE_TORCH=1 HCP_TORCH_DEVICE=cuda:0 bash scripts/run_rust
 - `HCP_TORCH_DEVICE=cuda` / `cuda:N` 时 report 中 `torch_bridge.status_code=3`，这才表示实际跑到 CUDA。
 - `torch_attention_bridge.status_code` 使用同一套设备成功码；`torch_attention_status=pass` 表示 attention compute 也在目标设备上执行并通过 CPU reference tolerance。
 - `torch_block_update_bridge.status_code` 使用同一套设备成功码；`torch_block_update_status=pass` 表示 CP ring smoke 产生的 block update 数量已驱动同等次数的 device-side attention block compute。
+- `torch_payload_block_bridge.status_code` 使用同一套设备成功码；`torch_payload_block_status=pass` 表示 CP runtime 捕获的 K/V payload blocks 已逐块驱动 device-side attention compute。
 - `HCP_ENABLE_TORCH=1` 时，torch bridge 不再只是附加信息；请求设备没有拿到对应成功码会使整体 smoke 失败，并在 CLI summary 中打印 `torch_status`、`torch_device`、`torch_code`。
 - `HCP_ENABLE_TORCH=1` 时，`torch_attention_bridge` 也参与整体 smoke 成败；CLI summary 会打印 `torch_attention_status` 和 `torch_attention_code`。
 - `HCP_ENABLE_TORCH=1` 时，`torch_block_update_bridge` 也参与整体 smoke 成败；CLI summary 会打印 `torch_block_update_status`、`torch_block_update_code`、`torch_block_updates`。
+- `HCP_ENABLE_TORCH=1` 时，`torch_payload_block_bridge` 也参与整体 smoke 成败；CLI summary 会打印 `torch_payload_block_status`、`torch_payload_block_code`、`torch_payload_blocks=<processed>/<requested>`。
 - torch bridge 失败时 CLI 会打印压缩后的 `torch_message`；完整异常仍保存在 `reports/<RUN_ID>/rust_ringattn_correctness.json`。
 - `torch_code=-5` 表示 `cuda` / `cuda:N` 设备名有效，但当前进程中的 libtorch 没有 CUDA backend；优先检查 `LIBTORCH` / `LIBTORCH_LIB` 是否指向 CUDA-enabled libtorch，以及是否链接/加载了 `libtorch_cuda`、`c10_cuda`。
 - Linux 下 CUDA 版 libtorch 需要保留 `libtorch_cuda` / `c10_cuda` 这类 registration library；`rust/build.rs` 会在检测到二者时用同一个 linker group 传入 `--push-state,--no-as-needed,-ltorch_cuda,-lc10_cuda,--pop-state`，防止链接器或 rustc 参数重排把它们优化掉。远端 `ldd rust/target/debug/hcp-ringattn-rust | grep -E 'torch|c10|cuda'` 应能看到 `libtorch_cuda.so` 和 `libc10_cuda.so`。
 - 远端 CUDA 验证已通过：`torch_status=pass torch_device=cuda:0 torch_code=3`，且 `ldd` 显示 `libtorch_cuda.so` / `libc10_cuda.so`。
 - 远端 CUDA attention compute 验证已通过：显式传入 `LIBTORCH*` 和 `LD_LIBRARY_PATH` 后，`torch_attention_status=pass torch_attention_code=3`。
 - CP block update device-side compute 验证已通过：本机非沙箱 MPS 显示 `torch_block_update_status=pass torch_block_update_code=2 torch_block_updates=30`，远端 CUDA 显示 `torch_block_update_status=pass torch_block_update_code=3 torch_block_updates=30`。
-- 当前 `torch_block_update_bridge` 证明的是 CP update 计数已接入真实 device-side ATen compute；它仍使用确定性 synthetic tensors，还没有把 `RingAttnMessage` 中的 K/V payload 作为真实 tensor 输入。
+- CP payload-backed device-side compute 验证已通过：本机非沙箱 MPS 显示 `torch_payload_block_status=pass torch_payload_block_code=2 torch_payload_blocks=30/30`，远端 CUDA 显示 `torch_payload_block_status=pass torch_payload_block_code=3 torch_payload_blocks=30/30`。
+- 当前 payload bridge 已消费 `RingAttnMessage` 的 K/V bytes；它仍是 smoke 级 block attention，不是完整 online softmax state / output tensor kernel。
 - 远端非交互 SSH 不会自动加载 `/home/stark/.cargo/bin` 或 libtorch 环境；通过 SSH 运行 CUDA smoke 时应显式传入 `PATH=/home/stark/.cargo/bin:$PATH LIBTORCH=/home/stark/libtorch LIBTORCH_INCLUDE=/home/stark/libtorch/include LIBTORCH_LIB=/home/stark/libtorch/lib LD_LIBRARY_PATH=/home/stark/libtorch/lib:$LD_LIBRARY_PATH`。
 - 因此短期推荐路线是 Rust -> C ABI -> C++ ATen/libtorch，而不是马上把完整 `torch/torch.h` 或 `tch-rs` 作为必需路径。
 - `torch.backends.mps.is_built()` 为 true；沙箱进程看不到 Metal device，非沙箱进程 MPS 可用。

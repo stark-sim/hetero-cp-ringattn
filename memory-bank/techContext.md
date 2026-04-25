@@ -30,6 +30,7 @@
   - Rust -> C++ runtime bridge smoke
   - 可选 Rust -> C++ ATen/libtorch smoke
   - Rust CP update-driven ATen/libtorch block compute smoke
+  - Rust CP payload-backed ATen/libtorch block compute smoke
   - Rust remote P2P pair smoke
   - Python controller / worker placeholder smoke 仅作历史占位
 - 后续应增加 online softmax correctness script / report。
@@ -142,6 +143,7 @@ PATH=/home/stark/.cargo/bin:$PATH \
 - 本机 Mac hardware smoke 使用 `HCP_TORCH_DEVICE=mps` 并越过普通沙箱；CPU smoke 只用于编译/链接 fallback。
 - 启用 `HCP_ENABLE_TORCH=1` 后，Rust smoke 要求 torch bridge 成功；CLI summary 中 `torch_status=pass` 且设备成功码匹配才算硬件 smoke 通过。
 - `torch_block_update_status=pass` 表示 `cp_ring_node_runtime.compute_updates()` 已驱动同等次数的 C++ ATen attention block compute；MPS 成功码为 2，CUDA 成功码为 3。
+- `torch_payload_block_status=pass` 表示 `RingAttnMessage.payload` 中的 captured K/V blocks 已逐块驱动 C++ ATen attention block compute；MPS 成功码为 2，CUDA 成功码为 3。
 - torch bridge 失败时 CLI summary 后会打印压缩 `torch_message`；完整信息写入 JSON report。
 - CUDA 请求下 `torch_code=-5` 表示当前 libtorch 进程无 CUDA backend，通常是 CPU-only libtorch 或 `libtorch_cuda` / `c10_cuda` 没有被链接/加载。
 - Linux CUDA libtorch 构建需要保留 `libtorch_cuda` / `c10_cuda` 动态依赖；build script 在检测到这两个库时会用同一个 linker group 传入 `--push-state,--no-as-needed,-ltorch_cuda,-lc10_cuda,--pop-state`。

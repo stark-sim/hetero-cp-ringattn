@@ -132,7 +132,14 @@ torch_block_update_status=pass torch_block_update_code=2 torch_block_updates=30 
 torch_block_update_status=pass torch_block_update_code=3 torch_block_updates=30  # CUDA
 ```
 
-这一步验证的是 CP ring update 事件已经能驱动真实 device-side compute；当前仍使用确定性 synthetic tensors，没有把 `RingAttnMessage` 的 K/V payload 作为真实 tensor 输入。
+`torch_payload_block_bridge` 进一步把 `RingAttnMessage.payload` 改为 float32 K/V bytes，并让 `cp_ring_node_runtime` 捕获每次 compute update 的 payload block。Rust 逐块把这些 payload 交给 C++ ATen，C++ 在请求设备上执行 payload-backed attention compute。通过时 CLI 会显示：
+
+```text
+torch_payload_block_status=pass torch_payload_block_code=2 torch_payload_blocks=30/30  # MPS
+torch_payload_block_status=pass torch_payload_block_code=3 torch_payload_blocks=30/30  # CUDA
+```
+
+这一步验证的是 CP ring update 事件已经能驱动真实消息 payload 的 device-side compute；它仍是 smoke 级 block attention，还没有形成完整 online softmax state / output tensor kernel。
 
 ## Remote CP Node Smoke
 
@@ -192,6 +199,7 @@ HCP_ENABLE_TORCH=1 HCP_TORCH_DEVICE=mps bash scripts/run_rust_ringattn_smoke.sh
 protocol_status=pass protocol_messages=22
 cp_ring_status=pass cp_ring_messages=20 cp_ring_compute_updates=30
 torch_block_update_status=pass torch_block_update_code=<2|3> torch_block_updates=30
+torch_payload_block_status=pass torch_payload_block_code=<2|3> torch_payload_blocks=30/30
 ```
 
 JSON report 中新增 `protocol_smoke`：
@@ -219,4 +227,4 @@ JSON report 中新增 `protocol_smoke`：
 
 ## 后续
 
-下一步应把 `RingAttnMessage` 的 K/V payload 映射成真实 tensor 输入，并把 `tcp_remote_cp_node` 扩展到 3+ remote nodes。后续 transport 可以扩展到 UCX/RDMA、NCCL send/recv、共享内存或 GPU-direct 路线。
+下一步应把 payload-backed compute 接入 `tcp_remote_cp_node` 的双机路径，并把 remote CP 拓扑扩展到 3+ nodes。后续 transport 可以扩展到 UCX/RDMA、NCCL send/recv、共享内存或 GPU-direct 路线。
