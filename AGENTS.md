@@ -20,7 +20,8 @@ This project uses a Memory Bank system in `memory-bank/` for cross-session conte
 - Do not wait until the end of a long session to make one large mixed commit.
 - Keep each commit focused on one coherent change: setup, correctness model, Rust bridge, docs, memory-bank update, etc.
 - Before committing, run the relevant verification for that checkpoint and mention it in the commit context.
-- Commit structured experiment reports when they document project progress or a known-good validation point.
+- Raw `reports/**/*.json` files are ignored by git by default. Do not commit generated report JSON unless the user explicitly asks for that exact artifact to be versioned.
+- When an experiment documents project progress or a known-good validation point, summarize the result in docs or memory-bank instead of committing raw generated JSON.
 - Do not commit build outputs, transient logs, cache directories, or large binary artifacts unless explicitly requested.
 - After committing on `main`, push the commit to the configured remote.
 - Never use `git push --force`, `git push -f`, or any force-push variant. Force-push is prohibited for all branches and remotes unless the user explicitly changes this rule in writing.

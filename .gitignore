@@ -3,7 +3,7 @@ rust/target/
 reports/*
 !reports/.gitkeep
 !reports/**/
-!reports/**/*.json
+reports/**/*.json
 reports/**/*.log
 __pycache__/
 *.pyc

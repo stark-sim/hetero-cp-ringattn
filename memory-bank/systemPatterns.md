@@ -39,6 +39,7 @@ project-root/
 - **最小可见 smoke**：C++ coordinator smoke 先验证 standalone build 和 runtime lifecycle；Rust smoke 同时验证 correctness、protocol、C++ bridge、可选 libtorch device bridge。
 - **Context Parallel ring 消息流**：每个 source domain 的 K/V block 沿 ring 逐 hop 转发；每个跨域 hop 都是一个可序列化 `RingAttnMessage`。
 - **Transport 可替换**：P2P 是 point-to-point message 语义；`local_p2p_queue` 用于本地协议闭环，`tcp_remote_pair` 用于双进程 / 双机器工程 smoke，后续可替换为 UCX/RDMA、NCCL send/recv 或 GPU-direct。
+- **CP 节点双角色**：真正的 remote CP P2P node 应同时具备 inbound listener 和 outbound peer；当前 `tcp_remote_pair` 只是单连接 server/client 握手，不代表最终节点拓扑。
 - **reference-first correctness**：Python kernel stub 保留 reference attention，用于与 block-wise online softmax 对照。
 - **报告纪律**：实验产物应落在 `reports/<RUN_ID>/` 下，便于回溯。
 
@@ -78,3 +79,4 @@ project-root/
 | 保留 standalone repo 边界 | 本仓不依赖 `phase2_native/` / `phase3_layerwise/` 源码，降低历史包袱 | [2026-04-24] |
 | 先固定 message schema，再扩展 transport | P2P 表示 point-to-point 非 collective，不应过早绑定到 IP/TCP；先做本地可诊断闭环 | [2026-04-25] |
 | TCP 只作为 remote smoke transport | 双机阶段需要一个最小可诊断传输；`tcp_remote_pair` 不改变 HCP protocol 的 P2P/非 collective 语义 | [2026-04-25] |
+| 每个 CP 节点最终应同时 server/client | Ring 中每个 domain 都既接收上游消息也向下游转发，本阶段 server/client 分离只用于最小连通性验证 | [2026-04-25] |

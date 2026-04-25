@@ -20,7 +20,7 @@
 
 - C++ core 使用 `Status`、`TensorDType`、`BoundaryTensor`、`RingAttnConfig` 等轻量结构体。
 - Python 原型使用 NumPy array 表达 attention 输入和 online softmax state。
-- 实验输出写入 `reports/<RUN_ID>/`。
+- 实验输出写入 `reports/<RUN_ID>/`；`reports/**/*.json` / `reports/**/*.log` 默认视为生成产物并被 git 忽略。
 
 ### Testing
 

@@ -103,6 +103,8 @@ RUN_ID=<same-run-id> \
 
 server report 预期 `sent=1 received=2`，client report 预期 `sent=2 received=1`。
 
+当前 `tcp_remote_pair` 仍是最小双机握手，不是最终 CP runtime 拓扑。在真正的 Context Parallel P2P 模式中，每个节点都应该同时承担 inbound receiver 和 outbound sender 的职责：既监听上游 / peer 发来的 K/V block，也主动向 ring next domain 转发自己的或已接收的 K/V block。当前 smoke 只证明一条双机链路上双向 frame 可以互通和校验，还没有验证多节点 ring、并发收发、每节点同时 server/client、多 block 持续转发或 device-side attention compute。
+
 ## Smoke Report
 
 运行：
@@ -144,6 +146,8 @@ JSON report 中新增 `protocol_smoke`：
 
 `route_preview` 会记录前几条 K/V block 的 source / sender / receiver / block range，用于检查 ring order 是否符合 Context Parallel 预期。
 
+`reports/**/*.json` 是生成产物，默认被 `.gitignore` 忽略；需要沉淀实验结论时，应优先写入文档或 memory-bank，而不是提交 raw report JSON。
+
 ## 后续
 
-下一步应把 `local_p2p_queue` 和 `tcp_remote_pair` 抽成统一 transport trait，并继续保留 protocol schema / report 字段稳定。后续 transport 可以扩展到 UCX/RDMA、NCCL send/recv、共享内存或 GPU-direct 路线。
+下一步应把 `local_p2p_queue` 和 `tcp_remote_pair` 抽成统一 transport trait，并把 remote role 从单一 server/client 扩展成每个 domain 同时具备 listener + outbound peer 的 node runtime。后续 transport 可以扩展到 UCX/RDMA、NCCL send/recv、共享内存或 GPU-direct 路线。
