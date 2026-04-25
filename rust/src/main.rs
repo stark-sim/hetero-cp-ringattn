@@ -88,6 +88,7 @@ struct Report {
     cp_ring_smoke: protocol::CpRingNodeSmokeReport,
     cxx_bridge: CxxBridgeReport,
     torch_bridge: TorchBridgeReport,
+    torch_attention_bridge: TorchBridgeReport,
     cases: Vec<CaseReport>,
 }
 
@@ -216,6 +217,8 @@ extern "C" {
     fn hcp_ringattn_cxx_smoke_domain_count() -> i32;
     fn hcp_ringattn_torch_smoke() -> i32;
     fn hcp_ringattn_torch_smoke_message() -> *const std::os::raw::c_char;
+    fn hcp_ringattn_torch_attention_smoke() -> i32;
+    fn hcp_ringattn_torch_attention_smoke_message() -> *const std::os::raw::c_char;
 }
 
 fn build_specs(config: &CaseConfig) -> Result<Vec<DomainSpec>, RingError> {
@@ -582,16 +585,51 @@ fn compact_message(message: &str, max_chars: usize) -> String {
     compact
 }
 
+fn c_string_from_ptr(ptr: *const std::os::raw::c_char) -> String {
+    if ptr.is_null() {
+        String::new()
+    } else {
+        unsafe { std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned() }
+    }
+}
+
 fn torch_bridge_report() -> TorchBridgeReport {
     let code = unsafe { hcp_ringattn_torch_smoke() };
-    let message = unsafe {
-        let ptr = hcp_ringattn_torch_smoke_message();
-        if ptr.is_null() {
-            String::new()
-        } else {
-            std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned()
-        }
-    };
+    let message = c_string_from_ptr(unsafe { hcp_ringattn_torch_smoke_message() });
+    torch_report_from_code(
+        code,
+        message,
+        "C++ libtorch bridge executed on CPU",
+        "C++ libtorch bridge executed on MPS",
+        "C++ libtorch bridge executed on CUDA",
+        "C++ libtorch bridge is disabled; build with HCP_ENABLE_TORCH=1",
+        "C++ libtorch bridge failed or returned an unexpected status",
+    )
+}
+
+fn torch_attention_bridge_report() -> TorchBridgeReport {
+    let code = unsafe { hcp_ringattn_torch_attention_smoke() };
+    let message = c_string_from_ptr(unsafe { hcp_ringattn_torch_attention_smoke_message() });
+    torch_report_from_code(
+        code,
+        message,
+        "C++ libtorch attention smoke executed on CPU",
+        "C++ libtorch attention smoke executed on MPS",
+        "C++ libtorch attention smoke executed on CUDA",
+        "C++ libtorch attention smoke is disabled; build with HCP_ENABLE_TORCH=1",
+        "C++ libtorch attention smoke failed or returned an unexpected status",
+    )
+}
+
+fn torch_report_from_code(
+    code: i32,
+    message: String,
+    cpu_note: &'static str,
+    mps_note: &'static str,
+    cuda_note: &'static str,
+    disabled_note: &'static str,
+    generic_fail_note: &'static str,
+) -> TorchBridgeReport {
     let requested_device = env::var("HCP_TORCH_DEVICE").unwrap_or_else(|_| "cpu".to_string());
     let expected_code = torch_device_success_code(&requested_device);
     let requested_is_cuda = expected_code == Some(3);
@@ -611,21 +649,17 @@ fn torch_bridge_report() -> TorchBridgeReport {
         requested_is_cuda,
         code,
     ) {
-        (false, _, _, _) => {
-            "C++ libtorch bridge is disabled; build with HCP_ENABLE_TORCH=1".to_string()
-        }
-        (true, "cpu", _, 1) => "C++ libtorch bridge executed on CPU".to_string(),
-        (true, "mps", _, 2) => "C++ libtorch bridge executed on MPS".to_string(),
-        (true, _, true, 3) => "C++ libtorch bridge executed on CUDA".to_string(),
+        (false, _, _, _) => disabled_note.to_string(),
+        (true, "cpu", _, 1) => cpu_note.to_string(),
+        (true, "mps", _, 2) => mps_note.to_string(),
+        (true, _, true, 3) => cuda_note.to_string(),
         (true, _, _, -4) => {
             "Unsupported HCP_TORCH_DEVICE; expected cpu, mps, cuda, or cuda:N".to_string()
         }
         (true, _, true, -5) => {
             "CUDA backend is unavailable in the current libtorch process".to_string()
         }
-        (true, _, _, _) => {
-            "C++ libtorch bridge failed or returned an unexpected status".to_string()
-        }
+        (true, _, _, _) => generic_fail_note.to_string(),
     };
     TorchBridgeReport {
         status,
@@ -652,10 +686,12 @@ fn run() -> Result<Report, RingError> {
     let protocol_smoke = protocol::run_protocol_smoke()?;
     let cp_ring_smoke = protocol::run_cp_ring_node_smoke()?;
     let torch_bridge = torch_bridge_report();
+    let torch_attention_bridge = torch_attention_bridge_report();
     let status = if failed == 0
         && protocol_smoke.status == "pass"
         && cp_ring_smoke.status == "pass"
         && torch_bridge.status != "fail"
+        && torch_attention_bridge.status != "fail"
     {
         "pass"
     } else {
@@ -675,6 +711,7 @@ fn run() -> Result<Report, RingError> {
             smoke_domains: unsafe { hcp_ringattn_cxx_smoke_domain_count() },
         },
         torch_bridge,
+        torch_attention_bridge,
         cases,
     })
 }
@@ -730,7 +767,7 @@ fn main() -> Result<(), RingError> {
     let report = run()?;
     write_json_report(&args.report_path, &report)?;
     println!(
-        "[rust-ringattn] status={} passed={}/{} protocol_status={} protocol_messages={} cp_ring_status={} cp_ring_messages={} cp_ring_compute_updates={} cxx_domains={} torch_status={} torch_device={} torch_code={} torch_compiled={} report={}",
+        "[rust-ringattn] status={} passed={}/{} protocol_status={} protocol_messages={} cp_ring_status={} cp_ring_messages={} cp_ring_compute_updates={} cxx_domains={} torch_status={} torch_device={} torch_code={} torch_attention_status={} torch_attention_code={} torch_compiled={} report={}",
         report.status,
         report.summary.passed,
         report.summary.cases,
@@ -743,6 +780,8 @@ fn main() -> Result<(), RingError> {
         report.torch_bridge.status,
         report.torch_bridge.requested_device,
         report.torch_bridge.status_code,
+        report.torch_attention_bridge.status,
+        report.torch_attention_bridge.status_code,
         report.torch_bridge.compiled,
         args.report_path
     );
@@ -750,6 +789,14 @@ fn main() -> Result<(), RingError> {
         println!(
             "[rust-ringattn] torch_message={}",
             compact_message(&report.torch_bridge.message, 360)
+        );
+    }
+    if report.torch_attention_bridge.status == "fail"
+        && !report.torch_attention_bridge.message.is_empty()
+    {
+        println!(
+            "[rust-ringattn] torch_attention_message={}",
+            compact_message(&report.torch_attention_bridge.message, 360)
         );
     }
     if report.status == "pass" {

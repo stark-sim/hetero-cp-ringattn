@@ -34,6 +34,8 @@ Rust 社区常用的 PyTorch 绑定是 `tch-rs`，它是 PyTorch C++ API/libtorc
 - 默认关闭，不影响纯 Rust smoke。
 - 设置 `HCP_ENABLE_TORCH=1` 后，`rust/build.rs` 会优先使用 `LIBTORCH` / `LIBTORCH_INCLUDE` / `LIBTORCH_LIB` 指向的独立 libtorch；如果这些变量缺失，才 fallback 到 Python torch path discovery。
 - 这条路径验证的是 Rust -> C ABI -> C++ -> libtorch。
+- `torch_bridge` 验证基础张量创建和 matmul 是否实际落在请求设备。
+- `torch_attention_bridge` 验证真实 attention block compute：C++ ATen 在请求设备上计算 `softmax(QK^T / sqrt(d))V`，再搬回 CPU 与 CPU reference 对比误差。
 
 尝试方式：
 
@@ -77,7 +79,9 @@ CARGO_OFFLINE=0 HCP_ENABLE_TORCH=1 HCP_TORCH_DEVICE=cuda:0 bash scripts/run_rust
 - `HCP_TORCH_DEVICE=cpu` 时 report 中 `torch_bridge.status_code=1`。
 - `HCP_TORCH_DEVICE=mps` 时 report 中 `torch_bridge.status_code=2`，这才表示实际跑到 MPS。
 - `HCP_TORCH_DEVICE=cuda` / `cuda:N` 时 report 中 `torch_bridge.status_code=3`，这才表示实际跑到 CUDA。
+- `torch_attention_bridge.status_code` 使用同一套设备成功码；`torch_attention_status=pass` 表示 attention compute 也在目标设备上执行并通过 CPU reference tolerance。
 - `HCP_ENABLE_TORCH=1` 时，torch bridge 不再只是附加信息；请求设备没有拿到对应成功码会使整体 smoke 失败，并在 CLI summary 中打印 `torch_status`、`torch_device`、`torch_code`。
+- `HCP_ENABLE_TORCH=1` 时，`torch_attention_bridge` 也参与整体 smoke 成败；CLI summary 会打印 `torch_attention_status` 和 `torch_attention_code`。
 - torch bridge 失败时 CLI 会打印压缩后的 `torch_message`；完整异常仍保存在 `reports/<RUN_ID>/rust_ringattn_correctness.json`。
 - `torch_code=-5` 表示 `cuda` / `cuda:N` 设备名有效，但当前进程中的 libtorch 没有 CUDA backend；优先检查 `LIBTORCH` / `LIBTORCH_LIB` 是否指向 CUDA-enabled libtorch，以及是否链接/加载了 `libtorch_cuda`、`c10_cuda`。
 - Linux 下 CUDA 版 libtorch 需要保留 `libtorch_cuda` / `c10_cuda` 这类 registration library；`rust/build.rs` 会在检测到二者时用同一个 linker group 传入 `--push-state,--no-as-needed,-ltorch_cuda,-lc10_cuda,--pop-state`，防止链接器或 rustc 参数重排把它们优化掉。远端 `ldd rust/target/debug/hcp-ringattn-rust | grep -E 'torch|c10|cuda'` 应能看到 `libtorch_cuda.so` 和 `libc10_cuda.so`。

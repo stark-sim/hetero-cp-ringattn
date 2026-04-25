@@ -1,4 +1,5 @@
 #include <cstdlib>
+#include <cmath>
 #include <exception>
 #include <string>
 
@@ -11,6 +12,7 @@
 
 namespace {
 std::string g_torch_smoke_message;
+std::string g_torch_attention_smoke_message;
 
 #ifdef HCP_ENABLE_TORCH
 struct TorchDeviceSelection {
@@ -57,11 +59,65 @@ bool SelectTorchDevice(const std::string& device_name, TorchDeviceSelection* sel
   }
   return false;
 }
+
+bool DeviceMatches(const at::Tensor& tensor, const at::Device& device) {
+  return device.is_cpu() ? tensor.is_cpu() : device.is_mps() ? tensor.is_mps() : tensor.is_cuda();
+}
+
+int RunTorchAttentionSmoke(std::string* message) {
+  message->clear();
+  const char* requested = std::getenv("HCP_TORCH_DEVICE");
+  std::string device_name = requested == nullptr ? "cpu" : requested;
+  TorchDeviceSelection selection{at::Device(at::kCPU), 1};
+  if (!SelectTorchDevice(device_name, &selection)) {
+    *message =
+        "unsupported HCP_TORCH_DEVICE=" + device_name + "; expected cpu, mps, cuda, or cuda:N";
+    return -4;
+  }
+  if (selection.device.is_cuda() && !at::hasCUDA()) {
+    *message =
+        "CUDA device name is valid, but CUDA backend is not available in the current libtorch "
+        "process. Verify LIBTORCH/LIBTORCH_LIB point to a CUDA-enabled libtorch build and that "
+        "libtorch_cuda and c10_cuda are linked/loaded.";
+    return -5;
+  }
+
+  auto cpu_options = at::TensorOptions().dtype(at::kFloat).device(at::kCPU);
+  auto q_cpu = at::arange(32, cpu_options).reshape({4, 8}) / 17.0;
+  auto k_cpu = at::arange(48, cpu_options).reshape({6, 8}) / 19.0;
+  auto v_cpu = at::arange(48, cpu_options).reshape({6, 8}) / 23.0;
+
+  const double scale = 1.0 / std::sqrt(8.0);
+  auto reference =
+      at::matmul(at::softmax(at::matmul(q_cpu, k_cpu.transpose(0, 1)) * scale, -1), v_cpu);
+
+  auto q = q_cpu.to(selection.device);
+  auto k = k_cpu.to(selection.device);
+  auto v = v_cpu.to(selection.device);
+  auto output = at::matmul(at::softmax(at::matmul(q, k.transpose(0, 1)) * scale, -1), v);
+  if (!DeviceMatches(output, selection.device)) {
+    *message = "attention output landed on unexpected device: " + output.device().str();
+    return -1;
+  }
+  auto output_cpu = output.to(at::kCPU);
+  const float max_abs_err = at::abs(output_cpu - reference).max().item<float>();
+  if (output.sizes()[0] == 4 && output.sizes()[1] == 8 && max_abs_err <= 1.0e-4F) {
+    *message = "ok max_abs_err=" + std::to_string(max_abs_err);
+    return selection.success_code;
+  }
+  *message = "attention mismatch max_abs_err=" + std::to_string(max_abs_err) +
+             " device=" + output.device().str();
+  return -1;
+}
 #endif
 }
 
 extern "C" const char* hcp_ringattn_torch_smoke_message() {
   return g_torch_smoke_message.c_str();
+}
+
+extern "C" const char* hcp_ringattn_torch_attention_smoke_message() {
+  return g_torch_attention_smoke_message.c_str();
 }
 
 extern "C" int hcp_ringattn_cxx_smoke_domain_count() {
@@ -127,11 +183,7 @@ extern "C" int hcp_ringattn_torch_smoke() {
     auto a = at::ones({2, 2}, options);
     auto b = at::eye(2, options);
     auto c = at::matmul(a, b);
-    const bool expected_device =
-        selection.device.is_cpu() ? c.is_cpu()
-        : selection.device.is_mps() ? c.is_mps()
-                                    : c.is_cuda();
-    if (c.sizes()[0] == 2 && c.sizes()[1] == 2 && expected_device) {
+    if (c.sizes()[0] == 2 && c.sizes()[1] == 2 && DeviceMatches(c, selection.device)) {
       g_torch_smoke_message = "ok";
       return selection.success_code;
     }
@@ -146,6 +198,23 @@ extern "C" int hcp_ringattn_torch_smoke() {
   }
 #else
   g_torch_smoke_message = "HCP_ENABLE_TORCH is not enabled";
+  return 0;
+#endif
+}
+
+extern "C" int hcp_ringattn_torch_attention_smoke() {
+#ifdef HCP_ENABLE_TORCH
+  try {
+    return RunTorchAttentionSmoke(&g_torch_attention_smoke_message);
+  } catch (const std::exception& exc) {
+    g_torch_attention_smoke_message = exc.what();
+    return -2;
+  } catch (...) {
+    g_torch_attention_smoke_message = "unknown exception";
+    return -3;
+  }
+#else
+  g_torch_attention_smoke_message = "HCP_ENABLE_TORCH is not enabled";
   return 0;
 #endif
 }

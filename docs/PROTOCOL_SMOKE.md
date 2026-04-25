@@ -121,7 +121,9 @@ server report 预期 `sent=1 received=2`，client report 预期 `sent=2 received
 cp_ring_status=pass cp_ring_messages=20 cp_ring_compute_updates=30
 ```
 
-这一步已经验证每节点双角色、多 block 持续转发和并发收发的协议语义；仍未验证真实双机多节点 TCP 拓扑或 device-side attention compute。
+这一步已经验证每节点双角色、多 block 持续转发和并发收发的协议语义；仍未验证真实双机多节点 TCP 拓扑。
+
+`torch_attention_bridge` 已提供独立的 device-side attention compute smoke：C++ ATen 在请求设备上计算小尺寸 `softmax(QK^T / sqrt(d))V`，并与 CPU reference 对比。它当前验证的是设备上的 attention block compute 能力，还没有接入 `cp_ring_node_runtime` 的每条 K/V block update。
 
 ## Smoke Report
 
@@ -168,4 +170,4 @@ JSON report 中新增 `protocol_smoke`：
 
 ## 后续
 
-下一步应把 `cp_ring_node_runtime` 映射到 remote transport：每个远端 node 进程同时具备 listener + outbound peer，并把 compute update counter 替换为真实 device-side attention block compute。后续 transport 可以扩展到 UCX/RDMA、NCCL send/recv、共享内存或 GPU-direct 路线。
+下一步应把 `cp_ring_node_runtime` 映射到 remote transport：每个远端 node 进程同时具备 listener + outbound peer，并把 compute update counter 接到 `torch_attention_bridge` 或后续 tensor backend 的真实 block update。后续 transport 可以扩展到 UCX/RDMA、NCCL send/recv、共享内存或 GPU-direct 路线。
