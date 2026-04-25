@@ -43,13 +43,14 @@
 - [x] [2026-04-25] 修复 macOS remote CP accepted stream 非阻塞读大 payload frame 的 `WouldBlock` 问题：`accept_with_retry` accept 成功后显式恢复 blocking mode。
 - [x] [2026-04-25] 3-node remote CP forwarding smoke 已通过：Mac node0、GPU node1、Mac node2 三个独立进程形成 ring，每个 node `sent=8 received=8 compute_updates=12`，并完成 payload-backed ATen compute。
 - [x] [2026-04-25] `torch_payload_online_bridge` 已通过：设备侧逐 block 维护 online softmax state，并与 full attention CPU reference 对比；本机 MPS、远端 CUDA、3-node remote CP 均已验证。
+- [x] [2026-04-25] `torch_payload_chunk_bridge` 已通过：设备侧对小尺寸 Q chunk 逐 block 维护 online softmax state，输出 chunk tensor 并与 CPU reference 对比；本机 MPS、远端 CUDA、3-node remote CP 均已验证。
 
 ## 进行中
 
 - [ ] M2：Rust online softmax correctness report 与 tolerance policy 扩展。
 - [ ] M3：抽出统一 transport trait，减少 local queue / TCP pair / TCP CP node 的重复 frame 与 metrics 逻辑。
 - [ ] M4：heterogeneous runtime stubs 与配置 / 环境纪律。
-- [ ] M5：将 smoke 级 online state 扩展为完整 per-domain Q chunk / output tensor kernel。
+- [ ] M5：将 bridge 内 deterministic Q chunk 替换为 domain-local Q payload / model state，并明确 state lifecycle。
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 
 ## 已知问题
@@ -63,7 +64,7 @@
 - [2026-04-25] 本机 CPU-only libtorch smoke 不能作为 hardware smoke 结论；需要以非沙箱 MPS report 为准。
 - [2026-04-25] 旧版 CLI 只打印 `torch_compiled=true`，不能证明 CUDA/MPS 实际执行；需使用包含 `torch_status` / `torch_code` 的新版 smoke。
 - [2026-04-25] 远端 CUDA smoke 历史问题已解决：根因是 Linux 链接阶段未保留 `libtorch_cuda` / `c10_cuda` registration libraries。
-- [2026-04-25] 当前 payload online bridge 仍是 smoke 级单 query/head 输出，尚未扩展成完整 per-domain Q chunk / output tensor kernel。
+- [2026-04-25] 当前 payload chunk bridge 的 Q 仍是 deterministic smoke input，尚未来自 domain-local Q payload / model state。
 
 ## 里程碑
 
