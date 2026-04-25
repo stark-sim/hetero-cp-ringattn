@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdlib>
 #include <cmath>
 #include <exception>
@@ -13,6 +14,7 @@
 namespace {
 std::string g_torch_smoke_message;
 std::string g_torch_attention_smoke_message;
+std::string g_torch_block_update_smoke_message;
 
 #ifdef HCP_ENABLE_TORCH
 struct TorchDeviceSelection {
@@ -64,8 +66,12 @@ bool DeviceMatches(const at::Tensor& tensor, const at::Device& device) {
   return device.is_cpu() ? tensor.is_cpu() : device.is_mps() ? tensor.is_mps() : tensor.is_cuda();
 }
 
-int RunTorchAttentionSmoke(std::string* message) {
+int RunTorchAttentionBlockUpdates(int block_updates, std::string* message) {
   message->clear();
+  if (block_updates <= 0) {
+    *message = "block_updates must be positive";
+    return -6;
+  }
   const char* requested = std::getenv("HCP_TORCH_DEVICE");
   std::string device_name = requested == nullptr ? "cpu" : requested;
   TorchDeviceSelection selection{at::Device(at::kCPU), 1};
@@ -88,25 +94,41 @@ int RunTorchAttentionSmoke(std::string* message) {
   auto v_cpu = at::arange(48, cpu_options).reshape({6, 8}) / 23.0;
 
   const double scale = 1.0 / std::sqrt(8.0);
-  auto reference =
-      at::matmul(at::softmax(at::matmul(q_cpu, k_cpu.transpose(0, 1)) * scale, -1), v_cpu);
+  float max_abs_err = 0.0F;
+  float checksum = 0.0F;
+  for (int update = 0; update < block_updates; ++update) {
+    const double shift = static_cast<double>(update) / 101.0;
+    auto q_update_cpu = q_cpu + shift;
+    auto k_update_cpu = k_cpu + shift / 3.0;
+    auto v_update_cpu = v_cpu + shift / 5.0;
+    auto reference =
+        at::matmul(at::softmax(at::matmul(q_update_cpu, k_update_cpu.transpose(0, 1)) * scale, -1),
+                   v_update_cpu);
 
-  auto q = q_cpu.to(selection.device);
-  auto k = k_cpu.to(selection.device);
-  auto v = v_cpu.to(selection.device);
-  auto output = at::matmul(at::softmax(at::matmul(q, k.transpose(0, 1)) * scale, -1), v);
-  if (!DeviceMatches(output, selection.device)) {
-    *message = "attention output landed on unexpected device: " + output.device().str();
-    return -1;
+    auto q = q_update_cpu.to(selection.device);
+    auto k = k_update_cpu.to(selection.device);
+    auto v = v_update_cpu.to(selection.device);
+    auto output = at::matmul(at::softmax(at::matmul(q, k.transpose(0, 1)) * scale, -1), v);
+    if (!DeviceMatches(output, selection.device)) {
+      *message = "attention output landed on unexpected device: " + output.device().str();
+      return -1;
+    }
+    auto output_cpu = output.to(at::kCPU);
+    max_abs_err = std::max(max_abs_err, at::abs(output_cpu - reference).max().item<float>());
+    checksum += output_cpu.sum().item<float>();
+    if (output.sizes()[0] != 4 || output.sizes()[1] != 8) {
+      *message = "unexpected attention output shape";
+      return -1;
+    }
   }
-  auto output_cpu = output.to(at::kCPU);
-  const float max_abs_err = at::abs(output_cpu - reference).max().item<float>();
-  if (output.sizes()[0] == 4 && output.sizes()[1] == 8 && max_abs_err <= 1.0e-4F) {
-    *message = "ok max_abs_err=" + std::to_string(max_abs_err);
+  if (max_abs_err <= 1.0e-4F) {
+    *message = "ok updates=" + std::to_string(block_updates) +
+               " max_abs_err=" + std::to_string(max_abs_err) +
+               " checksum=" + std::to_string(checksum);
     return selection.success_code;
   }
-  *message = "attention mismatch max_abs_err=" + std::to_string(max_abs_err) +
-             " device=" + output.device().str();
+  *message = "attention mismatch updates=" + std::to_string(block_updates) +
+             " max_abs_err=" + std::to_string(max_abs_err);
   return -1;
 }
 #endif
@@ -118,6 +140,10 @@ extern "C" const char* hcp_ringattn_torch_smoke_message() {
 
 extern "C" const char* hcp_ringattn_torch_attention_smoke_message() {
   return g_torch_attention_smoke_message.c_str();
+}
+
+extern "C" const char* hcp_ringattn_torch_block_update_smoke_message() {
+  return g_torch_block_update_smoke_message.c_str();
 }
 
 extern "C" int hcp_ringattn_cxx_smoke_domain_count() {
@@ -205,7 +231,7 @@ extern "C" int hcp_ringattn_torch_smoke() {
 extern "C" int hcp_ringattn_torch_attention_smoke() {
 #ifdef HCP_ENABLE_TORCH
   try {
-    return RunTorchAttentionSmoke(&g_torch_attention_smoke_message);
+    return RunTorchAttentionBlockUpdates(1, &g_torch_attention_smoke_message);
   } catch (const std::exception& exc) {
     g_torch_attention_smoke_message = exc.what();
     return -2;
@@ -215,6 +241,24 @@ extern "C" int hcp_ringattn_torch_attention_smoke() {
   }
 #else
   g_torch_attention_smoke_message = "HCP_ENABLE_TORCH is not enabled";
+  return 0;
+#endif
+}
+
+extern "C" int hcp_ringattn_torch_block_update_smoke(int block_updates) {
+#ifdef HCP_ENABLE_TORCH
+  try {
+    return RunTorchAttentionBlockUpdates(block_updates, &g_torch_block_update_smoke_message);
+  } catch (const std::exception& exc) {
+    g_torch_block_update_smoke_message = exc.what();
+    return -2;
+  } catch (...) {
+    g_torch_block_update_smoke_message = "unknown exception";
+    return -3;
+  }
+#else
+  (void)block_updates;
+  g_torch_block_update_smoke_message = "HCP_ENABLE_TORCH is not enabled";
   return 0;
 #endif
 }
