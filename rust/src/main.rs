@@ -179,6 +179,7 @@ struct Lcg {
 struct CliArgs {
     report_path: String,
     remote_p2p_role: Option<String>,
+    node_index: Option<usize>,
     bind_addr: Option<String>,
     connect_addr: Option<String>,
 }
@@ -521,6 +522,7 @@ fn parse_cli_args() -> Result<CliArgs, RingError> {
     let mut args = env::args().skip(1);
     let mut report_path = String::from("reports/rust_ringattn_correctness.json");
     let mut remote_p2p_role = None;
+    let mut node_index = None;
     let mut bind_addr = None;
     let mut connect_addr = None;
     while let Some(arg) = args.next() {
@@ -530,6 +532,12 @@ fn parse_cli_args() -> Result<CliArgs, RingError> {
             }
             "--remote-p2p-role" => {
                 remote_p2p_role = Some(next_cli_value(&mut args, "--remote-p2p-role")?);
+            }
+            "--node-index" => {
+                let value = next_cli_value(&mut args, "--node-index")?;
+                node_index = Some(value.parse::<usize>().map_err(|error| {
+                    RingError::InvalidCli(format!("invalid --node-index: {error}"))
+                })?);
             }
             "--bind" => {
                 bind_addr = Some(next_cli_value(&mut args, "--bind")?);
@@ -545,6 +553,7 @@ fn parse_cli_args() -> Result<CliArgs, RingError> {
     Ok(CliArgs {
         report_path,
         remote_p2p_role,
+        node_index,
         bind_addr,
         connect_addr,
     })
@@ -739,7 +748,7 @@ fn run_remote_p2p(args: &CliArgs) -> Result<protocol::RemoteP2pReport, RingError
             Ok(protocol::run_remote_p2p_client(connect_addr)?)
         }
         Some(role) => Err(RingError::InvalidCli(format!(
-            "unsupported --remote-p2p-role {role}; expected server or client"
+            "unsupported --remote-p2p-role {role}; expected server, client, or cp-node"
         ))),
         None => Err(RingError::InvalidCli(
             "--remote-p2p-role is required for remote mode".to_string(),
@@ -747,8 +756,42 @@ fn run_remote_p2p(args: &CliArgs) -> Result<protocol::RemoteP2pReport, RingError
     }
 }
 
+fn run_remote_cp_node(args: &CliArgs) -> Result<protocol::RemoteCpNodeReport, RingError> {
+    let node_index = args
+        .node_index
+        .ok_or_else(|| RingError::InvalidCli("--node-index is required for cp-node".to_string()))?;
+    let bind_addr = args
+        .bind_addr
+        .as_deref()
+        .ok_or_else(|| RingError::InvalidCli("--bind is required for cp-node".to_string()))?;
+    let connect_addr = args
+        .connect_addr
+        .as_deref()
+        .ok_or_else(|| RingError::InvalidCli("--connect is required for cp-node".to_string()))?;
+    Ok(protocol::run_remote_cp_node(
+        node_index,
+        bind_addr,
+        connect_addr,
+    )?)
+}
+
 fn main() -> Result<(), RingError> {
     let args = parse_cli_args()?;
+    if args.remote_p2p_role.as_deref() == Some("cp-node") {
+        let report = run_remote_cp_node(&args)?;
+        write_json_report(&args.report_path, &report)?;
+        println!(
+            "[rust-remote-cp-node] status={} role={} transport={} sent={} received={} compute_updates={} report={}",
+            report.status,
+            report.role(),
+            report.transport(),
+            report.messages_sent(),
+            report.messages_received(),
+            report.compute_updates(),
+            args.report_path
+        );
+        return Ok(());
+    }
     if args.remote_p2p_role.is_some() {
         let report = run_remote_p2p(&args)?;
         write_json_report(&args.report_path, &report)?;

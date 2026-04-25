@@ -11,6 +11,8 @@ const SCHEMA_VERSION: u16 = 1;
 const FRAME_LEN_BYTES: usize = 4;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const REMOTE_IO_TIMEOUT: Duration = Duration::from_secs(10);
+const REMOTE_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(200);
+const REMOTE_CONNECT_ATTEMPTS: usize = 50;
 const REMOTE_CLIENT_DOMAIN: &str = "mac-mps";
 const REMOTE_SERVER_DOMAIN: &str = "gpu-cuda";
 
@@ -26,6 +28,11 @@ pub enum ProtocolError {
     InvalidDomain { domain_id: String },
     #[error("invalid socket address {address}: {reason}")]
     InvalidSocketAddress { address: String, reason: String },
+    #[error("invalid node index {node_index} for domain_count={domain_count}")]
+    InvalidNodeIndex {
+        node_index: usize,
+        domain_count: usize,
+    },
     #[error("frame too large: {bytes} bytes")]
     FrameTooLarge { bytes: usize },
     #[error("transport has no peer for domain={domain_id}")]
@@ -176,6 +183,57 @@ impl CpRingNodeSmokeReport {
     pub fn compute_updates(&self) -> usize {
         self.summary.compute_updates
     }
+}
+
+#[derive(Serialize)]
+pub struct RemoteCpNodeReport {
+    pub status: &'static str,
+    role: &'static str,
+    transport: &'static str,
+    node_index: usize,
+    domain_id: String,
+    bind_addr: String,
+    connect_addr: String,
+    inbound_peer: String,
+    outbound_peer: String,
+    local_listener_addr: String,
+    outbound_local_addr: String,
+    outbound_peer_addr: String,
+    inbound_peer_addr: String,
+    summary: RemoteCpNodeSummary,
+    first_routes: Vec<CpRingRoutePreview>,
+}
+
+impl RemoteCpNodeReport {
+    pub fn role(&self) -> &'static str {
+        self.role
+    }
+
+    pub fn transport(&self) -> &'static str {
+        self.transport
+    }
+
+    pub fn messages_sent(&self) -> usize {
+        self.summary.messages_sent
+    }
+
+    pub fn messages_received(&self) -> usize {
+        self.summary.messages_received
+    }
+
+    pub fn compute_updates(&self) -> usize {
+        self.summary.compute_updates
+    }
+}
+
+#[derive(Default, Serialize)]
+struct RemoteCpNodeSummary {
+    source_blocks: usize,
+    messages_sent: usize,
+    messages_received: usize,
+    compute_updates: usize,
+    bytes_sent: usize,
+    bytes_received: usize,
 }
 
 #[derive(Default, Serialize)]
@@ -612,6 +670,108 @@ pub fn run_remote_p2p_client(connect_addr: &str) -> Result<RemoteP2pReport, Prot
     })
 }
 
+pub fn run_remote_cp_node(
+    node_index: usize,
+    bind_addr: &str,
+    connect_addr: &str,
+) -> Result<RemoteCpNodeReport, ProtocolError> {
+    let domains = remote_cp_domains();
+    if node_index >= domains.len() {
+        return Err(ProtocolError::InvalidNodeIndex {
+            node_index,
+            domain_count: domains.len(),
+        });
+    }
+    let domain = domains[node_index].clone();
+    let inbound_peer = domains[(node_index + domains.len() - 1) % domains.len()].clone();
+    let outbound_peer = domains[(node_index + 1) % domains.len()].clone();
+    let expected_inbound_messages = block_ranges(&inbound_peer).count();
+    let bind_socket = parse_socket_addr(bind_addr)?;
+    let connect_socket = parse_socket_addr(connect_addr)?;
+
+    let listener = TcpListener::bind(bind_socket)?;
+    let local_listener_addr = listener.local_addr()?.to_string();
+    let recv_domains = domains.clone();
+    let recv_domain_id = domain.domain_id.clone();
+    let recv_handle = thread::spawn(move || {
+        receive_remote_cp_node_messages(
+            node_index,
+            recv_domain_id,
+            recv_domains,
+            listener,
+            expected_inbound_messages,
+        )
+    });
+
+    let mut outbound_stream = connect_with_retry(connect_socket)?;
+    configure_stream(&outbound_stream)?;
+    let outbound_local_addr = outbound_stream.local_addr()?.to_string();
+    let outbound_peer_addr = outbound_stream.peer_addr()?.to_string();
+
+    let mut summary = RemoteCpNodeSummary::default();
+    let mut first_routes = Vec::new();
+    for (block_index, (block_start, block_stop)) in block_ranges(&domain).enumerate() {
+        let message = kv_block_message(
+            cp_ring_sequence_id(node_index, block_index),
+            1,
+            &domain,
+            &domain,
+            &outbound_peer,
+            block_start,
+            block_stop,
+        );
+        let bytes_sent = write_raw_message_frame(&mut outbound_stream, &message)?;
+        summary.source_blocks += 1;
+        summary.messages_sent += 1;
+        summary.bytes_sent += bytes_sent;
+        summary.compute_updates += 1;
+        push_remote_cp_route_preview(&mut first_routes, &message, Some(&outbound_peer.domain_id));
+    }
+    drop(outbound_stream);
+
+    let recv_report = recv_handle
+        .join()
+        .map_err(|_| ProtocolError::NodeThreadPanic {
+            domain_id: domain.domain_id.clone(),
+        })??;
+    summary.messages_received = recv_report.messages_received;
+    summary.bytes_received = recv_report.bytes_received;
+    summary.compute_updates += recv_report.compute_updates;
+    for route in recv_report.first_routes {
+        if first_routes.len() >= 8 {
+            break;
+        }
+        first_routes.push(route);
+    }
+
+    let status = if summary.messages_sent == summary.source_blocks
+        && summary.messages_received == expected_inbound_messages
+        && summary.compute_updates == summary.source_blocks + expected_inbound_messages
+    {
+        "pass"
+    } else {
+        "fail"
+    };
+
+    Ok(RemoteCpNodeReport {
+        status,
+        role: "listener_and_outbound_peer",
+        transport: "tcp_remote_cp_node",
+        node_index,
+        domain_id: domain.domain_id,
+        bind_addr: bind_addr.to_string(),
+        connect_addr: connect_addr.to_string(),
+        inbound_peer: inbound_peer.domain_id,
+        outbound_peer: outbound_peer.domain_id,
+        local_listener_addr,
+        outbound_local_addr,
+        outbound_peer_addr,
+        inbound_peer_addr: recv_report.inbound_peer_addr,
+        summary,
+        first_routes,
+    })
+}
+
 fn default_domains() -> Result<Vec<DomainSpec>, ProtocolError> {
     let chunks = [64_usize, 40, 56];
     let block_sizes = [32_usize, 10, 14];
@@ -930,6 +1090,138 @@ fn remote_server_domain() -> DomainSpec {
         block_size: 32,
         device: "cuda:0".to_string(),
     }
+}
+
+fn remote_cp_domains() -> Vec<DomainSpec> {
+    vec![
+        DomainSpec {
+            domain_id: REMOTE_CLIENT_DOMAIN.to_string(),
+            seq_offset: 0,
+            seq_chunk_len: 32,
+            block_size: 8,
+            device: "mps".to_string(),
+        },
+        DomainSpec {
+            domain_id: REMOTE_SERVER_DOMAIN.to_string(),
+            seq_offset: 32,
+            seq_chunk_len: 32,
+            block_size: 8,
+            device: "cuda:0".to_string(),
+        },
+    ]
+}
+
+struct RemoteCpRecvReport {
+    messages_received: usize,
+    compute_updates: usize,
+    bytes_received: usize,
+    inbound_peer_addr: String,
+    first_routes: Vec<CpRingRoutePreview>,
+}
+
+fn receive_remote_cp_node_messages(
+    node_index: usize,
+    domain_id: String,
+    domains: Vec<DomainSpec>,
+    listener: TcpListener,
+    expected_messages: usize,
+) -> Result<RemoteCpRecvReport, ProtocolError> {
+    let (mut stream, _) = listener.accept()?;
+    configure_stream(&stream)?;
+    let inbound_peer_addr = stream.peer_addr()?.to_string();
+    let mut report = RemoteCpRecvReport {
+        messages_received: 0,
+        compute_updates: 0,
+        bytes_received: 0,
+        inbound_peer_addr,
+        first_routes: Vec::new(),
+    };
+    while report.messages_received < expected_messages {
+        let (message, bytes_received) = read_raw_message_frame(&mut stream)?;
+        validate_cp_ring_message(node_index, &domains, &message)?;
+        report.messages_received += 1;
+        report.compute_updates += 1;
+        report.bytes_received += bytes_received;
+        push_remote_cp_route_preview(&mut report.first_routes, &message, None);
+    }
+    if report.messages_received != expected_messages {
+        return Err(ProtocolError::ChannelRecv {
+            domain_id,
+            reason: format!(
+                "expected {expected_messages} messages, received {}",
+                report.messages_received
+            ),
+        });
+    }
+    Ok(report)
+}
+
+fn connect_with_retry(connect_socket: SocketAddr) -> Result<TcpStream, ProtocolError> {
+    let mut last_error = None;
+    for _ in 0..REMOTE_CONNECT_ATTEMPTS {
+        match TcpStream::connect(connect_socket) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => {
+                last_error = Some(error);
+                thread::sleep(REMOTE_CONNECT_RETRY_DELAY);
+            }
+        }
+    }
+    Err(ProtocolError::Io(last_error.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, "connect retry exhausted")
+    })))
+}
+
+fn write_raw_message_frame(
+    stream: &mut TcpStream,
+    message: &RingAttnMessage,
+) -> Result<usize, ProtocolError> {
+    let frame = serialize_message(message)?;
+    if frame.len() > MAX_FRAME_BYTES {
+        return Err(ProtocolError::FrameTooLarge { bytes: frame.len() });
+    }
+    let frame_len = u32::try_from(frame.len())
+        .map_err(|_| ProtocolError::FrameTooLarge { bytes: frame.len() })?;
+    stream.write_all(&frame_len.to_be_bytes())?;
+    stream.write_all(&frame)?;
+    Ok(FRAME_LEN_BYTES + frame.len())
+}
+
+fn read_raw_message_frame(
+    stream: &mut TcpStream,
+) -> Result<(RingAttnMessage, usize), ProtocolError> {
+    let mut len_bytes = [0_u8; FRAME_LEN_BYTES];
+    stream.read_exact(&mut len_bytes)?;
+    let frame_len = u32::from_be_bytes(len_bytes) as usize;
+    if frame_len > MAX_FRAME_BYTES {
+        return Err(ProtocolError::FrameTooLarge { bytes: frame_len });
+    }
+    let mut frame = vec![0_u8; frame_len];
+    stream.read_exact(&mut frame)?;
+    Ok((deserialize_message(&frame)?, FRAME_LEN_BYTES + frame.len()))
+}
+
+fn push_remote_cp_route_preview(
+    routes: &mut Vec<CpRingRoutePreview>,
+    message: &RingAttnMessage,
+    next_receiver_domain: Option<&str>,
+) {
+    if routes.len() >= 8 {
+        return;
+    }
+    let Some(block) = &message.block else {
+        return;
+    };
+    routes.push(CpRingRoutePreview {
+        sequence_id: message.sequence_id,
+        source_domain: message.source_domain.clone(),
+        sender_domain: message.sender_domain.clone(),
+        receiver_domain: message.receiver_domain.clone(),
+        next_receiver_domain: next_receiver_domain.map(ToOwned::to_owned),
+        block_start: block.global_offset,
+        block_len: block.block_len,
+        ring_step: message.ring_step,
+    });
 }
 
 fn remote_kv_block_message(client: &DomainSpec, server: &DomainSpec) -> RingAttnMessage {
