@@ -6,6 +6,8 @@ use std::fs;
 use std::path::Path;
 use thiserror::Error;
 
+const PAYLOAD_CHUNK_QUERY_LEN: i32 = 4;
+
 #[derive(Debug, Error)]
 enum RingError {
     #[error("sum(seq_chunk_len)={actual} does not match global_seq_len={expected}")]
@@ -92,6 +94,7 @@ struct Report {
     torch_block_update_bridge: TorchBlockUpdateReport,
     torch_payload_block_bridge: TorchPayloadBlockReport,
     torch_payload_online_bridge: TorchPayloadBlockReport,
+    torch_payload_chunk_bridge: TorchPayloadBlockReport,
     cases: Vec<CaseReport>,
 }
 
@@ -101,6 +104,7 @@ struct RemoteCpNodeRunReport {
     cp_node: protocol::RemoteCpNodeReport,
     torch_payload_block_bridge: TorchPayloadBlockReport,
     torch_payload_online_bridge: TorchPayloadBlockReport,
+    torch_payload_chunk_bridge: TorchPayloadBlockReport,
 }
 
 #[derive(Serialize)]
@@ -273,6 +277,16 @@ extern "C" {
         head_dim: i32,
     ) -> i32;
     fn hcp_ringattn_torch_payload_online_smoke_message() -> *const std::os::raw::c_char;
+    fn hcp_ringattn_torch_payload_chunk_smoke(
+        payload: *const std::os::raw::c_uchar,
+        payload_len: usize,
+        block_lens: *const i32,
+        block_count: usize,
+        query_len: i32,
+        num_heads: i32,
+        head_dim: i32,
+    ) -> i32;
+    fn hcp_ringattn_torch_payload_chunk_smoke_message() -> *const std::os::raw::c_char;
 }
 
 fn build_specs(config: &CaseConfig) -> Result<Vec<DomainSpec>, RingError> {
@@ -889,6 +903,105 @@ fn torch_payload_online_bridge_report(
     }
 }
 
+fn torch_payload_chunk_bridge_report(
+    blocks: &[protocol::CpPayloadBlock],
+) -> TorchPayloadBlockReport {
+    let requested_blocks = blocks.len();
+    if !cfg!(hcp_torch_enabled) {
+        let report = torch_report_from_code(
+            0,
+            "HCP_ENABLE_TORCH is not enabled".to_string(),
+            "C++ libtorch payload chunk smoke executed on CPU",
+            "C++ libtorch payload chunk smoke executed on MPS",
+            "C++ libtorch payload chunk smoke executed on CUDA",
+            "C++ libtorch payload chunk smoke is disabled; build with HCP_ENABLE_TORCH=1",
+            "C++ libtorch payload chunk smoke failed or returned an unexpected status",
+        );
+        return TorchPayloadBlockReport {
+            status: report.status,
+            compiled: report.compiled,
+            requested_device: report.requested_device,
+            requested_blocks,
+            processed_blocks: 0,
+            status_code: report.status_code,
+            note: report.note,
+            message: report.message,
+        };
+    }
+    let Some(first_block) = blocks.first() else {
+        return TorchPayloadBlockReport {
+            status: "fail",
+            compiled: cfg!(hcp_torch_enabled),
+            requested_device: env::var("HCP_TORCH_DEVICE").unwrap_or_else(|_| "cpu".to_string()),
+            requested_blocks,
+            processed_blocks: 0,
+            status_code: -6,
+            note: "C++ libtorch payload chunk smoke has no payload blocks".to_string(),
+            message: "no CP payload blocks captured".to_string(),
+        };
+    };
+    let num_heads = first_block.num_heads();
+    let head_dim = first_block.head_dim();
+    if blocks
+        .iter()
+        .any(|block| block.num_heads() != num_heads || block.head_dim() != head_dim)
+    {
+        return TorchPayloadBlockReport {
+            status: "fail",
+            compiled: cfg!(hcp_torch_enabled),
+            requested_device: env::var("HCP_TORCH_DEVICE").unwrap_or_else(|_| "cpu".to_string()),
+            requested_blocks,
+            processed_blocks: 0,
+            status_code: -6,
+            note: "C++ libtorch payload chunk smoke received inconsistent tensor shapes"
+                .to_string(),
+            message: "inconsistent num_heads/head_dim across CP payload blocks".to_string(),
+        };
+    }
+    let mut payload = Vec::new();
+    let mut block_lens = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        payload.extend_from_slice(block.payload());
+        block_lens.push(i32::try_from(block.block_len()).unwrap_or(i32::MAX));
+    }
+    let code = unsafe {
+        hcp_ringattn_torch_payload_chunk_smoke(
+            payload.as_ptr(),
+            payload.len(),
+            block_lens.as_ptr(),
+            block_lens.len(),
+            PAYLOAD_CHUNK_QUERY_LEN,
+            i32::try_from(num_heads).unwrap_or(i32::MAX),
+            i32::try_from(head_dim).unwrap_or(i32::MAX),
+        )
+    };
+    let message = c_string_from_ptr(unsafe { hcp_ringattn_torch_payload_chunk_smoke_message() });
+    let report = torch_report_from_code(
+        code,
+        message,
+        "C++ libtorch payload chunk smoke executed on CPU",
+        "C++ libtorch payload chunk smoke executed on MPS",
+        "C++ libtorch payload chunk smoke executed on CUDA",
+        "C++ libtorch payload chunk smoke is disabled; build with HCP_ENABLE_TORCH=1",
+        "C++ libtorch payload chunk smoke failed or returned an unexpected status",
+    );
+    let processed_blocks = if report.status == "pass" {
+        requested_blocks
+    } else {
+        0
+    };
+    TorchPayloadBlockReport {
+        status: report.status,
+        compiled: report.compiled,
+        requested_device: report.requested_device,
+        requested_blocks,
+        processed_blocks,
+        status_code: report.status_code,
+        note: report.note,
+        message: report.message,
+    }
+}
+
 fn torch_report_from_code(
     code: i32,
     message: String,
@@ -961,6 +1074,8 @@ fn run() -> Result<Report, RingError> {
         torch_payload_block_bridge_report(cp_ring_smoke.payload_blocks());
     let torch_payload_online_bridge =
         torch_payload_online_bridge_report(cp_ring_smoke.payload_blocks());
+    let torch_payload_chunk_bridge =
+        torch_payload_chunk_bridge_report(cp_ring_smoke.payload_blocks());
     let status = if failed == 0
         && protocol_smoke.status == "pass"
         && cp_ring_smoke.status == "pass"
@@ -969,6 +1084,7 @@ fn run() -> Result<Report, RingError> {
         && torch_block_update_bridge.status != "fail"
         && torch_payload_block_bridge.status != "fail"
         && torch_payload_online_bridge.status != "fail"
+        && torch_payload_chunk_bridge.status != "fail"
     {
         "pass"
     } else {
@@ -992,6 +1108,7 @@ fn run() -> Result<Report, RingError> {
         torch_block_update_bridge,
         torch_payload_block_bridge,
         torch_payload_online_bridge,
+        torch_payload_chunk_bridge,
         cases,
     })
 }
@@ -1054,9 +1171,12 @@ fn main() -> Result<(), RingError> {
             torch_payload_block_bridge_report(cp_node.payload_blocks());
         let torch_payload_online_bridge =
             torch_payload_online_bridge_report(cp_node.payload_blocks());
+        let torch_payload_chunk_bridge =
+            torch_payload_chunk_bridge_report(cp_node.payload_blocks());
         let status = if cp_node.status == "pass"
             && torch_payload_block_bridge.status != "fail"
             && torch_payload_online_bridge.status != "fail"
+            && torch_payload_chunk_bridge.status != "fail"
         {
             "pass"
         } else {
@@ -1067,10 +1187,11 @@ fn main() -> Result<(), RingError> {
             cp_node,
             torch_payload_block_bridge,
             torch_payload_online_bridge,
+            torch_payload_chunk_bridge,
         };
         write_json_report(&args.report_path, &report)?;
         println!(
-            "[rust-remote-cp-node] status={} role={} transport={} sent={} received={} compute_updates={} torch_payload_block_status={} torch_payload_block_code={} torch_payload_blocks={}/{} torch_payload_online_status={} torch_payload_online_code={} torch_payload_online_blocks={}/{} report={}",
+            "[rust-remote-cp-node] status={} role={} transport={} sent={} received={} compute_updates={} torch_payload_block_status={} torch_payload_block_code={} torch_payload_blocks={}/{} torch_payload_online_status={} torch_payload_online_code={} torch_payload_online_blocks={}/{} torch_payload_chunk_status={} torch_payload_chunk_code={} torch_payload_chunk_blocks={}/{} report={}",
             report.status,
             report.cp_node.role(),
             report.cp_node.transport(),
@@ -1085,6 +1206,10 @@ fn main() -> Result<(), RingError> {
             report.torch_payload_online_bridge.status_code,
             report.torch_payload_online_bridge.processed_blocks,
             report.torch_payload_online_bridge.requested_blocks,
+            report.torch_payload_chunk_bridge.status,
+            report.torch_payload_chunk_bridge.status_code,
+            report.torch_payload_chunk_bridge.processed_blocks,
+            report.torch_payload_chunk_bridge.requested_blocks,
             args.report_path
         );
         if report.torch_payload_block_bridge.status == "fail"
@@ -1101,6 +1226,14 @@ fn main() -> Result<(), RingError> {
             println!(
                 "[rust-remote-cp-node] torch_payload_online_message={}",
                 compact_message(&report.torch_payload_online_bridge.message, 360)
+            );
+        }
+        if report.torch_payload_chunk_bridge.status == "fail"
+            && !report.torch_payload_chunk_bridge.message.is_empty()
+        {
+            println!(
+                "[rust-remote-cp-node] torch_payload_chunk_message={}",
+                compact_message(&report.torch_payload_chunk_bridge.message, 360)
             );
         }
         if report.status == "pass" {
@@ -1126,7 +1259,7 @@ fn main() -> Result<(), RingError> {
     let report = run()?;
     write_json_report(&args.report_path, &report)?;
     println!(
-        "[rust-ringattn] status={} passed={}/{} protocol_status={} protocol_messages={} cp_ring_status={} cp_ring_messages={} cp_ring_compute_updates={} cxx_domains={} torch_status={} torch_device={} torch_code={} torch_attention_status={} torch_attention_code={} torch_block_update_status={} torch_block_update_code={} torch_block_updates={} torch_payload_block_status={} torch_payload_block_code={} torch_payload_blocks={}/{} torch_payload_online_status={} torch_payload_online_code={} torch_payload_online_blocks={}/{} torch_compiled={} report={}",
+        "[rust-ringattn] status={} passed={}/{} protocol_status={} protocol_messages={} cp_ring_status={} cp_ring_messages={} cp_ring_compute_updates={} cxx_domains={} torch_status={} torch_device={} torch_code={} torch_attention_status={} torch_attention_code={} torch_block_update_status={} torch_block_update_code={} torch_block_updates={} torch_payload_block_status={} torch_payload_block_code={} torch_payload_blocks={}/{} torch_payload_online_status={} torch_payload_online_code={} torch_payload_online_blocks={}/{} torch_payload_chunk_status={} torch_payload_chunk_code={} torch_payload_chunk_blocks={}/{} torch_compiled={} report={}",
         report.status,
         report.summary.passed,
         report.summary.cases,
@@ -1152,6 +1285,10 @@ fn main() -> Result<(), RingError> {
         report.torch_payload_online_bridge.status_code,
         report.torch_payload_online_bridge.processed_blocks,
         report.torch_payload_online_bridge.requested_blocks,
+        report.torch_payload_chunk_bridge.status,
+        report.torch_payload_chunk_bridge.status_code,
+        report.torch_payload_chunk_bridge.processed_blocks,
+        report.torch_payload_chunk_bridge.requested_blocks,
         report.torch_bridge.compiled,
         args.report_path
     );
@@ -1191,6 +1328,14 @@ fn main() -> Result<(), RingError> {
         println!(
             "[rust-ringattn] torch_payload_online_message={}",
             compact_message(&report.torch_payload_online_bridge.message, 360)
+        );
+    }
+    if report.torch_payload_chunk_bridge.status == "fail"
+        && !report.torch_payload_chunk_bridge.message.is_empty()
+    {
+        println!(
+            "[rust-ringattn] torch_payload_chunk_message={}",
+            compact_message(&report.torch_payload_chunk_bridge.message, 360)
         );
     }
     if report.status == "pass" {
