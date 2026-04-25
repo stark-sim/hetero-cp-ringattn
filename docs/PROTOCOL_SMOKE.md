@@ -71,6 +71,38 @@ Rust 侧当前定义的最小 schema 包括：
 
 远端 NVIDIA GPU 当前在 `192.168.8.172`。代码变更只通过 git 同步：本地提交并 push，远端只执行 `git pull` 和 smoke 命令，不在远端直接编辑源码。
 
+## Remote P2P Pair Smoke
+
+`tcp_remote_pair` 是一个双进程 / 双机器 smoke transport，用于确认同一套 `RingAttnMessage` 可以跨机器点对点发送、接收和校验。它不改变 P2P 的定义：P2P 仍是 point-to-point protocol 语义，TCP 只是本阶段最小可诊断的工程传输。
+
+双机 smoke 不应使用 `127.0.0.1` 作为结论。远端 GPU 节点监听 `0.0.0.0:29172`，本机 client 连接 `192.168.8.172:29172`：
+
+```bash
+# 远端 GPU 节点执行，只通过 git 同步源码
+cd ~/hetero-cp-ringattn
+git pull
+RUN_ID=rust-remote-p2p-$(date +%Y%m%d-%H%M%S) \
+  BIND_ADDR=0.0.0.0:29172 \
+  CARGO_OFFLINE=0 \
+  bash scripts/run_rust_remote_p2p_server.sh
+```
+
+```bash
+# 本机执行
+RUN_ID=<same-run-id> \
+  CONNECT_ADDR=192.168.8.172:29172 \
+  CARGO_OFFLINE=0 \
+  bash scripts/run_rust_remote_p2p_client.sh
+```
+
+当前 remote pair 会验证 3 条消息：
+
+- client `mac-mps` 向 server `gpu-cuda` 发送 `kv_block`。
+- server `gpu-cuda` 向 client `mac-mps` 返回 `softmax_state` ack。
+- client `mac-mps` 向 server `gpu-cuda` 发送 `terminate`。
+
+server report 预期 `sent=1 received=2`，client report 预期 `sent=2 received=1`。
+
 ## Smoke Report
 
 运行：
@@ -114,4 +146,4 @@ JSON report 中新增 `protocol_smoke`：
 
 ## 后续
 
-下一步应为 `local_p2p_queue` 抽出明确 transport trait，再增加一个可选 remote transport 实现。remote 版本可以先用 TCP 做工程 smoke，但不应把 Ring Attention protocol 本身定义成 TCP。
+下一步应把 `local_p2p_queue` 和 `tcp_remote_pair` 抽成统一 transport trait，并继续保留 protocol schema / report 字段稳定。后续 transport 可以扩展到 UCX/RDMA、NCCL send/recv、共享内存或 GPU-direct 路线。

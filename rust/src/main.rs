@@ -18,6 +18,8 @@ enum RingError {
     Json(#[from] serde_json::Error),
     #[error("protocol error: {0}")]
     Protocol(#[from] protocol::ProtocolError),
+    #[error("invalid cli args: {0}")]
+    InvalidCli(String),
 }
 
 #[derive(Clone, Debug)]
@@ -169,6 +171,14 @@ struct BlockTrace {
 struct Lcg {
     state: u64,
     spare: Option<f64>,
+}
+
+#[derive(Debug)]
+struct CliArgs {
+    report_path: String,
+    remote_p2p_role: Option<String>,
+    bind_addr: Option<String>,
+    connect_addr: Option<String>,
 }
 
 impl Lcg {
@@ -503,17 +513,46 @@ fn default_cases() -> Vec<(&'static str, CaseConfig)> {
     ]
 }
 
-fn parse_report_path() -> String {
+fn parse_cli_args() -> Result<CliArgs, RingError> {
     let mut args = env::args().skip(1);
     let mut report_path = String::from("reports/rust_ringattn_correctness.json");
+    let mut remote_p2p_role = None;
+    let mut bind_addr = None;
+    let mut connect_addr = None;
     while let Some(arg) = args.next() {
-        if arg == "--report-path" {
-            if let Some(value) = args.next() {
-                report_path = value;
+        match arg.as_str() {
+            "--report-path" => {
+                report_path = next_cli_value(&mut args, "--report-path")?;
+            }
+            "--remote-p2p-role" => {
+                remote_p2p_role = Some(next_cli_value(&mut args, "--remote-p2p-role")?);
+            }
+            "--bind" => {
+                bind_addr = Some(next_cli_value(&mut args, "--bind")?);
+            }
+            "--connect" => {
+                connect_addr = Some(next_cli_value(&mut args, "--connect")?);
+            }
+            _ => {
+                return Err(RingError::InvalidCli(format!("unknown argument {arg}")));
             }
         }
     }
-    report_path
+    Ok(CliArgs {
+        report_path,
+        remote_p2p_role,
+        bind_addr,
+        connect_addr,
+    })
+}
+
+fn next_cli_value(
+    args: &mut impl Iterator<Item = String>,
+    flag: &'static str,
+) -> Result<String, RingError> {
+    args.next()
+        .filter(|value| !value.starts_with("--"))
+        .ok_or_else(|| RingError::InvalidCli(format!("missing value for {flag}")))
 }
 
 fn torch_device_success_code(requested_device: &str) -> Option<i32> {
@@ -634,15 +673,56 @@ fn run() -> Result<Report, RingError> {
     })
 }
 
-fn main() -> Result<(), RingError> {
-    let report_path = parse_report_path();
-    let report = run()?;
-    if let Some(parent) = Path::new(&report_path).parent() {
+fn write_json_report<T: Serialize>(report_path: &str, report: &T) -> Result<(), RingError> {
+    if let Some(parent) = Path::new(report_path).parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
         }
     }
-    fs::write(&report_path, serde_json::to_string_pretty(&report)?)?;
+    fs::write(report_path, serde_json::to_string_pretty(report)?)?;
+    Ok(())
+}
+
+fn run_remote_p2p(args: &CliArgs) -> Result<protocol::RemoteP2pReport, RingError> {
+    match args.remote_p2p_role.as_deref() {
+        Some("server") => {
+            let bind_addr = args.bind_addr.as_deref().unwrap_or("0.0.0.0:29172");
+            Ok(protocol::run_remote_p2p_server(bind_addr)?)
+        }
+        Some("client") => {
+            let connect_addr = args.connect_addr.as_deref().ok_or_else(|| {
+                RingError::InvalidCli("--connect is required for remote client".to_string())
+            })?;
+            Ok(protocol::run_remote_p2p_client(connect_addr)?)
+        }
+        Some(role) => Err(RingError::InvalidCli(format!(
+            "unsupported --remote-p2p-role {role}; expected server or client"
+        ))),
+        None => Err(RingError::InvalidCli(
+            "--remote-p2p-role is required for remote mode".to_string(),
+        )),
+    }
+}
+
+fn main() -> Result<(), RingError> {
+    let args = parse_cli_args()?;
+    if args.remote_p2p_role.is_some() {
+        let report = run_remote_p2p(&args)?;
+        write_json_report(&args.report_path, &report)?;
+        println!(
+            "[rust-remote-p2p] status={} role={} transport={} sent={} received={} report={}",
+            report.status,
+            report.role(),
+            report.transport(),
+            report.messages_sent(),
+            report.messages_received(),
+            args.report_path
+        );
+        return Ok(());
+    }
+
+    let report = run()?;
+    write_json_report(&args.report_path, &report)?;
     println!(
         "[rust-ringattn] status={} passed={}/{} protocol_status={} protocol_messages={} cxx_domains={} torch_status={} torch_device={} torch_code={} torch_compiled={} report={}",
         report.status,
@@ -655,7 +735,7 @@ fn main() -> Result<(), RingError> {
         report.torch_bridge.requested_device,
         report.torch_bridge.status_code,
         report.torch_bridge.compiled,
-        report_path
+        args.report_path
     );
     if report.torch_bridge.status == "fail" && !report.torch_bridge.message.is_empty() {
         println!(
