@@ -104,6 +104,29 @@ RUN_ID=rust-remote-p2p-<timestamp> \
   bash scripts/run_rust_remote_p2p_client.sh
 ```
 
+Rust remote CP dual-role node smoke：
+
+```bash
+# 本机 Mac node
+RUN_ID=rust-remote-cp-node-<timestamp> \
+  NODE_INDEX=0 \
+  BIND_ADDR=0.0.0.0:29176 \
+  CONNECT_ADDR=192.168.8.172:29175 \
+  CARGO_OFFLINE=0 \
+  bash scripts/run_rust_remote_cp_node.sh
+```
+
+```bash
+# 远端 GPU node
+PATH=/home/stark/.cargo/bin:$PATH \
+  RUN_ID=rust-remote-cp-node-<timestamp> \
+  NODE_INDEX=1 \
+  BIND_ADDR=0.0.0.0:29175 \
+  CONNECT_ADDR=192.168.8.204:29176 \
+  CARGO_OFFLINE=0 \
+  bash scripts/run_rust_remote_cp_node.sh
+```
+
 ### 环境变量
 
 - `RUN_ID`：覆盖 smoke report 目录名，默认 `hcp-ringattn-smoke-local`。
@@ -114,6 +137,7 @@ RUN_ID=rust-remote-p2p-<timestamp> \
 - `HCP_TORCH_DEVICE=cpu|mps|cuda|cuda:N`：选择 ATen smoke 设备；成功码分别为 CPU=1、MPS=2、CUDA=3。
 - `BIND_ADDR`：remote P2P server 监听地址，双机 smoke 使用 `0.0.0.0:29172` 或 GPU 子网地址。
 - `CONNECT_ADDR`：remote P2P client 连接地址，当前 GPU host 为 `192.168.8.172:29172`。
+- `NODE_INDEX`：remote CP node index；当前 `0=mac-mps`，`1=gpu-cuda`。
 - 本机 Mac hardware smoke 使用 `HCP_TORCH_DEVICE=mps` 并越过普通沙箱；CPU smoke 只用于编译/链接 fallback。
 - 启用 `HCP_ENABLE_TORCH=1` 后，Rust smoke 要求 torch bridge 成功；CLI summary 中 `torch_status=pass` 且设备成功码匹配才算硬件 smoke 通过。
 - torch bridge 失败时 CLI summary 后会打印压缩 `torch_message`；完整信息写入 JSON report。

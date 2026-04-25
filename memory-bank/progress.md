@@ -36,11 +36,12 @@
 - [x] [2026-04-25] `reports/**/*.json` 已加入 `.gitignore` 并从 git 索引移除，后续 smoke report 不再默认造成 dirty worktree 或远端 pull 前 stash。
 - [x] [2026-04-25] Rust `cp_ring_node_runtime` smoke 已通过：3 个 domain thread 同时扮演 inbound receiver + outbound peer，10 个 source blocks 产生 20 条跨域 K/V messages，并记录 30 次 compute updates。
 - [x] [2026-04-25] C++ ATen/libtorch `torch_attention_bridge` 已建立并在本机 MPS 与远端 CUDA 通过：实际计算 `softmax(QK^T / sqrt(d))V`，再与 CPU reference 比较；MPS 显示 `torch_attention_code=2`，CUDA 显示 `torch_attention_code=3`。
+- [x] [2026-04-25] Rust `tcp_remote_cp_node` 双机 smoke 已通过：Mac/GPU 两个进程都同时作为 listener + outbound peer，每个 node 发送 4 个 source blocks、接收 4 个 peer blocks、记录 8 次 compute updates。
 
 ## 进行中
 
 - [ ] M2：Rust online softmax correctness report 与 tolerance policy 扩展。
-- [ ] M3：把 `cp_ring_node_runtime` 映射到 remote TCP transport，并抽出统一 transport trait。
+- [ ] M3：把 `tcp_remote_cp_node` 扩展到 3+ remote nodes，并抽出统一 transport trait。
 - [ ] M4：heterogeneous runtime stubs 与配置 / 环境纪律。
 - [ ] M5：把 compute update counter 替换为真实 device-side block compute，并跑 2-domain remote heterogeneous runtime smoke。
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。

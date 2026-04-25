@@ -42,6 +42,7 @@
 - [2026-04-25] Rust 新增 `cp_ring_node_runtime` smoke：默认 3 个 domain 各起一个 Rust thread，每个节点同时承担 inbound receiver 和 outbound peer，持续转发 10 个 source blocks 产生的 20 条 K/V messages，并记录 30 次 compute updates。
 - [2026-04-25] C++ ATen/libtorch bridge 新增 `torch_attention_bridge`：在请求设备上实际计算小尺寸 `softmax(QK^T / sqrt(d))V`，并与 CPU reference 比较；本机非沙箱 MPS 已通过 `torch_attention_status=pass torch_attention_code=2`，远端 CUDA 已通过 `torch_attention_status=pass torch_attention_code=3`。
 - [2026-04-25] 远端非交互 SSH 默认也不加载 `LIBTORCH` / `LIBTORCH_INCLUDE` / `LIBTORCH_LIB` / `LD_LIBRARY_PATH`；跑 CUDA libtorch smoke 时需和 `PATH=/home/stark/.cargo/bin:$PATH` 一起显式传入。
+- [2026-04-25] Rust 新增 `tcp_remote_cp_node` dual-role smoke 并已双机通过：Mac `node_index=0` 和 GPU `node_index=1` 均同时作为 listener + outbound peer；每个 node `messages_sent=4 messages_received=4 compute_updates=8`。
 
 ## 活跃决策
 
@@ -60,7 +61,7 @@
 - [ ] 必要时增加 `max_rel_err` 并明确 tolerance policy。
 - [ ] 将 Rust correctness model 继续拆分为 library + binary，便于后续 protocol / transport 复用。
 - [ ] 为 `local_p2p_queue` / `tcp_remote_pair` 抽出统一 transport trait，保持当前 message schema / report 字段稳定。
-- [ ] 将 `cp_ring_node_runtime` 映射到 remote TCP transport：每个远端 node 进程同时 listener + outbound peer。
+- [ ] 将 `tcp_remote_cp_node` 扩展到 3+ remote nodes，覆盖 remote 多 hop forwarding。
 - [ ] 将 `cp_ring_node_runtime` 的 compute update counter 接入真实 device-side attention block update。
 - [ ] 在 cargo registry/network 可用后，增加 feature-gated `tch = 0.24.0` backend，并先实现 `tch_smoke`，再迁移 Ring Attention block update。
 - [ ] 在 cargo registry/network 可用后，引入 optional `tch = 0.24.0` 并实现 `tch_smoke`。
@@ -84,6 +85,7 @@
 - Remote GPU 纪律：`192.168.8.172` 只通过 git 同步代码；不要在远端直接编辑源码。
 - Remote P2P 纪律：双机验证不能用 `127.0.0.1` 作为结论；server 应监听 `0.0.0.0` 或目标子网地址，client 应连接 `192.168.8.x` 子网内的 GPU host。
 - Report 纪律：`reports/**/*.json` 是生成产物，默认不提交；如需长期记录实验进展，写入 docs 或 memory-bank。
+- Remote CP node 启动纪律：Mac 侧可先启动 listener，再启动 GPU 节点；GPU 能连入 Mac，但必须确保 Mac listener 已实际运行。
 
 ## 当前阻塞
 

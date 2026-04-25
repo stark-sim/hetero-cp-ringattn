@@ -125,6 +125,44 @@ cp_ring_status=pass cp_ring_messages=20 cp_ring_compute_updates=30
 
 `torch_attention_bridge` 已提供独立的 device-side attention compute smoke：C++ ATen 在请求设备上计算小尺寸 `softmax(QK^T / sqrt(d))V`，并与 CPU reference 对比。它当前验证的是设备上的 attention block compute 能力，还没有接入 `cp_ring_node_runtime` 的每条 K/V block update。
 
+## Remote CP Node Smoke
+
+`tcp_remote_cp_node` 是当前的双机 dual-role node smoke。每个进程同时做两件事：
+
+- listener：接收 peer 发来的 K/V block。
+- outbound peer：主动连接 peer listener，并发送本地 source blocks。
+
+当前 2-domain remote 配置为 `mac-mps <-> gpu-cuda`，每个 domain 有 4 个 source blocks。由于只有两个 domain，每个 block 只跨一个 hop，因此每个 node 预期：
+
+- `messages_sent=4`
+- `messages_received=4`
+- `compute_updates=8`
+
+已验证通过的双机命令形态：
+
+```bash
+# 本机先启动，避免 GPU 反连 Mac 时错过 listener
+RUN_ID=rust-remote-cp-node-<timestamp> \
+  NODE_INDEX=0 \
+  BIND_ADDR=0.0.0.0:29176 \
+  CONNECT_ADDR=192.168.8.172:29175 \
+  CARGO_OFFLINE=0 \
+  bash scripts/run_rust_remote_cp_node.sh
+```
+
+```bash
+# GPU 节点随后启动
+PATH=/home/stark/.cargo/bin:$PATH \
+  RUN_ID=rust-remote-cp-node-<timestamp> \
+  NODE_INDEX=1 \
+  BIND_ADDR=0.0.0.0:29175 \
+  CONNECT_ADDR=192.168.8.204:29176 \
+  CARGO_OFFLINE=0 \
+  bash scripts/run_rust_remote_cp_node.sh
+```
+
+这一步已经验证双机每节点双角色和双向多 block 持续收发。由于 remote 版本目前是 2-domain，它没有中间节点，因此不覆盖 remote 多 hop forwarding；多 hop forwarding 仍由本地 3-domain `cp_ring_node_runtime` 覆盖。
+
 ## Smoke Report
 
 运行：
@@ -170,4 +208,4 @@ JSON report 中新增 `protocol_smoke`：
 
 ## 后续
 
-下一步应把 `cp_ring_node_runtime` 映射到 remote transport：每个远端 node 进程同时具备 listener + outbound peer，并把 compute update counter 接到 `torch_attention_bridge` 或后续 tensor backend 的真实 block update。后续 transport 可以扩展到 UCX/RDMA、NCCL send/recv、共享内存或 GPU-direct 路线。
+下一步应把 `tcp_remote_cp_node` 扩展到 3+ remote nodes，或把当前 2-domain remote node 的 compute update counter 接到 `torch_attention_bridge` / 后续 tensor backend 的真实 block update。后续 transport 可以扩展到 UCX/RDMA、NCCL send/recv、共享内存或 GPU-direct 路线。
