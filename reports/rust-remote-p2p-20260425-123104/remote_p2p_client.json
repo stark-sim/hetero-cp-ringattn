@@ -1,0 +1,50 @@
+{
+  "status": "pass",
+  "role": "client",
+  "transport": "tcp_remote_pair",
+  "bind_addr": null,
+  "connect_addr": "192.168.8.172:29172",
+  "local_addr": "192.168.8.204:55727",
+  "peer_addr": "192.168.8.172:29172",
+  "summary": {
+    "kv_block_messages": 1,
+    "softmax_state_messages": 1,
+    "terminate_messages": 1,
+    "messages_sent": 2,
+    "messages_received": 1,
+    "bytes_sent": 807,
+    "bytes_received": 426
+  },
+  "validated_messages": [
+    {
+      "direction": "send",
+      "sequence_id": 1,
+      "message_kind": "kv_block",
+      "payload_kind": "kv_block",
+      "source_domain": "mac-mps",
+      "sender_domain": "mac-mps",
+      "receiver_domain": "gpu-cuda",
+      "payload_bytes": 42
+    },
+    {
+      "direction": "recv",
+      "sequence_id": 2,
+      "message_kind": "softmax_state",
+      "payload_kind": "softmax_state",
+      "source_domain": "gpu-cuda",
+      "sender_domain": "gpu-cuda",
+      "receiver_domain": "mac-mps",
+      "payload_bytes": 32
+    },
+    {
+      "direction": "send",
+      "sequence_id": 3,
+      "message_kind": "terminate",
+      "payload_kind": "control",
+      "source_domain": "mac-mps",
+      "sender_domain": "mac-mps",
+      "receiver_domain": "gpu-cuda",
+      "payload_bytes": 0
+    }
+  ]
+}

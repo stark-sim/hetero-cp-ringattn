@@ -31,13 +31,15 @@
 - [x] [2026-04-25] 远端 CUDA libtorch smoke 已通过：`torch_status=pass torch_device=cuda:0 torch_code=3`，且 `ldd` 显示 `libtorch_cuda.so` / `libc10_cuda.so`。
 - [x] [2026-04-25] Rust protocol smoke 已建立：本地 P2P queue transport 可序列化、发送、接收、解码 K/V block、softmax state、terminate 消息；P2P 语义不绑定 IP/TCP。
 - [x] [2026-04-25] `bash scripts/run_rust_ringattn_smoke.sh` 已输出 `protocol_status=pass protocol_messages=22`；非沙箱 MPS smoke 同样通过。
+- [x] [2026-04-25] Rust remote P2P pair smoke 已建立：`--remote-p2p-role server|client` 使用 `tcp_remote_pair` transport 跨进程发送同一套 `RingAttnMessage`。
+- [x] [2026-04-25] 双机 remote P2P smoke 已通过：GPU 节点 `192.168.8.172` 监听 `0.0.0.0:29172`，本机 client 连接后验证 `kv_block`、`softmax_state`、`terminate` 三类消息；结构化 report 已落在 `reports/rust-remote-p2p-20260425-123104/`。
 
 ## 进行中
 
 - [ ] M2：Rust online softmax correctness report 与 tolerance policy 扩展。
-- [ ] M3：抽出 transport trait，并增加可选双进程 / 双机器 P2P send/recv transport。
+- [ ] M3：把 `local_p2p_queue` / `tcp_remote_pair` 收敛到统一 transport trait，并扩展更多 ring steps / 多连接场景。
 - [ ] M4：heterogeneous runtime stubs 与配置 / 环境纪律。
-- [ ] M5：2-domain remote heterogeneous smoke。
+- [ ] M5：2-domain remote heterogeneous runtime smoke，把协议消息接入真实 device-side block compute。
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 
 ## 已知问题
@@ -59,7 +61,7 @@
 | M0: 独立化完成 | 已完成 | [2026-04-24] |
 | M1: 问题定义固定 | 已完成 | [2026-04-24] |
 | M2: 数学闭环 | 进行中 | 待定 |
-| M3: 协议闭环 | 未开始 | 待定 |
+| M3: 协议闭环 | 进行中 | 待定 |
 | M4: 异构 runtime 闭环 | 未开始 | 待定 |
-| M5: 远端闭环 | 未开始 | 待定 |
+| M5: 远端闭环 | 进行中 | 待定 |
 | M6: 扩展性论证 | 未开始 | 待定 |

@@ -41,6 +41,8 @@ This project uses a Memory Bank system in `memory-bank/` for cross-session conte
 - The NVIDIA GPU host is `192.168.8.172`.
 - Do not directly edit source files on the remote GPU host. Make code changes locally, commit them, push to the configured remote, then sync on the GPU host with `git pull`.
 - Remote GPU smoke results can be recorded in reports/docs, but source-of-truth code changes must flow through git.
+- For dual-machine P2P smoke, do not use `127.0.0.1` as the validation endpoint. Bind the server to `0.0.0.0` or the target subnet address and connect the client to the `192.168.8.x` GPU host address.
+- Non-interactive SSH on the GPU host may not load Cargo. Prefer an explicit PATH prefix such as `PATH=/home/stark/.cargo/bin:$PATH` when launching Rust smoke commands remotely; do not edit remote shell startup files just to work around this.
 
 ### Special Commands:
 - `memory bank update` / `memory bank güncelle` -> Review and update ALL memory bank files

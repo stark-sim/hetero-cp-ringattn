@@ -29,6 +29,7 @@
   - Rust Ring Attention correctness smoke
   - Rust -> C++ runtime bridge smoke
   - 可选 Rust -> C++ ATen/libtorch smoke
+  - Rust remote P2P pair smoke
   - Python controller / worker placeholder smoke 仅作历史占位
 - 后续应增加 online softmax correctness script / report。
 
@@ -84,6 +85,25 @@ Rust + C++ + ATen/libtorch smoke：
 HCP_ENABLE_TORCH=1 bash scripts/run_rust_ringattn_smoke.sh
 ```
 
+Rust remote P2P pair smoke：
+
+```bash
+# 远端 GPU 节点
+PATH=/home/stark/.cargo/bin:$PATH \
+  RUN_ID=rust-remote-p2p-<timestamp> \
+  BIND_ADDR=0.0.0.0:29172 \
+  CARGO_OFFLINE=0 \
+  bash scripts/run_rust_remote_p2p_server.sh
+```
+
+```bash
+# 本机 client
+RUN_ID=rust-remote-p2p-<timestamp> \
+  CONNECT_ADDR=192.168.8.172:29172 \
+  CARGO_OFFLINE=0 \
+  bash scripts/run_rust_remote_p2p_client.sh
+```
+
 ### 环境变量
 
 - `RUN_ID`：覆盖 smoke report 目录名，默认 `hcp-ringattn-smoke-local`。
@@ -92,11 +112,14 @@ HCP_ENABLE_TORCH=1 bash scripts/run_rust_ringattn_smoke.sh
 - `CARGO_OFFLINE=1`：Rust smoke 默认离线构建，避免 cargo registry 网络依赖。
 - `HCP_ENABLE_TORCH=1`：启用 C++ ATen/libtorch bridge。
 - `HCP_TORCH_DEVICE=cpu|mps|cuda|cuda:N`：选择 ATen smoke 设备；成功码分别为 CPU=1、MPS=2、CUDA=3。
+- `BIND_ADDR`：remote P2P server 监听地址，双机 smoke 使用 `0.0.0.0:29172` 或 GPU 子网地址。
+- `CONNECT_ADDR`：remote P2P client 连接地址，当前 GPU host 为 `192.168.8.172:29172`。
 - 本机 Mac hardware smoke 使用 `HCP_TORCH_DEVICE=mps` 并越过普通沙箱；CPU smoke 只用于编译/链接 fallback。
 - 启用 `HCP_ENABLE_TORCH=1` 后，Rust smoke 要求 torch bridge 成功；CLI summary 中 `torch_status=pass` 且设备成功码匹配才算硬件 smoke 通过。
 - torch bridge 失败时 CLI summary 后会打印压缩 `torch_message`；完整信息写入 JSON report。
 - CUDA 请求下 `torch_code=-5` 表示当前 libtorch 进程无 CUDA backend，通常是 CPU-only libtorch 或 `libtorch_cuda` / `c10_cuda` 没有被链接/加载。
 - Linux CUDA libtorch 构建需要保留 `libtorch_cuda` / `c10_cuda` 动态依赖；build script 在检测到这两个库时会用同一个 linker group 传入 `--push-state,--no-as-needed,-ltorch_cuda,-lc10_cuda,--pop-state`。
+- 远端非交互 SSH 默认 PATH 不包含 `/home/stark/.cargo/bin`；通过 SSH 启动 Rust smoke 时显式设置 `PATH=/home/stark/.cargo/bin:$PATH`。
 
 ## 项目结构
 
