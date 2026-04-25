@@ -31,6 +31,7 @@
 - [2026-04-25] 远端 CUDA smoke 返回 `torch_code=-2`，说明 C++ ATen bridge 抛异常；CLI 已补充失败时打印压缩 `torch_message`，完整异常保留在 JSON report。
 - [2026-04-25] C++ ATen bridge 增加 CUDA backend preflight：请求 `cuda` / `cuda:N` 时 `at::hasCUDA()==false` 会返回 `torch_code=-5`，明确指向 CPU-only libtorch 或 `libtorch_cuda` / `c10_cuda` 未链接加载。
 - [2026-04-25] 远端已确认 `/home/stark/libtorch/lib` 存在 `libtorch_cuda.so` / `libc10_cuda.so`，但 `ldd rust/target/debug/hcp-ringattn-rust` 未显示它们；`rust/build.rs` 已在 Linux CUDA libtorch 下用同一个 linker group 传入 `--push-state,--no-as-needed,-ltorch_cuda,-lc10_cuda,--pop-state`，避免 rustc / linker 参数重排导致 registration libraries 被丢弃。
+- [2026-04-25] 远端 GPU smoke 已通过：`CARGO_OFFLINE=0 HCP_ENABLE_TORCH=1 HCP_TORCH_DEVICE=cuda:0 bash scripts/run_rust_ringattn_smoke.sh` 输出 `torch_status=pass torch_device=cuda:0 torch_code=3`，`ldd` 已显示 `libtorch_cuda.so` / `libc10_cuda.so`。
 
 ## 活跃决策
 
@@ -48,7 +49,6 @@
 - [ ] 扩展 correctness case，覆盖更大的 seq、更多 seed、float32 / mixed precision tolerance policy。
 - [ ] 必要时增加 `max_rel_err` 并明确 tolerance policy。
 - [ ] 将 Rust correctness model 继续拆分为 library + binary，便于后续 protocol / transport 复用。
-- [ ] 在 GPU 端使用 CUDA 版 libtorch 运行 `HCP_ENABLE_TORCH=1 HCP_TORCH_DEVICE=cuda:0 bash scripts/run_rust_ringattn_smoke.sh`，确认 `status_code=3`。
 - [ ] 在 cargo registry/network 可用后，增加 feature-gated `tch = 0.24.0` backend，并先实现 `tch_smoke`，再迁移 Ring Attention block update。
 - [ ] 在 cargo registry/network 可用后，引入 optional `tch = 0.24.0` 并实现 `tch_smoke`。
 - [ ] 为 `RingAttnMessage` 设计 serialization / deserialization。
@@ -65,9 +65,7 @@
 - sudo / 系统改动纪律：如果修复需要 `sudo`、root-owned path、`/opt`、系统 linker 或机器级配置，应停止并给用户最小命令让用户自己执行；不要为了绕过 sudo 擅自修改第三方二进制、install_name 或 vendor artifacts。
 - 本机硬件 smoke 纪律：Mac 本机 libtorch smoke 应使用 `HCP_TORCH_DEVICE=mps` 并在非沙箱/授权进程运行；CPU smoke 不代表本机加速器路径有效。
 - GPU hardware smoke 纪律：远端 `HCP_TORCH_DEVICE=cuda:0` 必须看到 `torch_status=pass`、`torch_code=3`，仅有 correctness `passed=3/3` 不足以证明 CUDA 路径有效。
-- 远端 GPU smoke 若 `torch_code=-2`，下一步先看 `torch_message` / JSON report message；优先排查是否链接到 CPU-only libtorch 或运行时 CUDA libtorch 库不可见。
-- 远端 GPU smoke 若 `torch_code=-5`，不要怀疑 `cuda:0` 设备名；应检查 `LIBTORCH`、`LIBTORCH_LIB`、`LD_LIBRARY_PATH` / rpath 和 libtorch CUDA build。
-- 远端修复后需要 `cargo clean` 并重新构建 binary；如果 `ldd` 仍看不到 `libtorch_cuda.so` / `libc10_cuda.so`，说明链接阶段仍没有保留 CUDA registration libraries。
+- 远端 GPU smoke 排查经验：若 `torch_code=-2` 或 `torch_code=-5`，不要怀疑 `cuda:0` 设备名；优先看 `torch_message`，并检查 `LIBTORCH`、`LIBTORCH_LIB`、`LD_LIBRARY_PATH` / rpath、`ldd` 是否显示 `libtorch_cuda.so` / `libc10_cuda.so`。
 
 ## 当前阻塞
 
