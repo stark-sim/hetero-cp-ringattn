@@ -90,6 +90,7 @@ CARGO_OFFLINE=0 HCP_ENABLE_TORCH=1 HCP_TORCH_DEVICE=cuda:0 bash scripts/run_rust
 ```text
 rust correctness model
   ├── backend=pure-rust
+  ├── protocol=local-ring-transport
   ├── backend=cxx-libtorch
   └── backend=tch-rs
 ```

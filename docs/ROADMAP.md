@@ -70,6 +70,8 @@
 
 - `RingAttnMessage` 可以稳定编码、传输、解码
 
+当前 Rust smoke 已建立本地 in-memory ring transport，覆盖 K/V block、softmax state、terminate 三类消息，并在 JSON report 中输出 `protocol_smoke`。
+
 ## M4: 异构 runtime 闭环
 
 ### 目标

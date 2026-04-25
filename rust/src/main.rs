@@ -1,3 +1,5 @@
+mod protocol;
+
 use serde::Serialize;
 use std::env;
 use std::fs;
@@ -14,6 +16,8 @@ enum RingError {
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("protocol error: {0}")]
+    Protocol(#[from] protocol::ProtocolError),
 }
 
 #[derive(Clone, Debug)]
@@ -78,6 +82,7 @@ struct DomainSpec {
 struct Report {
     status: &'static str,
     summary: Summary,
+    protocol_smoke: protocol::ProtocolSmokeReport,
     cxx_bridge: CxxBridgeReport,
     torch_bridge: TorchBridgeReport,
     cases: Vec<CaseReport>,
@@ -604,8 +609,10 @@ fn run() -> Result<Report, RingError> {
         .collect::<Result<Vec<_>, _>>()?;
     let passed = cases.iter().filter(|case| case.status == "pass").count();
     let failed = cases.len() - passed;
+    let protocol_smoke = protocol::run_protocol_smoke()?;
     let torch_bridge = torch_bridge_report();
-    let status = if failed == 0 && torch_bridge.status != "fail" {
+    let status = if failed == 0 && protocol_smoke.status == "pass" && torch_bridge.status != "fail"
+    {
         "pass"
     } else {
         "fail"
@@ -617,6 +624,7 @@ fn run() -> Result<Report, RingError> {
             passed,
             failed,
         },
+        protocol_smoke,
         cxx_bridge: CxxBridgeReport {
             status: "ok",
             smoke_domains: unsafe { hcp_ringattn_cxx_smoke_domain_count() },
@@ -636,10 +644,12 @@ fn main() -> Result<(), RingError> {
     }
     fs::write(&report_path, serde_json::to_string_pretty(&report)?)?;
     println!(
-        "[rust-ringattn] status={} passed={}/{} cxx_domains={} torch_status={} torch_device={} torch_code={} torch_compiled={} report={}",
+        "[rust-ringattn] status={} passed={}/{} protocol_status={} protocol_messages={} cxx_domains={} torch_status={} torch_device={} torch_code={} torch_compiled={} report={}",
         report.status,
         report.summary.passed,
         report.summary.cases,
+        report.protocol_smoke.status,
+        report.protocol_smoke.messages_sent(),
         report.cxx_bridge.smoke_domains,
         report.torch_bridge.status,
         report.torch_bridge.requested_device,

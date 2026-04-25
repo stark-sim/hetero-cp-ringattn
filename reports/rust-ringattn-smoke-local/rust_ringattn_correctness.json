@@ -5,6 +5,95 @@
     "passed": 3,
     "failed": 0
   },
+  "protocol_smoke": {
+    "status": "pass",
+    "schema_version": 1,
+    "domains": 3,
+    "source_blocks": 10,
+    "summary": {
+      "kv_block_messages": 20,
+      "softmax_state_messages": 1,
+      "terminate_messages": 1,
+      "messages_sent": 22,
+      "messages_received": 22,
+      "bytes_sent": 10751,
+      "bytes_received": 10751
+    },
+    "route_preview": [
+      {
+        "sequence_id": 1,
+        "source_domain": "domain-0",
+        "sender_domain": "domain-0",
+        "receiver_domain": "domain-1",
+        "block_start": 0,
+        "block_len": 32,
+        "ring_step": 1
+      },
+      {
+        "sequence_id": 2,
+        "source_domain": "domain-0",
+        "sender_domain": "domain-1",
+        "receiver_domain": "domain-2",
+        "block_start": 0,
+        "block_len": 32,
+        "ring_step": 2
+      },
+      {
+        "sequence_id": 3,
+        "source_domain": "domain-0",
+        "sender_domain": "domain-0",
+        "receiver_domain": "domain-1",
+        "block_start": 32,
+        "block_len": 32,
+        "ring_step": 1
+      },
+      {
+        "sequence_id": 4,
+        "source_domain": "domain-0",
+        "sender_domain": "domain-1",
+        "receiver_domain": "domain-2",
+        "block_start": 32,
+        "block_len": 32,
+        "ring_step": 2
+      },
+      {
+        "sequence_id": 5,
+        "source_domain": "domain-1",
+        "sender_domain": "domain-1",
+        "receiver_domain": "domain-2",
+        "block_start": 64,
+        "block_len": 10,
+        "ring_step": 1
+      },
+      {
+        "sequence_id": 6,
+        "source_domain": "domain-1",
+        "sender_domain": "domain-2",
+        "receiver_domain": "domain-0",
+        "block_start": 64,
+        "block_len": 10,
+        "ring_step": 2
+      },
+      {
+        "sequence_id": 7,
+        "source_domain": "domain-1",
+        "sender_domain": "domain-1",
+        "receiver_domain": "domain-2",
+        "block_start": 74,
+        "block_len": 10,
+        "ring_step": 1
+      },
+      {
+        "sequence_id": 8,
+        "source_domain": "domain-1",
+        "sender_domain": "domain-2",
+        "receiver_domain": "domain-0",
+        "block_start": 74,
+        "block_len": 10,
+        "ring_step": 2
+      }
+    ]
+  },
   "cxx_bridge": {
     "status": "ok",
     "smoke_domains": 3

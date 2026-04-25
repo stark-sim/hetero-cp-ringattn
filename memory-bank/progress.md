@@ -29,11 +29,13 @@
 - [x] [2026-04-25] C++ ATen bridge 已增加 `at::hasCUDA()` preflight；CUDA backend 不可用时返回 `torch_code=-5`，避免误判为设备名错误。
 - [x] [2026-04-25] Rust build script 已在 Linux CUDA libtorch 下用单个 linker group 强制保留 `libtorch_cuda` / `c10_cuda`，防止 registration libraries 被链接器或 rustc 参数重排丢弃。
 - [x] [2026-04-25] 远端 CUDA libtorch smoke 已通过：`torch_status=pass torch_device=cuda:0 torch_code=3`，且 `ldd` 显示 `libtorch_cuda.so` / `libc10_cuda.so`。
+- [x] [2026-04-25] Rust protocol smoke 已建立：本地 in-memory ring transport 可序列化、发送、接收、解码 K/V block、softmax state、terminate 消息。
+- [x] [2026-04-25] `bash scripts/run_rust_ringattn_smoke.sh` 已输出 `protocol_status=pass protocol_messages=22`；非沙箱 MPS smoke 同样通过。
 
 ## 进行中
 
 - [ ] M2：Rust online softmax correctness report 与 tolerance policy 扩展。
-- [ ] M3：`RingAttnMessage` schema、serialization / deserialization、本地 send/recv smoke。
+- [ ] M3：将本地 in-memory transport 推进为最小 P2P send/recv transport。
 - [ ] M4：heterogeneous runtime stubs 与配置 / 环境纪律。
 - [ ] M5：2-domain remote heterogeneous smoke。
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
