@@ -41,13 +41,14 @@
 - [x] [2026-04-25] Rust `torch_payload_block_bridge` 已消费 `RingAttnMessage.payload` 中的 float32 K/V bytes：默认 30 个 captured CP payload blocks 在本机 MPS 与远端 CUDA 均已通过 payload-backed ATen block compute。
 - [x] [2026-04-25] 双机 `tcp_remote_cp_node` payload-backed compute 已通过：Mac MPS node 与 GPU CUDA node 均发送 4、接收 4、compute_updates=8，并各自完成 `torch_payload_blocks=8/8`。
 - [x] [2026-04-25] 修复 macOS remote CP accepted stream 非阻塞读大 payload frame 的 `WouldBlock` 问题：`accept_with_retry` accept 成功后显式恢复 blocking mode。
+- [x] [2026-04-25] 3-node remote CP forwarding smoke 已通过：Mac node0、GPU node1、Mac node2 三个独立进程形成 ring，每个 node `sent=8 received=8 compute_updates=12`，并完成 payload-backed ATen compute。
 
 ## 进行中
 
 - [ ] M2：Rust online softmax correctness report 与 tolerance policy 扩展。
-- [ ] M3：把 `tcp_remote_cp_node` 扩展到 3+ remote nodes，并抽出统一 transport trait。
+- [ ] M3：抽出统一 transport trait，减少 local queue / TCP pair / TCP CP node 的重复 frame 与 metrics 逻辑。
 - [ ] M4：heterogeneous runtime stubs 与配置 / 环境纪律。
-- [ ] M5：推进 3+ remote CP nodes，并在 payload-backed block compute 之上维护 online softmax state / output tensor。
+- [ ] M5：在 payload-backed block compute 之上维护 online softmax state / output tensor。
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 
 ## 已知问题

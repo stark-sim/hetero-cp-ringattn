@@ -148,11 +148,13 @@ PATH=/home/stark/.cargo/bin:$PATH \
 - `BIND_ADDR`：remote P2P server 监听地址，双机 smoke 使用 `0.0.0.0:29172` 或 GPU 子网地址。
 - `CONNECT_ADDR`：remote P2P client 连接地址，当前 GPU host 为 `192.168.8.172:29172`。
 - `NODE_INDEX`：remote CP node index；当前 `0=mac-mps`，`1=gpu-cuda`。
+- `HCP_REMOTE_CP_DOMAINS=2|3`：remote CP node 拓扑大小，默认 2；设置为 3 时为 `mac-mps -> gpu-cuda -> mac-mps-2 -> mac-mps`。
 - 本机 Mac hardware smoke 使用 `HCP_TORCH_DEVICE=mps` 并越过普通沙箱；CPU smoke 只用于编译/链接 fallback。
 - 启用 `HCP_ENABLE_TORCH=1` 后，Rust smoke 要求 torch bridge 成功；CLI summary 中 `torch_status=pass` 且设备成功码匹配才算硬件 smoke 通过。
 - `torch_block_update_status=pass` 表示 `cp_ring_node_runtime.compute_updates()` 已驱动同等次数的 C++ ATen attention block compute；MPS 成功码为 2，CUDA 成功码为 3。
 - `torch_payload_block_status=pass` 表示 `RingAttnMessage.payload` 中的 captured K/V blocks 已逐块驱动 C++ ATen attention block compute；MPS 成功码为 2，CUDA 成功码为 3。
 - remote CP node 启用 `HCP_ENABLE_TORCH=1` 后也会执行 payload-backed compute；当前双机期望每个 node `torch_payload_blocks=8/8`。
+- 3-node remote CP smoke 期望每个 node `messages_sent=8 messages_received=8 compute_updates=12 torch_payload_blocks=12/12`；启动顺序建议 node2 -> GPU node1 -> node0。
 - torch bridge 失败时 CLI summary 后会打印压缩 `torch_message`；完整信息写入 JSON report。
 - CUDA 请求下 `torch_code=-5` 表示当前 libtorch 进程无 CUDA backend，通常是 CPU-only libtorch 或 `libtorch_cuda` / `c10_cuda` 没有被链接/加载。
 - Linux CUDA libtorch 构建需要保留 `libtorch_cuda` / `c10_cuda` 动态依赖；build script 在检测到这两个库时会用同一个 linker group 传入 `--push-state,--no-as-needed,-ltorch_cuda,-lc10_cuda,--pop-state`。

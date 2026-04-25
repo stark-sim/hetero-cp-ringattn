@@ -143,10 +143,11 @@ torch_payload_block_status=pass torch_payload_block_code=3 torch_payload_blocks=
 
 ## Remote CP Node Smoke
 
-`tcp_remote_cp_node` 是当前的双机 dual-role node smoke。每个进程同时做两件事：
+`tcp_remote_cp_node` 是当前的 remote dual-role node smoke。每个进程同时做两件事：
 
 - listener：接收 peer 发来的 K/V block。
 - outbound peer：主动连接 peer listener，并发送本地 source blocks。
+- forwarder：当收到的 K/V block 还没有走完 ring 时，继续转发给 outbound peer。
 
 当前 2-domain remote 配置为 `mac-mps <-> gpu-cuda`，每个 domain 有 4 个 source blocks。由于只有两个 domain，每个 block 只跨一个 hop，因此每个 node 预期：
 
@@ -189,6 +190,75 @@ PATH=/home/stark/.cargo/bin:$PATH \
 这一步已经验证双机每节点双角色、双向多 block 持续收发，以及每个 node 对 8 个 captured K/V payload blocks 的本地 device-side ATen compute。由于 remote 版本目前是 2-domain，它没有中间节点，因此不覆盖 remote 多 hop forwarding；多 hop forwarding 仍由本地 3-domain `cp_ring_node_runtime` 覆盖。
 
 macOS 上非阻塞 listener accept 出来的 stream 可能继承 nonblocking 状态；当前实现会在 `accept_with_retry` 成功后显式切回 blocking stream，避免大 payload frame 读取时出现 `WouldBlock`。
+
+### 3-Node Remote CP Smoke
+
+设置 `HCP_REMOTE_CP_DOMAINS=3` 后，remote 拓扑为：
+
+```text
+node0 mac-mps -> node1 gpu-cuda -> node2 mac-mps-2 -> node0 mac-mps
+```
+
+当前验证使用两台物理机器上的三个进程：node0 和 node2 在 Mac，node1 在 GPU host。每个 domain 仍有 4 个 source blocks；3-domain ring 中每个 block 跨 2 hop，因此每个 node 预期：
+
+- `messages_sent=8`，其中 4 条本地 source blocks，4 条 forwarded peer blocks。
+- `messages_received=8`，来自上游 peer 的本地 source blocks 和 forwarded blocks。
+- `compute_updates=12`，本地 4 blocks + 远端 8 blocks。
+- `torch_payload_blocks=12/12`，本地设备消费全部 captured payload blocks。
+
+已验证通过的启动顺序是先启动 node2，再启动 GPU node1，最后启动 node0：
+
+```bash
+# Mac node2
+RUN_ID=rust-remote-cp-3node-<timestamp> \
+  HCP_REMOTE_CP_DOMAINS=3 \
+  NODE_INDEX=2 \
+  BIND_ADDR=0.0.0.0:29207 \
+  CONNECT_ADDR=192.168.8.204:29206 \
+  CARGO_OFFLINE=0 \
+  HCP_ENABLE_TORCH=1 \
+  HCP_TORCH_DEVICE=mps \
+  bash scripts/run_rust_remote_cp_node.sh
+```
+
+```bash
+# GPU node1
+PATH=/home/stark/.cargo/bin:$PATH \
+  LIBTORCH=/home/stark/libtorch \
+  LIBTORCH_INCLUDE=/home/stark/libtorch/include \
+  LIBTORCH_LIB=/home/stark/libtorch/lib \
+  LD_LIBRARY_PATH=/home/stark/libtorch/lib:$LD_LIBRARY_PATH \
+  RUN_ID=rust-remote-cp-3node-<timestamp> \
+  HCP_REMOTE_CP_DOMAINS=3 \
+  NODE_INDEX=1 \
+  BIND_ADDR=0.0.0.0:29205 \
+  CONNECT_ADDR=192.168.8.204:29207 \
+  CARGO_OFFLINE=0 \
+  HCP_ENABLE_TORCH=1 \
+  HCP_TORCH_DEVICE=cuda:0 \
+  bash scripts/run_rust_remote_cp_node.sh
+```
+
+```bash
+# Mac node0
+RUN_ID=rust-remote-cp-3node-<timestamp> \
+  HCP_REMOTE_CP_DOMAINS=3 \
+  NODE_INDEX=0 \
+  BIND_ADDR=0.0.0.0:29206 \
+  CONNECT_ADDR=192.168.8.172:29205 \
+  CARGO_OFFLINE=0 \
+  HCP_ENABLE_TORCH=1 \
+  HCP_TORCH_DEVICE=mps \
+  bash scripts/run_rust_remote_cp_node.sh
+```
+
+已通过的结果：
+
+```text
+node0: sent=8 received=8 compute_updates=12 torch_payload_block_code=2 torch_payload_blocks=12/12
+node1: sent=8 received=8 compute_updates=12 torch_payload_block_code=3 torch_payload_blocks=12/12
+node2: sent=8 received=8 compute_updates=12 torch_payload_block_code=2 torch_payload_blocks=12/12
+```
 
 ## Smoke Report
 
@@ -238,4 +308,4 @@ JSON report 中新增 `protocol_smoke`：
 
 ## 后续
 
-下一步应把 remote CP 拓扑扩展到 3+ nodes，并开始维护真实 online softmax state / output tensor。后续 transport 可以扩展到 UCX/RDMA、NCCL send/recv、共享内存或 GPU-direct 路线。
+下一步应开始维护真实 online softmax state / output tensor，并抽出统一 transport trait。后续 transport 可以扩展到 UCX/RDMA、NCCL send/recv、共享内存或 GPU-direct 路线。

@@ -39,7 +39,7 @@ project-root/
 - **最小可见 smoke**：C++ coordinator smoke 先验证 standalone build 和 runtime lifecycle；Rust smoke 同时验证 correctness、protocol、C++ bridge、可选 libtorch device bridge。
 - **Context Parallel ring 消息流**：每个 source domain 的 K/V block 沿 ring 逐 hop 转发；每个跨域 hop 都是一个可序列化 `RingAttnMessage`。
 - **Transport 可替换**：P2P 是 point-to-point message 语义；`local_p2p_queue` 用于本地协议闭环，`tcp_remote_pair` 用于双进程 / 双机器工程 smoke，后续可替换为 UCX/RDMA、NCCL send/recv 或 GPU-direct。
-- **CP 节点双角色**：`cp_ring_node_runtime` 中每个 domain thread 同时具备 inbound receiver 和 outbound peer；`tcp_remote_cp_node` 已在 Mac/GPU 双机上验证每个进程同时 listener + outbound peer。
+- **CP 节点双角色**：`cp_ring_node_runtime` 中每个 domain thread 同时具备 inbound receiver 和 outbound peer；`tcp_remote_cp_node` 已在 Mac/GPU 上验证每个进程同时 listener + outbound peer，并在 3-node remote ring 中验证多 hop forwarding。
 - **CP payload 驱动 device compute**：`RingAttnMessage.payload` 携带 float32 K/V bytes；`cp_ring_node_runtime` 和 `tcp_remote_cp_node` 都会捕获每次 compute update 的 payload block，并通过 C ABI 驱动 C++ ATen/libtorch 在目标设备上执行 payload-backed attention block compute。
 - **reference-first correctness**：Python kernel stub 保留 reference attention，用于与 block-wise online softmax 对照。
 - **报告纪律**：实验产物应落在 `reports/<RUN_ID>/` 下，便于回溯。
@@ -68,7 +68,7 @@ project-root/
 4. 收到 block 后计算局部 score 和 `P @ V` 贡献。
 5. 使用 online softmax 更新 `running_max`、`running_sum`、`output`。
 6. block 转发给下一个 domain，直到 ring 遍历完成。
-7. 当前 Rust protocol smoke 以本地 P2P queue transport 验证完整 ring 转发路径，以 `cp_ring_node_runtime` 验证每节点双角色并发收发和 payload-backed device compute，以 `tcp_remote_pair` 验证双进程 / 双机器 send/recv frame，以 `tcp_remote_cp_node` 验证双机每节点双角色与 payload-backed device compute。
+7. 当前 Rust protocol smoke 以本地 P2P queue transport 验证完整 ring 转发路径，以 `cp_ring_node_runtime` 验证每节点双角色并发收发和 payload-backed device compute，以 `tcp_remote_pair` 验证双进程 / 双机器 send/recv frame，以 `tcp_remote_cp_node` 验证 remote 多节点 forwarding 与 payload-backed device compute。
 
 ## 架构决策
 
@@ -85,3 +85,4 @@ project-root/
 | 双机 remote CP node 先验证 2-domain 双角色 | 现有 Mac/GPU 两台机器可以先证明每个进程同时 listen/connect 和多 block 双向流动；remote 多 hop 需要 3+ node 扩展 | [2026-04-25] |
 | 先用本地 CP runtime 接入 payload-backed device compute | 这样可以先验证 Rust message payload -> C ABI -> C++ ATen 的执行闭环和 MPS/CUDA 设备路径，再把同一能力接入 remote CP node | [2026-04-25] |
 | accepted TCP stream 必须恢复 blocking mode | macOS 上非阻塞 listener accept 出来的 stream 可能继承 nonblocking；大 payload frame 用 `read_exact` 时会触发 `WouldBlock` | [2026-04-25] |
+| 3-node remote smoke 可先用两台物理机器三进程 | 当前目标是验证 remote process-level multi-hop forwarding；node0/node2 可同在 Mac，node1 在 GPU，后续再扩展到三台物理机器 | [2026-04-25] |
