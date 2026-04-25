@@ -12,7 +12,9 @@ const FRAME_LEN_BYTES: usize = 4;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const REMOTE_IO_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(200);
-const REMOTE_CONNECT_ATTEMPTS: usize = 50;
+const REMOTE_CONNECT_ATTEMPTS: usize = 300;
+const REMOTE_ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(200);
+const REMOTE_ACCEPT_ATTEMPTS: usize = 300;
 const REMOTE_CLIENT_DOMAIN: &str = "mac-mps";
 const REMOTE_SERVER_DOMAIN: &str = "gpu-cuda";
 
@@ -1126,7 +1128,7 @@ fn receive_remote_cp_node_messages(
     listener: TcpListener,
     expected_messages: usize,
 ) -> Result<RemoteCpRecvReport, ProtocolError> {
-    let (mut stream, _) = listener.accept()?;
+    let mut stream = accept_with_retry(listener)?;
     configure_stream(&stream)?;
     let inbound_peer_addr = stream.peer_addr()?.to_string();
     let mut report = RemoteCpRecvReport {
@@ -1154,6 +1156,26 @@ fn receive_remote_cp_node_messages(
         });
     }
     Ok(report)
+}
+
+fn accept_with_retry(listener: TcpListener) -> Result<TcpStream, ProtocolError> {
+    listener.set_nonblocking(true)?;
+    let mut last_error = None;
+    for _ in 0..REMOTE_ACCEPT_ATTEMPTS {
+        match listener.accept() {
+            Ok((stream, _)) => return Ok(stream),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(REMOTE_ACCEPT_RETRY_DELAY);
+            }
+            Err(error) => {
+                last_error = Some(error);
+                thread::sleep(REMOTE_ACCEPT_RETRY_DELAY);
+            }
+        }
+    }
+    Err(ProtocolError::Io(last_error.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, "accept retry exhausted")
+    })))
 }
 
 fn connect_with_retry(connect_socket: SocketAddr) -> Result<TcpStream, ProtocolError> {
