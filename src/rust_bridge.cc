@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -20,6 +21,7 @@ std::string g_torch_smoke_message;
 std::string g_torch_attention_smoke_message;
 std::string g_torch_block_update_smoke_message;
 std::string g_torch_payload_block_smoke_message;
+std::string g_torch_payload_online_smoke_message;
 
 #ifdef HCP_ENABLE_TORCH
 struct TorchDeviceSelection {
@@ -234,6 +236,136 @@ int RunTorchPayloadBlockSmoke(const std::uint8_t* payload,
              " max_abs_err=" + std::to_string(max_abs_err);
   return -1;
 }
+
+int RunTorchPayloadOnlineSmoke(const std::uint8_t* payload,
+                               std::size_t payload_len,
+                               const int* block_lens,
+                               std::size_t block_count,
+                               int num_heads,
+                               int head_dim,
+                               std::string* message) {
+  message->clear();
+  if (payload == nullptr || block_lens == nullptr) {
+    *message = "payload or block_lens pointer is null";
+    return -6;
+  }
+  if (block_count == 0 || num_heads <= 0 || head_dim <= 0) {
+    *message = "block_count, num_heads, and head_dim must be positive";
+    return -6;
+  }
+  std::size_t token_count = 0;
+  for (std::size_t index = 0; index < block_count; ++index) {
+    if (block_lens[index] <= 0) {
+      *message = "all block_lens entries must be positive";
+      return -6;
+    }
+    token_count += static_cast<std::size_t>(block_lens[index]);
+  }
+  const std::size_t expected_values =
+      token_count * static_cast<std::size_t>(num_heads) * static_cast<std::size_t>(head_dim) * 2;
+  const std::size_t expected_bytes = expected_values * sizeof(float);
+  if (payload_len != expected_bytes) {
+    *message = "online payload byte size mismatch expected=" + std::to_string(expected_bytes) +
+               " actual=" + std::to_string(payload_len);
+    return -6;
+  }
+
+  const char* requested = std::getenv("HCP_TORCH_DEVICE");
+  std::string device_name = requested == nullptr ? "cpu" : requested;
+  TorchDeviceSelection selection{at::Device(at::kCPU), 1};
+  if (!SelectTorchDevice(device_name, &selection)) {
+    *message =
+        "unsupported HCP_TORCH_DEVICE=" + device_name + "; expected cpu, mps, cuda, or cuda:N";
+    return -4;
+  }
+  if (selection.device.is_cuda() && !at::hasCUDA()) {
+    *message =
+        "CUDA device name is valid, but CUDA backend is not available in the current libtorch "
+        "process. Verify LIBTORCH/LIBTORCH_LIB point to a CUDA-enabled libtorch build and that "
+        "libtorch_cuda and c10_cuda are linked/loaded.";
+    return -5;
+  }
+
+  std::vector<float> values(expected_values);
+  std::memcpy(values.data(), payload, expected_bytes);
+  auto cpu_options = at::TensorOptions().dtype(at::kFloat).device(at::kCPU);
+  auto device_options = at::TensorOptions().dtype(at::kFloat).device(selection.device);
+  auto q_cpu = (at::arange(num_heads * head_dim, cpu_options)
+                    .reshape({static_cast<std::int64_t>(num_heads),
+                              static_cast<std::int64_t>(head_dim)}) /
+                31.0) +
+               0.125;
+  auto q = q_cpu.to(selection.device);
+  auto running_max =
+      at::full({num_heads}, -std::numeric_limits<float>::infinity(), device_options);
+  auto running_sum = at::zeros({num_heads}, device_options);
+  auto output = at::zeros({num_heads, head_dim}, device_options);
+  std::vector<at::Tensor> k_refs;
+  std::vector<at::Tensor> v_refs;
+  k_refs.reserve(block_count);
+  v_refs.reserve(block_count);
+
+  std::size_t value_offset = 0;
+  const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
+  for (std::size_t block_index = 0; block_index < block_count; ++block_index) {
+    const int block_len = block_lens[block_index];
+    const std::size_t block_values = static_cast<std::size_t>(block_len) *
+                                     static_cast<std::size_t>(num_heads) *
+                                     static_cast<std::size_t>(head_dim) * 2;
+    auto kv_cpu =
+        at::from_blob(values.data() + value_offset,
+                      {2, static_cast<std::int64_t>(block_len),
+                       static_cast<std::int64_t>(num_heads),
+                       static_cast<std::int64_t>(head_dim)},
+                      cpu_options)
+            .clone();
+    value_offset += block_values;
+    auto k_cpu = kv_cpu[0];
+    auto v_cpu = kv_cpu[1];
+    k_refs.push_back(k_cpu);
+    v_refs.push_back(v_cpu);
+
+    auto k = k_cpu.to(selection.device);
+    auto v = v_cpu.to(selection.device);
+    auto k_by_head = k.permute({1, 0, 2});
+    auto v_by_head = v.permute({1, 0, 2});
+    auto scores = at::bmm(k_by_head, q.unsqueeze(2)).squeeze(2) * scale;
+    auto local_max = std::get<0>(scores.max(1));
+    auto weights = at::exp(scores - local_max.unsqueeze(1));
+    auto local_sum = weights.sum(1);
+    auto local_pv = at::bmm(weights.unsqueeze(1), v_by_head).squeeze(1);
+
+    auto new_max = at::maximum(running_max, local_max);
+    auto exp_prev = at::exp(running_max - new_max);
+    auto exp_local = at::exp(local_max - new_max);
+    auto new_sum = exp_prev * running_sum + exp_local * local_sum;
+    output = (exp_prev.unsqueeze(1) * running_sum.unsqueeze(1) * output +
+              exp_local.unsqueeze(1) * local_pv) /
+             new_sum.unsqueeze(1);
+    running_max = new_max;
+    running_sum = new_sum;
+  }
+
+  if (!DeviceMatches(output, selection.device)) {
+    *message = "online output landed on unexpected device: " + output.device().str();
+    return -1;
+  }
+  auto reference = PayloadAttention(q_cpu, at::cat(k_refs, 0), at::cat(v_refs, 0));
+  auto output_cpu = output.to(at::kCPU);
+  const float max_abs_err = at::abs(output_cpu - reference).max().item<float>();
+  const float checksum = output_cpu.sum().item<float>();
+  if (max_abs_err <= 1.0e-4F) {
+    *message = "ok blocks=" + std::to_string(block_count) +
+               " tokens=" + std::to_string(token_count) +
+               " max_abs_err=" + std::to_string(max_abs_err) +
+               " checksum=" + std::to_string(checksum);
+    return selection.success_code;
+  }
+  *message = "online payload mismatch blocks=" + std::to_string(block_count) +
+             " tokens=" + std::to_string(token_count) +
+             " max_abs_err=" + std::to_string(max_abs_err);
+  return -1;
+}
 #endif
 }
 
@@ -251,6 +383,10 @@ extern "C" const char* hcp_ringattn_torch_block_update_smoke_message() {
 
 extern "C" const char* hcp_ringattn_torch_payload_block_smoke_message() {
   return g_torch_payload_block_smoke_message.c_str();
+}
+
+extern "C" const char* hcp_ringattn_torch_payload_online_smoke_message() {
+  return g_torch_payload_online_smoke_message.c_str();
 }
 
 extern "C" int hcp_ringattn_cxx_smoke_domain_count() {
@@ -393,6 +529,35 @@ extern "C" int hcp_ringattn_torch_payload_block_smoke(const std::uint8_t* payloa
   (void)num_heads;
   (void)head_dim;
   g_torch_payload_block_smoke_message = "HCP_ENABLE_TORCH is not enabled";
+  return 0;
+#endif
+}
+
+extern "C" int hcp_ringattn_torch_payload_online_smoke(const std::uint8_t* payload,
+                                                        std::size_t payload_len,
+                                                        const int* block_lens,
+                                                        std::size_t block_count,
+                                                        int num_heads,
+                                                        int head_dim) {
+#ifdef HCP_ENABLE_TORCH
+  try {
+    return RunTorchPayloadOnlineSmoke(payload, payload_len, block_lens, block_count, num_heads,
+                                      head_dim, &g_torch_payload_online_smoke_message);
+  } catch (const std::exception& exc) {
+    g_torch_payload_online_smoke_message = exc.what();
+    return -2;
+  } catch (...) {
+    g_torch_payload_online_smoke_message = "unknown exception";
+    return -3;
+  }
+#else
+  (void)payload;
+  (void)payload_len;
+  (void)block_lens;
+  (void)block_count;
+  (void)num_heads;
+  (void)head_dim;
+  g_torch_payload_online_smoke_message = "HCP_ENABLE_TORCH is not enabled";
   return 0;
 #endif
 }
