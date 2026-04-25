@@ -95,6 +95,7 @@ CARGO_OFFLINE=0 HCP_ENABLE_TORCH=1 HCP_TORCH_DEVICE=cuda:0 bash scripts/run_rust
 - 远端 CUDA attention compute 验证已通过：显式传入 `LIBTORCH*` 和 `LD_LIBRARY_PATH` 后，`torch_attention_status=pass torch_attention_code=3`。
 - CP block update device-side compute 验证已通过：本机非沙箱 MPS 显示 `torch_block_update_status=pass torch_block_update_code=2 torch_block_updates=30`，远端 CUDA 显示 `torch_block_update_status=pass torch_block_update_code=3 torch_block_updates=30`。
 - CP payload-backed device-side compute 验证已通过：本机非沙箱 MPS 显示 `torch_payload_block_status=pass torch_payload_block_code=2 torch_payload_blocks=30/30`，远端 CUDA 显示 `torch_payload_block_status=pass torch_payload_block_code=3 torch_payload_blocks=30/30`。
+- 双机 remote CP node payload-backed compute 验证已通过：Mac node 显示 `torch_payload_block_status=pass torch_payload_block_code=2 torch_payload_blocks=8/8`，GPU node 显示 `torch_payload_block_status=pass torch_payload_block_code=3 torch_payload_blocks=8/8`。
 - 当前 payload bridge 已消费 `RingAttnMessage` 的 K/V bytes；它仍是 smoke 级 block attention，不是完整 online softmax state / output tensor kernel。
 - 远端非交互 SSH 不会自动加载 `/home/stark/.cargo/bin` 或 libtorch 环境；通过 SSH 运行 CUDA smoke 时应显式传入 `PATH=/home/stark/.cargo/bin:$PATH LIBTORCH=/home/stark/libtorch LIBTORCH_INCLUDE=/home/stark/libtorch/include LIBTORCH_LIB=/home/stark/libtorch/lib LD_LIBRARY_PATH=/home/stark/libtorch/lib:$LD_LIBRARY_PATH`。
 - 因此短期推荐路线是 Rust -> C ABI -> C++ ATen/libtorch，而不是马上把完整 `torch/torch.h` 或 `tch-rs` 作为必需路径。

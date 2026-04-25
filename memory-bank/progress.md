@@ -39,13 +39,15 @@
 - [x] [2026-04-25] Rust `tcp_remote_cp_node` 双机 smoke 已通过：Mac/GPU 两个进程都同时作为 listener + outbound peer，每个 node 发送 4 个 source blocks、接收 4 个 peer blocks、记录 8 次 compute updates。
 - [x] [2026-04-25] Rust `torch_block_update_bridge` 已接入 `cp_ring_node_runtime.compute_updates()`：默认 30 次 CP update 会驱动 30 次 C++ ATen attention block compute；本机 MPS 与远端 CUDA 均已通过。
 - [x] [2026-04-25] Rust `torch_payload_block_bridge` 已消费 `RingAttnMessage.payload` 中的 float32 K/V bytes：默认 30 个 captured CP payload blocks 在本机 MPS 与远端 CUDA 均已通过 payload-backed ATen block compute。
+- [x] [2026-04-25] 双机 `tcp_remote_cp_node` payload-backed compute 已通过：Mac MPS node 与 GPU CUDA node 均发送 4、接收 4、compute_updates=8，并各自完成 `torch_payload_blocks=8/8`。
+- [x] [2026-04-25] 修复 macOS remote CP accepted stream 非阻塞读大 payload frame 的 `WouldBlock` 问题：`accept_with_retry` accept 成功后显式恢复 blocking mode。
 
 ## 进行中
 
 - [ ] M2：Rust online softmax correctness report 与 tolerance policy 扩展。
 - [ ] M3：把 `tcp_remote_cp_node` 扩展到 3+ remote nodes，并抽出统一 transport trait。
 - [ ] M4：heterogeneous runtime stubs 与配置 / 环境纪律。
-- [ ] M5：把 payload-backed block compute 接入 2-domain remote CP node，并继续推进 3+ remote nodes。
+- [ ] M5：推进 3+ remote CP nodes，并在 payload-backed block compute 之上维护 online softmax state / output tensor。
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 
 ## 已知问题

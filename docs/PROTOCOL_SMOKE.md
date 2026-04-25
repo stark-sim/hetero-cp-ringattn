@@ -153,6 +153,7 @@ torch_payload_block_status=pass torch_payload_block_code=3 torch_payload_blocks=
 - `messages_sent=4`
 - `messages_received=4`
 - `compute_updates=8`
+- `torch_payload_blocks=8/8`，当启用 `HCP_ENABLE_TORCH=1` 时每个 node 都在本地请求设备上消费本地与 peer 的 K/V payload。
 
 已验证通过的双机命令形态：
 
@@ -163,21 +164,31 @@ RUN_ID=rust-remote-cp-node-<timestamp> \
   BIND_ADDR=0.0.0.0:29176 \
   CONNECT_ADDR=192.168.8.172:29175 \
   CARGO_OFFLINE=0 \
+  HCP_ENABLE_TORCH=1 \
+  HCP_TORCH_DEVICE=mps \
   bash scripts/run_rust_remote_cp_node.sh
 ```
 
 ```bash
 # GPU 节点随后启动
 PATH=/home/stark/.cargo/bin:$PATH \
+  LIBTORCH=/home/stark/libtorch \
+  LIBTORCH_INCLUDE=/home/stark/libtorch/include \
+  LIBTORCH_LIB=/home/stark/libtorch/lib \
+  LD_LIBRARY_PATH=/home/stark/libtorch/lib:$LD_LIBRARY_PATH \
   RUN_ID=rust-remote-cp-node-<timestamp> \
   NODE_INDEX=1 \
   BIND_ADDR=0.0.0.0:29175 \
   CONNECT_ADDR=192.168.8.204:29176 \
   CARGO_OFFLINE=0 \
+  HCP_ENABLE_TORCH=1 \
+  HCP_TORCH_DEVICE=cuda:0 \
   bash scripts/run_rust_remote_cp_node.sh
 ```
 
-这一步已经验证双机每节点双角色和双向多 block 持续收发。由于 remote 版本目前是 2-domain，它没有中间节点，因此不覆盖 remote 多 hop forwarding；多 hop forwarding 仍由本地 3-domain `cp_ring_node_runtime` 覆盖。
+这一步已经验证双机每节点双角色、双向多 block 持续收发，以及每个 node 对 8 个 captured K/V payload blocks 的本地 device-side ATen compute。由于 remote 版本目前是 2-domain，它没有中间节点，因此不覆盖 remote 多 hop forwarding；多 hop forwarding 仍由本地 3-domain `cp_ring_node_runtime` 覆盖。
+
+macOS 上非阻塞 listener accept 出来的 stream 可能继承 nonblocking 状态；当前实现会在 `accept_with_retry` 成功后显式切回 blocking stream，避免大 payload frame 读取时出现 `WouldBlock`。
 
 ## Smoke Report
 
@@ -227,4 +238,4 @@ JSON report 中新增 `protocol_smoke`：
 
 ## 后续
 
-下一步应把 payload-backed compute 接入 `tcp_remote_cp_node` 的双机路径，并把 remote CP 拓扑扩展到 3+ nodes。后续 transport 可以扩展到 UCX/RDMA、NCCL send/recv、共享内存或 GPU-direct 路线。
+下一步应把 remote CP 拓扑扩展到 3+ nodes，并开始维护真实 online softmax state / output tensor。后续 transport 可以扩展到 UCX/RDMA、NCCL send/recv、共享内存或 GPU-direct 路线。
