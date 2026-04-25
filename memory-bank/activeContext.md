@@ -39,6 +39,7 @@
 - [2026-04-25] 双机 remote P2P smoke 已通过：远端 GPU `192.168.8.172` 监听 `0.0.0.0:29172`，本机 `192.168.8.204` 连接；client report 为 `sent=2 received=1`，server report 为 `sent=1 received=2`，三类消息 `kv_block` / `softmax_state` / `terminate` 均验证通过。
 - [2026-04-25] 远端非交互 SSH 默认 PATH 不包含 cargo；启动远端 Rust smoke 时需显式加 `PATH=/home/stark/.cargo/bin:$PATH`，不要修改远端 shell 配置文件作为临时 workaround。
 - [2026-04-25] `reports/**/*.json` 已改为默认 git ignore，并从 git 索引移除历史 report JSON；实验结论应优先沉淀到 docs / memory-bank，除非用户明确要求提交 raw JSON。
+- [2026-04-25] Rust 新增 `cp_ring_node_runtime` smoke：默认 3 个 domain 各起一个 Rust thread，每个节点同时承担 inbound receiver 和 outbound peer，持续转发 10 个 source blocks 产生的 20 条 K/V messages，并记录 30 次 compute updates。
 
 ## 活跃决策
 
@@ -57,8 +58,8 @@
 - [ ] 必要时增加 `max_rel_err` 并明确 tolerance policy。
 - [ ] 将 Rust correctness model 继续拆分为 library + binary，便于后续 protocol / transport 复用。
 - [ ] 为 `local_p2p_queue` / `tcp_remote_pair` 抽出统一 transport trait，保持当前 message schema / report 字段稳定。
-- [ ] 扩展 remote P2P pair，从单连接 3 消息握手推进到每个节点同时 listener + outbound peer 的 CP node runtime。
-- [ ] 在 remote node runtime 中覆盖多 block / 多 ring step / 多连接并发场景。
+- [ ] 将 `cp_ring_node_runtime` 映射到 remote TCP transport：每个远端 node 进程同时 listener + outbound peer。
+- [ ] 将 compute update counter 替换为真实 device-side attention block compute。
 - [ ] 在 cargo registry/network 可用后，增加 feature-gated `tch = 0.24.0` backend，并先实现 `tch_smoke`，再迁移 Ring Attention block update。
 - [ ] 在 cargo registry/network 可用后，引入 optional `tch = 0.24.0` 并实现 `tch_smoke`。
 - [ ] 为 `RingAttnMessage` 设计 serialization / deserialization。

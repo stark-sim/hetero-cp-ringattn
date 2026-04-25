@@ -85,6 +85,7 @@ struct Report {
     status: &'static str,
     summary: Summary,
     protocol_smoke: protocol::ProtocolSmokeReport,
+    cp_ring_smoke: protocol::CpRingNodeSmokeReport,
     cxx_bridge: CxxBridgeReport,
     torch_bridge: TorchBridgeReport,
     cases: Vec<CaseReport>,
@@ -649,8 +650,12 @@ fn run() -> Result<Report, RingError> {
     let passed = cases.iter().filter(|case| case.status == "pass").count();
     let failed = cases.len() - passed;
     let protocol_smoke = protocol::run_protocol_smoke()?;
+    let cp_ring_smoke = protocol::run_cp_ring_node_smoke()?;
     let torch_bridge = torch_bridge_report();
-    let status = if failed == 0 && protocol_smoke.status == "pass" && torch_bridge.status != "fail"
+    let status = if failed == 0
+        && protocol_smoke.status == "pass"
+        && cp_ring_smoke.status == "pass"
+        && torch_bridge.status != "fail"
     {
         "pass"
     } else {
@@ -664,6 +669,7 @@ fn run() -> Result<Report, RingError> {
             failed,
         },
         protocol_smoke,
+        cp_ring_smoke,
         cxx_bridge: CxxBridgeReport {
             status: "ok",
             smoke_domains: unsafe { hcp_ringattn_cxx_smoke_domain_count() },
@@ -724,12 +730,15 @@ fn main() -> Result<(), RingError> {
     let report = run()?;
     write_json_report(&args.report_path, &report)?;
     println!(
-        "[rust-ringattn] status={} passed={}/{} protocol_status={} protocol_messages={} cxx_domains={} torch_status={} torch_device={} torch_code={} torch_compiled={} report={}",
+        "[rust-ringattn] status={} passed={}/{} protocol_status={} protocol_messages={} cp_ring_status={} cp_ring_messages={} cp_ring_compute_updates={} cxx_domains={} torch_status={} torch_device={} torch_code={} torch_compiled={} report={}",
         report.status,
         report.summary.passed,
         report.summary.cases,
         report.protocol_smoke.status,
         report.protocol_smoke.messages_sent(),
+        report.cp_ring_smoke.status,
+        report.cp_ring_smoke.messages_sent(),
+        report.cp_ring_smoke.compute_updates(),
         report.cxx_bridge.smoke_domains,
         report.torch_bridge.status,
         report.torch_bridge.requested_device,

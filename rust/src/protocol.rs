@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -36,6 +38,16 @@ pub enum ProtocolError {
         expected: String,
         actual: String,
     },
+    #[error("channel send failed from {sender_domain} to {receiver_domain}: {reason}")]
+    ChannelSend {
+        sender_domain: String,
+        receiver_domain: String,
+        reason: String,
+    },
+    #[error("channel recv failed for domain={domain_id}: {reason}")]
+    ChannelRecv { domain_id: String, reason: String },
+    #[error("node thread panicked for domain={domain_id}")]
+    NodeThreadPanic { domain_id: String },
 }
 
 #[derive(Clone, Debug)]
@@ -142,6 +154,69 @@ impl RemoteP2pReport {
     pub fn messages_received(&self) -> usize {
         self.summary.messages_received
     }
+}
+
+#[derive(Serialize)]
+pub struct CpRingNodeSmokeReport {
+    pub status: &'static str,
+    transport: &'static str,
+    schema_version: u16,
+    domains: usize,
+    source_blocks: usize,
+    expected_kv_messages: usize,
+    summary: CpRingNodeSummary,
+    nodes: Vec<CpRingNodeReport>,
+}
+
+impl CpRingNodeSmokeReport {
+    pub fn messages_sent(&self) -> usize {
+        self.summary.messages_sent
+    }
+
+    pub fn compute_updates(&self) -> usize {
+        self.summary.compute_updates
+    }
+}
+
+#[derive(Default, Serialize)]
+struct CpRingNodeSummary {
+    node_threads: usize,
+    source_blocks: usize,
+    initial_messages_sent: usize,
+    forwarded_messages_sent: usize,
+    messages_sent: usize,
+    messages_received: usize,
+    compute_updates: usize,
+    bytes_sent: usize,
+    bytes_received: usize,
+}
+
+#[derive(Serialize)]
+struct CpRingNodeReport {
+    domain_id: String,
+    role: &'static str,
+    inbound_peer: String,
+    outbound_peer: String,
+    source_blocks: usize,
+    initial_messages_sent: usize,
+    forwarded_messages_sent: usize,
+    messages_received: usize,
+    compute_updates: usize,
+    bytes_sent: usize,
+    bytes_received: usize,
+    first_routes: Vec<CpRingRoutePreview>,
+}
+
+#[derive(Clone, Serialize)]
+struct CpRingRoutePreview {
+    sequence_id: u64,
+    source_domain: String,
+    sender_domain: String,
+    receiver_domain: String,
+    next_receiver_domain: Option<String>,
+    block_start: usize,
+    block_len: usize,
+    ring_step: usize,
 }
 
 #[derive(Default, Serialize)]
@@ -366,6 +441,98 @@ pub fn run_protocol_smoke() -> Result<ProtocolSmokeReport, ProtocolError> {
     })
 }
 
+pub fn run_cp_ring_node_smoke() -> Result<CpRingNodeSmokeReport, ProtocolError> {
+    let domains = default_domains()?;
+    let domain_count = domains.len();
+    let source_block_counts = domains
+        .iter()
+        .map(|domain| block_ranges(domain).count())
+        .collect::<Vec<_>>();
+    let total_source_blocks = source_block_counts.iter().sum::<usize>();
+    let expected_kv_messages = total_source_blocks * (domain_count - 1);
+
+    let mut senders = Vec::with_capacity(domain_count);
+    let mut receivers = Vec::with_capacity(domain_count);
+    for _ in 0..domain_count {
+        let (sender, receiver) = mpsc::channel::<Vec<u8>>();
+        senders.push(sender);
+        receivers.push(Some(receiver));
+    }
+
+    let mut handles = Vec::with_capacity(domain_count);
+    for domain_index in 0..domain_count {
+        let domain_id = domains[domain_index].domain_id.clone();
+        let receiver =
+            receivers[domain_index]
+                .take()
+                .ok_or_else(|| ProtocolError::MissingPeer {
+                    domain_id: domain_id.clone(),
+                })?;
+        let next_sender = senders[(domain_index + 1) % domain_count].clone();
+        let thread_domains = domains.clone();
+        let expected_inbound_messages = total_source_blocks - source_block_counts[domain_index];
+        handles.push((
+            domain_id.clone(),
+            thread::spawn(move || {
+                run_cp_ring_node(
+                    domain_index,
+                    thread_domains,
+                    receiver,
+                    next_sender,
+                    expected_inbound_messages,
+                )
+            }),
+        ));
+    }
+    drop(senders);
+
+    let mut nodes = Vec::with_capacity(domain_count);
+    for (domain_id, handle) in handles {
+        let node = handle
+            .join()
+            .map_err(|_| ProtocolError::NodeThreadPanic { domain_id })??;
+        nodes.push(node);
+    }
+    nodes.sort_by(|lhs, rhs| lhs.domain_id.cmp(&rhs.domain_id));
+
+    let summary = CpRingNodeSummary {
+        node_threads: nodes.len(),
+        source_blocks: total_source_blocks,
+        initial_messages_sent: nodes.iter().map(|node| node.initial_messages_sent).sum(),
+        forwarded_messages_sent: nodes.iter().map(|node| node.forwarded_messages_sent).sum(),
+        messages_sent: nodes
+            .iter()
+            .map(|node| node.initial_messages_sent + node.forwarded_messages_sent)
+            .sum(),
+        messages_received: nodes.iter().map(|node| node.messages_received).sum(),
+        compute_updates: nodes.iter().map(|node| node.compute_updates).sum(),
+        bytes_sent: nodes.iter().map(|node| node.bytes_sent).sum(),
+        bytes_received: nodes.iter().map(|node| node.bytes_received).sum(),
+    };
+    let expected_compute_updates = total_source_blocks * domain_count;
+    let status = if summary.node_threads == domain_count
+        && summary.initial_messages_sent == total_source_blocks
+        && summary.messages_sent == expected_kv_messages
+        && summary.messages_received == expected_kv_messages
+        && summary.compute_updates == expected_compute_updates
+    {
+        "pass"
+    } else {
+        "fail"
+    };
+
+    Ok(CpRingNodeSmokeReport {
+        status,
+        transport: "cp_ring_node_runtime",
+        schema_version: SCHEMA_VERSION,
+        domains: domain_count,
+        source_blocks: total_source_blocks,
+        expected_kv_messages,
+        summary,
+        nodes,
+    })
+}
+
 pub fn run_remote_p2p_server(bind_addr: &str) -> Result<RemoteP2pReport, ProtocolError> {
     let bind_socket = parse_socket_addr(bind_addr)?;
     let listener = TcpListener::bind(bind_socket)?;
@@ -491,6 +658,258 @@ fn ring_links(domains: &[DomainSpec]) -> Vec<LinkReport> {
             }
         })
         .collect()
+}
+
+fn run_cp_ring_node(
+    domain_index: usize,
+    domains: Vec<DomainSpec>,
+    receiver: Receiver<Vec<u8>>,
+    next_sender: Sender<Vec<u8>>,
+    expected_inbound_messages: usize,
+) -> Result<CpRingNodeReport, ProtocolError> {
+    let domain_count = domains.len();
+    let domain = domains[domain_index].clone();
+    let inbound_peer = domains[(domain_index + domain_count - 1) % domain_count].clone();
+    let outbound_peer = domains[(domain_index + 1) % domain_count].clone();
+    let mut report = CpRingNodeReport {
+        domain_id: domain.domain_id.clone(),
+        role: "listener_and_outbound_peer",
+        inbound_peer: inbound_peer.domain_id.clone(),
+        outbound_peer: outbound_peer.domain_id.clone(),
+        source_blocks: 0,
+        initial_messages_sent: 0,
+        forwarded_messages_sent: 0,
+        messages_received: 0,
+        compute_updates: 0,
+        bytes_sent: 0,
+        bytes_received: 0,
+        first_routes: Vec::new(),
+    };
+
+    for (block_index, (block_start, block_stop)) in block_ranges(&domain).enumerate() {
+        let message = kv_block_message(
+            cp_ring_sequence_id(domain_index, block_index),
+            1,
+            &domain,
+            &domain,
+            &outbound_peer,
+            block_start,
+            block_stop,
+        );
+        send_cp_node_frame(&next_sender, &message, &mut report, true)?;
+        report.source_blocks += 1;
+        report.compute_updates += 1;
+        push_cp_route_preview(&mut report, &message, Some(&outbound_peer.domain_id));
+    }
+
+    while report.messages_received < expected_inbound_messages {
+        let frame = receiver
+            .recv()
+            .map_err(|error| ProtocolError::ChannelRecv {
+                domain_id: domain.domain_id.clone(),
+                reason: error.to_string(),
+            })?;
+        report.bytes_received += frame.len();
+        report.messages_received += 1;
+        let message = deserialize_message(&frame)?;
+        validate_cp_ring_message(domain_index, &domains, &message)?;
+        report.compute_updates += 1;
+
+        let should_forward = message.ring_step < domain_count - 1;
+        if should_forward {
+            let forwarded = forward_kv_message(&message, &domain, &outbound_peer);
+            push_cp_route_preview(&mut report, &message, Some(&outbound_peer.domain_id));
+            send_cp_node_frame(&next_sender, &forwarded, &mut report, false)?;
+        } else {
+            push_cp_route_preview(&mut report, &message, None);
+        }
+    }
+
+    Ok(report)
+}
+
+fn cp_ring_sequence_id(domain_index: usize, block_index: usize) -> u64 {
+    100_000 + (domain_index as u64) * 10_000 + block_index as u64
+}
+
+fn send_cp_node_frame(
+    sender: &Sender<Vec<u8>>,
+    message: &RingAttnMessage,
+    report: &mut CpRingNodeReport,
+    is_initial_message: bool,
+) -> Result<(), ProtocolError> {
+    let frame = serialize_message(message)?;
+    let frame_len = frame.len();
+    sender
+        .send(frame)
+        .map_err(|error| ProtocolError::ChannelSend {
+            sender_domain: message.sender_domain.clone(),
+            receiver_domain: message.receiver_domain.clone(),
+            reason: error.to_string(),
+        })?;
+    if is_initial_message {
+        report.initial_messages_sent += 1;
+    } else {
+        report.forwarded_messages_sent += 1;
+    }
+    report.bytes_sent += frame_len;
+    Ok(())
+}
+
+fn forward_kv_message(
+    message: &RingAttnMessage,
+    sender: &DomainSpec,
+    receiver: &DomainSpec,
+) -> RingAttnMessage {
+    let mut forwarded = message.clone();
+    forwarded.ring_step += 1;
+    forwarded.sender_domain = sender.domain_id.clone();
+    forwarded.receiver_domain = receiver.domain_id.clone();
+    forwarded
+}
+
+fn push_cp_route_preview(
+    report: &mut CpRingNodeReport,
+    message: &RingAttnMessage,
+    next_receiver_domain: Option<&str>,
+) {
+    if report.first_routes.len() >= 6 {
+        return;
+    }
+    let Some(block) = &message.block else {
+        return;
+    };
+    report.first_routes.push(CpRingRoutePreview {
+        sequence_id: message.sequence_id,
+        source_domain: message.source_domain.clone(),
+        sender_domain: message.sender_domain.clone(),
+        receiver_domain: message.receiver_domain.clone(),
+        next_receiver_domain: next_receiver_domain.map(ToOwned::to_owned),
+        block_start: block.global_offset,
+        block_len: block.block_len,
+        ring_step: message.ring_step,
+    });
+}
+
+fn validate_cp_ring_message(
+    receiver_index: usize,
+    domains: &[DomainSpec],
+    message: &RingAttnMessage,
+) -> Result<(), ProtocolError> {
+    if message.schema_version != SCHEMA_VERSION {
+        return Err(ProtocolError::MessageMismatch {
+            field: "schema_version",
+            expected: SCHEMA_VERSION.to_string(),
+            actual: message.schema_version.to_string(),
+        });
+    }
+    if message.message_kind != RingAttnMessageKind::KvBlock {
+        return Err(ProtocolError::MessageMismatch {
+            field: "message_kind",
+            expected: format!("{:?}", RingAttnMessageKind::KvBlock),
+            actual: format!("{:?}", message.message_kind),
+        });
+    }
+    if message.payload_kind != PayloadKind::KvBlock {
+        return Err(ProtocolError::MessageMismatch {
+            field: "payload_kind",
+            expected: format!("{:?}", PayloadKind::KvBlock),
+            actual: format!("{:?}", message.payload_kind),
+        });
+    }
+
+    let receiver = &domains[receiver_index];
+    if message.receiver_domain != receiver.domain_id {
+        return Err(ProtocolError::MessageMismatch {
+            field: "receiver_domain",
+            expected: receiver.domain_id.clone(),
+            actual: message.receiver_domain.clone(),
+        });
+    }
+    let expected_sender = &domains[(receiver_index + domains.len() - 1) % domains.len()];
+    if message.sender_domain != expected_sender.domain_id {
+        return Err(ProtocolError::MessageMismatch {
+            field: "sender_domain",
+            expected: expected_sender.domain_id.clone(),
+            actual: message.sender_domain.clone(),
+        });
+    }
+
+    let source_index = domain_index_by_id(domains, &message.source_domain)?;
+    let expected_ring_step = (receiver_index + domains.len() - source_index) % domains.len();
+    if expected_ring_step == 0 || expected_ring_step >= domains.len() {
+        return Err(ProtocolError::MessageMismatch {
+            field: "ring_step",
+            expected: "1..domain_count-1".to_string(),
+            actual: expected_ring_step.to_string(),
+        });
+    }
+    if message.ring_step != expected_ring_step {
+        return Err(ProtocolError::MessageMismatch {
+            field: "ring_step",
+            expected: expected_ring_step.to_string(),
+            actual: message.ring_step.to_string(),
+        });
+    }
+
+    let source = &domains[source_index];
+    let Some(block) = &message.block else {
+        return Err(ProtocolError::MessageMismatch {
+            field: "block",
+            expected: "Some(BlockMetadata)".to_string(),
+            actual: "None".to_string(),
+        });
+    };
+    if block.source_seq_offset != source.seq_offset {
+        return Err(ProtocolError::MessageMismatch {
+            field: "block.source_seq_offset",
+            expected: source.seq_offset.to_string(),
+            actual: block.source_seq_offset.to_string(),
+        });
+    }
+    let source_stop = source.seq_offset + source.seq_chunk_len;
+    if block.block_len == 0
+        || block.global_offset < source.seq_offset
+        || block.global_offset + block.block_len > source_stop
+    {
+        return Err(ProtocolError::MessageMismatch {
+            field: "block.range",
+            expected: format!("{}..={source_stop}", source.seq_offset),
+            actual: format!("{}+{}", block.global_offset, block.block_len),
+        });
+    }
+    let Some(tensor) = &message.tensor else {
+        return Err(ProtocolError::MessageMismatch {
+            field: "tensor",
+            expected: "Some(TensorMetadata)".to_string(),
+            actual: "None".to_string(),
+        });
+    };
+    if tensor.payload_bytes != message.payload.len() {
+        return Err(ProtocolError::MessageMismatch {
+            field: "tensor.payload_bytes",
+            expected: message.payload.len().to_string(),
+            actual: tensor.payload_bytes.to_string(),
+        });
+    }
+    let actual_checksum = checksum(&message.payload);
+    if tensor.checksum != actual_checksum {
+        return Err(ProtocolError::MessageMismatch {
+            field: "tensor.checksum",
+            expected: actual_checksum.to_string(),
+            actual: tensor.checksum.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn domain_index_by_id(domains: &[DomainSpec], domain_id: &str) -> Result<usize, ProtocolError> {
+    domains
+        .iter()
+        .position(|domain| domain.domain_id == domain_id)
+        .ok_or_else(|| ProtocolError::MissingPeer {
+            domain_id: domain_id.to_string(),
+        })
 }
 
 fn remote_client_domain() -> DomainSpec {

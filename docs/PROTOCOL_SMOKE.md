@@ -103,7 +103,25 @@ RUN_ID=<same-run-id> \
 
 server report 预期 `sent=1 received=2`，client report 预期 `sent=2 received=1`。
 
-当前 `tcp_remote_pair` 仍是最小双机握手，不是最终 CP runtime 拓扑。在真正的 Context Parallel P2P 模式中，每个节点都应该同时承担 inbound receiver 和 outbound sender 的职责：既监听上游 / peer 发来的 K/V block，也主动向 ring next domain 转发自己的或已接收的 K/V block。当前 smoke 只证明一条双机链路上双向 frame 可以互通和校验，还没有验证多节点 ring、并发收发、每节点同时 server/client、多 block 持续转发或 device-side attention compute。
+当前 `tcp_remote_pair` 仍是最小双机握手，不是最终 CP runtime 拓扑。在真正的 Context Parallel P2P 模式中，每个节点都应该同时承担 inbound receiver 和 outbound sender 的职责：既监听上游 / peer 发来的 K/V block，也主动向 ring next domain 转发自己的或已接收的 K/V block。
+
+## CP Ring Node Runtime Smoke
+
+`cp_ring_node_runtime` 是当前的并发 CP ring 语义 smoke。它仍运行在单进程内，但每个 domain 对应一个 Rust thread，每个 thread 同时持有：
+
+- inbound receiver：从 ring previous domain 接收 K/V block。
+- outbound peer：向 ring next domain 发送本地 source block 或转发收到的 block。
+- local compute update counter：收到每个远端 block 时计数，本地 source block 也计入本 domain 的 compute update。
+
+默认 3 domain 配置下共有 10 个 source blocks。每个 block 跨域传递 `domain_count - 1` hop，因此预期 K/V message 数为 `10 * 2 = 20`。每个 domain 都会消费全部 10 个 source blocks，因此总 compute update 数为 `10 * 3 = 30`。
+
+通过时 CLI 会显示：
+
+```text
+cp_ring_status=pass cp_ring_messages=20 cp_ring_compute_updates=30
+```
+
+这一步已经验证每节点双角色、多 block 持续转发和并发收发的协议语义；仍未验证真实双机多节点 TCP 拓扑或 device-side attention compute。
 
 ## Smoke Report
 
@@ -150,4 +168,4 @@ JSON report 中新增 `protocol_smoke`：
 
 ## 后续
 
-下一步应把 `local_p2p_queue` 和 `tcp_remote_pair` 抽成统一 transport trait，并把 remote role 从单一 server/client 扩展成每个 domain 同时具备 listener + outbound peer 的 node runtime。后续 transport 可以扩展到 UCX/RDMA、NCCL send/recv、共享内存或 GPU-direct 路线。
+下一步应把 `cp_ring_node_runtime` 映射到 remote transport：每个远端 node 进程同时具备 listener + outbound peer，并把 compute update counter 替换为真实 device-side attention block compute。后续 transport 可以扩展到 UCX/RDMA、NCCL send/recv、共享内存或 GPU-direct 路线。
