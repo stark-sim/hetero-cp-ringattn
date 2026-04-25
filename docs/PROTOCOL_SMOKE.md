@@ -139,7 +139,7 @@ torch_payload_block_status=pass torch_payload_block_code=2 torch_payload_blocks=
 torch_payload_block_status=pass torch_payload_block_code=3 torch_payload_blocks=30/30  # CUDA
 ```
 
-这一步验证的是 CP ring update 事件已经能驱动真实消息 payload 的 device-side compute；它仍是 smoke 级 block attention，还没有形成完整 online softmax state / output tensor kernel。
+这一步验证的是 CP ring update 事件已经能驱动真实消息 payload 的 device-side compute。`torch_payload_online_bridge` 进一步在设备上逐 block 维护 running max / running sum / output，并与 full attention CPU reference 对比；当前仍是 smoke 级单 query/head 输出，不是完整 per-domain Q chunk kernel。
 
 ## Remote CP Node Smoke
 
@@ -205,6 +205,7 @@ node0 mac-mps -> node1 gpu-cuda -> node2 mac-mps-2 -> node0 mac-mps
 - `messages_received=8`，来自上游 peer 的本地 source blocks 和 forwarded blocks。
 - `compute_updates=12`，本地 4 blocks + 远端 8 blocks。
 - `torch_payload_blocks=12/12`，本地设备消费全部 captured payload blocks。
+- `torch_payload_online_blocks=12/12`，本地设备逐 block 维护 online softmax state 并通过 CPU reference 对比。
 
 已验证通过的启动顺序是先启动 node2，再启动 GPU node1，最后启动 node0：
 
@@ -255,9 +256,9 @@ RUN_ID=rust-remote-cp-3node-<timestamp> \
 已通过的结果：
 
 ```text
-node0: sent=8 received=8 compute_updates=12 torch_payload_block_code=2 torch_payload_blocks=12/12
-node1: sent=8 received=8 compute_updates=12 torch_payload_block_code=3 torch_payload_blocks=12/12
-node2: sent=8 received=8 compute_updates=12 torch_payload_block_code=2 torch_payload_blocks=12/12
+node0: sent=8 received=8 compute_updates=12 torch_payload_block_code=2 torch_payload_blocks=12/12 torch_payload_online_code=2 torch_payload_online_blocks=12/12
+node1: sent=8 received=8 compute_updates=12 torch_payload_block_code=3 torch_payload_blocks=12/12 torch_payload_online_code=3 torch_payload_online_blocks=12/12
+node2: sent=8 received=8 compute_updates=12 torch_payload_block_code=2 torch_payload_blocks=12/12 torch_payload_online_code=2 torch_payload_online_blocks=12/12
 ```
 
 ## Smoke Report
@@ -281,6 +282,7 @@ protocol_status=pass protocol_messages=22
 cp_ring_status=pass cp_ring_messages=20 cp_ring_compute_updates=30
 torch_block_update_status=pass torch_block_update_code=<2|3> torch_block_updates=30
 torch_payload_block_status=pass torch_payload_block_code=<2|3> torch_payload_blocks=30/30
+torch_payload_online_status=pass torch_payload_online_code=<2|3> torch_payload_online_blocks=30/30
 ```
 
 JSON report 中新增 `protocol_smoke`：
@@ -308,4 +310,4 @@ JSON report 中新增 `protocol_smoke`：
 
 ## 后续
 
-下一步应开始维护真实 online softmax state / output tensor，并抽出统一 transport trait。后续 transport 可以扩展到 UCX/RDMA、NCCL send/recv、共享内存或 GPU-direct 路线。
+下一步应把 online state 从 smoke 级单 query/head 扩展为完整 per-domain Q chunk / output tensor，并抽出统一 transport trait。后续 transport 可以扩展到 UCX/RDMA、NCCL send/recv、共享内存或 GPU-direct 路线。

@@ -97,7 +97,8 @@ CARGO_OFFLINE=0 HCP_ENABLE_TORCH=1 HCP_TORCH_DEVICE=cuda:0 bash scripts/run_rust
 - CP payload-backed device-side compute 验证已通过：本机非沙箱 MPS 显示 `torch_payload_block_status=pass torch_payload_block_code=2 torch_payload_blocks=30/30`，远端 CUDA 显示 `torch_payload_block_status=pass torch_payload_block_code=3 torch_payload_blocks=30/30`。
 - 双机 remote CP node payload-backed compute 验证已通过：Mac node 显示 `torch_payload_block_status=pass torch_payload_block_code=2 torch_payload_blocks=8/8`，GPU node 显示 `torch_payload_block_status=pass torch_payload_block_code=3 torch_payload_blocks=8/8`。
 - 3-node remote CP forwarding + payload-backed compute 验证已通过：Mac node0 / GPU node1 / Mac node2 均显示 `sent=8 received=8 compute_updates=12`，MPS nodes 显示 `torch_payload_block_code=2 torch_payload_blocks=12/12`，CUDA node 显示 `torch_payload_block_code=3 torch_payload_blocks=12/12`。
-- 当前 payload bridge 已消费 `RingAttnMessage` 的 K/V bytes；它仍是 smoke 级 block attention，不是完整 online softmax state / output tensor kernel。
+- Payload online softmax state 验证已通过：本机 MPS 和远端 CUDA 主 smoke 均显示 `torch_payload_online_blocks=30/30`；3-node remote CP 中 MPS nodes 和 CUDA node 均显示 `torch_payload_online_blocks=12/12`。
+- 当前 payload bridge 已消费 `RingAttnMessage` 的 K/V bytes，并维护 smoke 级 online softmax state；它仍不是完整 per-domain Q chunk / output tensor kernel。
 - 远端非交互 SSH 不会自动加载 `/home/stark/.cargo/bin` 或 libtorch 环境；通过 SSH 运行 CUDA smoke 时应显式传入 `PATH=/home/stark/.cargo/bin:$PATH LIBTORCH=/home/stark/libtorch LIBTORCH_INCLUDE=/home/stark/libtorch/include LIBTORCH_LIB=/home/stark/libtorch/lib LD_LIBRARY_PATH=/home/stark/libtorch/lib:$LD_LIBRARY_PATH`。
 - 因此短期推荐路线是 Rust -> C ABI -> C++ ATen/libtorch，而不是马上把完整 `torch/torch.h` 或 `tch-rs` 作为必需路径。
 - `torch.backends.mps.is_built()` 为 true；沙箱进程看不到 Metal device，非沙箱进程 MPS 可用。
