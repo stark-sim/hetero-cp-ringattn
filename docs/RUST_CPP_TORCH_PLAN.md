@@ -86,6 +86,8 @@ CARGO_OFFLINE=0 HCP_ENABLE_TORCH=1 HCP_TORCH_DEVICE=cuda:0 bash scripts/run_rust
 - `torch_code=-5` 表示 `cuda` / `cuda:N` 设备名有效，但当前进程中的 libtorch 没有 CUDA backend；优先检查 `LIBTORCH` / `LIBTORCH_LIB` 是否指向 CUDA-enabled libtorch，以及是否链接/加载了 `libtorch_cuda`、`c10_cuda`。
 - Linux 下 CUDA 版 libtorch 需要保留 `libtorch_cuda` / `c10_cuda` 这类 registration library；`rust/build.rs` 会在检测到二者时用同一个 linker group 传入 `--push-state,--no-as-needed,-ltorch_cuda,-lc10_cuda,--pop-state`，防止链接器或 rustc 参数重排把它们优化掉。远端 `ldd rust/target/debug/hcp-ringattn-rust | grep -E 'torch|c10|cuda'` 应能看到 `libtorch_cuda.so` 和 `libc10_cuda.so`。
 - 远端 CUDA 验证已通过：`torch_status=pass torch_device=cuda:0 torch_code=3`，且 `ldd` 显示 `libtorch_cuda.so` / `libc10_cuda.so`。
+- 远端 CUDA attention compute 验证已通过：显式传入 `LIBTORCH*` 和 `LD_LIBRARY_PATH` 后，`torch_attention_status=pass torch_attention_code=3`。
+- 远端非交互 SSH 不会自动加载 `/home/stark/.cargo/bin` 或 libtorch 环境；通过 SSH 运行 CUDA smoke 时应显式传入 `PATH=/home/stark/.cargo/bin:$PATH LIBTORCH=/home/stark/libtorch LIBTORCH_INCLUDE=/home/stark/libtorch/include LIBTORCH_LIB=/home/stark/libtorch/lib LD_LIBRARY_PATH=/home/stark/libtorch/lib:$LD_LIBRARY_PATH`。
 - 因此短期推荐路线是 Rust -> C ABI -> C++ ATen/libtorch，而不是马上把完整 `torch/torch.h` 或 `tch-rs` 作为必需路径。
 - `torch.backends.mps.is_built()` 为 true；沙箱进程看不到 Metal device，非沙箱进程 MPS 可用。
 

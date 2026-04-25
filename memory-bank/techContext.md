@@ -119,7 +119,7 @@ RUN_ID=rust-remote-p2p-<timestamp> \
 - torch bridge 失败时 CLI summary 后会打印压缩 `torch_message`；完整信息写入 JSON report。
 - CUDA 请求下 `torch_code=-5` 表示当前 libtorch 进程无 CUDA backend，通常是 CPU-only libtorch 或 `libtorch_cuda` / `c10_cuda` 没有被链接/加载。
 - Linux CUDA libtorch 构建需要保留 `libtorch_cuda` / `c10_cuda` 动态依赖；build script 在检测到这两个库时会用同一个 linker group 传入 `--push-state,--no-as-needed,-ltorch_cuda,-lc10_cuda,--pop-state`。
-- 远端非交互 SSH 默认 PATH 不包含 `/home/stark/.cargo/bin`；通过 SSH 启动 Rust smoke 时显式设置 `PATH=/home/stark/.cargo/bin:$PATH`。
+- 远端非交互 SSH 默认 PATH 不包含 `/home/stark/.cargo/bin`，也不会自动加载 libtorch 环境；通过 SSH 启动 CUDA Rust smoke 时显式设置 `PATH=/home/stark/.cargo/bin:$PATH`、`LIBTORCH=/home/stark/libtorch`、`LIBTORCH_INCLUDE=/home/stark/libtorch/include`、`LIBTORCH_LIB=/home/stark/libtorch/lib`、`LD_LIBRARY_PATH=/home/stark/libtorch/lib:$LD_LIBRARY_PATH`。
 
 ## 项目结构
 
