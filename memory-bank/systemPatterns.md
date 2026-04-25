@@ -40,6 +40,7 @@ project-root/
 - **Context Parallel ring 消息流**：每个 source domain 的 K/V block 沿 ring 逐 hop 转发；每个跨域 hop 都是一个可序列化 `RingAttnMessage`。
 - **Transport 可替换**：P2P 是 point-to-point message 语义；`local_p2p_queue` 用于本地协议闭环，`tcp_remote_pair` 用于双进程 / 双机器工程 smoke，后续可替换为 UCX/RDMA、NCCL send/recv 或 GPU-direct。
 - **CP 节点双角色**：`cp_ring_node_runtime` 中每个 domain thread 同时具备 inbound receiver 和 outbound peer；`tcp_remote_cp_node` 已在 Mac/GPU 双机上验证每个进程同时 listener + outbound peer。
+- **CP update 驱动 device compute**：`cp_ring_node_runtime.compute_updates()` 作为 bridge 输入，驱动 C++ ATen/libtorch 在目标设备上执行同等次数的 attention block compute；当前 tensor 内容仍是 deterministic smoke input。
 - **reference-first correctness**：Python kernel stub 保留 reference attention，用于与 block-wise online softmax 对照。
 - **报告纪律**：实验产物应落在 `reports/<RUN_ID>/` 下，便于回溯。
 
@@ -67,7 +68,7 @@ project-root/
 4. 收到 block 后计算局部 score 和 `P @ V` 贡献。
 5. 使用 online softmax 更新 `running_max`、`running_sum`、`output`。
 6. block 转发给下一个 domain，直到 ring 遍历完成。
-7. 当前 Rust protocol smoke 以本地 P2P queue transport 验证完整 ring 转发路径，以 `cp_ring_node_runtime` 验证每节点双角色并发收发，以 `tcp_remote_pair` 验证双进程 / 双机器 send/recv frame，以 `tcp_remote_cp_node` 验证双机每节点双角色。
+7. 当前 Rust protocol smoke 以本地 P2P queue transport 验证完整 ring 转发路径，以 `cp_ring_node_runtime` 验证每节点双角色并发收发，以 `torch_block_update_bridge` 验证 update-driven device compute，以 `tcp_remote_pair` 验证双进程 / 双机器 send/recv frame，以 `tcp_remote_cp_node` 验证双机每节点双角色。
 
 ## 架构决策
 
@@ -82,3 +83,4 @@ project-root/
 | 每个 CP 节点最终应同时 server/client | Ring 中每个 domain 都既接收上游消息也向下游转发，本阶段 server/client 分离只用于最小连通性验证 | [2026-04-25] |
 | 先在单进程 thread runtime 固定 CP node 语义 | 并发收发、持续转发、统计验证应先和远端网络问题解耦，再映射到 TCP / RDMA transport | [2026-04-25] |
 | 双机 remote CP node 先验证 2-domain 双角色 | 现有 Mac/GPU 两台机器可以先证明每个进程同时 listen/connect 和多 block 双向流动；remote 多 hop 需要 3+ node 扩展 | [2026-04-25] |
+| 先用 update 数接入 device compute，再接入真实 payload | 这样可以先验证 Rust -> C ABI -> C++ ATen 的执行闭环和 MPS/CUDA 设备路径，再把协议消息 payload 映射成真实 tensor 输入 | [2026-04-25] |

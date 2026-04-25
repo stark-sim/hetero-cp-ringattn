@@ -37,13 +37,14 @@
 - [x] [2026-04-25] Rust `cp_ring_node_runtime` smoke 已通过：3 个 domain thread 同时扮演 inbound receiver + outbound peer，10 个 source blocks 产生 20 条跨域 K/V messages，并记录 30 次 compute updates。
 - [x] [2026-04-25] C++ ATen/libtorch `torch_attention_bridge` 已建立并在本机 MPS 与远端 CUDA 通过：实际计算 `softmax(QK^T / sqrt(d))V`，再与 CPU reference 比较；MPS 显示 `torch_attention_code=2`，CUDA 显示 `torch_attention_code=3`。
 - [x] [2026-04-25] Rust `tcp_remote_cp_node` 双机 smoke 已通过：Mac/GPU 两个进程都同时作为 listener + outbound peer，每个 node 发送 4 个 source blocks、接收 4 个 peer blocks、记录 8 次 compute updates。
+- [x] [2026-04-25] Rust `torch_block_update_bridge` 已接入 `cp_ring_node_runtime.compute_updates()`：默认 30 次 CP update 会驱动 30 次 C++ ATen attention block compute；本机 MPS 与远端 CUDA 均已通过。
 
 ## 进行中
 
 - [ ] M2：Rust online softmax correctness report 与 tolerance policy 扩展。
 - [ ] M3：把 `tcp_remote_cp_node` 扩展到 3+ remote nodes，并抽出统一 transport trait。
 - [ ] M4：heterogeneous runtime stubs 与配置 / 环境纪律。
-- [ ] M5：把 compute update counter 替换为真实 device-side block compute，并跑 2-domain remote heterogeneous runtime smoke。
+- [ ] M5：把真实 K/V tensor payload 接入 device-side block compute，并跑 2-domain remote heterogeneous runtime smoke。
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 
 ## 已知问题
@@ -57,6 +58,7 @@
 - [2026-04-25] 本机 CPU-only libtorch smoke 不能作为 hardware smoke 结论；需要以非沙箱 MPS report 为准。
 - [2026-04-25] 旧版 CLI 只打印 `torch_compiled=true`，不能证明 CUDA/MPS 实际执行；需使用包含 `torch_status` / `torch_code` 的新版 smoke。
 - [2026-04-25] 远端 CUDA smoke 历史问题已解决：根因是 Linux 链接阶段未保留 `libtorch_cuda` / `c10_cuda` registration libraries。
+- [2026-04-25] `torch_block_update_bridge` 当前使用 synthetic tensors 验证 update-driven device compute；尚未消费 `RingAttnMessage` 的真实 K/V payload。
 
 ## 里程碑
 

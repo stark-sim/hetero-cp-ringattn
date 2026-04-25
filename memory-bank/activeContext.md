@@ -43,6 +43,7 @@
 - [2026-04-25] C++ ATen/libtorch bridge 新增 `torch_attention_bridge`：在请求设备上实际计算小尺寸 `softmax(QK^T / sqrt(d))V`，并与 CPU reference 比较；本机非沙箱 MPS 已通过 `torch_attention_status=pass torch_attention_code=2`，远端 CUDA 已通过 `torch_attention_status=pass torch_attention_code=3`。
 - [2026-04-25] 远端非交互 SSH 默认也不加载 `LIBTORCH` / `LIBTORCH_INCLUDE` / `LIBTORCH_LIB` / `LD_LIBRARY_PATH`；跑 CUDA libtorch smoke 时需和 `PATH=/home/stark/.cargo/bin:$PATH` 一起显式传入。
 - [2026-04-25] Rust 新增 `tcp_remote_cp_node` dual-role smoke 并已双机通过：Mac `node_index=0` 和 GPU `node_index=1` 均同时作为 listener + outbound peer；每个 node `messages_sent=4 messages_received=4 compute_updates=8`。
+- [2026-04-25] Rust smoke 新增 `torch_block_update_bridge`：`cp_ring_node_runtime` 的 `compute_updates=30` 会传入 C++ ATen bridge，并在请求设备上执行同等次数的 `softmax(QK^T / sqrt(d))V` block compute；本机非沙箱 MPS 已通过 `torch_block_update_code=2`，远端 CUDA 已通过 `torch_block_update_code=3`。
 
 ## 活跃决策
 
@@ -62,7 +63,7 @@
 - [ ] 将 Rust correctness model 继续拆分为 library + binary，便于后续 protocol / transport 复用。
 - [ ] 为 `local_p2p_queue` / `tcp_remote_pair` 抽出统一 transport trait，保持当前 message schema / report 字段稳定。
 - [ ] 将 `tcp_remote_cp_node` 扩展到 3+ remote nodes，覆盖 remote 多 hop forwarding。
-- [ ] 将 `cp_ring_node_runtime` 的 compute update counter 接入真实 device-side attention block update。
+- [ ] 将 `RingAttnMessage` 的 K/V payload 接入真实 tensor backend，让 device-side block update 使用协议消息中的真实输入，而不是 synthetic tensors。
 - [ ] 在 cargo registry/network 可用后，增加 feature-gated `tch = 0.24.0` backend，并先实现 `tch_smoke`，再迁移 Ring Attention block update。
 - [ ] 在 cargo registry/network 可用后，引入 optional `tch = 0.24.0` 并实现 `tch_smoke`。
 - [ ] 为 `RingAttnMessage` 设计 serialization / deserialization。
@@ -86,6 +87,7 @@
 - Remote P2P 纪律：双机验证不能用 `127.0.0.1` 作为结论；server 应监听 `0.0.0.0` 或目标子网地址，client 应连接 `192.168.8.x` 子网内的 GPU host。
 - Report 纪律：`reports/**/*.json` 是生成产物，默认不提交；如需长期记录实验进展，写入 docs 或 memory-bank。
 - Remote CP node 启动纪律：Mac 侧可先启动 listener，再启动 GPU 节点；GPU 能连入 Mac，但必须确保 Mac listener 已实际运行。
+- CP block update 纪律：`torch_block_update_status=pass` 证明 CP update 数量已驱动真实 device-side ATen compute；但在接入真实 payload 前，不应把它描述为完整 Ring Attention kernel。
 
 ## 当前阻塞
 

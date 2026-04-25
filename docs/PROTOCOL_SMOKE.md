@@ -123,7 +123,16 @@ cp_ring_status=pass cp_ring_messages=20 cp_ring_compute_updates=30
 
 这一步已经验证每节点双角色、多 block 持续转发和并发收发的协议语义；仍未验证真实双机多节点 TCP 拓扑。
 
-`torch_attention_bridge` 已提供独立的 device-side attention compute smoke：C++ ATen 在请求设备上计算小尺寸 `softmax(QK^T / sqrt(d))V`，并与 CPU reference 对比。它当前验证的是设备上的 attention block compute 能力，还没有接入 `cp_ring_node_runtime` 的每条 K/V block update。
+`torch_attention_bridge` 已提供独立的 device-side attention compute smoke：C++ ATen 在请求设备上计算小尺寸 `softmax(QK^T / sqrt(d))V`，并与 CPU reference 对比。
+
+`torch_block_update_bridge` 已将 `cp_ring_node_runtime` 的 `compute_updates=30` 接入 C++ ATen bridge：Rust 将 update 数传给 C++，C++ 在请求设备上执行同等次数的 attention block compute。通过时 CLI 会显示：
+
+```text
+torch_block_update_status=pass torch_block_update_code=2 torch_block_updates=30  # MPS
+torch_block_update_status=pass torch_block_update_code=3 torch_block_updates=30  # CUDA
+```
+
+这一步验证的是 CP ring update 事件已经能驱动真实 device-side compute；当前仍使用确定性 synthetic tensors，没有把 `RingAttnMessage` 的 K/V payload 作为真实 tensor 输入。
 
 ## Remote CP Node Smoke
 
@@ -181,6 +190,8 @@ HCP_ENABLE_TORCH=1 HCP_TORCH_DEVICE=mps bash scripts/run_rust_ringattn_smoke.sh
 
 ```text
 protocol_status=pass protocol_messages=22
+cp_ring_status=pass cp_ring_messages=20 cp_ring_compute_updates=30
+torch_block_update_status=pass torch_block_update_code=<2|3> torch_block_updates=30
 ```
 
 JSON report 中新增 `protocol_smoke`：
@@ -208,4 +219,4 @@ JSON report 中新增 `protocol_smoke`：
 
 ## 后续
 
-下一步应把 `tcp_remote_cp_node` 扩展到 3+ remote nodes，或把当前 2-domain remote node 的 compute update counter 接到 `torch_attention_bridge` / 后续 tensor backend 的真实 block update。后续 transport 可以扩展到 UCX/RDMA、NCCL send/recv、共享内存或 GPU-direct 路线。
+下一步应把 `RingAttnMessage` 的 K/V payload 映射成真实 tensor 输入，并把 `tcp_remote_cp_node` 扩展到 3+ remote nodes。后续 transport 可以扩展到 UCX/RDMA、NCCL send/recv、共享内存或 GPU-direct 路线。
