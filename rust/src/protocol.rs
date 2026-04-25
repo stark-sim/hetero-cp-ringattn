@@ -214,6 +214,8 @@ pub struct RemoteCpNodeReport {
     inbound_peer_addr: String,
     summary: RemoteCpNodeSummary,
     first_routes: Vec<CpRingRoutePreview>,
+    #[serde(skip_serializing)]
+    payload_blocks: Vec<CpPayloadBlock>,
 }
 
 impl RemoteCpNodeReport {
@@ -236,11 +238,16 @@ impl RemoteCpNodeReport {
     pub fn compute_updates(&self) -> usize {
         self.summary.compute_updates
     }
+
+    pub fn payload_blocks(&self) -> &[CpPayloadBlock] {
+        &self.payload_blocks
+    }
 }
 
 #[derive(Default, Serialize)]
 struct RemoteCpNodeSummary {
     source_blocks: usize,
+    payload_blocks_captured: usize,
     messages_sent: usize,
     messages_received: usize,
     compute_updates: usize,
@@ -763,6 +770,7 @@ pub fn run_remote_cp_node(
 
     let mut summary = RemoteCpNodeSummary::default();
     let mut first_routes = Vec::new();
+    let mut payload_blocks = Vec::new();
     for (block_index, (block_start, block_stop)) in block_ranges(&domain).enumerate() {
         let message = kv_block_message(
             cp_ring_sequence_id(node_index, block_index),
@@ -778,6 +786,7 @@ pub fn run_remote_cp_node(
         summary.messages_sent += 1;
         summary.bytes_sent += bytes_sent;
         summary.compute_updates += 1;
+        push_payload_block(&mut payload_blocks, &message);
         push_remote_cp_route_preview(&mut first_routes, &message, Some(&outbound_peer.domain_id));
     }
     drop(outbound_stream);
@@ -790,6 +799,8 @@ pub fn run_remote_cp_node(
     summary.messages_received = recv_report.messages_received;
     summary.bytes_received = recv_report.bytes_received;
     summary.compute_updates += recv_report.compute_updates;
+    payload_blocks.extend(recv_report.payload_blocks);
+    summary.payload_blocks_captured = payload_blocks.len();
     for route in recv_report.first_routes {
         if first_routes.len() >= 8 {
             break;
@@ -800,6 +811,7 @@ pub fn run_remote_cp_node(
     let status = if summary.messages_sent == summary.source_blocks
         && summary.messages_received == expected_inbound_messages
         && summary.compute_updates == summary.source_blocks + expected_inbound_messages
+        && summary.payload_blocks_captured == summary.compute_updates
     {
         "pass"
     } else {
@@ -822,6 +834,7 @@ pub fn run_remote_cp_node(
         inbound_peer_addr: recv_report.inbound_peer_addr,
         summary,
         first_routes,
+        payload_blocks,
     })
 }
 
@@ -1189,6 +1202,7 @@ struct RemoteCpRecvReport {
     bytes_received: usize,
     inbound_peer_addr: String,
     first_routes: Vec<CpRingRoutePreview>,
+    payload_blocks: Vec<CpPayloadBlock>,
 }
 
 fn receive_remote_cp_node_messages(
@@ -1207,6 +1221,7 @@ fn receive_remote_cp_node_messages(
         bytes_received: 0,
         inbound_peer_addr,
         first_routes: Vec::new(),
+        payload_blocks: Vec::new(),
     };
     while report.messages_received < expected_messages {
         let (message, bytes_received) = read_raw_message_frame(&mut stream)?;
@@ -1214,6 +1229,7 @@ fn receive_remote_cp_node_messages(
         report.messages_received += 1;
         report.compute_updates += 1;
         report.bytes_received += bytes_received;
+        push_payload_block(&mut report.payload_blocks, &message);
         push_remote_cp_route_preview(&mut report.first_routes, &message, None);
     }
     if report.messages_received != expected_messages {

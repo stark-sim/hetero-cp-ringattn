@@ -95,6 +95,13 @@ struct Report {
 }
 
 #[derive(Serialize)]
+struct RemoteCpNodeRunReport {
+    status: &'static str,
+    cp_node: protocol::RemoteCpNodeReport,
+    torch_payload_block_bridge: TorchPayloadBlockReport,
+}
+
+#[derive(Serialize)]
 struct Summary {
     cases: usize,
     passed: usize,
@@ -929,19 +936,46 @@ fn run_remote_cp_node(args: &CliArgs) -> Result<protocol::RemoteCpNodeReport, Ri
 fn main() -> Result<(), RingError> {
     let args = parse_cli_args()?;
     if args.remote_p2p_role.as_deref() == Some("cp-node") {
-        let report = run_remote_cp_node(&args)?;
+        let cp_node = run_remote_cp_node(&args)?;
+        let torch_payload_block_bridge =
+            torch_payload_block_bridge_report(cp_node.payload_blocks());
+        let status = if cp_node.status == "pass" && torch_payload_block_bridge.status != "fail" {
+            "pass"
+        } else {
+            "fail"
+        };
+        let report = RemoteCpNodeRunReport {
+            status,
+            cp_node,
+            torch_payload_block_bridge,
+        };
         write_json_report(&args.report_path, &report)?;
         println!(
-            "[rust-remote-cp-node] status={} role={} transport={} sent={} received={} compute_updates={} report={}",
+            "[rust-remote-cp-node] status={} role={} transport={} sent={} received={} compute_updates={} torch_payload_block_status={} torch_payload_block_code={} torch_payload_blocks={}/{} report={}",
             report.status,
-            report.role(),
-            report.transport(),
-            report.messages_sent(),
-            report.messages_received(),
-            report.compute_updates(),
+            report.cp_node.role(),
+            report.cp_node.transport(),
+            report.cp_node.messages_sent(),
+            report.cp_node.messages_received(),
+            report.cp_node.compute_updates(),
+            report.torch_payload_block_bridge.status,
+            report.torch_payload_block_bridge.status_code,
+            report.torch_payload_block_bridge.processed_blocks,
+            report.torch_payload_block_bridge.requested_blocks,
             args.report_path
         );
-        return Ok(());
+        if report.torch_payload_block_bridge.status == "fail"
+            && !report.torch_payload_block_bridge.message.is_empty()
+        {
+            println!(
+                "[rust-remote-cp-node] torch_payload_block_message={}",
+                compact_message(&report.torch_payload_block_bridge.message, 360)
+            );
+        }
+        if report.status == "pass" {
+            return Ok(());
+        }
+        std::process::exit(1);
     }
     if args.remote_p2p_role.is_some() {
         let report = run_remote_p2p(&args)?;
