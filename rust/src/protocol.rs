@@ -1249,7 +1249,10 @@ fn accept_with_retry(listener: TcpListener) -> Result<TcpStream, ProtocolError> 
     let mut last_error = None;
     for _ in 0..REMOTE_ACCEPT_ATTEMPTS {
         match listener.accept() {
-            Ok((stream, _)) => return Ok(stream),
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false)?;
+                return Ok(stream);
+            }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(REMOTE_ACCEPT_RETRY_DELAY);
             }
