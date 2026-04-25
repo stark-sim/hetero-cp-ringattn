@@ -1,8 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
+use std::env;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{
+    mpsc::{self, Receiver, Sender},
+    Arc, Mutex,
+};
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
@@ -39,6 +43,8 @@ pub enum ProtocolError {
         node_index: usize,
         domain_count: usize,
     },
+    #[error("unsupported HCP_REMOTE_CP_DOMAINS={value}; expected 2 or 3")]
+    UnsupportedRemoteCpDomainCount { value: String },
     #[error("frame too large: {bytes} bytes")]
     FrameTooLarge { bytes: usize },
     #[error("transport has no peer for domain={domain_id}")]
@@ -248,6 +254,8 @@ impl RemoteCpNodeReport {
 struct RemoteCpNodeSummary {
     source_blocks: usize,
     payload_blocks_captured: usize,
+    initial_messages_sent: usize,
+    forwarded_messages_sent: usize,
     messages_sent: usize,
     messages_received: usize,
     compute_updates: usize,
@@ -735,24 +743,41 @@ pub fn run_remote_cp_node(
     bind_addr: &str,
     connect_addr: &str,
 ) -> Result<RemoteCpNodeReport, ProtocolError> {
-    let domains = remote_cp_domains();
+    let domains = remote_cp_domains()?;
     if node_index >= domains.len() {
         return Err(ProtocolError::InvalidNodeIndex {
             node_index,
             domain_count: domains.len(),
         });
     }
+    let domain_count = domains.len();
+    let source_block_counts = domains
+        .iter()
+        .map(|domain| block_ranges(domain).count())
+        .collect::<Vec<_>>();
+    let total_source_blocks = source_block_counts.iter().sum::<usize>();
     let domain = domains[node_index].clone();
-    let inbound_peer = domains[(node_index + domains.len() - 1) % domains.len()].clone();
-    let outbound_peer = domains[(node_index + 1) % domains.len()].clone();
-    let expected_inbound_messages = block_ranges(&inbound_peer).count();
+    let inbound_peer = domains[(node_index + domain_count - 1) % domain_count].clone();
+    let outbound_peer = domains[(node_index + 1) % domain_count].clone();
+    let expected_inbound_messages = total_source_blocks - source_block_counts[node_index];
+    let expected_forwarded_messages =
+        expected_inbound_messages - source_block_counts[(node_index + 1) % domain_count];
     let bind_socket = parse_socket_addr(bind_addr)?;
     let connect_socket = parse_socket_addr(connect_addr)?;
 
     let listener = TcpListener::bind(bind_socket)?;
     let local_listener_addr = listener.local_addr()?.to_string();
+
+    let outbound_stream = connect_with_retry(connect_socket)?;
+    configure_stream(&outbound_stream)?;
+    let outbound_local_addr = outbound_stream.local_addr()?.to_string();
+    let outbound_peer_addr = outbound_stream.peer_addr()?.to_string();
+    let outbound_stream = Arc::new(Mutex::new(outbound_stream));
+
     let recv_domains = domains.clone();
     let recv_domain_id = domain.domain_id.clone();
+    let recv_outbound_peer = outbound_peer.clone();
+    let recv_outbound_stream = Arc::clone(&outbound_stream);
     let recv_handle = thread::spawn(move || {
         receive_remote_cp_node_messages(
             node_index,
@@ -760,13 +785,10 @@ pub fn run_remote_cp_node(
             recv_domains,
             listener,
             expected_inbound_messages,
+            recv_outbound_peer,
+            recv_outbound_stream,
         )
     });
-
-    let mut outbound_stream = connect_with_retry(connect_socket)?;
-    configure_stream(&outbound_stream)?;
-    let outbound_local_addr = outbound_stream.local_addr()?.to_string();
-    let outbound_peer_addr = outbound_stream.peer_addr()?.to_string();
 
     let mut summary = RemoteCpNodeSummary::default();
     let mut first_routes = Vec::new();
@@ -781,15 +803,25 @@ pub fn run_remote_cp_node(
             block_start,
             block_stop,
         );
-        let bytes_sent = write_raw_message_frame(&mut outbound_stream, &message)?;
+        let bytes_sent = {
+            let mut stream =
+                outbound_stream
+                    .lock()
+                    .map_err(|error| ProtocolError::ChannelSend {
+                        sender_domain: domain.domain_id.clone(),
+                        receiver_domain: outbound_peer.domain_id.clone(),
+                        reason: error.to_string(),
+                    })?;
+            write_raw_message_frame(&mut stream, &message)?
+        };
         summary.source_blocks += 1;
+        summary.initial_messages_sent += 1;
         summary.messages_sent += 1;
         summary.bytes_sent += bytes_sent;
         summary.compute_updates += 1;
         push_payload_block(&mut payload_blocks, &message);
         push_remote_cp_route_preview(&mut first_routes, &message, Some(&outbound_peer.domain_id));
     }
-    drop(outbound_stream);
 
     let recv_report = recv_handle
         .join()
@@ -798,6 +830,9 @@ pub fn run_remote_cp_node(
         })??;
     summary.messages_received = recv_report.messages_received;
     summary.bytes_received = recv_report.bytes_received;
+    summary.forwarded_messages_sent = recv_report.forwarded_messages_sent;
+    summary.messages_sent += recv_report.forwarded_messages_sent;
+    summary.bytes_sent += recv_report.bytes_forwarded;
     summary.compute_updates += recv_report.compute_updates;
     payload_blocks.extend(recv_report.payload_blocks);
     summary.payload_blocks_captured = payload_blocks.len();
@@ -808,7 +843,9 @@ pub fn run_remote_cp_node(
         first_routes.push(route);
     }
 
-    let status = if summary.messages_sent == summary.source_blocks
+    let status = if summary.messages_sent == summary.source_blocks + summary.forwarded_messages_sent
+        && summary.initial_messages_sent == source_block_counts[node_index]
+        && summary.forwarded_messages_sent == expected_forwarded_messages
         && summary.messages_received == expected_inbound_messages
         && summary.compute_updates == summary.source_blocks + expected_inbound_messages
         && summary.payload_blocks_captured == summary.compute_updates
@@ -1177,29 +1214,68 @@ fn remote_server_domain() -> DomainSpec {
     }
 }
 
-fn remote_cp_domains() -> Vec<DomainSpec> {
-    vec![
-        DomainSpec {
-            domain_id: REMOTE_CLIENT_DOMAIN.to_string(),
-            seq_offset: 0,
-            seq_chunk_len: 32,
-            block_size: 8,
-            device: "mps".to_string(),
-        },
-        DomainSpec {
-            domain_id: REMOTE_SERVER_DOMAIN.to_string(),
-            seq_offset: 32,
-            seq_chunk_len: 32,
-            block_size: 8,
-            device: "cuda:0".to_string(),
-        },
-    ]
+fn remote_cp_domains() -> Result<Vec<DomainSpec>, ProtocolError> {
+    let domain_count_value = env::var("HCP_REMOTE_CP_DOMAINS").unwrap_or_else(|_| "2".to_string());
+    let domain_count = domain_count_value.parse::<usize>().map_err(|_| {
+        ProtocolError::UnsupportedRemoteCpDomainCount {
+            value: domain_count_value.clone(),
+        }
+    })?;
+    let domains = match domain_count {
+        2 => vec![
+            DomainSpec {
+                domain_id: REMOTE_CLIENT_DOMAIN.to_string(),
+                seq_offset: 0,
+                seq_chunk_len: 32,
+                block_size: 8,
+                device: "mps".to_string(),
+            },
+            DomainSpec {
+                domain_id: REMOTE_SERVER_DOMAIN.to_string(),
+                seq_offset: 32,
+                seq_chunk_len: 32,
+                block_size: 8,
+                device: "cuda:0".to_string(),
+            },
+        ],
+        3 => vec![
+            DomainSpec {
+                domain_id: REMOTE_CLIENT_DOMAIN.to_string(),
+                seq_offset: 0,
+                seq_chunk_len: 32,
+                block_size: 8,
+                device: "mps".to_string(),
+            },
+            DomainSpec {
+                domain_id: REMOTE_SERVER_DOMAIN.to_string(),
+                seq_offset: 32,
+                seq_chunk_len: 32,
+                block_size: 8,
+                device: "cuda:0".to_string(),
+            },
+            DomainSpec {
+                domain_id: "mac-mps-2".to_string(),
+                seq_offset: 64,
+                seq_chunk_len: 32,
+                block_size: 8,
+                device: "mps".to_string(),
+            },
+        ],
+        _ => {
+            return Err(ProtocolError::UnsupportedRemoteCpDomainCount {
+                value: domain_count_value,
+            });
+        }
+    };
+    Ok(domains)
 }
 
 struct RemoteCpRecvReport {
     messages_received: usize,
+    forwarded_messages_sent: usize,
     compute_updates: usize,
     bytes_received: usize,
+    bytes_forwarded: usize,
     inbound_peer_addr: String,
     first_routes: Vec<CpRingRoutePreview>,
     payload_blocks: Vec<CpPayloadBlock>,
@@ -1211,14 +1287,18 @@ fn receive_remote_cp_node_messages(
     domains: Vec<DomainSpec>,
     listener: TcpListener,
     expected_messages: usize,
+    outbound_peer: DomainSpec,
+    outbound_stream: Arc<Mutex<TcpStream>>,
 ) -> Result<RemoteCpRecvReport, ProtocolError> {
     let mut stream = accept_with_retry(listener)?;
     configure_stream(&stream)?;
     let inbound_peer_addr = stream.peer_addr()?.to_string();
     let mut report = RemoteCpRecvReport {
         messages_received: 0,
+        forwarded_messages_sent: 0,
         compute_updates: 0,
         bytes_received: 0,
+        bytes_forwarded: 0,
         inbound_peer_addr,
         first_routes: Vec::new(),
         payload_blocks: Vec::new(),
@@ -1230,7 +1310,30 @@ fn receive_remote_cp_node_messages(
         report.compute_updates += 1;
         report.bytes_received += bytes_received;
         push_payload_block(&mut report.payload_blocks, &message);
-        push_remote_cp_route_preview(&mut report.first_routes, &message, None);
+        let should_forward = message.ring_step < domains.len() - 1;
+        if should_forward {
+            let forwarded = forward_kv_message(&message, &domains[node_index], &outbound_peer);
+            let bytes_forwarded = {
+                let mut stream =
+                    outbound_stream
+                        .lock()
+                        .map_err(|error| ProtocolError::ChannelSend {
+                            sender_domain: domains[node_index].domain_id.clone(),
+                            receiver_domain: outbound_peer.domain_id.clone(),
+                            reason: error.to_string(),
+                        })?;
+                write_raw_message_frame(&mut stream, &forwarded)?
+            };
+            report.forwarded_messages_sent += 1;
+            report.bytes_forwarded += bytes_forwarded;
+            push_remote_cp_route_preview(
+                &mut report.first_routes,
+                &message,
+                Some(&outbound_peer.domain_id),
+            );
+        } else {
+            push_remote_cp_route_preview(&mut report.first_routes, &message, None);
+        }
     }
     if report.messages_received != expected_messages {
         return Err(ProtocolError::ChannelRecv {
