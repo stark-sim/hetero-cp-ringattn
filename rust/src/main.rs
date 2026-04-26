@@ -97,6 +97,7 @@ struct Report {
     torch_payload_online_bridge: TorchPayloadBlockReport,
     torch_payload_chunk_bridge: TorchPayloadBlockReport,
     torch_query_chunk_bridge: TorchPayloadBlockReport,
+    torch_query_output_bridge: TorchQueryOutputReport,
     cases: Vec<CaseReport>,
 }
 
@@ -108,6 +109,7 @@ struct RemoteCpNodeRunReport {
     torch_payload_online_bridge: TorchPayloadBlockReport,
     torch_payload_chunk_bridge: TorchPayloadBlockReport,
     torch_query_chunk_bridge: TorchPayloadBlockReport,
+    torch_query_output_bridge: TorchQueryOutputReport,
 }
 
 #[derive(Serialize)]
@@ -154,6 +156,28 @@ struct TorchPayloadBlockReport {
     status_code: i32,
     note: String,
     message: String,
+}
+
+#[derive(Serialize)]
+struct TorchQueryOutputReport {
+    status: &'static str,
+    compiled: bool,
+    requested_device: String,
+    requested_blocks: usize,
+    processed_blocks: usize,
+    status_code: i32,
+    note: String,
+    message: String,
+    output_groups: Vec<TorchQueryOutputGroup>,
+}
+
+#[derive(Serialize)]
+struct TorchQueryOutputGroup {
+    compute_domain: String,
+    blocks: usize,
+    output_values: usize,
+    output_checksum: f64,
+    max_abs_err: f64,
 }
 
 #[derive(Serialize)]
@@ -302,6 +326,21 @@ extern "C" {
         head_dim: i32,
     ) -> i32;
     fn hcp_ringattn_torch_query_chunk_smoke_message() -> *const std::os::raw::c_char;
+    fn hcp_ringattn_torch_query_chunk_output_smoke(
+        q_payload: *const std::os::raw::c_uchar,
+        q_payload_len: usize,
+        kv_payload: *const std::os::raw::c_uchar,
+        kv_payload_len: usize,
+        block_lens: *const i32,
+        block_count: usize,
+        query_len: i32,
+        num_heads: i32,
+        head_dim: i32,
+        output_checksum: *mut f64,
+        max_abs_err: *mut f64,
+        output_values: *mut usize,
+    ) -> i32;
+    fn hcp_ringattn_torch_query_chunk_output_smoke_message() -> *const std::os::raw::c_char;
 }
 
 fn build_specs(config: &CaseConfig) -> Result<Vec<DomainSpec>, RingError> {
@@ -1164,6 +1203,163 @@ fn torch_query_chunk_bridge_report(blocks: &[protocol::CpPayloadBlock]) -> Torch
     }
 }
 
+fn torch_query_output_bridge_report(blocks: &[protocol::CpPayloadBlock]) -> TorchQueryOutputReport {
+    let requested_blocks = blocks.len();
+    if !cfg!(hcp_torch_enabled) {
+        let report = torch_report_from_code(
+            0,
+            "HCP_ENABLE_TORCH is not enabled".to_string(),
+            "C++ libtorch query output smoke executed on CPU",
+            "C++ libtorch query output smoke executed on MPS",
+            "C++ libtorch query output smoke executed on CUDA",
+            "C++ libtorch query output smoke is disabled; build with HCP_ENABLE_TORCH=1",
+            "C++ libtorch query output smoke failed or returned an unexpected status",
+        );
+        return TorchQueryOutputReport {
+            status: report.status,
+            compiled: report.compiled,
+            requested_device: report.requested_device,
+            requested_blocks,
+            processed_blocks: 0,
+            status_code: report.status_code,
+            note: report.note,
+            message: report.message,
+            output_groups: Vec::new(),
+        };
+    }
+    let Some(first_block) = blocks.first() else {
+        return TorchQueryOutputReport {
+            status: "fail",
+            compiled: cfg!(hcp_torch_enabled),
+            requested_device: env::var("HCP_TORCH_DEVICE").unwrap_or_else(|_| "cpu".to_string()),
+            requested_blocks,
+            processed_blocks: 0,
+            status_code: -6,
+            note: "C++ libtorch query output smoke has no payload blocks".to_string(),
+            message: "no CP payload blocks captured".to_string(),
+            output_groups: Vec::new(),
+        };
+    };
+    let num_heads = first_block.num_heads();
+    let head_dim = first_block.head_dim();
+    let query_len = first_block.query_len();
+    if blocks.iter().any(|block| {
+        block.num_heads() != num_heads
+            || block.head_dim() != head_dim
+            || block.query_len() != query_len
+    }) {
+        return TorchQueryOutputReport {
+            status: "fail",
+            compiled: cfg!(hcp_torch_enabled),
+            requested_device: env::var("HCP_TORCH_DEVICE").unwrap_or_else(|_| "cpu".to_string()),
+            requested_blocks,
+            processed_blocks: 0,
+            status_code: -6,
+            note: "C++ libtorch query output smoke received inconsistent tensor shapes".to_string(),
+            message: "inconsistent query_len/num_heads/head_dim across CP payload blocks"
+                .to_string(),
+            output_groups: Vec::new(),
+        };
+    }
+
+    let mut groups: BTreeMap<&str, Vec<&protocol::CpPayloadBlock>> = BTreeMap::new();
+    for block in blocks {
+        groups
+            .entry(block.compute_domain())
+            .or_default()
+            .push(block);
+    }
+
+    let mut processed_blocks = 0_usize;
+    let mut code = -6;
+    let mut message = String::new();
+    let mut output_groups = Vec::new();
+    for (compute_domain, group_blocks) in groups {
+        let Some(group_first) = group_blocks.first() else {
+            continue;
+        };
+        if group_blocks
+            .iter()
+            .any(|block| block.query_payload() != group_first.query_payload())
+        {
+            code = -6;
+            message = format!("inconsistent query payload for compute_domain={compute_domain}");
+            break;
+        }
+
+        let mut kv_payload = Vec::new();
+        let mut block_lens = Vec::with_capacity(group_blocks.len());
+        for block in &group_blocks {
+            kv_payload.extend_from_slice(block.payload());
+            block_lens.push(i32::try_from(block.block_len()).unwrap_or(i32::MAX));
+        }
+
+        let mut output_checksum = 0.0_f64;
+        let mut max_abs_err = 0.0_f64;
+        let mut output_values = 0_usize;
+        code = unsafe {
+            hcp_ringattn_torch_query_chunk_output_smoke(
+                group_first.query_payload().as_ptr(),
+                group_first.query_payload().len(),
+                kv_payload.as_ptr(),
+                kv_payload.len(),
+                block_lens.as_ptr(),
+                block_lens.len(),
+                i32::try_from(group_first.query_len()).unwrap_or(i32::MAX),
+                i32::try_from(num_heads).unwrap_or(i32::MAX),
+                i32::try_from(head_dim).unwrap_or(i32::MAX),
+                &mut output_checksum,
+                &mut max_abs_err,
+                &mut output_values,
+            )
+        };
+        message =
+            c_string_from_ptr(unsafe { hcp_ringattn_torch_query_chunk_output_smoke_message() });
+        let group_report = torch_report_from_code(
+            code,
+            message.clone(),
+            "C++ libtorch query output smoke executed on CPU",
+            "C++ libtorch query output smoke executed on MPS",
+            "C++ libtorch query output smoke executed on CUDA",
+            "C++ libtorch query output smoke is disabled; build with HCP_ENABLE_TORCH=1",
+            "C++ libtorch query output smoke failed or returned an unexpected status",
+        );
+        if group_report.status == "fail" {
+            message = format!("compute_domain={compute_domain} {message}");
+            break;
+        }
+        output_groups.push(TorchQueryOutputGroup {
+            compute_domain: compute_domain.to_string(),
+            blocks: group_blocks.len(),
+            output_values,
+            output_checksum,
+            max_abs_err,
+        });
+        processed_blocks += group_blocks.len();
+    }
+
+    let report = torch_report_from_code(
+        code,
+        message,
+        "C++ libtorch query output smoke executed on CPU",
+        "C++ libtorch query output smoke executed on MPS",
+        "C++ libtorch query output smoke executed on CUDA",
+        "C++ libtorch query output smoke is disabled; build with HCP_ENABLE_TORCH=1",
+        "C++ libtorch query output smoke failed or returned an unexpected status",
+    );
+    TorchQueryOutputReport {
+        status: report.status,
+        compiled: report.compiled,
+        requested_device: report.requested_device,
+        requested_blocks,
+        processed_blocks,
+        status_code: report.status_code,
+        note: report.note,
+        message: report.message,
+        output_groups,
+    }
+}
+
 fn torch_report_from_code(
     code: i32,
     message: String,
@@ -1239,6 +1435,8 @@ fn run() -> Result<Report, RingError> {
     let torch_payload_chunk_bridge =
         torch_payload_chunk_bridge_report(cp_ring_smoke.payload_blocks());
     let torch_query_chunk_bridge = torch_query_chunk_bridge_report(cp_ring_smoke.payload_blocks());
+    let torch_query_output_bridge =
+        torch_query_output_bridge_report(cp_ring_smoke.payload_blocks());
     let status = if failed == 0
         && protocol_smoke.status == "pass"
         && cp_ring_smoke.status == "pass"
@@ -1249,6 +1447,7 @@ fn run() -> Result<Report, RingError> {
         && torch_payload_online_bridge.status != "fail"
         && torch_payload_chunk_bridge.status != "fail"
         && torch_query_chunk_bridge.status != "fail"
+        && torch_query_output_bridge.status != "fail"
     {
         "pass"
     } else {
@@ -1274,6 +1473,7 @@ fn run() -> Result<Report, RingError> {
         torch_payload_online_bridge,
         torch_payload_chunk_bridge,
         torch_query_chunk_bridge,
+        torch_query_output_bridge,
         cases,
     })
 }
@@ -1339,11 +1539,13 @@ fn main() -> Result<(), RingError> {
         let torch_payload_chunk_bridge =
             torch_payload_chunk_bridge_report(cp_node.payload_blocks());
         let torch_query_chunk_bridge = torch_query_chunk_bridge_report(cp_node.payload_blocks());
+        let torch_query_output_bridge = torch_query_output_bridge_report(cp_node.payload_blocks());
         let status = if cp_node.status == "pass"
             && torch_payload_block_bridge.status != "fail"
             && torch_payload_online_bridge.status != "fail"
             && torch_payload_chunk_bridge.status != "fail"
             && torch_query_chunk_bridge.status != "fail"
+            && torch_query_output_bridge.status != "fail"
         {
             "pass"
         } else {
@@ -1356,10 +1558,11 @@ fn main() -> Result<(), RingError> {
             torch_payload_online_bridge,
             torch_payload_chunk_bridge,
             torch_query_chunk_bridge,
+            torch_query_output_bridge,
         };
         write_json_report(&args.report_path, &report)?;
         println!(
-            "[rust-remote-cp-node] status={} role={} transport={} sent={} received={} compute_updates={} torch_payload_block_status={} torch_payload_block_code={} torch_payload_blocks={}/{} torch_payload_online_status={} torch_payload_online_code={} torch_payload_online_blocks={}/{} torch_payload_chunk_status={} torch_payload_chunk_code={} torch_payload_chunk_blocks={}/{} torch_query_chunk_status={} torch_query_chunk_code={} torch_query_chunk_blocks={}/{} report={}",
+            "[rust-remote-cp-node] status={} role={} transport={} sent={} received={} compute_updates={} torch_payload_block_status={} torch_payload_block_code={} torch_payload_blocks={}/{} torch_payload_online_status={} torch_payload_online_code={} torch_payload_online_blocks={}/{} torch_payload_chunk_status={} torch_payload_chunk_code={} torch_payload_chunk_blocks={}/{} torch_query_chunk_status={} torch_query_chunk_code={} torch_query_chunk_blocks={}/{} torch_query_output_status={} torch_query_output_code={} torch_query_output_groups={} torch_query_output_blocks={}/{} report={}",
             report.status,
             report.cp_node.role(),
             report.cp_node.transport(),
@@ -1382,6 +1585,11 @@ fn main() -> Result<(), RingError> {
             report.torch_query_chunk_bridge.status_code,
             report.torch_query_chunk_bridge.processed_blocks,
             report.torch_query_chunk_bridge.requested_blocks,
+            report.torch_query_output_bridge.status,
+            report.torch_query_output_bridge.status_code,
+            report.torch_query_output_bridge.output_groups.len(),
+            report.torch_query_output_bridge.processed_blocks,
+            report.torch_query_output_bridge.requested_blocks,
             args.report_path
         );
         if report.torch_payload_block_bridge.status == "fail"
@@ -1416,6 +1624,14 @@ fn main() -> Result<(), RingError> {
                 compact_message(&report.torch_query_chunk_bridge.message, 360)
             );
         }
+        if report.torch_query_output_bridge.status == "fail"
+            && !report.torch_query_output_bridge.message.is_empty()
+        {
+            println!(
+                "[rust-remote-cp-node] torch_query_output_message={}",
+                compact_message(&report.torch_query_output_bridge.message, 360)
+            );
+        }
         if report.status == "pass" {
             return Ok(());
         }
@@ -1439,7 +1655,7 @@ fn main() -> Result<(), RingError> {
     let report = run()?;
     write_json_report(&args.report_path, &report)?;
     println!(
-        "[rust-ringattn] status={} passed={}/{} protocol_status={} protocol_messages={} cp_ring_status={} cp_ring_messages={} cp_ring_compute_updates={} cxx_domains={} torch_status={} torch_device={} torch_code={} torch_attention_status={} torch_attention_code={} torch_block_update_status={} torch_block_update_code={} torch_block_updates={} torch_payload_block_status={} torch_payload_block_code={} torch_payload_blocks={}/{} torch_payload_online_status={} torch_payload_online_code={} torch_payload_online_blocks={}/{} torch_payload_chunk_status={} torch_payload_chunk_code={} torch_payload_chunk_blocks={}/{} torch_query_chunk_status={} torch_query_chunk_code={} torch_query_chunk_blocks={}/{} torch_compiled={} report={}",
+        "[rust-ringattn] status={} passed={}/{} protocol_status={} protocol_messages={} cp_ring_status={} cp_ring_messages={} cp_ring_compute_updates={} cxx_domains={} torch_status={} torch_device={} torch_code={} torch_attention_status={} torch_attention_code={} torch_block_update_status={} torch_block_update_code={} torch_block_updates={} torch_payload_block_status={} torch_payload_block_code={} torch_payload_blocks={}/{} torch_payload_online_status={} torch_payload_online_code={} torch_payload_online_blocks={}/{} torch_payload_chunk_status={} torch_payload_chunk_code={} torch_payload_chunk_blocks={}/{} torch_query_chunk_status={} torch_query_chunk_code={} torch_query_chunk_blocks={}/{} torch_query_output_status={} torch_query_output_code={} torch_query_output_groups={} torch_query_output_blocks={}/{} torch_compiled={} report={}",
         report.status,
         report.summary.passed,
         report.summary.cases,
@@ -1473,6 +1689,11 @@ fn main() -> Result<(), RingError> {
         report.torch_query_chunk_bridge.status_code,
         report.torch_query_chunk_bridge.processed_blocks,
         report.torch_query_chunk_bridge.requested_blocks,
+        report.torch_query_output_bridge.status,
+        report.torch_query_output_bridge.status_code,
+        report.torch_query_output_bridge.output_groups.len(),
+        report.torch_query_output_bridge.processed_blocks,
+        report.torch_query_output_bridge.requested_blocks,
         report.torch_bridge.compiled,
         args.report_path
     );
@@ -1528,6 +1749,14 @@ fn main() -> Result<(), RingError> {
         println!(
             "[rust-ringattn] torch_query_chunk_message={}",
             compact_message(&report.torch_query_chunk_bridge.message, 360)
+        );
+    }
+    if report.torch_query_output_bridge.status == "fail"
+        && !report.torch_query_output_bridge.message.is_empty()
+    {
+        println!(
+            "[rust-ringattn] torch_query_output_message={}",
+            compact_message(&report.torch_query_output_bridge.message, 360)
         );
     }
     if report.status == "pass" {

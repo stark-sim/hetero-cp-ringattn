@@ -24,6 +24,7 @@ std::string g_torch_payload_block_smoke_message;
 std::string g_torch_payload_online_smoke_message;
 std::string g_torch_payload_chunk_smoke_message;
 std::string g_torch_query_chunk_smoke_message;
+std::string g_torch_query_chunk_output_smoke_message;
 
 #ifdef HCP_ENABLE_TORCH
 struct TorchDeviceSelection {
@@ -92,6 +93,16 @@ at::Tensor PayloadChunkAttention(const at::Tensor& q, const at::Tensor& k, const
   auto scores = at::bmm(q_by_head, k_by_head.transpose(1, 2)) * scale;
   auto weights = at::softmax(scores, -1);
   return at::bmm(weights, v_by_head).permute({1, 0, 2});
+}
+
+double TensorWeightedChecksum(const at::Tensor& tensor) {
+  auto flat = tensor.contiguous().view({-1});
+  const auto values = flat.data_ptr<float>();
+  double checksum = 0.0;
+  for (std::int64_t index = 0; index < flat.numel(); ++index) {
+    checksum += static_cast<double>(values[index]) * static_cast<double>((index % 997) + 1);
+  }
+  return checksum;
 }
 
 int RunTorchAttentionBlockUpdates(int block_updates, std::string* message) {
@@ -387,6 +398,9 @@ int RunTorchPayloadChunkSmokeWithQCpu(const at::Tensor& q_cpu,
                                       int query_len,
                                       int num_heads,
                                       int head_dim,
+                                      double* output_checksum,
+                                      double* max_abs_err_out,
+                                      std::size_t* output_values,
                                       std::string* message) {
   message->clear();
   if (payload == nullptr || block_lens == nullptr) {
@@ -499,7 +513,16 @@ int RunTorchPayloadChunkSmokeWithQCpu(const at::Tensor& q_cpu,
   auto reference = PayloadChunkAttention(q_cpu, at::cat(k_refs, 0), at::cat(v_refs, 0));
   auto output_cpu = output.to(at::kCPU);
   const float max_abs_err = at::abs(output_cpu - reference).max().item<float>();
-  const float checksum = output_cpu.sum().item<float>();
+  const double checksum = TensorWeightedChecksum(output_cpu);
+  if (output_checksum != nullptr) {
+    *output_checksum = checksum;
+  }
+  if (max_abs_err_out != nullptr) {
+    *max_abs_err_out = static_cast<double>(max_abs_err);
+  }
+  if (output_values != nullptr) {
+    *output_values = static_cast<std::size_t>(output_cpu.numel());
+  }
   if (max_abs_err <= 1.0e-4F) {
     *message = "ok blocks=" + std::to_string(block_count) +
                " query_len=" + std::to_string(query_len) +
@@ -536,7 +559,8 @@ int RunTorchPayloadChunkSmoke(const std::uint8_t* payload,
                 37.0) +
                0.0625;
   return RunTorchPayloadChunkSmokeWithQCpu(q_cpu, payload, payload_len, block_lens, block_count,
-                                           query_len, num_heads, head_dim, message);
+                                           query_len, num_heads, head_dim, nullptr, nullptr,
+                                           nullptr, message);
 }
 
 int RunTorchQueryChunkSmoke(const std::uint8_t* q_payload,
@@ -548,6 +572,9 @@ int RunTorchQueryChunkSmoke(const std::uint8_t* q_payload,
                             int query_len,
                             int num_heads,
                             int head_dim,
+                            double* output_checksum,
+                            double* max_abs_err,
+                            std::size_t* output_values,
                             std::string* message) {
   message->clear();
   if (q_payload == nullptr) {
@@ -578,7 +605,8 @@ int RunTorchQueryChunkSmoke(const std::uint8_t* q_payload,
                              cpu_options)
                    .clone();
   return RunTorchPayloadChunkSmokeWithQCpu(q_cpu, kv_payload, kv_payload_len, block_lens,
-                                           block_count, query_len, num_heads, head_dim, message);
+                                           block_count, query_len, num_heads, head_dim,
+                                           output_checksum, max_abs_err, output_values, message);
 }
 #endif
 }
@@ -609,6 +637,10 @@ extern "C" const char* hcp_ringattn_torch_payload_chunk_smoke_message() {
 
 extern "C" const char* hcp_ringattn_torch_query_chunk_smoke_message() {
   return g_torch_query_chunk_smoke_message.c_str();
+}
+
+extern "C" const char* hcp_ringattn_torch_query_chunk_output_smoke_message() {
+  return g_torch_query_chunk_output_smoke_message.c_str();
 }
 
 extern "C" int hcp_ringattn_cxx_smoke_domain_count() {
@@ -827,7 +859,8 @@ extern "C" int hcp_ringattn_torch_query_chunk_smoke(const std::uint8_t* q_payloa
 #ifdef HCP_ENABLE_TORCH
   try {
     return RunTorchQueryChunkSmoke(q_payload, q_payload_len, kv_payload, kv_payload_len,
-                                   block_lens, block_count, query_len, num_heads, head_dim,
+                                   block_lens, block_count, query_len, num_heads, head_dim, nullptr,
+                                   nullptr, nullptr,
                                    &g_torch_query_chunk_smoke_message);
   } catch (const std::exception& exc) {
     g_torch_query_chunk_smoke_message = exc.what();
@@ -847,6 +880,49 @@ extern "C" int hcp_ringattn_torch_query_chunk_smoke(const std::uint8_t* q_payloa
   (void)num_heads;
   (void)head_dim;
   g_torch_query_chunk_smoke_message = "HCP_ENABLE_TORCH is not enabled";
+  return 0;
+#endif
+}
+
+extern "C" int hcp_ringattn_torch_query_chunk_output_smoke(const std::uint8_t* q_payload,
+                                                            std::size_t q_payload_len,
+                                                            const std::uint8_t* kv_payload,
+                                                            std::size_t kv_payload_len,
+                                                            const int* block_lens,
+                                                            std::size_t block_count,
+                                                            int query_len,
+                                                            int num_heads,
+                                                            int head_dim,
+                                                            double* output_checksum,
+                                                            double* max_abs_err,
+                                                            std::size_t* output_values) {
+#ifdef HCP_ENABLE_TORCH
+  try {
+    return RunTorchQueryChunkSmoke(q_payload, q_payload_len, kv_payload, kv_payload_len,
+                                   block_lens, block_count, query_len, num_heads, head_dim,
+                                   output_checksum, max_abs_err, output_values,
+                                   &g_torch_query_chunk_output_smoke_message);
+  } catch (const std::exception& exc) {
+    g_torch_query_chunk_output_smoke_message = exc.what();
+    return -2;
+  } catch (...) {
+    g_torch_query_chunk_output_smoke_message = "unknown exception";
+    return -3;
+  }
+#else
+  (void)q_payload;
+  (void)q_payload_len;
+  (void)kv_payload;
+  (void)kv_payload_len;
+  (void)block_lens;
+  (void)block_count;
+  (void)query_len;
+  (void)num_heads;
+  (void)head_dim;
+  (void)output_checksum;
+  (void)max_abs_err;
+  (void)output_values;
+  g_torch_query_chunk_output_smoke_message = "HCP_ENABLE_TORCH is not enabled";
   return 0;
 #endif
 }
