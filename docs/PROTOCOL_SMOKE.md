@@ -210,65 +210,32 @@ node0 mac-mps -> node1 gpu-cuda -> node2 mac-mps-2 -> node0 mac-mps
 - `torch_payload_online_blocks=12/12`，本地设备逐 block 维护 online softmax state 并通过 CPU reference 对比。
 - `torch_payload_chunk_blocks=12/12`，本地设备对小尺寸 Q chunk 维护 online softmax state 并输出 chunk tensor。
 - `torch_query_chunk_blocks=12/12`，本地设备消费 Rust/domain-side Q payload 与 captured K/V payload blocks。
+- `torch_query_output_blocks=12/12`，本地设备返回 Q chunk output digest，并由 Rust report 记录 output checksum / preview。
 
-重跑前先确认当前 Mac 子网地址：
-
-```bash
-ifconfig | rg 'inet 192\.168\.8\.'
-```
-
-已验证通过的启动方式是快速启动 node2、node0、GPU node1，让三个节点都处在 connect / accept retry 窗口内：
+推荐使用统一 launcher，而不是手工分别启动三个节点：
 
 ```bash
-# Mac node2
 RUN_ID=rust-remote-cp-3node-<timestamp> \
-  HCP_REMOTE_CP_DOMAINS=3 \
-  NODE_INDEX=2 \
-  BIND_ADDR=0.0.0.0:29207 \
-  CONNECT_ADDR=<MAC_192_ADDR>:29206 \
-  CARGO_OFFLINE=0 \
-  HCP_ENABLE_TORCH=1 \
-  HCP_TORCH_DEVICE=mps \
-  bash scripts/run_rust_remote_cp_node.sh
+  PORT_BASE=29285 \
+  bash scripts/run_rust_remote_cp_3node_smoke.sh
 ```
 
-```bash
-# GPU node1
-PATH=/home/stark/.cargo/bin:$PATH \
-  LIBTORCH=/home/stark/libtorch \
-  LIBTORCH_INCLUDE=/home/stark/libtorch/include \
-  LIBTORCH_LIB=/home/stark/libtorch/lib \
-  LD_LIBRARY_PATH=/home/stark/libtorch/lib:$LD_LIBRARY_PATH \
-  RUN_ID=rust-remote-cp-3node-<timestamp> \
-  HCP_REMOTE_CP_DOMAINS=3 \
-  NODE_INDEX=1 \
-  BIND_ADDR=0.0.0.0:29205 \
-  CONNECT_ADDR=<MAC_192_ADDR>:29207 \
-  CARGO_OFFLINE=0 \
-  HCP_ENABLE_TORCH=1 \
-  HCP_TORCH_DEVICE=cuda:0 \
-  bash scripts/run_rust_remote_cp_node.sh
-```
+该脚本会：
 
-```bash
-# Mac node0
-RUN_ID=rust-remote-cp-3node-<timestamp> \
-  HCP_REMOTE_CP_DOMAINS=3 \
-  NODE_INDEX=0 \
-  BIND_ADDR=0.0.0.0:29206 \
-  CONNECT_ADDR=192.168.8.172:29205 \
-  CARGO_OFFLINE=0 \
-  HCP_ENABLE_TORCH=1 \
-  HCP_TORCH_DEVICE=mps \
-  bash scripts/run_rust_remote_cp_node.sh
-```
+- 自动发现当前 Mac 的 `192.168.8.x` 地址，也可用 `MAC_192_ADDR` 覆盖。
+- 在 GPU host `192.168.8.172` 上执行 `git pull --ff-only`，保持远端源码只通过 git 同步。
+- 对本机和远端先做 cargo preflight build，降低节点启动后因编译耗时错过 retry 窗口的风险。
+- 统一启动 node0、node2、node1，并把 launcher stdout/stderr 写入 `reports/<RUN_ID>/launch_node_<N>.log`。
+- 默认本机节点使用 `HCP_TORCH_DEVICE=mps`，GPU 节点使用 `HCP_TORCH_DEVICE=cuda:0`。
+
+如果需要手工排查，仍可直接调用 `scripts/run_rust_remote_cp_node.sh`，但正式 smoke 应优先使用统一 launcher，避免三节点启动时序由人工操作决定。
 
 已通过的结果：
 
 ```text
-node0: sent=8 received=8 compute_updates=12 torch_payload_block_code=2 torch_payload_blocks=12/12 torch_payload_online_code=2 torch_payload_online_blocks=12/12 torch_payload_chunk_code=2 torch_payload_chunk_blocks=12/12
-node1: sent=8 received=8 compute_updates=12 torch_payload_block_code=3 torch_payload_blocks=12/12 torch_payload_online_code=3 torch_payload_online_blocks=12/12 torch_payload_chunk_code=3 torch_payload_chunk_blocks=12/12
-node2: sent=8 received=8 compute_updates=12 torch_payload_block_code=2 torch_payload_blocks=12/12 torch_payload_online_code=2 torch_payload_online_blocks=12/12 torch_payload_chunk_code=2 torch_payload_chunk_blocks=12/12
+node0: sent=8 received=8 compute_updates=12 torch_payload_block_code=2 torch_payload_blocks=12/12 torch_payload_online_code=2 torch_payload_online_blocks=12/12 torch_payload_chunk_code=2 torch_payload_chunk_blocks=12/12 torch_query_chunk_code=2 torch_query_chunk_blocks=12/12 torch_query_output_code=2 torch_query_output_blocks=12/12
+node1: sent=8 received=8 compute_updates=12 torch_payload_block_code=3 torch_payload_blocks=12/12 torch_payload_online_code=3 torch_payload_online_blocks=12/12 torch_payload_chunk_code=3 torch_payload_chunk_blocks=12/12 torch_query_chunk_code=3 torch_query_chunk_blocks=12/12 torch_query_output_code=3 torch_query_output_blocks=12/12
+node2: sent=8 received=8 compute_updates=12 torch_payload_block_code=2 torch_payload_blocks=12/12 torch_payload_online_code=2 torch_payload_online_blocks=12/12 torch_payload_chunk_code=2 torch_payload_chunk_blocks=12/12 torch_query_chunk_code=2 torch_query_chunk_blocks=12/12 torch_query_output_code=2 torch_query_output_blocks=12/12
 ```
 
 `torch_query_chunk_bridge` 的主 smoke 已在本机 MPS 与远端 CUDA 验证通过：
@@ -292,6 +259,14 @@ node2: sent=8 received=8 compute_updates=12 torch_query_chunk_code=2 torch_query
 node0: sent=8 received=8 compute_updates=12 torch_query_chunk_code=2 torch_query_chunk_blocks=12/12
 node1: sent=8 received=8 compute_updates=12 torch_query_chunk_code=3 torch_query_chunk_blocks=12/12
 node2: sent=8 received=8 compute_updates=12 torch_query_chunk_code=2 torch_query_chunk_blocks=12/12
+```
+
+2026-04-26 已用 `RUN_ID=rust-remote-cp-output-unified-20260426` 验证统一 launcher 和 query output digest 路径。结果通过：
+
+```text
+node0: sent=8 received=8 compute_updates=12 torch_query_output_code=2 torch_query_output_blocks=12/12
+node1: sent=8 received=8 compute_updates=12 torch_query_output_code=3 torch_query_output_blocks=12/12
+node2: sent=8 received=8 compute_updates=12 torch_query_output_code=2 torch_query_output_blocks=12/12
 ```
 
 ## Smoke Report

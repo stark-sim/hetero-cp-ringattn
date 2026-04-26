@@ -138,6 +138,16 @@ PATH=/home/stark/.cargo/bin:$PATH \
   bash scripts/run_rust_remote_cp_node.sh
 ```
 
+Rust remote CP 3-node unified smoke：
+
+```bash
+RUN_ID=rust-remote-cp-3node-<timestamp> \
+  PORT_BASE=29285 \
+  bash scripts/run_rust_remote_cp_3node_smoke.sh
+```
+
+该脚本会自动发现当前 Mac `192.168.8.x` 地址，在 GPU host `192.168.8.172` 上执行 `git pull --ff-only` 和 cargo preflight build，然后统一启动本机 node0/node2 与远端 CUDA node1。默认本机节点使用 MPS，GPU 节点使用 CUDA。
+
 ### 环境变量
 
 - `RUN_ID`：覆盖 smoke report 目录名，默认 `hcp-ringattn-smoke-local`。
@@ -150,6 +160,10 @@ PATH=/home/stark/.cargo/bin:$PATH \
 - `CONNECT_ADDR`：remote P2P client 连接地址，当前 GPU host 为 `192.168.8.172:29172`。
 - `NODE_INDEX`：remote CP node index；当前 `0=mac-mps`，`1=gpu-cuda`。
 - `HCP_REMOTE_CP_DOMAINS=2|3`：remote CP node 拓扑大小，默认 2；设置为 3 时为 `mac-mps -> gpu-cuda -> mac-mps-2 -> mac-mps`。
+- `PORT_BASE`：`run_rust_remote_cp_3node_smoke.sh` 使用的三节点端口基准，默认 `29250`；GPU node1 使用 `PORT_BASE`，node0 使用 `PORT_BASE+1`，node2 使用 `PORT_BASE+2`。
+- `MAC_192_ADDR`：覆盖统一 launcher 自动发现的 Mac `192.168.8.x` 地址。
+- `GPU_HOST` / `GPU_USER` / `GPU_REPO_DIR`：覆盖统一 launcher 的远端 GPU 地址、SSH 用户和远端仓库目录；默认分别为 `192.168.8.172`、`stark`、`hetero-cp-ringattn`。
+- `LOCAL_CARGO_OFFLINE` / `REMOTE_CARGO_OFFLINE`：统一 launcher 的本机/远端 cargo offline 开关，默认均为 `0`，避免远端 cache miss 干扰 smoke。
 - remote CP smoke 前应先用 `ifconfig | rg 'inet 192\\.168\\.8\\.'` 确认当前 Mac `192.168.8.x` 地址，并把 GPU 侧 `CONNECT_ADDR=<MAC_192_ADDR>:...` 更新为当前值；2026-04-26 已出现从 `192.168.8.204` 变为 `192.168.8.239` 的情况。
 - 本机 Mac hardware smoke 使用 `HCP_TORCH_DEVICE=mps` 并越过普通沙箱；CPU smoke 只用于编译/链接 fallback。
 - 启用 `HCP_ENABLE_TORCH=1` 后，Rust smoke 要求 torch bridge 成功；CLI summary 中 `torch_status=pass` 且设备成功码匹配才算硬件 smoke 通过。
@@ -158,7 +172,7 @@ PATH=/home/stark/.cargo/bin:$PATH \
 - `torch_payload_online_status=pass` 表示 captured K/V block 流已在 C++ ATen 中逐 block 维护 online softmax state，并与 full attention CPU reference 对比；MPS 成功码为 2，CUDA 成功码为 3。
 - `torch_payload_chunk_status=pass` 表示 captured K/V block 流已在 C++ ATen 中对小尺寸 Q chunk 维护 online softmax output，并与 full attention CPU reference 对比；MPS 成功码为 2，CUDA 成功码为 3。
 - remote CP node 启用 `HCP_ENABLE_TORCH=1` 后也会执行 payload-backed compute；当前双机期望每个 node `torch_payload_blocks=8/8`。
-- 3-node remote CP smoke 期望每个 node `messages_sent=8 messages_received=8 compute_updates=12 torch_payload_blocks=12/12 torch_payload_online_blocks=12/12 torch_payload_chunk_blocks=12/12`；启动顺序建议 node2 -> GPU node1 -> node0。
+- 3-node remote CP smoke 期望每个 node `messages_sent=8 messages_received=8 compute_updates=12 torch_payload_blocks=12/12 torch_payload_online_blocks=12/12 torch_payload_chunk_blocks=12/12 torch_query_chunk_blocks=12/12 torch_query_output_blocks=12/12`；正式验证优先使用 `scripts/run_rust_remote_cp_3node_smoke.sh` 统一启动。
 - torch bridge 失败时 CLI summary 后会打印压缩 `torch_message`；完整信息写入 JSON report。
 - CUDA 请求下 `torch_code=-5` 表示当前 libtorch 进程无 CUDA backend，通常是 CPU-only libtorch 或 `libtorch_cuda` / `c10_cuda` 没有被链接/加载。
 - Linux CUDA libtorch 构建需要保留 `libtorch_cuda` / `c10_cuda` 动态依赖；build script 在检测到这两个库时会用同一个 linker group 传入 `--push-state,--no-as-needed,-ltorch_cuda,-lc10_cuda,--pop-state`。

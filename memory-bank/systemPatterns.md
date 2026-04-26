@@ -43,6 +43,7 @@ project-root/
 - **CP payload 驱动 device compute**：`RingAttnMessage.payload` 携带 float32 K/V bytes；`cp_ring_node_runtime` 和 `tcp_remote_cp_node` 都会捕获每次 compute update 的 payload block，并通过 C ABI 驱动 C++ ATen/libtorch 在目标设备上执行 payload-backed attention block compute、online softmax state update 和小尺寸 Q chunk output。
 - **Domain-local model state**：`DomainModelState` 是当前最小模型状态边界；每个 domain 持有自己的 Q chunk 和 K/V storage。source domain 从自己的 K/V storage 切出 block，target domain 捕获 compute update 时携带自己的 Q payload。
 - **Rust/domain-side Q payload**：`torch_query_chunk_bridge` 使用 captured block 上的 target-domain Q payload，并按 `compute_domain` 分组调用 C++ ATen bridge；C++ 只负责 tensor parse / device compute / CPU reference 对比，不在该路径内部生成 Q。
+- **统一 remote CP launcher**：3-node remote CP smoke 通过 `scripts/run_rust_remote_cp_3node_smoke.sh` 收敛 Mac 地址发现、GPU git 同步、cargo preflight build、三节点统一启动和 launcher 日志，避免手工时序导致 connect / accept retry 窗口失败。
 - **reference-first correctness**：Python kernel stub 保留 reference attention，用于与 block-wise online softmax 对照。
 - **报告纪律**：实验产物应落在 `reports/<RUN_ID>/` 下，便于回溯。
 
@@ -90,3 +91,4 @@ project-root/
 | 3-node remote smoke 可先用两台物理机器三进程 | 当前目标是验证 remote process-level multi-hop forwarding；node0/node2 可同在 Mac，node1 在 GPU，后续再扩展到三台物理机器 | [2026-04-25] |
 | Q payload 先从 Rust/domain-side 显式传入 C++ | 这样先切断 C++ bridge 内部 synthetic Q 的隐式依赖，再逐步升级到真实 model activation / state lifecycle | [2026-04-26] |
 | 用 `DomainModelState` 收敛 Q/K/V ownership | 先在 Rust runtime 中明确每个 domain 拥有哪些 Q/K/V state，再接真实模型 activation / weight lifecycle | [2026-04-26] |
+| 3-node remote CP smoke 使用统一 launcher | 三节点需要同时覆盖本机 MPS、远端 CUDA、git 同步、当前 Mac 子网地址和启动时序；用脚本统一执行比手工命令更可复现 | [2026-04-26] |

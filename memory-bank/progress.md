@@ -47,6 +47,8 @@
 - [x] [2026-04-26] `torch_query_chunk_bridge` 已通过主 smoke：Rust/domain-side 显式 Q chunk payload 与 captured K/V payload blocks 一起进入 C++ ATen bridge；本机非沙箱 MPS 显示 `torch_query_chunk_code=2 torch_query_chunk_blocks=30/30`，远端 CUDA 显示 `torch_query_chunk_code=3 torch_query_chunk_blocks=30/30`。
 - [x] [2026-04-26] `torch_query_chunk_bridge` 已通过 3-node remote CP smoke：Mac node0 / GPU node1 / Mac node2 均 `sent=8 received=8 compute_updates=12`，MPS nodes `torch_query_chunk_code=2 torch_query_chunk_blocks=12/12`，CUDA node `torch_query_chunk_code=3 torch_query_chunk_blocks=12/12`。
 - [x] [2026-04-26] `DomainModelState` 已接入 CP payload path：每个 domain 持有本地 Q chunk 与 K/V storage，source K/V block 从 state 切片，target compute capture 携带本地 Q payload；本机 MPS、远端 CUDA 和 3-node remote CP 均已验证。
+- [x] [2026-04-26] 已新增统一 3-node remote CP launcher：`scripts/run_rust_remote_cp_3node_smoke.sh` 会自动发现 Mac 子网地址、远端 GPU `git pull --ff-only`、预构建本机/远端 Rust crate，并统一启动 node0/node2 MPS 与 node1 CUDA。
+- [x] [2026-04-26] `RUN_ID=rust-remote-cp-output-unified-20260426` 三节点 remote CP output digest smoke 已通过：node0/node2 MPS `torch_query_output_code=2 torch_query_output_blocks=12/12`，node1 CUDA `torch_query_output_code=3 torch_query_output_blocks=12/12`。
 
 ## 进行中
 
