@@ -45,6 +45,7 @@
 - [x] [2026-04-25] `torch_payload_online_bridge` 已通过：设备侧逐 block 维护 online softmax state，并与 full attention CPU reference 对比；本机 MPS、远端 CUDA、3-node remote CP 均已验证。
 - [x] [2026-04-25] `torch_payload_chunk_bridge` 已通过：设备侧对小尺寸 Q chunk 逐 block 维护 online softmax state，输出 chunk tensor 并与 CPU reference 对比；本机 MPS、远端 CUDA、3-node remote CP 均已验证。
 - [x] [2026-04-26] `torch_query_chunk_bridge` 已通过主 smoke：Rust/domain-side 显式 Q chunk payload 与 captured K/V payload blocks 一起进入 C++ ATen bridge；本机非沙箱 MPS 显示 `torch_query_chunk_code=2 torch_query_chunk_blocks=30/30`，远端 CUDA 显示 `torch_query_chunk_code=3 torch_query_chunk_blocks=30/30`。
+- [x] [2026-04-26] `torch_query_chunk_bridge` 已通过 3-node remote CP smoke：Mac node0 / GPU node1 / Mac node2 均 `sent=8 received=8 compute_updates=12`，MPS nodes `torch_query_chunk_code=2 torch_query_chunk_blocks=12/12`，CUDA node `torch_query_chunk_code=3 torch_query_chunk_blocks=12/12`。
 
 ## 进行中
 
@@ -66,7 +67,7 @@
 - [2026-04-25] 旧版 CLI 只打印 `torch_compiled=true`，不能证明 CUDA/MPS 实际执行；需使用包含 `torch_status` / `torch_code` 的新版 smoke。
 - [2026-04-25] 远端 CUDA smoke 历史问题已解决：根因是 Linux 链接阶段未保留 `libtorch_cuda` / `c10_cuda` registration libraries。
 - [2026-04-26] 当前 query chunk bridge 的 Q 已从 Rust/domain-side 显式 payload 进入 C++，但仍是 deterministic smoke tensor，尚未来自真实 domain-local model activation / weights。
-- [2026-04-26] 3-node remote CP query chunk smoke 因 GPU host `192.168.8.172` 网络不可达暂未重跑完成；本机已清理残留进程，待 SSH 恢复后重试。
+- [2026-04-26] 3-node remote CP query chunk smoke 的一次失败根因是 Mac 子网地址从 `192.168.8.204` 变化到 `192.168.8.239`；后续重跑已通过。后续 remote smoke 前应先用 `ifconfig | rg 'inet 192\\.168\\.8\\.'` 确认当前 Mac 地址。
 
 ## 里程碑
 

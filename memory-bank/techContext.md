@@ -130,7 +130,7 @@ PATH=/home/stark/.cargo/bin:$PATH \
   RUN_ID=rust-remote-cp-node-<timestamp> \
   NODE_INDEX=1 \
   BIND_ADDR=0.0.0.0:29175 \
-  CONNECT_ADDR=192.168.8.204:29176 \
+  CONNECT_ADDR=<MAC_192_ADDR>:29176 \
   CARGO_OFFLINE=0 \
   HCP_ENABLE_TORCH=1 \
   HCP_TORCH_DEVICE=cuda:0 \
@@ -149,6 +149,7 @@ PATH=/home/stark/.cargo/bin:$PATH \
 - `CONNECT_ADDR`：remote P2P client 连接地址，当前 GPU host 为 `192.168.8.172:29172`。
 - `NODE_INDEX`：remote CP node index；当前 `0=mac-mps`，`1=gpu-cuda`。
 - `HCP_REMOTE_CP_DOMAINS=2|3`：remote CP node 拓扑大小，默认 2；设置为 3 时为 `mac-mps -> gpu-cuda -> mac-mps-2 -> mac-mps`。
+- remote CP smoke 前应先用 `ifconfig | rg 'inet 192\\.168\\.8\\.'` 确认当前 Mac `192.168.8.x` 地址，并把 GPU 侧 `CONNECT_ADDR=<MAC_192_ADDR>:...` 更新为当前值；2026-04-26 已出现从 `192.168.8.204` 变为 `192.168.8.239` 的情况。
 - 本机 Mac hardware smoke 使用 `HCP_TORCH_DEVICE=mps` 并越过普通沙箱；CPU smoke 只用于编译/链接 fallback。
 - 启用 `HCP_ENABLE_TORCH=1` 后，Rust smoke 要求 torch bridge 成功；CLI summary 中 `torch_status=pass` 且设备成功码匹配才算硬件 smoke 通过。
 - `torch_block_update_status=pass` 表示 `cp_ring_node_runtime.compute_updates()` 已驱动同等次数的 C++ ATen attention block compute；MPS 成功码为 2，CUDA 成功码为 3。

@@ -171,7 +171,7 @@ RUN_ID=rust-remote-cp-node-<timestamp> \
 ```
 
 ```bash
-# GPU 节点随后启动
+# GPU 节点随后启动；先用 `ifconfig | rg 'inet 192\.168\.8\.'` 确认当前 Mac 地址
 PATH=/home/stark/.cargo/bin:$PATH \
   LIBTORCH=/home/stark/libtorch \
   LIBTORCH_INCLUDE=/home/stark/libtorch/include \
@@ -180,7 +180,7 @@ PATH=/home/stark/.cargo/bin:$PATH \
   RUN_ID=rust-remote-cp-node-<timestamp> \
   NODE_INDEX=1 \
   BIND_ADDR=0.0.0.0:29175 \
-  CONNECT_ADDR=192.168.8.204:29176 \
+  CONNECT_ADDR=<MAC_192_ADDR>:29176 \
   CARGO_OFFLINE=0 \
   HCP_ENABLE_TORCH=1 \
   HCP_TORCH_DEVICE=cuda:0 \
@@ -209,7 +209,13 @@ node0 mac-mps -> node1 gpu-cuda -> node2 mac-mps-2 -> node0 mac-mps
 - `torch_payload_chunk_blocks=12/12`，本地设备对小尺寸 Q chunk 维护 online softmax state 并输出 chunk tensor。
 - `torch_query_chunk_blocks=12/12`，本地设备消费 Rust/domain-side Q payload 与 captured K/V payload blocks。
 
-已验证通过的启动顺序是先启动 node2，再启动 GPU node1，最后启动 node0：
+重跑前先确认当前 Mac 子网地址：
+
+```bash
+ifconfig | rg 'inet 192\.168\.8\.'
+```
+
+已验证通过的启动方式是快速启动 node2、node0、GPU node1，让三个节点都处在 connect / accept retry 窗口内：
 
 ```bash
 # Mac node2
@@ -217,7 +223,7 @@ RUN_ID=rust-remote-cp-3node-<timestamp> \
   HCP_REMOTE_CP_DOMAINS=3 \
   NODE_INDEX=2 \
   BIND_ADDR=0.0.0.0:29207 \
-  CONNECT_ADDR=192.168.8.204:29206 \
+  CONNECT_ADDR=<MAC_192_ADDR>:29206 \
   CARGO_OFFLINE=0 \
   HCP_ENABLE_TORCH=1 \
   HCP_TORCH_DEVICE=mps \
@@ -235,7 +241,7 @@ PATH=/home/stark/.cargo/bin:$PATH \
   HCP_REMOTE_CP_DOMAINS=3 \
   NODE_INDEX=1 \
   BIND_ADDR=0.0.0.0:29205 \
-  CONNECT_ADDR=192.168.8.204:29207 \
+  CONNECT_ADDR=<MAC_192_ADDR>:29207 \
   CARGO_OFFLINE=0 \
   HCP_ENABLE_TORCH=1 \
   HCP_TORCH_DEVICE=cuda:0 \
@@ -270,7 +276,13 @@ Mac MPS: torch_query_chunk_status=pass torch_query_chunk_code=2 torch_query_chun
 GPU CUDA: torch_query_chunk_status=pass torch_query_chunk_code=3 torch_query_chunk_blocks=30/30
 ```
 
-2026-04-26 尝试重跑 3-node remote CP query chunk smoke 时，GPU host `192.168.8.172` 网络在 node2 超时后再次返回 `No route to host` / `Host is down`；本机已确认无残留 remote CP/SSH 进程。待网络稳定后按同一三节点顺序重跑，预期每个 node 额外显示 `torch_query_chunk_blocks=12/12`。
+2026-04-26 已用 `RUN_ID=rust-remote-cp-queryq-20260426-rerun2` 重跑 3-node remote CP query chunk smoke。上一轮失败根因是 Mac 的 `192.168.8.x` 地址从 `192.168.8.204` 变化到 `192.168.8.239`，node1/node2 仍在连接旧地址；使用当前地址后三节点均通过：
+
+```text
+node0: sent=8 received=8 compute_updates=12 torch_query_chunk_code=2 torch_query_chunk_blocks=12/12
+node1: sent=8 received=8 compute_updates=12 torch_query_chunk_code=3 torch_query_chunk_blocks=12/12
+node2: sent=8 received=8 compute_updates=12 torch_query_chunk_code=2 torch_query_chunk_blocks=12/12
+```
 
 ## Smoke Report
 

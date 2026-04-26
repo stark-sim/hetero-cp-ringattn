@@ -103,6 +103,7 @@ CARGO_OFFLINE=0 HCP_ENABLE_TORCH=1 HCP_TORCH_DEVICE=cuda:0 bash scripts/run_rust
 - Payload online softmax state 验证已通过：本机 MPS 和远端 CUDA 主 smoke 均显示 `torch_payload_online_blocks=30/30`；3-node remote CP 中 MPS nodes 和 CUDA node 均显示 `torch_payload_online_blocks=12/12`。
 - Payload chunk output 验证已通过：本机 MPS 和远端 CUDA 主 smoke 均显示 `torch_payload_chunk_blocks=30/30`；3-node remote CP 中 MPS nodes 和 CUDA node 均显示 `torch_payload_chunk_blocks=12/12`。
 - Query chunk payload 验证已通过：本机非沙箱 MPS 主 smoke 显示 `torch_query_chunk_status=pass torch_query_chunk_code=2 torch_query_chunk_blocks=30/30`，远端 CUDA 主 smoke 显示 `torch_query_chunk_status=pass torch_query_chunk_code=3 torch_query_chunk_blocks=30/30`。
+- 3-node remote CP query chunk 验证已通过：`RUN_ID=rust-remote-cp-queryq-20260426-rerun2` 中 Mac node0 / GPU node1 / Mac node2 均显示 `sent=8 received=8 compute_updates=12`，MPS nodes 显示 `torch_query_chunk_code=2 torch_query_chunk_blocks=12/12`，CUDA node 显示 `torch_query_chunk_code=3 torch_query_chunk_blocks=12/12`。
 - 当前 query chunk bridge 已消费 Rust/domain-side 显式 Q payload 和 `RingAttnMessage` 的 K/V bytes；Q 仍是 deterministic smoke tensor，尚未升级为真实模型 activation / weight lifecycle。
 - 远端非交互 SSH 不会自动加载 `/home/stark/.cargo/bin` 或 libtorch 环境；通过 SSH 运行 CUDA smoke 时应显式传入 `PATH=/home/stark/.cargo/bin:$PATH LIBTORCH=/home/stark/libtorch LIBTORCH_INCLUDE=/home/stark/libtorch/include LIBTORCH_LIB=/home/stark/libtorch/lib LD_LIBRARY_PATH=/home/stark/libtorch/lib:$LD_LIBRARY_PATH`。
 - 因此短期推荐路线是 Rust -> C ABI -> C++ ATen/libtorch，而不是马上把完整 `torch/torch.h` 或 `tch-rs` 作为必需路径。
