@@ -174,6 +174,10 @@ struct TorchQueryOutputReport {
 #[derive(Serialize)]
 struct TorchQueryOutputGroup {
     compute_domain: String,
+    layer_index: i32,
+    output_seq_offset: usize,
+    query_len: usize,
+    output_slot_values: usize,
     blocks: usize,
     output_values: usize,
     output_checksum: f64,
@@ -1145,6 +1149,15 @@ fn torch_query_chunk_bridge_report(blocks: &[protocol::CpPayloadBlock]) -> Torch
             message = format!("inconsistent query payload for compute_domain={compute_domain}");
             break;
         }
+        if group_blocks.iter().any(|block| {
+            block.layer_index() != group_first.layer_index()
+                || block.output_seq_offset() != group_first.output_seq_offset()
+                || block.output_slot_values() != group_first.output_slot_values()
+        }) {
+            code = -6;
+            message = format!("inconsistent output slot for compute_domain={compute_domain}");
+            break;
+        }
 
         let mut kv_payload = Vec::new();
         let mut block_lens = Vec::with_capacity(group_blocks.len());
@@ -1328,8 +1341,20 @@ fn torch_query_output_bridge_report(blocks: &[protocol::CpPayloadBlock]) -> Torc
             message = format!("compute_domain={compute_domain} {message}");
             break;
         }
+        if output_values != group_first.output_slot_values() {
+            code = -6;
+            message = format!(
+                "compute_domain={compute_domain} output values mismatch expected_slot={} actual={output_values}",
+                group_first.output_slot_values()
+            );
+            break;
+        }
         output_groups.push(TorchQueryOutputGroup {
             compute_domain: compute_domain.to_string(),
+            layer_index: group_first.layer_index(),
+            output_seq_offset: group_first.output_seq_offset(),
+            query_len: group_first.query_len(),
+            output_slot_values: group_first.output_slot_values(),
             blocks: group_blocks.len(),
             output_values,
             output_checksum,

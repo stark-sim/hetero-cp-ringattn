@@ -80,23 +80,51 @@ struct DomainSpec {
 }
 
 #[derive(Clone, Debug)]
-struct DomainModelState {
+struct LayerActivationState {
+    layer_index: i32,
     seq_offset: usize,
     seq_chunk_len: usize,
     query_len: usize,
     num_heads: usize,
     head_dim: usize,
     q_chunk: Vec<u8>,
-    kv_storage: Vec<u8>,
+    k_cache: Vec<u8>,
+    v_cache: Vec<u8>,
+    output_slot: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+struct DomainModelState {
+    domain_id: String,
+    device: String,
+    activation: LayerActivationState,
+}
+
+#[derive(Clone, Serialize)]
+struct ModelStateSummary {
+    domain_id: String,
+    device: String,
+    layer_index: i32,
+    seq_offset: usize,
+    seq_chunk_len: usize,
+    query_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    q_bytes: usize,
+    k_cache_bytes: usize,
+    v_cache_bytes: usize,
+    output_slot_bytes: usize,
 }
 
 impl DomainModelState {
     fn new(domain: &DomainSpec) -> Self {
         let query_len = usize::min(QUERY_CHUNK_LEN, domain.seq_chunk_len);
         let q_values = query_len * KV_NUM_HEADS * KV_HEAD_DIM;
-        let kv_values = KV_TENSOR_COUNT * domain.seq_chunk_len * KV_NUM_HEADS * KV_HEAD_DIM;
+        let cache_values = domain.seq_chunk_len * KV_NUM_HEADS * KV_HEAD_DIM;
+        let output_values = query_len * KV_NUM_HEADS * KV_HEAD_DIM;
         let mut q_chunk = Vec::with_capacity(q_values * FLOAT32_BYTES);
-        let mut kv_storage = Vec::with_capacity(kv_values * FLOAT32_BYTES);
+        let mut k_cache = Vec::with_capacity(cache_values * FLOAT32_BYTES);
+        let mut v_cache = Vec::with_capacity(cache_values * FLOAT32_BYTES);
 
         for token_offset in 0..query_len {
             let global_token = domain.seq_offset + token_offset;
@@ -108,26 +136,33 @@ impl DomainModelState {
             }
         }
 
-        for tensor_index in 0..KV_TENSOR_COUNT {
-            for token_offset in 0..domain.seq_chunk_len {
-                let global_token = domain.seq_offset + token_offset;
-                for head in 0..KV_NUM_HEADS {
-                    for dim in 0..KV_HEAD_DIM {
-                        let value = model_kv_value(domain, tensor_index, global_token, head, dim);
-                        kv_storage.extend_from_slice(&value.to_le_bytes());
-                    }
+        for token_offset in 0..domain.seq_chunk_len {
+            let global_token = domain.seq_offset + token_offset;
+            for head in 0..KV_NUM_HEADS {
+                for dim in 0..KV_HEAD_DIM {
+                    let k_value = model_kv_value(domain, 0, global_token, head, dim);
+                    let v_value = model_kv_value(domain, 1, global_token, head, dim);
+                    k_cache.extend_from_slice(&k_value.to_le_bytes());
+                    v_cache.extend_from_slice(&v_value.to_le_bytes());
                 }
             }
         }
 
         Self {
-            seq_offset: domain.seq_offset,
-            seq_chunk_len: domain.seq_chunk_len,
-            query_len,
-            num_heads: KV_NUM_HEADS,
-            head_dim: KV_HEAD_DIM,
-            q_chunk,
-            kv_storage,
+            domain_id: domain.domain_id.clone(),
+            device: domain.device.clone(),
+            activation: LayerActivationState {
+                layer_index: 0,
+                seq_offset: domain.seq_offset,
+                seq_chunk_len: domain.seq_chunk_len,
+                query_len,
+                num_heads: KV_NUM_HEADS,
+                head_dim: KV_HEAD_DIM,
+                q_chunk,
+                k_cache,
+                v_cache,
+                output_slot: vec![0_u8; output_values * FLOAT32_BYTES],
+            },
         }
     }
 
@@ -136,26 +171,57 @@ impl DomainModelState {
     }
 
     fn kv_block_payload(&self, block_start: usize, block_stop: usize) -> Vec<u8> {
-        debug_assert!(block_start >= self.seq_offset);
-        debug_assert!(block_stop <= self.seq_offset + self.seq_chunk_len);
+        debug_assert!(block_start >= self.activation.seq_offset);
+        debug_assert!(block_stop <= self.activation.seq_offset + self.activation.seq_chunk_len);
         let block_len = block_stop - block_start;
-        let values_per_token = self.num_heads * self.head_dim;
+        let values_per_token = self.activation.num_heads * self.activation.head_dim;
         let bytes_per_token = values_per_token * FLOAT32_BYTES;
-        let tensor_stride_bytes = self.seq_chunk_len * bytes_per_token;
-        let local_start = block_start - self.seq_offset;
+        let local_start = block_start - self.activation.seq_offset;
         let mut payload =
             Vec::with_capacity(KV_TENSOR_COUNT * block_len * values_per_token * FLOAT32_BYTES);
 
-        for tensor_index in 0..KV_TENSOR_COUNT {
-            let offset = tensor_index * tensor_stride_bytes + local_start * bytes_per_token;
-            let bytes = block_len * bytes_per_token;
-            payload.extend_from_slice(&self.kv_storage[offset..offset + bytes]);
-        }
+        let offset = local_start * bytes_per_token;
+        let bytes = block_len * bytes_per_token;
+        payload.extend_from_slice(&self.activation.k_cache[offset..offset + bytes]);
+        payload.extend_from_slice(&self.activation.v_cache[offset..offset + bytes]);
         payload
     }
 
     fn query_payload(&self) -> &[u8] {
-        &self.q_chunk
+        &self.activation.q_chunk
+    }
+
+    fn layer_index(&self) -> i32 {
+        self.activation.layer_index
+    }
+
+    fn query_len(&self) -> usize {
+        self.activation.query_len
+    }
+
+    fn output_seq_offset(&self) -> usize {
+        self.activation.seq_offset
+    }
+
+    fn output_slot_values(&self) -> usize {
+        self.activation.output_slot.len() / FLOAT32_BYTES
+    }
+
+    fn summary(&self) -> ModelStateSummary {
+        ModelStateSummary {
+            domain_id: self.domain_id.clone(),
+            device: self.device.clone(),
+            layer_index: self.activation.layer_index,
+            seq_offset: self.activation.seq_offset,
+            seq_chunk_len: self.activation.seq_chunk_len,
+            query_len: self.activation.query_len,
+            num_heads: self.activation.num_heads,
+            head_dim: self.activation.head_dim,
+            q_bytes: self.activation.q_chunk.len(),
+            k_cache_bytes: self.activation.k_cache.len(),
+            v_cache_bytes: self.activation.v_cache.len(),
+            output_slot_bytes: self.activation.output_slot.len(),
+        }
     }
 }
 
@@ -291,6 +357,7 @@ pub struct RemoteCpNodeReport {
     transport: &'static str,
     node_index: usize,
     domain_id: String,
+    model_state: ModelStateSummary,
     bind_addr: String,
     connect_addr: String,
     inbound_peer: String,
@@ -364,6 +431,7 @@ struct CpRingNodeReport {
     role: &'static str,
     inbound_peer: String,
     outbound_peer: String,
+    model_state: ModelStateSummary,
     source_blocks: usize,
     initial_messages_sent: usize,
     forwarded_messages_sent: usize,
@@ -391,7 +459,10 @@ struct CpRingRoutePreview {
 #[derive(Clone, Debug)]
 pub struct CpPayloadBlock {
     sequence_id: u64,
+    layer_index: i32,
     compute_domain: String,
+    output_seq_offset: usize,
+    output_slot_values: usize,
     block_len: usize,
     query_len: usize,
     num_heads: usize,
@@ -405,8 +476,20 @@ impl CpPayloadBlock {
         self.sequence_id
     }
 
+    pub fn layer_index(&self) -> i32 {
+        self.layer_index
+    }
+
     pub fn compute_domain(&self) -> &str {
         &self.compute_domain
+    }
+
+    pub fn output_seq_offset(&self) -> usize {
+        self.output_seq_offset
+    }
+
+    pub fn output_slot_values(&self) -> usize {
+        self.output_slot_values
     }
 
     pub fn block_len(&self) -> usize {
@@ -963,6 +1046,7 @@ pub fn run_remote_cp_node(
         transport: "tcp_remote_cp_node",
         node_index,
         domain_id: domain.domain_id,
+        model_state: local_model_state.summary(),
         bind_addr: bind_addr.to_string(),
         connect_addr: connect_addr.to_string(),
         inbound_peer: inbound_peer.domain_id,
@@ -1042,6 +1126,7 @@ fn run_cp_ring_node(
         role: "listener_and_outbound_peer",
         inbound_peer: inbound_peer.domain_id.clone(),
         outbound_peer: outbound_peer.domain_id.clone(),
+        model_state: model_state.summary(),
         source_blocks: 0,
         initial_messages_sent: 0,
         forwarded_messages_sent: 0,
@@ -1175,9 +1260,12 @@ fn push_payload_block(
     };
     payload_blocks.push(CpPayloadBlock {
         sequence_id: message.sequence_id,
+        layer_index: model_state.layer_index(),
         compute_domain: compute_domain.domain_id.clone(),
+        output_seq_offset: model_state.output_seq_offset(),
+        output_slot_values: model_state.output_slot_values(),
         block_len: block.block_len,
-        query_len: model_state.query_len,
+        query_len: model_state.query_len(),
         num_heads: tensor.num_heads,
         head_dim: tensor.head_dim,
         query_payload: model_state.query_payload().to_vec(),
@@ -1919,5 +2007,32 @@ mod tests {
             QUERY_CHUNK_LEN * KV_NUM_HEADS * KV_HEAD_DIM * FLOAT32_BYTES
         );
         assert_ne!(lhs.query_payload(), rhs.query_payload());
+    }
+
+    #[test]
+    fn domain_model_state_tracks_layer_output_slot() {
+        let domain = test_domain(16, 12);
+        let state = DomainModelState::new(&domain);
+        let summary = state.summary();
+
+        assert_eq!(state.layer_index(), 0);
+        assert_eq!(state.output_seq_offset(), domain.seq_offset);
+        assert_eq!(state.query_len(), QUERY_CHUNK_LEN);
+        assert_eq!(
+            state.output_slot_values(),
+            QUERY_CHUNK_LEN * KV_NUM_HEADS * KV_HEAD_DIM
+        );
+        assert_eq!(
+            summary.output_slot_bytes,
+            state.output_slot_values() * FLOAT32_BYTES
+        );
+        assert_eq!(
+            summary.k_cache_bytes,
+            domain.seq_chunk_len * KV_NUM_HEADS * KV_HEAD_DIM * FLOAT32_BYTES
+        );
+        assert_eq!(
+            summary.v_cache_bytes,
+            domain.seq_chunk_len * KV_NUM_HEADS * KV_HEAD_DIM * FLOAT32_BYTES
+        );
     }
 }
