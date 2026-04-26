@@ -46,13 +46,14 @@
 - [x] [2026-04-25] `torch_payload_chunk_bridge` 已通过：设备侧对小尺寸 Q chunk 逐 block 维护 online softmax state，输出 chunk tensor 并与 CPU reference 对比；本机 MPS、远端 CUDA、3-node remote CP 均已验证。
 - [x] [2026-04-26] `torch_query_chunk_bridge` 已通过主 smoke：Rust/domain-side 显式 Q chunk payload 与 captured K/V payload blocks 一起进入 C++ ATen bridge；本机非沙箱 MPS 显示 `torch_query_chunk_code=2 torch_query_chunk_blocks=30/30`，远端 CUDA 显示 `torch_query_chunk_code=3 torch_query_chunk_blocks=30/30`。
 - [x] [2026-04-26] `torch_query_chunk_bridge` 已通过 3-node remote CP smoke：Mac node0 / GPU node1 / Mac node2 均 `sent=8 received=8 compute_updates=12`，MPS nodes `torch_query_chunk_code=2 torch_query_chunk_blocks=12/12`，CUDA node `torch_query_chunk_code=3 torch_query_chunk_blocks=12/12`。
+- [x] [2026-04-26] `DomainModelState` 已接入 CP payload path：每个 domain 持有本地 Q chunk 与 K/V storage，source K/V block 从 state 切片，target compute capture 携带本地 Q payload；本机 MPS、远端 CUDA 和 3-node remote CP 均已验证。
 
 ## 进行中
 
 - [ ] M2：Rust online softmax correctness report 与 tolerance policy 扩展。
 - [ ] M3：抽出统一 transport trait，减少 local queue / TCP pair / TCP CP node 的重复 frame 与 metrics 逻辑。
 - [ ] M4：heterogeneous runtime stubs 与配置 / 环境纪律。
-- [ ] M5：将 Rust/domain-side deterministic Q payload 升级为真实 domain-local model activation / state lifecycle，并明确 ownership。
+- [ ] M5：将 `DomainModelState` deterministic Q/K/V fixtures 升级为真实 domain-local model activation / weight lifecycle，并明确 output ownership。
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 
 ## 已知问题
@@ -66,7 +67,7 @@
 - [2026-04-25] 本机 CPU-only libtorch smoke 不能作为 hardware smoke 结论；需要以非沙箱 MPS report 为准。
 - [2026-04-25] 旧版 CLI 只打印 `torch_compiled=true`，不能证明 CUDA/MPS 实际执行；需使用包含 `torch_status` / `torch_code` 的新版 smoke。
 - [2026-04-25] 远端 CUDA smoke 历史问题已解决：根因是 Linux 链接阶段未保留 `libtorch_cuda` / `c10_cuda` registration libraries。
-- [2026-04-26] 当前 query chunk bridge 的 Q 已从 Rust/domain-side 显式 payload 进入 C++，但仍是 deterministic smoke tensor，尚未来自真实 domain-local model activation / weights。
+- [2026-04-26] 当前 query chunk bridge 的 Q/K/V 已由 Rust `DomainModelState` 持有并切片进入 C++，但仍是 deterministic fixture，尚未接入真实模型 activation / weights。
 - [2026-04-26] 3-node remote CP query chunk smoke 的一次失败根因是 Mac 子网地址从 `192.168.8.204` 变化到 `192.168.8.239`；后续重跑已通过。后续 remote smoke 前应先用 `ifconfig | rg 'inet 192\\.168\\.8\\.'` 确认当前 Mac 地址。
 
 ## 里程碑

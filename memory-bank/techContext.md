@@ -31,6 +31,7 @@
   - 可选 Rust -> C++ ATen/libtorch smoke
   - Rust CP update-driven ATen/libtorch block compute smoke
   - Rust CP payload-backed ATen/libtorch block compute smoke
+  - Rust `DomainModelState` unit tests for Q/K/V state ownership and K/V block slicing
   - Rust remote P2P pair smoke
   - Python controller / worker placeholder smoke 仅作历史占位
 - 后续应增加 online softmax correctness script / report。

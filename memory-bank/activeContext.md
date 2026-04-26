@@ -52,6 +52,8 @@
 - [2026-04-26] 新增 `torch_query_chunk_bridge`：Rust/domain-side 生成显式 float32 Q chunk payload，C++ ATen bridge 消费该 Q payload 与 captured K/V payload blocks，不再在该路径内部构造 Q。本机非沙箱 MPS 主 smoke 通过 `torch_query_chunk_code=2 30/30`，远端 CUDA 主 smoke 通过 `torch_query_chunk_code=3 30/30`。
 - [2026-04-26] 尝试重跑 3-node remote CP query chunk smoke 时，node2 先启动后连接 node0 超时退出；随后 GPU host `192.168.8.172` SSH 返回 `No route to host` / `Host is down`。本机已确认无残留 remote CP/SSH 进程，待网络稳定后重跑 3-node。
 - [2026-04-26] 3-node remote CP query chunk smoke 已重跑通过：失败根因是 Mac 的 `192.168.8.x` 地址从 `192.168.8.204` 变化到 `192.168.8.239`；使用当前地址后 node0/node2 MPS 均通过 `torch_query_chunk_code=2 12/12`，GPU node1 CUDA 通过 `torch_query_chunk_code=3 12/12`。
+- [2026-04-26] Rust protocol 新增 `DomainModelState`：每个 domain 持有本地 Q chunk 与 K/V storage；K/V 消息从 source state 切片生成，compute capture 携带 target state 的 Q payload。`torch_query_chunk_bridge_report` 已按 `compute_domain` 分组，避免不同 domain blocks 混用同一个 Q。
+- [2026-04-26] `DomainModelState` 路径已验证：`cargo test --offline` 通过 2 个 state 单元测试；本机非沙箱 MPS 主 smoke、远端 CUDA 主 smoke、`RUN_ID=rust-remote-cp-modelstate-20260426` 三节点 remote CP smoke 均通过。
 
 ## 活跃决策
 
@@ -70,7 +72,7 @@
 - [ ] 必要时增加 `max_rel_err` 并明确 tolerance policy。
 - [ ] 将 Rust correctness model 继续拆分为 library + binary，便于后续 protocol / transport 复用。
 - [ ] 抽出统一 transport trait，收敛 `local_p2p_queue`、`cp_ring_node_runtime`、`tcp_remote_pair`、`tcp_remote_cp_node` 的共用 send/recv/frame 语义，并保持当前 message schema / report 字段稳定。
-- [ ] 将 Rust/domain-side deterministic Q payload 升级为真实 domain-local model activation / state lifecycle，并明确 state ownership。
+- [ ] 将 `DomainModelState` 中 deterministic Q/K/V fixtures 升级为真实模型 activation / weight lifecycle，并明确 output buffer ownership。
 - [ ] 在 cargo registry/network 可用后，增加 feature-gated `tch = 0.24.0` backend，并先实现 `tch_smoke`，再迁移 Ring Attention block update。
 - [ ] 在 cargo registry/network 可用后，引入 optional `tch = 0.24.0` 并实现 `tch_smoke`。
 - [ ] 为 `RingAttnMessage` 设计 serialization / deserialization。

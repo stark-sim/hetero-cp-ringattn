@@ -141,6 +141,8 @@ torch_payload_block_status=pass torch_payload_block_code=3 torch_payload_blocks=
 
 这一步验证的是 CP ring update 事件已经能驱动真实消息 payload 的 device-side compute。`torch_payload_online_bridge` 进一步在设备上逐 block 维护 running max / running sum / output，并与 full attention CPU reference 对比。`torch_payload_chunk_bridge` 则把 online update 扩展到小尺寸 Q chunk，输出 `[query, head, dim]` chunk tensor。`torch_query_chunk_bridge` 在此基础上把 Q 改为 Rust/domain-side 显式 float32 payload，C++ bridge 不再为该路径内部构造 Q。
 
+`DomainModelState` 是当前最小模型状态边界：每个 domain 持有自己的 Q chunk 和 K/V storage。source domain 发送 K/V block 时从自己的 K/V storage 切片；target domain 捕获 compute update 时带上自己的 Q payload。这样 query bridge 不再把不同 compute domain 的 blocks 混用同一个 Q，而是按 `compute_domain` 分组调用 C++ ATen bridge。
+
 ## Remote CP Node Smoke
 
 `tcp_remote_cp_node` 是当前的 remote dual-role node smoke。每个进程同时做两件事：
@@ -277,6 +279,14 @@ GPU CUDA: torch_query_chunk_status=pass torch_query_chunk_code=3 torch_query_chu
 ```
 
 2026-04-26 已用 `RUN_ID=rust-remote-cp-queryq-20260426-rerun2` 重跑 3-node remote CP query chunk smoke。上一轮失败根因是 Mac 的 `192.168.8.x` 地址从 `192.168.8.204` 变化到 `192.168.8.239`，node1/node2 仍在连接旧地址；使用当前地址后三节点均通过：
+
+```text
+node0: sent=8 received=8 compute_updates=12 torch_query_chunk_code=2 torch_query_chunk_blocks=12/12
+node1: sent=8 received=8 compute_updates=12 torch_query_chunk_code=3 torch_query_chunk_blocks=12/12
+node2: sent=8 received=8 compute_updates=12 torch_query_chunk_code=2 torch_query_chunk_blocks=12/12
+```
+
+2026-04-26 已用 `RUN_ID=rust-remote-cp-modelstate-20260426` 验证 `DomainModelState` 路径。结果同样通过：
 
 ```text
 node0: sent=8 received=8 compute_updates=12 torch_query_chunk_code=2 torch_query_chunk_blocks=12/12
