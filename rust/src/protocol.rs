@@ -233,6 +233,10 @@ impl RemoteCpNodeReport {
         self.transport
     }
 
+    pub fn node_index(&self) -> usize {
+        self.node_index
+    }
+
     pub fn messages_sent(&self) -> usize {
         self.summary.messages_sent
     }
