@@ -139,7 +139,7 @@ torch_payload_block_status=pass torch_payload_block_code=2 torch_payload_blocks=
 torch_payload_block_status=pass torch_payload_block_code=3 torch_payload_blocks=30/30  # CUDA
 ```
 
-这一步验证的是 CP ring update 事件已经能驱动真实消息 payload 的 device-side compute。`torch_payload_online_bridge` 进一步在设备上逐 block 维护 running max / running sum / output，并与 full attention CPU reference 对比。`torch_payload_chunk_bridge` 则把 online update 扩展到小尺寸 Q chunk，输出 `[query, head, dim]` chunk tensor。
+这一步验证的是 CP ring update 事件已经能驱动真实消息 payload 的 device-side compute。`torch_payload_online_bridge` 进一步在设备上逐 block 维护 running max / running sum / output，并与 full attention CPU reference 对比。`torch_payload_chunk_bridge` 则把 online update 扩展到小尺寸 Q chunk，输出 `[query, head, dim]` chunk tensor。`torch_query_chunk_bridge` 在此基础上把 Q 改为 Rust/domain-side 显式 float32 payload，C++ bridge 不再为该路径内部构造 Q。
 
 ## Remote CP Node Smoke
 
@@ -207,6 +207,7 @@ node0 mac-mps -> node1 gpu-cuda -> node2 mac-mps-2 -> node0 mac-mps
 - `torch_payload_blocks=12/12`，本地设备消费全部 captured payload blocks。
 - `torch_payload_online_blocks=12/12`，本地设备逐 block 维护 online softmax state 并通过 CPU reference 对比。
 - `torch_payload_chunk_blocks=12/12`，本地设备对小尺寸 Q chunk 维护 online softmax state 并输出 chunk tensor。
+- `torch_query_chunk_blocks=12/12`，本地设备消费 Rust/domain-side Q payload 与 captured K/V payload blocks。
 
 已验证通过的启动顺序是先启动 node2，再启动 GPU node1，最后启动 node0：
 
@@ -261,6 +262,15 @@ node0: sent=8 received=8 compute_updates=12 torch_payload_block_code=2 torch_pay
 node1: sent=8 received=8 compute_updates=12 torch_payload_block_code=3 torch_payload_blocks=12/12 torch_payload_online_code=3 torch_payload_online_blocks=12/12 torch_payload_chunk_code=3 torch_payload_chunk_blocks=12/12
 node2: sent=8 received=8 compute_updates=12 torch_payload_block_code=2 torch_payload_blocks=12/12 torch_payload_online_code=2 torch_payload_online_blocks=12/12 torch_payload_chunk_code=2 torch_payload_chunk_blocks=12/12
 ```
+
+`torch_query_chunk_bridge` 的主 smoke 已在本机 MPS 与远端 CUDA 验证通过：
+
+```text
+Mac MPS: torch_query_chunk_status=pass torch_query_chunk_code=2 torch_query_chunk_blocks=30/30
+GPU CUDA: torch_query_chunk_status=pass torch_query_chunk_code=3 torch_query_chunk_blocks=30/30
+```
+
+2026-04-26 尝试重跑 3-node remote CP query chunk smoke 时，GPU host `192.168.8.172` 网络在 node2 超时后再次返回 `No route to host` / `Host is down`；本机已确认无残留 remote CP/SSH 进程。待网络稳定后按同一三节点顺序重跑，预期每个 node 额外显示 `torch_query_chunk_blocks=12/12`。
 
 ## Smoke Report
 

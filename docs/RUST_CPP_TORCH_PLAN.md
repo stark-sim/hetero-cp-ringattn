@@ -38,6 +38,9 @@ Rust 社区常用的 PyTorch 绑定是 `tch-rs`，它是 PyTorch C++ API/libtorc
 - `torch_attention_bridge` 验证真实 attention block compute：C++ ATen 在请求设备上计算 `softmax(QK^T / sqrt(d))V`，再搬回 CPU 与 CPU reference 对比误差。
 - `torch_block_update_bridge` 将 `cp_ring_node_runtime` 统计出的 compute update 数量传入 C++ ATen bridge，并在请求设备上循环执行同等次数的 attention block compute。
 - `torch_payload_block_bridge` 将 `RingAttnMessage.payload` 中的 float32 K/V bytes 传入 C++ ATen bridge，在请求设备上对每个 captured CP block 执行 payload-backed attention compute。
+- `torch_payload_online_bridge` 在请求设备上按 K/V payload block 流维护 online softmax state。
+- `torch_payload_chunk_bridge` 在请求设备上对小尺寸 Q chunk 输出 `[query, head, dim]` attention chunk。
+- `torch_query_chunk_bridge` 从 Rust/domain-side 生成显式 float32 Q chunk payload，并与 captured K/V payload blocks 一起传入 C++ ATen bridge；C++ 不再为该路径内部构造 Q。
 
 尝试方式：
 
@@ -99,7 +102,8 @@ CARGO_OFFLINE=0 HCP_ENABLE_TORCH=1 HCP_TORCH_DEVICE=cuda:0 bash scripts/run_rust
 - 3-node remote CP forwarding + payload-backed compute 验证已通过：Mac node0 / GPU node1 / Mac node2 均显示 `sent=8 received=8 compute_updates=12`，MPS nodes 显示 `torch_payload_block_code=2 torch_payload_blocks=12/12`，CUDA node 显示 `torch_payload_block_code=3 torch_payload_blocks=12/12`。
 - Payload online softmax state 验证已通过：本机 MPS 和远端 CUDA 主 smoke 均显示 `torch_payload_online_blocks=30/30`；3-node remote CP 中 MPS nodes 和 CUDA node 均显示 `torch_payload_online_blocks=12/12`。
 - Payload chunk output 验证已通过：本机 MPS 和远端 CUDA 主 smoke 均显示 `torch_payload_chunk_blocks=30/30`；3-node remote CP 中 MPS nodes 和 CUDA node 均显示 `torch_payload_chunk_blocks=12/12`。
-- 当前 payload bridge 已消费 `RingAttnMessage` 的 K/V bytes，并维护小尺寸 Q chunk 的 online softmax output；Q 仍是 bridge 内 deterministic smoke input，尚未来自 domain-local Q payload / model state。
+- Query chunk payload 验证已通过：本机非沙箱 MPS 主 smoke 显示 `torch_query_chunk_status=pass torch_query_chunk_code=2 torch_query_chunk_blocks=30/30`，远端 CUDA 主 smoke 显示 `torch_query_chunk_status=pass torch_query_chunk_code=3 torch_query_chunk_blocks=30/30`。
+- 当前 query chunk bridge 已消费 Rust/domain-side 显式 Q payload 和 `RingAttnMessage` 的 K/V bytes；Q 仍是 deterministic smoke tensor，尚未升级为真实模型 activation / weight lifecycle。
 - 远端非交互 SSH 不会自动加载 `/home/stark/.cargo/bin` 或 libtorch 环境；通过 SSH 运行 CUDA smoke 时应显式传入 `PATH=/home/stark/.cargo/bin:$PATH LIBTORCH=/home/stark/libtorch LIBTORCH_INCLUDE=/home/stark/libtorch/include LIBTORCH_LIB=/home/stark/libtorch/lib LD_LIBRARY_PATH=/home/stark/libtorch/lib:$LD_LIBRARY_PATH`。
 - 因此短期推荐路线是 Rust -> C ABI -> C++ ATen/libtorch，而不是马上把完整 `torch/torch.h` 或 `tch-rs` 作为必需路径。
 - `torch.backends.mps.is_built()` 为 true；沙箱进程看不到 Metal device，非沙箱进程 MPS 可用。

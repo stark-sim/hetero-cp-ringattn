@@ -49,6 +49,8 @@
 - [2026-04-25] `tcp_remote_cp_node` 已扩展到 3-node remote forwarding 并验证通过：Mac node0 -> GPU node1 -> Mac node2 -> Mac node0；每个 node `messages_sent=8 messages_received=8 compute_updates=12`，MPS nodes `torch_payload_block_code=2 torch_payload_blocks=12/12`，CUDA node `torch_payload_block_code=3 torch_payload_blocks=12/12`。
 - [2026-04-25] 新增 `torch_payload_online_bridge`：C++ ATen 在请求设备上按 captured K/V payload block 流维护 running max / running sum / output，并与 full attention CPU reference 对比。本机 MPS / 远端 CUDA 主 smoke 均通过 `30/30`，3-node remote CP 每个 node 均通过 `12/12`。
 - [2026-04-25] 新增 `torch_payload_chunk_bridge`：C++ ATen 将 online softmax state 扩展到小尺寸 Q chunk，输出 `[query, head, dim]` chunk tensor。本机 MPS / 远端 CUDA 主 smoke 均通过 `30/30`，3-node remote CP 每个 node 均通过 `12/12`。
+- [2026-04-26] 新增 `torch_query_chunk_bridge`：Rust/domain-side 生成显式 float32 Q chunk payload，C++ ATen bridge 消费该 Q payload 与 captured K/V payload blocks，不再在该路径内部构造 Q。本机非沙箱 MPS 主 smoke 通过 `torch_query_chunk_code=2 30/30`，远端 CUDA 主 smoke 通过 `torch_query_chunk_code=3 30/30`。
+- [2026-04-26] 尝试重跑 3-node remote CP query chunk smoke 时，node2 先启动后连接 node0 超时退出；随后 GPU host `192.168.8.172` SSH 返回 `No route to host` / `Host is down`。本机已确认无残留 remote CP/SSH 进程，待网络稳定后重跑 3-node。
 
 ## 活跃决策
 
@@ -67,7 +69,7 @@
 - [ ] 必要时增加 `max_rel_err` 并明确 tolerance policy。
 - [ ] 将 Rust correctness model 继续拆分为 library + binary，便于后续 protocol / transport 复用。
 - [ ] 抽出统一 transport trait，收敛 `local_p2p_queue`、`cp_ring_node_runtime`、`tcp_remote_pair`、`tcp_remote_cp_node` 的共用 send/recv/frame 语义，并保持当前 message schema / report 字段稳定。
-- [ ] 将 bridge 内 deterministic Q chunk 替换为 domain-local Q payload / model state，并明确 state lifecycle。
+- [ ] 将 Rust/domain-side deterministic Q payload 升级为真实 domain-local model activation / state lifecycle，并明确 state ownership。
 - [ ] 在 cargo registry/network 可用后，增加 feature-gated `tch = 0.24.0` backend，并先实现 `tch_smoke`，再迁移 Ring Attention block update。
 - [ ] 在 cargo registry/network 可用后，引入 optional `tch = 0.24.0` 并实现 `tch_smoke`。
 - [ ] 为 `RingAttnMessage` 设计 serialization / deserialization。
@@ -91,7 +93,7 @@
 - Remote P2P 纪律：双机验证不能用 `127.0.0.1` 作为结论；server 应监听 `0.0.0.0` 或目标子网地址，client 应连接 `192.168.8.x` 子网内的 GPU host。
 - Report 纪律：`reports/**/*.json` 是生成产物，默认不提交；如需长期记录实验进展，写入 docs 或 memory-bank。
 - Remote CP node 启动纪律：Mac 侧可先启动 listener，再启动 GPU 节点；GPU 能连入 Mac，但必须确保 Mac listener 已实际运行。
-- CP block update 纪律：`torch_payload_chunk_status=pass` 证明 CP 消息 payload 已驱动设备侧 Q chunk online softmax output smoke；但在 Q 来自 domain-local model state 并接入完整 lifecycle 前，不应把它描述为完整 Ring Attention kernel。
+- CP block update 纪律：`torch_query_chunk_status=pass` 证明 CP 消息 K/V payload 和 Rust/domain-side Q payload 已驱动设备侧 Q chunk online softmax output smoke；但在 Q 来自真实 domain-local model state 并接入完整 lifecycle 前，不应把它描述为完整 Ring Attention kernel。
 
 ## 当前阻塞
 
@@ -101,3 +103,4 @@
 - [2026-04-24] PyTorch 2.11.0 在默认沙箱进程中 `mps_available=false`，原因是沙箱内 `MTLCopyAllDevices()` 返回 0；非沙箱进程可枚举 `Apple M1 Pro`，且 `torch.ones(..., device="mps")` 成功。
 - [2026-04-24] 后续所有 Metal/MPS 相关验证必须在非沙箱/授权进程中运行；默认沙箱结果不能作为 MPS 不可用结论。
 - [2026-04-25] GPU 端 `CARGO_OFFLINE=1` 失败且提示 `no matching package named serde_json found` 时，优先判定为 Cargo registry cache miss，不是 CUDA/libtorch 问题。
+- [2026-04-26] 3-node remote CP query chunk smoke 当前阻塞在 GPU host 网络可达性：`ssh stark@192.168.8.172` 返回 `No route to host` / `Host is down`。
