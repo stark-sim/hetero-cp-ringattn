@@ -24,6 +24,7 @@ const REMOTE_SERVER_DOMAIN: &str = "gpu-cuda";
 const KV_NUM_HEADS: usize = 3;
 const KV_HEAD_DIM: usize = 24;
 const KV_TENSOR_COUNT: usize = 2;
+const QUERY_CHUNK_LEN: usize = 4;
 const FLOAT32_BYTES: usize = 4;
 
 #[derive(Debug, Error)]
@@ -76,6 +77,86 @@ struct DomainSpec {
     seq_chunk_len: usize,
     block_size: usize,
     device: String,
+}
+
+#[derive(Clone, Debug)]
+struct DomainModelState {
+    seq_offset: usize,
+    seq_chunk_len: usize,
+    query_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    q_chunk: Vec<u8>,
+    kv_storage: Vec<u8>,
+}
+
+impl DomainModelState {
+    fn new(domain: &DomainSpec) -> Self {
+        let query_len = usize::min(QUERY_CHUNK_LEN, domain.seq_chunk_len);
+        let q_values = query_len * KV_NUM_HEADS * KV_HEAD_DIM;
+        let kv_values = KV_TENSOR_COUNT * domain.seq_chunk_len * KV_NUM_HEADS * KV_HEAD_DIM;
+        let mut q_chunk = Vec::with_capacity(q_values * FLOAT32_BYTES);
+        let mut kv_storage = Vec::with_capacity(kv_values * FLOAT32_BYTES);
+
+        for token_offset in 0..query_len {
+            let global_token = domain.seq_offset + token_offset;
+            for head in 0..KV_NUM_HEADS {
+                for dim in 0..KV_HEAD_DIM {
+                    let value = model_q_value(domain, global_token, head, dim);
+                    q_chunk.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+
+        for tensor_index in 0..KV_TENSOR_COUNT {
+            for token_offset in 0..domain.seq_chunk_len {
+                let global_token = domain.seq_offset + token_offset;
+                for head in 0..KV_NUM_HEADS {
+                    for dim in 0..KV_HEAD_DIM {
+                        let value = model_kv_value(domain, tensor_index, global_token, head, dim);
+                        kv_storage.extend_from_slice(&value.to_le_bytes());
+                    }
+                }
+            }
+        }
+
+        Self {
+            seq_offset: domain.seq_offset,
+            seq_chunk_len: domain.seq_chunk_len,
+            query_len,
+            num_heads: KV_NUM_HEADS,
+            head_dim: KV_HEAD_DIM,
+            q_chunk,
+            kv_storage,
+        }
+    }
+
+    fn build_all(domains: &[DomainSpec]) -> Vec<Self> {
+        domains.iter().map(Self::new).collect()
+    }
+
+    fn kv_block_payload(&self, block_start: usize, block_stop: usize) -> Vec<u8> {
+        debug_assert!(block_start >= self.seq_offset);
+        debug_assert!(block_stop <= self.seq_offset + self.seq_chunk_len);
+        let block_len = block_stop - block_start;
+        let values_per_token = self.num_heads * self.head_dim;
+        let bytes_per_token = values_per_token * FLOAT32_BYTES;
+        let tensor_stride_bytes = self.seq_chunk_len * bytes_per_token;
+        let local_start = block_start - self.seq_offset;
+        let mut payload =
+            Vec::with_capacity(KV_TENSOR_COUNT * block_len * values_per_token * FLOAT32_BYTES);
+
+        for tensor_index in 0..KV_TENSOR_COUNT {
+            let offset = tensor_index * tensor_stride_bytes + local_start * bytes_per_token;
+            let bytes = block_len * bytes_per_token;
+            payload.extend_from_slice(&self.kv_storage[offset..offset + bytes]);
+        }
+        payload
+    }
+
+    fn query_payload(&self) -> &[u8] {
+        &self.q_chunk
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -233,10 +314,6 @@ impl RemoteCpNodeReport {
         self.transport
     }
 
-    pub fn node_index(&self) -> usize {
-        self.node_index
-    }
-
     pub fn messages_sent(&self) -> usize {
         self.summary.messages_sent
     }
@@ -314,9 +391,12 @@ struct CpRingRoutePreview {
 #[derive(Clone, Debug)]
 pub struct CpPayloadBlock {
     sequence_id: u64,
+    compute_domain: String,
     block_len: usize,
+    query_len: usize,
     num_heads: usize,
     head_dim: usize,
+    query_payload: Vec<u8>,
     payload: Vec<u8>,
 }
 
@@ -325,8 +405,16 @@ impl CpPayloadBlock {
         self.sequence_id
     }
 
+    pub fn compute_domain(&self) -> &str {
+        &self.compute_domain
+    }
+
     pub fn block_len(&self) -> usize {
         self.block_len
+    }
+
+    pub fn query_len(&self) -> usize {
+        self.query_len
     }
 
     pub fn num_heads(&self) -> usize {
@@ -335,6 +423,10 @@ impl CpPayloadBlock {
 
     pub fn head_dim(&self) -> usize {
         self.head_dim
+    }
+
+    pub fn query_payload(&self) -> &[u8] {
+        &self.query_payload
     }
 
     pub fn payload(&self) -> &[u8] {
@@ -480,6 +572,7 @@ impl LocalP2pTransport {
 
 pub fn run_protocol_smoke() -> Result<ProtocolSmokeReport, ProtocolError> {
     let domains = default_domains()?;
+    let model_states = DomainModelState::build_all(&domains);
     let mut transport = LocalP2pTransport::new(&domains);
     let mut route_preview = Vec::new();
     let mut sequence_id = 1_u64;
@@ -496,6 +589,7 @@ pub fn run_protocol_smoke() -> Result<ProtocolSmokeReport, ProtocolError> {
                     sequence_id,
                     ring_step,
                     &domains[source_index],
+                    &model_states[source_index],
                     &domains[sender_index],
                     &domains[receiver_index],
                     block_start,
@@ -755,6 +849,7 @@ pub fn run_remote_cp_node(
         });
     }
     let domain_count = domains.len();
+    let local_model_state = DomainModelState::new(&domains[node_index]);
     let source_block_counts = domains
         .iter()
         .map(|domain| block_ranges(domain).count())
@@ -780,6 +875,7 @@ pub fn run_remote_cp_node(
 
     let recv_domains = domains.clone();
     let recv_domain_id = domain.domain_id.clone();
+    let recv_model_state = local_model_state.clone();
     let recv_outbound_peer = outbound_peer.clone();
     let recv_outbound_stream = Arc::clone(&outbound_stream);
     let recv_handle = thread::spawn(move || {
@@ -787,6 +883,7 @@ pub fn run_remote_cp_node(
             node_index,
             recv_domain_id,
             recv_domains,
+            recv_model_state,
             listener,
             expected_inbound_messages,
             recv_outbound_peer,
@@ -802,6 +899,7 @@ pub fn run_remote_cp_node(
             cp_ring_sequence_id(node_index, block_index),
             1,
             &domain,
+            &local_model_state,
             &domain,
             &outbound_peer,
             block_start,
@@ -823,7 +921,7 @@ pub fn run_remote_cp_node(
         summary.messages_sent += 1;
         summary.bytes_sent += bytes_sent;
         summary.compute_updates += 1;
-        push_payload_block(&mut payload_blocks, &message);
+        push_payload_block(&mut payload_blocks, &domain, &local_model_state, &message);
         push_remote_cp_route_preview(&mut first_routes, &message, Some(&outbound_peer.domain_id));
     }
 
@@ -936,6 +1034,7 @@ fn run_cp_ring_node(
 ) -> Result<CpRingNodeReport, ProtocolError> {
     let domain_count = domains.len();
     let domain = domains[domain_index].clone();
+    let model_state = DomainModelState::new(&domain);
     let inbound_peer = domains[(domain_index + domain_count - 1) % domain_count].clone();
     let outbound_peer = domains[(domain_index + 1) % domain_count].clone();
     let mut report = CpRingNodeReport {
@@ -959,6 +1058,7 @@ fn run_cp_ring_node(
             cp_ring_sequence_id(domain_index, block_index),
             1,
             &domain,
+            &model_state,
             &domain,
             &outbound_peer,
             block_start,
@@ -967,7 +1067,7 @@ fn run_cp_ring_node(
         send_cp_node_frame(&next_sender, &message, &mut report, true)?;
         report.source_blocks += 1;
         report.compute_updates += 1;
-        push_payload_block(&mut report.payload_blocks, &message);
+        push_payload_block(&mut report.payload_blocks, &domain, &model_state, &message);
         push_cp_route_preview(&mut report, &message, Some(&outbound_peer.domain_id));
     }
 
@@ -983,7 +1083,7 @@ fn run_cp_ring_node(
         let message = deserialize_message(&frame)?;
         validate_cp_ring_message(domain_index, &domains, &message)?;
         report.compute_updates += 1;
-        push_payload_block(&mut report.payload_blocks, &message);
+        push_payload_block(&mut report.payload_blocks, &domain, &model_state, &message);
 
         let should_forward = message.ring_step < domain_count - 1;
         if should_forward {
@@ -1061,7 +1161,12 @@ fn push_cp_route_preview(
     });
 }
 
-fn push_payload_block(payload_blocks: &mut Vec<CpPayloadBlock>, message: &RingAttnMessage) {
+fn push_payload_block(
+    payload_blocks: &mut Vec<CpPayloadBlock>,
+    compute_domain: &DomainSpec,
+    model_state: &DomainModelState,
+    message: &RingAttnMessage,
+) {
     if message.message_kind != RingAttnMessageKind::KvBlock {
         return;
     }
@@ -1070,9 +1175,12 @@ fn push_payload_block(payload_blocks: &mut Vec<CpPayloadBlock>, message: &RingAt
     };
     payload_blocks.push(CpPayloadBlock {
         sequence_id: message.sequence_id,
+        compute_domain: compute_domain.domain_id.clone(),
         block_len: block.block_len,
+        query_len: model_state.query_len,
         num_heads: tensor.num_heads,
         head_dim: tensor.head_dim,
+        query_payload: model_state.query_payload().to_vec(),
         payload: message.payload.clone(),
     });
 }
@@ -1285,10 +1393,12 @@ struct RemoteCpRecvReport {
     payload_blocks: Vec<CpPayloadBlock>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn receive_remote_cp_node_messages(
     node_index: usize,
     domain_id: String,
     domains: Vec<DomainSpec>,
+    model_state: DomainModelState,
     listener: TcpListener,
     expected_messages: usize,
     outbound_peer: DomainSpec,
@@ -1313,7 +1423,12 @@ fn receive_remote_cp_node_messages(
         report.messages_received += 1;
         report.compute_updates += 1;
         report.bytes_received += bytes_received;
-        push_payload_block(&mut report.payload_blocks, &message);
+        push_payload_block(
+            &mut report.payload_blocks,
+            &domains[node_index],
+            &model_state,
+            &message,
+        );
         let should_forward = message.ring_step < domains.len() - 1;
         if should_forward {
             let forwarded = forward_kv_message(&message, &domains[node_index], &outbound_peer);
@@ -1443,10 +1558,12 @@ fn push_remote_cp_route_preview(
 }
 
 fn remote_kv_block_message(client: &DomainSpec, server: &DomainSpec) -> RingAttnMessage {
+    let client_model_state = DomainModelState::new(client);
     kv_block_message(
         1,
         1,
         client,
+        &client_model_state,
         client,
         server,
         client.seq_offset,
@@ -1578,17 +1695,19 @@ fn block_ranges(spec: &DomainSpec) -> impl Iterator<Item = (usize, usize)> + '_ 
         .map(move |block_start| (block_start, usize::min(block_start + spec.block_size, stop)))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn kv_block_message(
     sequence_id: u64,
     ring_step: usize,
     source: &DomainSpec,
+    source_model_state: &DomainModelState,
     sender: &DomainSpec,
     receiver: &DomainSpec,
     block_start: usize,
     block_stop: usize,
 ) -> RingAttnMessage {
     let block_len = block_stop - block_start;
-    let payload = make_kv_payload(sequence_id, source, block_start, block_len);
+    let payload = source_model_state.kv_block_payload(block_start, block_stop);
     RingAttnMessage {
         schema_version: SCHEMA_VERSION,
         sequence_id,
@@ -1670,37 +1789,16 @@ fn control_message(
     }
 }
 
-fn make_kv_payload(
-    sequence_id: u64,
-    source: &DomainSpec,
-    block_start: usize,
-    block_len: usize,
-) -> Vec<u8> {
-    let values = KV_TENSOR_COUNT * block_len * KV_NUM_HEADS * KV_HEAD_DIM;
-    let mut payload = Vec::with_capacity(values * FLOAT32_BYTES);
-    for tensor_index in 0..KV_TENSOR_COUNT {
-        for token_offset in 0..block_len {
-            let global_token = block_start + token_offset;
-            for head in 0..KV_NUM_HEADS {
-                for dim in 0..KV_HEAD_DIM {
-                    let value = kv_payload_value(
-                        sequence_id,
-                        source,
-                        tensor_index,
-                        global_token,
-                        head,
-                        dim,
-                    );
-                    payload.extend_from_slice(&value.to_le_bytes());
-                }
-            }
-        }
-    }
-    payload
+fn model_q_value(source: &DomainSpec, global_token: usize, head: usize, dim: usize) -> f32 {
+    let source_bias = (source.seq_offset as f32 + 1.0) * 0.0001;
+    (global_token as f32 + 1.0) * 0.011
+        + head as f32 * 0.007_812_5
+        + dim as f32 * 0.000_976_562_5
+        + source_bias
+        + 0.0625
 }
 
-fn kv_payload_value(
-    sequence_id: u64,
+fn model_kv_value(
     source: &DomainSpec,
     tensor_index: usize,
     global_token: usize,
@@ -1708,13 +1806,11 @@ fn kv_payload_value(
     dim: usize,
 ) -> f32 {
     let source_bias = (source.seq_offset as f32 + 1.0) * 0.0001;
-    let sequence_bias = (sequence_id % 97) as f32 * 0.00001;
     let tensor_bias = tensor_index as f32 * 0.031;
     (global_token as f32 + 1.0) * 0.013
         + head as f32 * 0.017
         + dim as f32 * 0.0019
         + source_bias
-        + sequence_bias
         + tensor_bias
 }
 
@@ -1772,4 +1868,56 @@ fn checksum(payload: &[u8]) -> u64 {
     payload.iter().fold(0_u64, |acc, byte| {
         acc.wrapping_mul(131).wrapping_add(*byte as u64)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_domain(seq_offset: usize, seq_chunk_len: usize) -> DomainSpec {
+        DomainSpec {
+            domain_id: format!("test-domain-{seq_offset}"),
+            seq_offset,
+            seq_chunk_len,
+            block_size: 2,
+            device: "cpu".to_string(),
+        }
+    }
+
+    #[test]
+    fn domain_model_state_slices_kv_blocks_from_owned_storage() {
+        let domain = test_domain(8, 6);
+        let state = DomainModelState::new(&domain);
+        let block_start = 10;
+        let block_stop = 13;
+        let payload = state.kv_block_payload(block_start, block_stop);
+
+        let mut expected = Vec::new();
+        for tensor_index in 0..KV_TENSOR_COUNT {
+            for global_token in block_start..block_stop {
+                for head in 0..KV_NUM_HEADS {
+                    for dim in 0..KV_HEAD_DIM {
+                        let value = model_kv_value(&domain, tensor_index, global_token, head, dim);
+                        expected.extend_from_slice(&value.to_le_bytes());
+                    }
+                }
+            }
+        }
+
+        assert_eq!(payload, expected);
+    }
+
+    #[test]
+    fn domain_model_state_query_payload_is_domain_local() {
+        let lhs_domain = test_domain(0, 8);
+        let rhs_domain = test_domain(32, 8);
+        let lhs = DomainModelState::new(&lhs_domain);
+        let rhs = DomainModelState::new(&rhs_domain);
+
+        assert_eq!(
+            lhs.query_payload().len(),
+            QUERY_CHUNK_LEN * KV_NUM_HEADS * KV_HEAD_DIM * FLOAT32_BYTES
+        );
+        assert_ne!(lhs.query_payload(), rhs.query_payload());
+    }
 }

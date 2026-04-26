@@ -1,6 +1,7 @@
 mod protocol;
 
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -1016,10 +1017,7 @@ fn torch_payload_chunk_bridge_report(
     }
 }
 
-fn torch_query_chunk_bridge_report(
-    blocks: &[protocol::CpPayloadBlock],
-    query_seed: u64,
-) -> TorchPayloadBlockReport {
+fn torch_query_chunk_bridge_report(blocks: &[protocol::CpPayloadBlock]) -> TorchPayloadBlockReport {
     let requested_blocks = blocks.len();
     if !cfg!(hcp_torch_enabled) {
         let report = torch_report_from_code(
@@ -1056,6 +1054,7 @@ fn torch_query_chunk_bridge_report(
     };
     let num_heads = first_block.num_heads();
     let head_dim = first_block.head_dim();
+    let query_len = first_block.query_len();
     if blocks
         .iter()
         .any(|block| block.num_heads() != num_heads || block.head_dim() != head_dim)
@@ -1071,32 +1070,79 @@ fn torch_query_chunk_bridge_report(
             message: "inconsistent num_heads/head_dim across CP payload blocks".to_string(),
         };
     }
-    let mut kv_payload = Vec::new();
-    let mut block_lens = Vec::with_capacity(blocks.len());
-    for block in blocks {
-        kv_payload.extend_from_slice(block.payload());
-        block_lens.push(i32::try_from(block.block_len()).unwrap_or(i32::MAX));
+    if blocks.iter().any(|block| block.query_len() != query_len) {
+        return TorchPayloadBlockReport {
+            status: "fail",
+            compiled: cfg!(hcp_torch_enabled),
+            requested_device: env::var("HCP_TORCH_DEVICE").unwrap_or_else(|_| "cpu".to_string()),
+            requested_blocks,
+            processed_blocks: 0,
+            status_code: -6,
+            note: "C++ libtorch query chunk smoke received inconsistent query shapes".to_string(),
+            message: "inconsistent query_len across CP payload blocks".to_string(),
+        };
     }
-    let query_payload = make_domain_query_payload(
-        PAYLOAD_CHUNK_QUERY_LEN as usize,
-        num_heads,
-        head_dim,
-        query_seed,
-    );
-    let code = unsafe {
-        hcp_ringattn_torch_query_chunk_smoke(
-            query_payload.as_ptr(),
-            query_payload.len(),
-            kv_payload.as_ptr(),
-            kv_payload.len(),
-            block_lens.as_ptr(),
-            block_lens.len(),
-            PAYLOAD_CHUNK_QUERY_LEN,
-            i32::try_from(num_heads).unwrap_or(i32::MAX),
-            i32::try_from(head_dim).unwrap_or(i32::MAX),
-        )
-    };
-    let message = c_string_from_ptr(unsafe { hcp_ringattn_torch_query_chunk_smoke_message() });
+
+    let mut groups: BTreeMap<&str, Vec<&protocol::CpPayloadBlock>> = BTreeMap::new();
+    for block in blocks {
+        groups
+            .entry(block.compute_domain())
+            .or_default()
+            .push(block);
+    }
+
+    let mut processed_blocks = 0_usize;
+    let mut code = -6;
+    let mut message = String::new();
+    for (compute_domain, group_blocks) in groups {
+        let Some(group_first) = group_blocks.first() else {
+            continue;
+        };
+        if group_blocks
+            .iter()
+            .any(|block| block.query_payload() != group_first.query_payload())
+        {
+            code = -6;
+            message = format!("inconsistent query payload for compute_domain={compute_domain}");
+            break;
+        }
+
+        let mut kv_payload = Vec::new();
+        let mut block_lens = Vec::with_capacity(group_blocks.len());
+        for block in &group_blocks {
+            kv_payload.extend_from_slice(block.payload());
+            block_lens.push(i32::try_from(block.block_len()).unwrap_or(i32::MAX));
+        }
+        code = unsafe {
+            hcp_ringattn_torch_query_chunk_smoke(
+                group_first.query_payload().as_ptr(),
+                group_first.query_payload().len(),
+                kv_payload.as_ptr(),
+                kv_payload.len(),
+                block_lens.as_ptr(),
+                block_lens.len(),
+                i32::try_from(group_first.query_len()).unwrap_or(i32::MAX),
+                i32::try_from(num_heads).unwrap_or(i32::MAX),
+                i32::try_from(head_dim).unwrap_or(i32::MAX),
+            )
+        };
+        message = c_string_from_ptr(unsafe { hcp_ringattn_torch_query_chunk_smoke_message() });
+        let group_report = torch_report_from_code(
+            code,
+            message.clone(),
+            "C++ libtorch query chunk smoke executed on CPU",
+            "C++ libtorch query chunk smoke executed on MPS",
+            "C++ libtorch query chunk smoke executed on CUDA",
+            "C++ libtorch query chunk smoke is disabled; build with HCP_ENABLE_TORCH=1",
+            "C++ libtorch query chunk smoke failed or returned an unexpected status",
+        );
+        if group_report.status == "fail" {
+            message = format!("compute_domain={compute_domain} {message}");
+            break;
+        }
+        processed_blocks += group_blocks.len();
+    }
+
     let report = torch_report_from_code(
         code,
         message,
@@ -1106,11 +1152,6 @@ fn torch_query_chunk_bridge_report(
         "C++ libtorch query chunk smoke is disabled; build with HCP_ENABLE_TORCH=1",
         "C++ libtorch query chunk smoke failed or returned an unexpected status",
     );
-    let processed_blocks = if report.status == "pass" {
-        requested_blocks
-    } else {
-        0
-    };
     TorchPayloadBlockReport {
         status: report.status,
         compiled: report.compiled,
@@ -1121,29 +1162,6 @@ fn torch_query_chunk_bridge_report(
         note: report.note,
         message: report.message,
     }
-}
-
-fn make_domain_query_payload(
-    query_len: usize,
-    num_heads: usize,
-    head_dim: usize,
-    query_seed: u64,
-) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(query_len * num_heads * head_dim * 4);
-    let seed_shift = (query_seed % 97) as f32 * 0.000_13;
-    for query_index in 0..query_len {
-        for head_index in 0..num_heads {
-            for dim_index in 0..head_dim {
-                let value = 0.0625
-                    + seed_shift
-                    + query_index as f32 * 0.031_25
-                    + head_index as f32 * 0.007_812_5
-                    + dim_index as f32 * 0.000_976_562_5;
-                payload.extend_from_slice(&value.to_le_bytes());
-            }
-        }
-    }
-    payload
 }
 
 fn torch_report_from_code(
@@ -1220,8 +1238,7 @@ fn run() -> Result<Report, RingError> {
         torch_payload_online_bridge_report(cp_ring_smoke.payload_blocks());
     let torch_payload_chunk_bridge =
         torch_payload_chunk_bridge_report(cp_ring_smoke.payload_blocks());
-    let torch_query_chunk_bridge =
-        torch_query_chunk_bridge_report(cp_ring_smoke.payload_blocks(), 0);
+    let torch_query_chunk_bridge = torch_query_chunk_bridge_report(cp_ring_smoke.payload_blocks());
     let status = if failed == 0
         && protocol_smoke.status == "pass"
         && cp_ring_smoke.status == "pass"
@@ -1321,8 +1338,7 @@ fn main() -> Result<(), RingError> {
             torch_payload_online_bridge_report(cp_node.payload_blocks());
         let torch_payload_chunk_bridge =
             torch_payload_chunk_bridge_report(cp_node.payload_blocks());
-        let torch_query_chunk_bridge =
-            torch_query_chunk_bridge_report(cp_node.payload_blocks(), cp_node.node_index() as u64);
+        let torch_query_chunk_bridge = torch_query_chunk_bridge_report(cp_node.payload_blocks());
         let status = if cp_node.status == "pass"
             && torch_payload_block_bridge.status != "fail"
             && torch_payload_online_bridge.status != "fail"
