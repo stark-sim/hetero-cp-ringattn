@@ -25,11 +25,14 @@ REMOTE_LIBTORCH="${REMOTE_LIBTORCH:-/home/stark/libtorch}"
 REMOTE_LIBTORCH_INCLUDE="${REMOTE_LIBTORCH_INCLUDE:-${REMOTE_LIBTORCH}/include}"
 REMOTE_LIBTORCH_LIB="${REMOTE_LIBTORCH_LIB:-${REMOTE_LIBTORCH}/lib}"
 
-if [ -z "${MAC_192_ADDR:-}" ]; then
-    MAC_192_ADDR="$(ifconfig | awk '/inet 192\.168\.8\./ { print $2; exit }')"
+if [ -z "${MAC_NODE_ADDR:-}" ] && [ -n "${MAC_192_ADDR:-}" ]; then
+    MAC_NODE_ADDR="${MAC_192_ADDR}"
 fi
-if [ -z "${MAC_192_ADDR}" ]; then
-    echo "Could not find a local 192.168.8.x address. Set MAC_192_ADDR explicitly." >&2
+if [ -z "${MAC_NODE_ADDR:-}" ]; then
+    MAC_NODE_ADDR="$(ifconfig | awk '/inet / && ($2 ~ /^192\.168\.8\./ || $2 ~ /^100\./) { print $2; exit }')"
+fi
+if [ -z "${MAC_NODE_ADDR}" ]; then
+    echo "Could not find a local 192.168.8.x or 100.x address. Set MAC_NODE_ADDR explicitly." >&2
     exit 1
 fi
 
@@ -70,11 +73,11 @@ run_remote() {
 
 echo "=== HCP Rust Remote CP 3-Node Smoke ==="
 echo "RUN_ID=${RUN_ID}"
-echo "MAC_192_ADDR=${MAC_192_ADDR}"
+echo "MAC_NODE_ADDR=${MAC_NODE_ADDR}"
 echo "GPU_HOST=${GPU_HOST}"
 echo "node0: bind=0.0.0.0:${NODE0_PORT} connect=${GPU_HOST}:${GPU_PORT} device=${LOCAL_TORCH_DEVICE}"
-echo "node1: bind=0.0.0.0:${GPU_PORT} connect=${MAC_192_ADDR}:${NODE2_PORT} device=${GPU_TORCH_DEVICE}"
-echo "node2: bind=0.0.0.0:${NODE2_PORT} connect=${MAC_192_ADDR}:${NODE0_PORT} device=${LOCAL_TORCH_DEVICE}"
+echo "node1: bind=0.0.0.0:${GPU_PORT} connect=${MAC_NODE_ADDR}:${NODE2_PORT} device=${GPU_TORCH_DEVICE}"
+echo "node2: bind=0.0.0.0:${NODE2_PORT} connect=${MAC_NODE_ADDR}:${NODE0_PORT} device=${LOCAL_TORCH_DEVICE}"
 echo "Reports: ${REPORT_DIR}"
 
 if [ "${LOCAL_PREFLIGHT_BUILD}" = "1" ]; then
@@ -131,7 +134,7 @@ start_remote_node() {
     remote_repo_q="$(shell_quote "${GPU_REPO_DIR}")"
     remote_run_id_q="$(shell_quote "${RUN_ID}")"
     remote_bind_q="$(shell_quote "0.0.0.0:${GPU_PORT}")"
-    remote_connect_q="$(shell_quote "${MAC_192_ADDR}:${NODE2_PORT}")"
+    remote_connect_q="$(shell_quote "${MAC_NODE_ADDR}:${NODE2_PORT}")"
     remote_cargo_offline_q="$(shell_quote "${REMOTE_CARGO_OFFLINE}")"
     remote_enable_torch_q="$(shell_quote "${HCP_ENABLE_TORCH}")"
     remote_torch_device_q="$(shell_quote "${GPU_TORCH_DEVICE}")"
@@ -155,7 +158,7 @@ cleanup() {
 trap 'status=$?; cleanup "${status}"; exit "${status}"' INT TERM EXIT
 
 start_local_node 0 "${NODE0_PORT}" "${GPU_HOST}:${GPU_PORT}"
-start_local_node 2 "${NODE2_PORT}" "${MAC_192_ADDR}:${NODE0_PORT}"
+start_local_node 2 "${NODE2_PORT}" "${MAC_NODE_ADDR}:${NODE0_PORT}"
 start_remote_node
 
 overall_status=0

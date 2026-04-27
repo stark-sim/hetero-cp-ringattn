@@ -222,8 +222,8 @@ RUN_ID=rust-remote-cp-3node-<timestamp> \
 
 该脚本会：
 
-- 自动发现当前 Mac 的 `192.168.8.x` 地址，也可用 `MAC_192_ADDR` 覆盖。
-- 在 GPU host `192.168.8.172` 上执行 `git pull --ff-only`，保持远端源码只通过 git 同步。
+- 自动发现当前 Mac 的 `192.168.8.x` 或 `100.x` 地址，也可用 `MAC_NODE_ADDR` 覆盖；`MAC_192_ADDR` 仅保留为兼容旧命令的别名。
+- 在 GPU host 上执行 `git pull --ff-only`，保持远端源码只通过 git 同步；默认 GPU host 为 `192.168.8.172`，临时 VPN 路由可用 `GPU_HOST=100.118.253.68 MAC_NODE_ADDR=100.121.35.138` 覆盖。
 - 对本机和远端先做 cargo preflight build，降低节点启动后因编译耗时错过 retry 窗口的风险。
 - 统一启动 node0、node2、node1，并把 launcher stdout/stderr 写入 `reports/<RUN_ID>/launch_node_<N>.log`。
 - 默认本机节点使用 `HCP_TORCH_DEVICE=mps`，GPU 节点使用 `HCP_TORCH_DEVICE=cuda:0`。
@@ -267,6 +267,14 @@ node2: sent=8 received=8 compute_updates=12 torch_query_chunk_code=2 torch_query
 node0: sent=8 received=8 compute_updates=12 torch_query_output_code=2 torch_query_output_blocks=12/12
 node1: sent=8 received=8 compute_updates=12 torch_query_output_code=3 torch_query_output_blocks=12/12
 node2: sent=8 received=8 compute_updates=12 torch_query_output_code=2 torch_query_output_blocks=12/12
+```
+
+2026-04-27 已用临时 VPN 地址 `GPU_HOST=100.118.253.68 MAC_NODE_ADDR=100.121.35.138` 重跑 `RUN_ID=rust-remote-cp-modelstate-vpn-20260426`。远端先从 `d868522` fast-forward 到 `a84dc9c`，随后三节点均通过：
+
+```text
+node0: sent=8 received=8 compute_updates=12 torch_query_output_code=2 torch_query_output_blocks=12/12 output_seq_offset=0 output_slot_values=288
+node1: sent=8 received=8 compute_updates=12 torch_query_output_code=3 torch_query_output_blocks=12/12 output_seq_offset=32 output_slot_values=288
+node2: sent=8 received=8 compute_updates=12 torch_query_output_code=2 torch_query_output_blocks=12/12 output_seq_offset=64 output_slot_values=288
 ```
 
 ## Smoke Report

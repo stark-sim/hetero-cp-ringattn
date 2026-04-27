@@ -49,6 +49,8 @@
 - [x] [2026-04-26] `DomainModelState` 已接入 CP payload path：每个 domain 持有本地 Q chunk 与 K/V storage，source K/V block 从 state 切片，target compute capture 携带本地 Q payload；本机 MPS、远端 CUDA 和 3-node remote CP 均已验证。
 - [x] [2026-04-26] 已新增统一 3-node remote CP launcher：`scripts/run_rust_remote_cp_3node_smoke.sh` 会自动发现 Mac 子网地址、远端 GPU `git pull --ff-only`、预构建本机/远端 Rust crate，并统一启动 node0/node2 MPS 与 node1 CUDA。
 - [x] [2026-04-26] `RUN_ID=rust-remote-cp-output-unified-20260426` 三节点 remote CP output digest smoke 已通过：node0/node2 MPS `torch_query_output_code=2 torch_query_output_blocks=12/12`，node1 CUDA `torch_query_output_code=3 torch_query_output_blocks=12/12`。
+- [x] [2026-04-27] 已新增 `LayerActivationState` / output slot ownership：每个 domain-local layer state 明确持有 Q chunk、K cache、V cache、output slot，并把 output slot 元数据写入 CP report。
+- [x] [2026-04-27] 临时 VPN remote CP smoke 已通过：`GPU_HOST=100.118.253.68 MAC_NODE_ADDR=100.121.35.138 RUN_ID=rust-remote-cp-modelstate-vpn-20260426` 下 node0/node2 MPS 与 node1 CUDA 均 `sent=8 received=8 compute_updates=12 torch_query_output_blocks=12/12`。
 
 ## 进行中
 
@@ -69,7 +71,7 @@
 - [2026-04-25] 本机 CPU-only libtorch smoke 不能作为 hardware smoke 结论；需要以非沙箱 MPS report 为准。
 - [2026-04-25] 旧版 CLI 只打印 `torch_compiled=true`，不能证明 CUDA/MPS 实际执行；需使用包含 `torch_status` / `torch_code` 的新版 smoke。
 - [2026-04-25] 远端 CUDA smoke 历史问题已解决：根因是 Linux 链接阶段未保留 `libtorch_cuda` / `c10_cuda` registration libraries。
-- [2026-04-26] 当前 query chunk bridge 的 Q/K/V 已由 Rust `DomainModelState` 持有并切片进入 C++，但仍是 deterministic fixture，尚未接入真实模型 activation / weights。
+- [2026-04-27] 当前 query chunk bridge 的 Q/K/V 已由 Rust `LayerActivationState` 持有并切片进入 C++，output slot ownership 已明确；但数值仍是 deterministic fixture，尚未接入真实模型 activation / weights。
 - [2026-04-26] 3-node remote CP query chunk smoke 的一次失败根因是 Mac 子网地址从 `192.168.8.204` 变化到 `192.168.8.239`；后续重跑已通过。后续 remote smoke 前应先用 `ifconfig | rg 'inet 192\\.168\\.8\\.'` 确认当前 Mac 地址。
 
 ## 里程碑

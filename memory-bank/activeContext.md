@@ -56,6 +56,8 @@
 - [2026-04-26] `DomainModelState` 路径已验证：`cargo test --offline` 通过 2 个 state 单元测试；本机非沙箱 MPS 主 smoke、远端 CUDA 主 smoke、`RUN_ID=rust-remote-cp-modelstate-20260426` 三节点 remote CP smoke 均通过。
 - [2026-04-26] 新增 `scripts/run_rust_remote_cp_3node_smoke.sh` 统一 launcher：自动发现当前 Mac `192.168.8.x` 地址、远端 GPU `git pull --ff-only`、本机/远端 cargo preflight build，并统一启动 node0/node2 MPS 与 node1 CUDA。
 - [2026-04-26] `RUN_ID=rust-remote-cp-output-unified-20260426 PORT_BASE=29285 bash scripts/run_rust_remote_cp_3node_smoke.sh` 已通过；三节点均 `sent=8 received=8 compute_updates=12`，MPS nodes `torch_query_output_code=2 12/12`，CUDA node `torch_query_output_code=3 12/12`。
+- [2026-04-27] `DomainModelState` 已拆出 `LayerActivationState`，明确每个 domain-local layer 拥有 Q chunk、K cache、V cache 和 output slot；`torch_query_output_bridge` 会校验 output value 数匹配本地 output slot。
+- [2026-04-27] 临时 VPN 路由已验证：CUDA 节点 `100.118.253.68`，Mac 节点 `100.121.35.138`。`RUN_ID=rust-remote-cp-modelstate-vpn-20260426 PORT_BASE=29295 GPU_HOST=100.118.253.68 MAC_NODE_ADDR=100.121.35.138 bash scripts/run_rust_remote_cp_3node_smoke.sh` 三节点通过，node0/node2 MPS `torch_query_output_code=2 12/12`，node1 CUDA `torch_query_output_code=3 12/12`。
 
 ## 活跃决策
 
@@ -98,7 +100,7 @@
 - Remote P2P 纪律：双机验证不能用 `127.0.0.1` 作为结论；server 应监听 `0.0.0.0` 或目标子网地址，client 应连接 `192.168.8.x` 子网内的 GPU host。
 - Report 纪律：`reports/**/*.json` 是生成产物，默认不提交；如需长期记录实验进展，写入 docs 或 memory-bank。
 - Remote CP node 启动纪律：正式 3-node remote CP smoke 优先使用 `scripts/run_rust_remote_cp_3node_smoke.sh`，让 Mac 地址发现、GPU git 同步、preflight build、节点启动和日志路径统一收敛；手工启动只用于排查。
-- Remote CP 地址纪律：Mac 的 `192.168.8.x` 地址可能变化；重跑 remote CP 前先用 `ifconfig | rg 'inet 192\\.168\\.8\\.'` 确认当前地址，并同步更新 GPU `CONNECT_ADDR` 和本机 node 间 `CONNECT_ADDR`。
+- Remote CP 地址纪律：Mac 的可达地址可能在 `192.168.8.x` 子网或 `100.x` VPN/overlay 网络之间切换；统一 launcher 使用 `MAC_NODE_ADDR` 覆盖本机可达地址，`GPU_HOST` 覆盖 CUDA host。
 - CP block update 纪律：`torch_query_chunk_status=pass` 证明 CP 消息 K/V payload 和 Rust/domain-side Q payload 已驱动设备侧 Q chunk online softmax output smoke；但在 Q 来自真实 domain-local model state 并接入完整 lifecycle 前，不应把它描述为完整 Ring Attention kernel。
 
 ## 当前阻塞

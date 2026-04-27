@@ -42,6 +42,7 @@ project-root/
 - **CP 节点双角色**：`cp_ring_node_runtime` 中每个 domain thread 同时具备 inbound receiver 和 outbound peer；`tcp_remote_cp_node` 已在 Mac/GPU 上验证每个进程同时 listener + outbound peer，并在 3-node remote ring 中验证多 hop forwarding。
 - **CP payload 驱动 device compute**：`RingAttnMessage.payload` 携带 float32 K/V bytes；`cp_ring_node_runtime` 和 `tcp_remote_cp_node` 都会捕获每次 compute update 的 payload block，并通过 C ABI 驱动 C++ ATen/libtorch 在目标设备上执行 payload-backed attention block compute、online softmax state update 和小尺寸 Q chunk output。
 - **Domain-local model state**：`DomainModelState` 是当前最小模型状态边界；每个 domain 持有自己的 Q chunk 和 K/V storage。source domain 从自己的 K/V storage 切出 block，target domain 捕获 compute update 时携带自己的 Q payload。
+- **Layer activation state**：`LayerActivationState` 将 domain-local Q chunk、K cache、V cache 与 output slot 作为同一个 layer 生命周期的所有权边界；CP compute capture 会带出 output slot 元数据，Rust report 校验设备侧 output value 数与本地 output slot 匹配。
 - **Rust/domain-side Q payload**：`torch_query_chunk_bridge` 使用 captured block 上的 target-domain Q payload，并按 `compute_domain` 分组调用 C++ ATen bridge；C++ 只负责 tensor parse / device compute / CPU reference 对比，不在该路径内部生成 Q。
 - **统一 remote CP launcher**：3-node remote CP smoke 通过 `scripts/run_rust_remote_cp_3node_smoke.sh` 收敛 Mac 地址发现、GPU git 同步、cargo preflight build、三节点统一启动和 launcher 日志，避免手工时序导致 connect / accept retry 窗口失败。
 - **reference-first correctness**：Python kernel stub 保留 reference attention，用于与 block-wise online softmax 对照。
@@ -92,3 +93,4 @@ project-root/
 | Q payload 先从 Rust/domain-side 显式传入 C++ | 这样先切断 C++ bridge 内部 synthetic Q 的隐式依赖，再逐步升级到真实 model activation / state lifecycle | [2026-04-26] |
 | 用 `DomainModelState` 收敛 Q/K/V ownership | 先在 Rust runtime 中明确每个 domain 拥有哪些 Q/K/V state，再接真实模型 activation / weight lifecycle | [2026-04-26] |
 | 3-node remote CP smoke 使用统一 launcher | 三节点需要同时覆盖本机 MPS、远端 CUDA、git 同步、当前 Mac 子网地址和启动时序；用脚本统一执行比手工命令更可复现 | [2026-04-26] |
+| 用 `LayerActivationState` 表达真实模型层生命周期 | 真实模型推进前必须先明确 Q/K/V cache 与 output buffer ownership，否则设备侧 output digest 无法对应到 domain-local 输出槽 | [2026-04-27] |

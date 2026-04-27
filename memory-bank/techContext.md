@@ -146,7 +146,7 @@ RUN_ID=rust-remote-cp-3node-<timestamp> \
   bash scripts/run_rust_remote_cp_3node_smoke.sh
 ```
 
-该脚本会自动发现当前 Mac `192.168.8.x` 地址，在 GPU host `192.168.8.172` 上执行 `git pull --ff-only` 和 cargo preflight build，然后统一启动本机 node0/node2 与远端 CUDA node1。默认本机节点使用 MPS，GPU 节点使用 CUDA。
+该脚本会自动发现当前 Mac `192.168.8.x` 或 `100.x` 地址，在 GPU host 上执行 `git pull --ff-only` 和 cargo preflight build，然后统一启动本机 node0/node2 与远端 CUDA node1。默认本机节点使用 MPS，GPU 节点使用 CUDA。默认 GPU host 为 `192.168.8.172`；临时 VPN 路由使用 `GPU_HOST=100.118.253.68 MAC_NODE_ADDR=100.121.35.138`。
 
 ### 环境变量
 
@@ -161,10 +161,11 @@ RUN_ID=rust-remote-cp-3node-<timestamp> \
 - `NODE_INDEX`：remote CP node index；当前 `0=mac-mps`，`1=gpu-cuda`。
 - `HCP_REMOTE_CP_DOMAINS=2|3`：remote CP node 拓扑大小，默认 2；设置为 3 时为 `mac-mps -> gpu-cuda -> mac-mps-2 -> mac-mps`。
 - `PORT_BASE`：`run_rust_remote_cp_3node_smoke.sh` 使用的三节点端口基准，默认 `29250`；GPU node1 使用 `PORT_BASE`，node0 使用 `PORT_BASE+1`，node2 使用 `PORT_BASE+2`。
-- `MAC_192_ADDR`：覆盖统一 launcher 自动发现的 Mac `192.168.8.x` 地址。
+- `MAC_NODE_ADDR`：覆盖统一 launcher 自动发现的 Mac node 地址，支持 `192.168.8.x` 和 `100.x` VPN/overlay 地址。
+- `MAC_192_ADDR`：兼容旧命令的别名；如果 `MAC_NODE_ADDR` 未设置且 `MAC_192_ADDR` 存在，launcher 会使用它。
 - `GPU_HOST` / `GPU_USER` / `GPU_REPO_DIR`：覆盖统一 launcher 的远端 GPU 地址、SSH 用户和远端仓库目录；默认分别为 `192.168.8.172`、`stark`、`hetero-cp-ringattn`。
 - `LOCAL_CARGO_OFFLINE` / `REMOTE_CARGO_OFFLINE`：统一 launcher 的本机/远端 cargo offline 开关，默认均为 `0`，避免远端 cache miss 干扰 smoke。
-- remote CP smoke 前应先用 `ifconfig | rg 'inet 192\\.168\\.8\\.'` 确认当前 Mac `192.168.8.x` 地址，并把 GPU 侧 `CONNECT_ADDR=<MAC_192_ADDR>:...` 更新为当前值；2026-04-26 已出现从 `192.168.8.204` 变为 `192.168.8.239` 的情况。
+- remote CP smoke 前应确认当前 Mac 可被 GPU 节点访问的地址。`192.168.8.x` 子网曾出现从 `192.168.8.204` 变为 `192.168.8.239` 的情况；2026-04-27 临时 VPN 路由使用 Mac `100.121.35.138`、CUDA `100.118.253.68`。
 - 本机 Mac hardware smoke 使用 `HCP_TORCH_DEVICE=mps` 并越过普通沙箱；CPU smoke 只用于编译/链接 fallback。
 - 启用 `HCP_ENABLE_TORCH=1` 后，Rust smoke 要求 torch bridge 成功；CLI summary 中 `torch_status=pass` 且设备成功码匹配才算硬件 smoke 通过。
 - `torch_block_update_status=pass` 表示 `cp_ring_node_runtime.compute_updates()` 已驱动同等次数的 C++ ATen attention block compute；MPS 成功码为 2，CUDA 成功码为 3。
