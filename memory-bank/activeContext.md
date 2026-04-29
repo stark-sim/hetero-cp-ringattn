@@ -58,6 +58,8 @@
 - [2026-04-26] `RUN_ID=rust-remote-cp-output-unified-20260426 PORT_BASE=29285 bash scripts/run_rust_remote_cp_3node_smoke.sh` 已通过；三节点均 `sent=8 received=8 compute_updates=12`，MPS nodes `torch_query_output_code=2 12/12`，CUDA node `torch_query_output_code=3 12/12`。
 - [2026-04-27] `DomainModelState` 已拆出 `LayerActivationState`，明确每个 domain-local layer 拥有 Q chunk、K cache、V cache 和 output slot；`torch_query_output_bridge` 会校验 output value 数匹配本地 output slot。
 - [2026-04-27] 临时 VPN 路由已验证：CUDA 节点 `100.118.253.68`，Mac 节点 `100.121.35.138`。`RUN_ID=rust-remote-cp-modelstate-vpn-20260426 PORT_BASE=29295 GPU_HOST=100.118.253.68 MAC_NODE_ADDR=100.121.35.138 bash scripts/run_rust_remote_cp_3node_smoke.sh` 三节点通过，node0/node2 MPS `torch_query_output_code=2 12/12`，node1 CUDA `torch_query_output_code=3 12/12`。
+- [2026-04-29] `DomainModelState` 已从直接 Q/K/V fixture 生成推进到 projection 数据流：domain-local hidden states 通过 `ModelLayerWeights` 的 Q/K/V projection 生成 Q chunk、K cache、V cache；当前 projection weights deterministic 初始化，用于可复现 smoke，后续可替换真实权重加载。
+- [2026-04-29] `RUN_ID=rust-remote-cp-projection-lan-20260429 PORT_BASE=29315 GPU_HOST=192.168.8.172 MAC_NODE_ADDR=192.168.8.239 bash scripts/run_rust_remote_cp_3node_smoke.sh` 已通过；远端 CUDA node 从 `ccffedc` fast-forward 到 `46c9e18`，三节点均 `sent=8 received=8 compute_updates=12 torch_query_output_blocks=12/12`。
 
 ## 活跃决策
 
@@ -101,7 +103,7 @@
 - Report 纪律：`reports/**/*.json` 是生成产物，默认不提交；如需长期记录实验进展，写入 docs 或 memory-bank。
 - Remote CP node 启动纪律：正式 3-node remote CP smoke 优先使用 `scripts/run_rust_remote_cp_3node_smoke.sh`，让 Mac 地址发现、GPU git 同步、preflight build、节点启动和日志路径统一收敛；手工启动只用于排查。
 - Remote CP 地址纪律：Mac 的可达地址可能在 `192.168.8.x` 子网或 `100.x` VPN/overlay 网络之间切换；统一 launcher 使用 `MAC_NODE_ADDR` 覆盖本机可达地址，`GPU_HOST` 覆盖 CUDA host。
-- CP block update 纪律：`torch_query_chunk_status=pass` 证明 CP 消息 K/V payload 和 Rust/domain-side Q payload 已驱动设备侧 Q chunk online softmax output smoke；但在 Q 来自真实 domain-local model state 并接入完整 lifecycle 前，不应把它描述为完整 Ring Attention kernel。
+- CP block update 纪律：`torch_query_chunk_status=pass` 证明 CP 消息 K/V payload 和 Rust/domain-side Q payload 已驱动设备侧 Q chunk online softmax output smoke；当前 Q/K/V 已来自 hidden states + projection weights，但在权重加载、RoPE、norm/residual 和完整 layer lifecycle 接入前，不应把它描述为完整 Transformer layer。
 
 ## 当前阻塞
 

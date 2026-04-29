@@ -277,6 +277,14 @@ node1: sent=8 received=8 compute_updates=12 torch_query_output_code=3 torch_quer
 node2: sent=8 received=8 compute_updates=12 torch_query_output_code=2 torch_query_output_blocks=12/12 output_seq_offset=64 output_slot_values=288
 ```
 
+2026-04-29 已将 `DomainModelState` 从直接 Q/K/V fixture 生成推进到 projection 数据流：domain-local hidden states 通过 `ModelLayerWeights` 的 Q/K/V projection 生成 Q chunk、K cache、V cache。`RUN_ID=rust-remote-cp-projection-lan-20260429` 在 `GPU_HOST=192.168.8.172 MAC_NODE_ADDR=192.168.8.239` 下通过，远端先从 `ccffedc` fast-forward 到 `46c9e18`：
+
+```text
+node0: sent=8 received=8 compute_updates=12 torch_query_output_code=2 torch_query_output_blocks=12/12 hidden_bytes=2048 q_proj_bytes=4608 k_proj_bytes=4608 v_proj_bytes=4608
+node1: sent=8 received=8 compute_updates=12 torch_query_output_code=3 torch_query_output_blocks=12/12 hidden_bytes=2048 q_proj_bytes=4608 k_proj_bytes=4608 v_proj_bytes=4608
+node2: sent=8 received=8 compute_updates=12 torch_query_output_code=2 torch_query_output_blocks=12/12 hidden_bytes=2048 q_proj_bytes=4608 k_proj_bytes=4608 v_proj_bytes=4608
+```
+
 ## Smoke Report
 
 运行：
