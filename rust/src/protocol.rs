@@ -24,6 +24,8 @@ const REMOTE_SERVER_DOMAIN: &str = "gpu-cuda";
 const KV_NUM_HEADS: usize = 3;
 const KV_HEAD_DIM: usize = 24;
 const KV_TENSOR_COUNT: usize = 2;
+const MODEL_HIDDEN_DIM: usize = 16;
+const MODEL_LAYER_INDEX: i32 = 0;
 const QUERY_CHUNK_LEN: usize = 4;
 const FLOAT32_BYTES: usize = 4;
 
@@ -80,13 +82,32 @@ struct DomainSpec {
 }
 
 #[derive(Clone, Debug)]
+struct ModelLayerWeights {
+    layer_index: i32,
+    hidden_dim: usize,
+    projection_dim: usize,
+    q_proj: Vec<f32>,
+    k_proj: Vec<f32>,
+    v_proj: Vec<f32>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ProjectionKind {
+    Query,
+    Key,
+    Value,
+}
+
+#[derive(Clone, Debug)]
 struct LayerActivationState {
     layer_index: i32,
     seq_offset: usize,
     seq_chunk_len: usize,
+    hidden_dim: usize,
     query_len: usize,
     num_heads: usize,
     head_dim: usize,
+    hidden_states: Vec<f32>,
     q_chunk: Vec<u8>,
     k_cache: Vec<u8>,
     v_cache: Vec<u8>,
@@ -97,6 +118,7 @@ struct LayerActivationState {
 struct DomainModelState {
     domain_id: String,
     device: String,
+    weights: ModelLayerWeights,
     activation: LayerActivationState,
 }
 
@@ -107,57 +129,115 @@ struct ModelStateSummary {
     layer_index: i32,
     seq_offset: usize,
     seq_chunk_len: usize,
+    hidden_dim: usize,
     query_len: usize,
     num_heads: usize,
     head_dim: usize,
+    hidden_bytes: usize,
+    q_proj_bytes: usize,
+    k_proj_bytes: usize,
+    v_proj_bytes: usize,
     q_bytes: usize,
     k_cache_bytes: usize,
     v_cache_bytes: usize,
     output_slot_bytes: usize,
 }
 
+impl ModelLayerWeights {
+    fn new(layer_index: i32, hidden_dim: usize, projection_dim: usize) -> Self {
+        Self {
+            layer_index,
+            hidden_dim,
+            projection_dim,
+            q_proj: build_projection_weights(
+                layer_index,
+                hidden_dim,
+                projection_dim,
+                ProjectionKind::Query,
+            ),
+            k_proj: build_projection_weights(
+                layer_index,
+                hidden_dim,
+                projection_dim,
+                ProjectionKind::Key,
+            ),
+            v_proj: build_projection_weights(
+                layer_index,
+                hidden_dim,
+                projection_dim,
+                ProjectionKind::Value,
+            ),
+        }
+    }
+
+    fn projection(&self, kind: ProjectionKind) -> &[f32] {
+        match kind {
+            ProjectionKind::Query => &self.q_proj,
+            ProjectionKind::Key => &self.k_proj,
+            ProjectionKind::Value => &self.v_proj,
+        }
+    }
+
+    fn project_token(&self, hidden: &[f32], kind: ProjectionKind) -> Vec<f32> {
+        debug_assert_eq!(hidden.len(), self.hidden_dim);
+        let weights = self.projection(kind);
+        let mut output = Vec::with_capacity(self.projection_dim);
+        for output_index in 0..self.projection_dim {
+            let mut value = projection_bias(self.layer_index, output_index, kind);
+            for hidden_index in 0..self.hidden_dim {
+                value += hidden[hidden_index]
+                    * weights[hidden_index * self.projection_dim + output_index];
+            }
+            output.push(value);
+        }
+        output
+    }
+}
+
 impl DomainModelState {
     fn new(domain: &DomainSpec) -> Self {
         let query_len = usize::min(QUERY_CHUNK_LEN, domain.seq_chunk_len);
-        let q_values = query_len * KV_NUM_HEADS * KV_HEAD_DIM;
-        let cache_values = domain.seq_chunk_len * KV_NUM_HEADS * KV_HEAD_DIM;
+        let projection_dim = KV_NUM_HEADS * KV_HEAD_DIM;
+        let weights = ModelLayerWeights::new(MODEL_LAYER_INDEX, MODEL_HIDDEN_DIM, projection_dim);
         let output_values = query_len * KV_NUM_HEADS * KV_HEAD_DIM;
-        let mut q_chunk = Vec::with_capacity(q_values * FLOAT32_BYTES);
-        let mut k_cache = Vec::with_capacity(cache_values * FLOAT32_BYTES);
-        let mut v_cache = Vec::with_capacity(cache_values * FLOAT32_BYTES);
+        let hidden_states = build_hidden_states(domain, MODEL_HIDDEN_DIM);
+        let mut q_chunk = Vec::with_capacity(query_len * projection_dim * FLOAT32_BYTES);
+        let mut k_cache = Vec::with_capacity(domain.seq_chunk_len * projection_dim * FLOAT32_BYTES);
+        let mut v_cache = Vec::with_capacity(domain.seq_chunk_len * projection_dim * FLOAT32_BYTES);
 
         for token_offset in 0..query_len {
-            let global_token = domain.seq_offset + token_offset;
-            for head in 0..KV_NUM_HEADS {
-                for dim in 0..KV_HEAD_DIM {
-                    let value = model_q_value(domain, global_token, head, dim);
-                    q_chunk.extend_from_slice(&value.to_le_bytes());
-                }
-            }
+            let hidden = hidden_token(&hidden_states, token_offset, MODEL_HIDDEN_DIM);
+            append_f32_values(
+                &mut q_chunk,
+                &weights.project_token(hidden, ProjectionKind::Query),
+            );
         }
 
         for token_offset in 0..domain.seq_chunk_len {
-            let global_token = domain.seq_offset + token_offset;
-            for head in 0..KV_NUM_HEADS {
-                for dim in 0..KV_HEAD_DIM {
-                    let k_value = model_kv_value(domain, 0, global_token, head, dim);
-                    let v_value = model_kv_value(domain, 1, global_token, head, dim);
-                    k_cache.extend_from_slice(&k_value.to_le_bytes());
-                    v_cache.extend_from_slice(&v_value.to_le_bytes());
-                }
-            }
+            let hidden = hidden_token(&hidden_states, token_offset, MODEL_HIDDEN_DIM);
+            append_f32_values(
+                &mut k_cache,
+                &weights.project_token(hidden, ProjectionKind::Key),
+            );
+            append_f32_values(
+                &mut v_cache,
+                &weights.project_token(hidden, ProjectionKind::Value),
+            );
         }
 
         Self {
             domain_id: domain.domain_id.clone(),
             device: domain.device.clone(),
+            weights,
             activation: LayerActivationState {
-                layer_index: 0,
+                layer_index: MODEL_LAYER_INDEX,
                 seq_offset: domain.seq_offset,
                 seq_chunk_len: domain.seq_chunk_len,
+                hidden_dim: MODEL_HIDDEN_DIM,
                 query_len,
                 num_heads: KV_NUM_HEADS,
                 head_dim: KV_HEAD_DIM,
+                hidden_states,
                 q_chunk,
                 k_cache,
                 v_cache,
@@ -214,9 +294,14 @@ impl DomainModelState {
             layer_index: self.activation.layer_index,
             seq_offset: self.activation.seq_offset,
             seq_chunk_len: self.activation.seq_chunk_len,
+            hidden_dim: self.activation.hidden_dim,
             query_len: self.activation.query_len,
             num_heads: self.activation.num_heads,
             head_dim: self.activation.head_dim,
+            hidden_bytes: self.activation.hidden_states.len() * FLOAT32_BYTES,
+            q_proj_bytes: self.weights.q_proj.len() * FLOAT32_BYTES,
+            k_proj_bytes: self.weights.k_proj.len() * FLOAT32_BYTES,
+            v_proj_bytes: self.weights.v_proj.len() * FLOAT32_BYTES,
             q_bytes: self.activation.q_chunk.len(),
             k_cache_bytes: self.activation.k_cache.len(),
             v_cache_bytes: self.activation.v_cache.len(),
@@ -1799,7 +1884,7 @@ fn kv_block_message(
     RingAttnMessage {
         schema_version: SCHEMA_VERSION,
         sequence_id,
-        layer_index: 0,
+        layer_index: source_model_state.layer_index(),
         ring_step,
         source_domain: source.domain_id.clone(),
         sender_domain: sender.domain_id.clone(),
@@ -1877,29 +1962,78 @@ fn control_message(
     }
 }
 
-fn model_q_value(source: &DomainSpec, global_token: usize, head: usize, dim: usize) -> f32 {
-    let source_bias = (source.seq_offset as f32 + 1.0) * 0.0001;
-    (global_token as f32 + 1.0) * 0.011
-        + head as f32 * 0.007_812_5
-        + dim as f32 * 0.000_976_562_5
-        + source_bias
-        + 0.0625
+fn build_hidden_states(domain: &DomainSpec, hidden_dim: usize) -> Vec<f32> {
+    let mut hidden_states = Vec::with_capacity(domain.seq_chunk_len * hidden_dim);
+    for token_offset in 0..domain.seq_chunk_len {
+        let global_token = domain.seq_offset + token_offset;
+        for hidden_index in 0..hidden_dim {
+            hidden_states.push(hidden_state_value(domain, global_token, hidden_index));
+        }
+    }
+    hidden_states
 }
 
-fn model_kv_value(
-    source: &DomainSpec,
-    tensor_index: usize,
-    global_token: usize,
-    head: usize,
-    dim: usize,
+fn hidden_token(hidden_states: &[f32], token_offset: usize, hidden_dim: usize) -> &[f32] {
+    let start = token_offset * hidden_dim;
+    &hidden_states[start..start + hidden_dim]
+}
+
+fn append_f32_values(bytes: &mut Vec<u8>, values: &[f32]) {
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn build_projection_weights(
+    layer_index: i32,
+    hidden_dim: usize,
+    projection_dim: usize,
+    kind: ProjectionKind,
+) -> Vec<f32> {
+    let mut weights = Vec::with_capacity(hidden_dim * projection_dim);
+    for hidden_index in 0..hidden_dim {
+        for output_index in 0..projection_dim {
+            weights.push(projection_weight_value(
+                layer_index,
+                hidden_index,
+                output_index,
+                kind,
+            ));
+        }
+    }
+    weights
+}
+
+fn hidden_state_value(source: &DomainSpec, global_token: usize, hidden_index: usize) -> f32 {
+    let source_bias = (source.seq_offset as f32 + 1.0) * 0.000_017;
+    (global_token as f32 + 1.0) * 0.0025 + hidden_index as f32 * 0.000_83 + source_bias + 0.01
+}
+
+fn projection_weight_value(
+    layer_index: i32,
+    hidden_index: usize,
+    output_index: usize,
+    kind: ProjectionKind,
 ) -> f32 {
-    let source_bias = (source.seq_offset as f32 + 1.0) * 0.0001;
-    let tensor_bias = tensor_index as f32 * 0.031;
-    (global_token as f32 + 1.0) * 0.013
-        + head as f32 * 0.017
-        + dim as f32 * 0.0019
-        + source_bias
-        + tensor_bias
+    let kind_bias = match kind {
+        ProjectionKind::Query => 0.000_31,
+        ProjectionKind::Key => 0.000_47,
+        ProjectionKind::Value => 0.000_59,
+    };
+    let layer_bias = (layer_index as f32 + 1.0) * 0.000_019;
+    (hidden_index as f32 + 1.0) * 0.000_071
+        + (output_index as f32 + 1.0) * 0.000_003_7
+        + kind_bias
+        + layer_bias
+}
+
+fn projection_bias(layer_index: i32, output_index: usize, kind: ProjectionKind) -> f32 {
+    let kind_bias = match kind {
+        ProjectionKind::Query => 0.0031,
+        ProjectionKind::Key => 0.0047,
+        ProjectionKind::Value => 0.0059,
+    };
+    kind_bias + (layer_index as f32 + 1.0) * 0.000_13 + output_index as f32 * 0.000_002
 }
 
 fn make_softmax_state_payload(source: &DomainSpec) -> Vec<u8> {
@@ -1980,17 +2114,14 @@ mod tests {
         let block_stop = 13;
         let payload = state.kv_block_payload(block_start, block_stop);
 
+        let local_start = block_start - domain.seq_offset;
+        let block_len = block_stop - block_start;
+        let bytes_per_token = KV_NUM_HEADS * KV_HEAD_DIM * FLOAT32_BYTES;
+        let offset = local_start * bytes_per_token;
+        let bytes = block_len * bytes_per_token;
         let mut expected = Vec::new();
-        for tensor_index in 0..KV_TENSOR_COUNT {
-            for global_token in block_start..block_stop {
-                for head in 0..KV_NUM_HEADS {
-                    for dim in 0..KV_HEAD_DIM {
-                        let value = model_kv_value(&domain, tensor_index, global_token, head, dim);
-                        expected.extend_from_slice(&value.to_le_bytes());
-                    }
-                }
-            }
-        }
+        expected.extend_from_slice(&state.activation.k_cache[offset..offset + bytes]);
+        expected.extend_from_slice(&state.activation.v_cache[offset..offset + bytes]);
 
         assert_eq!(payload, expected);
     }
@@ -2034,5 +2165,33 @@ mod tests {
             summary.v_cache_bytes,
             domain.seq_chunk_len * KV_NUM_HEADS * KV_HEAD_DIM * FLOAT32_BYTES
         );
+    }
+
+    #[test]
+    fn domain_model_state_projects_qkv_from_hidden_states() {
+        let domain = test_domain(4, 8);
+        let state = DomainModelState::new(&domain);
+        let hidden = hidden_token(&state.activation.hidden_states, 0, MODEL_HIDDEN_DIM);
+        let expected_q0 = state.weights.project_token(hidden, ProjectionKind::Query)[0];
+        let expected_k0 = state.weights.project_token(hidden, ProjectionKind::Key)[0];
+        let expected_v0 = state.weights.project_token(hidden, ProjectionKind::Value)[0];
+
+        assert!((read_f32(&state.activation.q_chunk, 0) - expected_q0).abs() < f32::EPSILON);
+        assert!((read_f32(&state.activation.k_cache, 0) - expected_k0).abs() < f32::EPSILON);
+        assert!((read_f32(&state.activation.v_cache, 0) - expected_v0).abs() < f32::EPSILON);
+        assert_ne!(
+            expected_q0,
+            hidden_state_value(&domain, domain.seq_offset, 0)
+        );
+    }
+
+    fn read_f32(bytes: &[u8], value_index: usize) -> f32 {
+        let start = value_index * FLOAT32_BYTES;
+        f32::from_le_bytes([
+            bytes[start],
+            bytes[start + 1],
+            bytes[start + 2],
+            bytes[start + 3],
+        ])
     }
 }
