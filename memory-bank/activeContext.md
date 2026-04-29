@@ -2,7 +2,7 @@
 
 ## 当前焦点
 
-[2026-04-24] 当前主线切到 Rust + C++：Rust 负责 Ring Attention correctness / report / 后续协议模型，C++ 继续承载已有 core/runtime skeleton，并通过 C ABI 与 Rust binary 集成。Python 只保留历史原型，不再作为优先实现路径。
+[2026-04-29] 当前主线是 Rust + C++ 的 projection-first Ring Attention runtime：Rust 负责 correctness / report / protocol / remote CP smoke，C++ 负责 libtorch attention bridge；Python 只保留历史原型，不再作为优先实现路径。当前已完成 hidden states + projection weights -> Q/K/V 的最小真实数据流，下一步是接真实权重加载与 layer config。
 
 ## 近期变化
 
