@@ -1,4 +1,5 @@
 mod compute_runtime;
+mod model;
 mod protocol;
 mod tch_backend;
 
