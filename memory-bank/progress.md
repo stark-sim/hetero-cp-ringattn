@@ -68,6 +68,9 @@
 - [x] [2026-04-30] `tch_backend.rs` 已实现全部 6 个 C++ ATen 桥接对标函数（attention block updates、payload block、payload online、payload chunk、query chunk、query chunk output）。
 - [x] [2026-04-30] `main.rs` 已接入全部 5 个 tch payload/query bridge report，与 C++ bridge 并行；`Report` / `RemoteCpNodeRunReport` / `run()` / cp-node 路径 / CLI summary / fail message 打印均已同步。
 - [x] [2026-04-30] 本机 CPU tch 全桥接 smoke 通过：`status=pass`，全部 6 个 bridge `code=1`，payload/query 各 `30/30`，query output `groups=3`。
+- [x] [2026-04-30] 本机 MPS + 远端 CUDA tch 全桥接 smoke 通过。
+- [x] [2026-04-30] 3-node remote CP tch 全桥接 smoke 通过：node0/node2 MPS `code=2 12/12`，node1 CUDA `code=3 12/12`；C++ bridge 与 tch bridge 并行全部通过。
+- [x] [2026-04-30] `scripts/run_rust_remote_cp_node.sh` 和 `run_rust_remote_cp_3node_smoke.sh` 已支持自动启用 `tch-backend` feature 并传递 `HCP_TCH_DEVICE`。
 
 ## 进行中
 

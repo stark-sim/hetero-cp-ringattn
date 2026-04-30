@@ -74,6 +74,10 @@
 - [2026-04-30] `tch_backend.rs` 已扩展全部 6 个桥接函数：`run_attention_block_updates`、`run_payload_block_smoke`、`run_payload_online_smoke`、`run_payload_chunk_smoke`、`run_query_chunk_smoke`、`run_query_chunk_output_smoke`（通过 `run_query_chunk_smoke` 返回 checksum/max_err/output_values）。
 - [2026-04-30] `main.rs` 已完整接入全部 5 个 tch payload/query 桥接 report：`tch_payload_block_bridge`、`tch_payload_online_bridge`、`tch_payload_chunk_bridge`、`tch_query_chunk_bridge`、`tch_query_output_bridge`。`Report` 和 `RemoteCpNodeRunReport` 均已包含对应字段；`run()` 和 cp-node 路径均已调用并纳入 `status` pass/fail 逻辑；CLI summary 已输出全部 tch 字段；fail message 打印块已补充。
 - [2026-04-30] 本机 CPU tch 全桥接 smoke 通过：`status=pass`，全部 6 个 tch bridge `status=pass code=1`，payload/query 各 `30/30` blocks，query output `groups=3`。
+- [2026-04-30] 本机 MPS tch 全桥接 smoke 通过：全部 6 个 tch bridge `code=2`。
+- [2026-04-30] 远端 CUDA tch 全桥接 smoke 通过：全部 6 个 tch bridge `code=3`。
+- [2026-04-30] 3-node remote CP tch 全桥接 smoke 通过：`RUN_ID=rust-remote-cp-tch-full-20260430 PORT_BASE=29325`，node0/node2 MPS `code=2 12/12`，node1 CUDA `code=3 12/12`；C++ bridge 和 tch bridge 并行全部通过。
+- [2026-04-30] `scripts/run_rust_remote_cp_node.sh` 已支持自动启用 `tch-backend` feature 并显式指定 `--bin hcp-ringattn-rust`；`scripts/run_rust_remote_cp_3node_smoke.sh` 已传递 `HCP_TCH_DEVICE` 到所有节点并在 preflight build 中启用 tch-backend。
 
 ## 活跃决策
 
