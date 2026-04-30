@@ -1,4 +1,5 @@
 mod protocol;
+mod tch_backend;
 
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -92,6 +93,7 @@ struct Report {
     cxx_bridge: CxxBridgeReport,
     torch_bridge: TorchBridgeReport,
     torch_attention_bridge: TorchBridgeReport,
+    tch_attention_bridge: TorchBridgeReport,
     torch_block_update_bridge: TorchBlockUpdateReport,
     torch_payload_block_bridge: TorchPayloadBlockReport,
     torch_payload_online_bridge: TorchPayloadBlockReport,
@@ -753,6 +755,53 @@ fn torch_attention_bridge_report() -> TorchBridgeReport {
         "C++ libtorch attention smoke is disabled; build with HCP_ENABLE_TORCH=1",
         "C++ libtorch attention smoke failed or returned an unexpected status",
     )
+}
+
+fn tch_attention_bridge_report() -> TorchBridgeReport {
+    if !cfg!(feature = "tch-backend") {
+        return TorchBridgeReport {
+            status: "disabled",
+            compiled: false,
+            requested_device: "none".to_string(),
+            status_code: 0,
+            note: "tch-rs attention smoke is disabled; build with --features tch-backend".to_string(),
+            message: "tch-backend feature not enabled".to_string(),
+        };
+    }
+    match tch_backend::backend::run_attention_block_updates(1) {
+        Ok((code, message)) => {
+            let device_name = env::var("HCP_TCH_DEVICE")
+                .or_else(|_| env::var("HCP_TORCH_DEVICE"))
+                .unwrap_or_else(|_| "cpu".to_string());
+            let (note, status) = match code {
+                1 => ("tch-rs attention smoke executed on CPU".to_string(), "pass"),
+                2 => ("tch-rs attention smoke executed on MPS".to_string(), "pass"),
+                3 => ("tch-rs attention smoke executed on CUDA".to_string(), "pass"),
+                _ => ("tch-rs attention smoke returned unexpected status".to_string(), "fail"),
+            };
+            TorchBridgeReport {
+                status,
+                compiled: true,
+                requested_device: device_name,
+                status_code: code,
+                note,
+                message,
+            }
+        }
+        Err(e) => {
+            let device_name = env::var("HCP_TCH_DEVICE")
+                .or_else(|_| env::var("HCP_TORCH_DEVICE"))
+                .unwrap_or_else(|_| "cpu".to_string());
+            TorchBridgeReport {
+                status: "fail",
+                compiled: true,
+                requested_device: device_name,
+                status_code: -1,
+                note: "tch-rs attention smoke failed".to_string(),
+                message: e,
+            }
+        }
+    }
 }
 
 fn torch_block_update_bridge_report(requested_updates: usize) -> TorchBlockUpdateReport {
@@ -1451,6 +1500,7 @@ fn run() -> Result<Report, RingError> {
     let cp_ring_smoke = protocol::run_cp_ring_node_smoke()?;
     let torch_bridge = torch_bridge_report();
     let torch_attention_bridge = torch_attention_bridge_report();
+    let tch_attention_bridge = tch_attention_bridge_report();
     let torch_block_update_bridge =
         torch_block_update_bridge_report(cp_ring_smoke.compute_updates());
     let torch_payload_block_bridge =
@@ -1467,6 +1517,7 @@ fn run() -> Result<Report, RingError> {
         && cp_ring_smoke.status == "pass"
         && torch_bridge.status != "fail"
         && torch_attention_bridge.status != "fail"
+        && tch_attention_bridge.status != "fail"
         && torch_block_update_bridge.status != "fail"
         && torch_payload_block_bridge.status != "fail"
         && torch_payload_online_bridge.status != "fail"
@@ -1493,6 +1544,7 @@ fn run() -> Result<Report, RingError> {
         },
         torch_bridge,
         torch_attention_bridge,
+        tch_attention_bridge,
         torch_block_update_bridge,
         torch_payload_block_bridge,
         torch_payload_online_bridge,
@@ -1680,7 +1732,7 @@ fn main() -> Result<(), RingError> {
     let report = run()?;
     write_json_report(&args.report_path, &report)?;
     println!(
-        "[rust-ringattn] status={} passed={}/{} protocol_status={} protocol_messages={} cp_ring_status={} cp_ring_messages={} cp_ring_compute_updates={} cxx_domains={} torch_status={} torch_device={} torch_code={} torch_attention_status={} torch_attention_code={} torch_block_update_status={} torch_block_update_code={} torch_block_updates={} torch_payload_block_status={} torch_payload_block_code={} torch_payload_blocks={}/{} torch_payload_online_status={} torch_payload_online_code={} torch_payload_online_blocks={}/{} torch_payload_chunk_status={} torch_payload_chunk_code={} torch_payload_chunk_blocks={}/{} torch_query_chunk_status={} torch_query_chunk_code={} torch_query_chunk_blocks={}/{} torch_query_output_status={} torch_query_output_code={} torch_query_output_groups={} torch_query_output_blocks={}/{} torch_compiled={} report={}",
+        "[rust-ringattn] status={} passed={}/{} protocol_status={} protocol_messages={} cp_ring_status={} cp_ring_messages={} cp_ring_compute_updates={} cxx_domains={} torch_status={} torch_device={} torch_code={} torch_attention_status={} torch_attention_code={} tch_attention_status={} tch_attention_code={} torch_block_update_status={} torch_block_update_code={} torch_block_updates={} torch_payload_block_status={} torch_payload_block_code={} torch_payload_blocks={}/{} torch_payload_online_status={} torch_payload_online_code={} torch_payload_online_blocks={}/{} torch_payload_chunk_status={} torch_payload_chunk_code={} torch_payload_chunk_blocks={}/{} torch_query_chunk_status={} torch_query_chunk_code={} torch_query_chunk_blocks={}/{} torch_query_output_status={} torch_query_output_code={} torch_query_output_groups={} torch_query_output_blocks={}/{} torch_compiled={} report={}",
         report.status,
         report.summary.passed,
         report.summary.cases,
@@ -1695,6 +1747,8 @@ fn main() -> Result<(), RingError> {
         report.torch_bridge.status_code,
         report.torch_attention_bridge.status,
         report.torch_attention_bridge.status_code,
+        report.tch_attention_bridge.status,
+        report.tch_attention_bridge.status_code,
         report.torch_block_update_bridge.status,
         report.torch_block_update_bridge.status_code,
         report.torch_block_update_bridge.requested_updates,
@@ -1734,6 +1788,14 @@ fn main() -> Result<(), RingError> {
         println!(
             "[rust-ringattn] torch_attention_message={}",
             compact_message(&report.torch_attention_bridge.message, 360)
+        );
+    }
+    if report.tch_attention_bridge.status == "fail"
+        && !report.tch_attention_bridge.message.is_empty()
+    {
+        println!(
+            "[rust-ringattn] tch_attention_message={}",
+            compact_message(&report.tch_attention_bridge.message, 360)
         );
     }
     if report.torch_block_update_bridge.status == "fail"

@@ -59,6 +59,8 @@
 - [x] [2026-04-30] 已新增 `scripts/run_tch_ringattn_smoke.sh`，自动处理 `LIBTORCH` 与 `DYLD_LIBRARY_PATH`。
 - [x] [2026-04-30] tch-rs CPU smoke 通过：`tch_status=pass tch_device=cpu tch_code=1 ops=3/3`。
 - [x] [2026-04-30] tch-rs MPS smoke 通过：`tch_status=pass tch_device=mps tch_code=2 ops=3/3`。
+- [x] [2026-04-30] `tch_backend.rs` attention block update 已实现：`tch::Tensor` 替代 C++ `RunTorchAttentionBlockUpdates`，CPU `tch_attention_code=1`、MPS `tch_attention_code=2` 均通过。
+- [x] [2026-04-30] `main.rs` 已接入 `tch_attention_bridge` report，与 C++ `torch_attention_bridge` 并行存在，互不影响。
 
 ## 进行中
 

@@ -66,6 +66,8 @@
 - [2026-04-30] 新增 `scripts/run_tch_ringattn_smoke.sh`：自动设置 `LIBTORCH`、`DYLD_LIBRARY_PATH`、`LD_LIBRARY_PATH`，支持 `HCP_TCH_DEVICE=cpu|mps|cuda` 和 `RUN_ID`。
 - [2026-04-30] tch-rs CPU smoke 通过：`tch_status=pass tch_device=cpu tch_code=1 ops=3/3`。
 - [2026-04-30] tch-rs MPS smoke 通过：`tch_status=pass tch_device=mps tch_code=2 ops=3/3`（当前进程可直接访问 Metal device）。
+- [2026-04-30] 新增 `rust/src/tch_backend.rs`：用 `tch::Tensor` 实现 attention block update smoke，对标 C++ `RunTorchAttentionBlockUpdates`；CPU/MPS 均通过 `tch_attention_status=pass`。
+- [2026-04-30] `main.rs` 已新增 `tch_attention_bridge` report 字段，CLI summary 同步输出 `tch_attention_status` / `tch_attention_code`；当 `tch-backend` feature 未启用时状态为 `disabled`，不影响 C++ ATen 路径。
 
 ## 活跃决策
 
