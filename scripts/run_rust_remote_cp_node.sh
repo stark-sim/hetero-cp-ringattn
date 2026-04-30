@@ -19,10 +19,22 @@ echo "HCP_REMOTE_CP_DOMAINS=${HCP_REMOTE_CP_DOMAINS:-2}"
 
 cd "${REPO_ROOT}/rust"
 CARGO_OFFLINE="${CARGO_OFFLINE:-1}"
+CARGO_FEATURES=()
+if [ -n "${LIBTORCH:-}" ] || [ "${HCP_ENABLE_TORCH:-0}" = "1" ]; then
+    CARGO_FEATURES+=("tch-backend")
+fi
 if [ "${CARGO_OFFLINE}" = "1" ]; then
     CARGO_ARGS=(run --offline)
 else
     CARGO_ARGS=(run)
+fi
+CARGO_ARGS+=(--bin hcp-ringattn-rust)
+if [ "${#CARGO_FEATURES[@]}" -gt 0 ]; then
+    CARGO_ARGS+=(--features "$(IFS=,; echo "${CARGO_FEATURES[*]}")")
+fi
+if [ -n "${LIBTORCH:-}" ]; then
+    export DYLD_LIBRARY_PATH="${LIBTORCH}/lib:${DYLD_LIBRARY_PATH:-}"
+    export LD_LIBRARY_PATH="${LIBTORCH}/lib:${LD_LIBRARY_PATH:-}"
 fi
 set +e
 cargo "${CARGO_ARGS[@]}" -- \

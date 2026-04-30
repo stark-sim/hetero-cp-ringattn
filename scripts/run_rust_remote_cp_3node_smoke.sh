@@ -17,6 +17,8 @@ LOCAL_CARGO_OFFLINE="${LOCAL_CARGO_OFFLINE:-0}"
 REMOTE_CARGO_OFFLINE="${REMOTE_CARGO_OFFLINE:-0}"
 LOCAL_TORCH_DEVICE="${LOCAL_TORCH_DEVICE:-mps}"
 GPU_TORCH_DEVICE="${GPU_TORCH_DEVICE:-cuda:0}"
+LOCAL_TCH_DEVICE="${LOCAL_TCH_DEVICE:-${LOCAL_TORCH_DEVICE}}"
+GPU_TCH_DEVICE="${GPU_TCH_DEVICE:-${GPU_TORCH_DEVICE}}"
 HCP_ENABLE_TORCH="${HCP_ENABLE_TORCH:-1}"
 LOCAL_PREFLIGHT_BUILD="${LOCAL_PREFLIGHT_BUILD:-1}"
 REMOTE_PREFLIGHT_BUILD="${REMOTE_PREFLIGHT_BUILD:-1}"
@@ -62,16 +64,24 @@ echo "=== HCP Rust Remote CP 3-Node Smoke ==="
 echo "RUN_ID=${RUN_ID}"
 echo "MAC_NODE_ADDR=${MAC_NODE_ADDR}"
 echo "GPU_HOST=${GPU_HOST}"
-echo "node0: bind=0.0.0.0:${NODE0_PORT} connect=${GPU_HOST}:${GPU_PORT} device=${LOCAL_TORCH_DEVICE}"
-echo "node1: bind=0.0.0.0:${GPU_PORT} connect=${MAC_NODE_ADDR}:${NODE2_PORT} device=${GPU_TORCH_DEVICE}"
-echo "node2: bind=0.0.0.0:${NODE2_PORT} connect=${MAC_NODE_ADDR}:${NODE0_PORT} device=${LOCAL_TORCH_DEVICE}"
+echo "node0: bind=0.0.0.0:${NODE0_PORT} connect=${GPU_HOST}:${GPU_PORT} torch=${LOCAL_TORCH_DEVICE} tch=${LOCAL_TCH_DEVICE}"
+echo "node1: bind=0.0.0.0:${GPU_PORT} connect=${MAC_NODE_ADDR}:${NODE2_PORT} torch=${GPU_TORCH_DEVICE} tch=${GPU_TCH_DEVICE}"
+echo "node2: bind=0.0.0.0:${NODE2_PORT} connect=${MAC_NODE_ADDR}:${NODE0_PORT} torch=${LOCAL_TORCH_DEVICE} tch=${LOCAL_TCH_DEVICE}"
 echo "Reports: ${REPORT_DIR}"
 
 if [ "${LOCAL_PREFLIGHT_BUILD}" = "1" ]; then
     echo "Preflight local cargo build"
     (
         cd "${REPO_ROOT}/rust"
-        cargo $(cargo_build_args "${LOCAL_CARGO_OFFLINE}")
+        CARGO_FEATURES=()
+        if [ -n "${LIBTORCH:-}" ] || [ "${HCP_ENABLE_TORCH:-0}" = "1" ]; then
+            CARGO_FEATURES+=("tch-backend")
+        fi
+        if [ "${#CARGO_FEATURES[@]}" -gt 0 ]; then
+            cargo $(cargo_build_args "${LOCAL_CARGO_OFFLINE}") --features "$(IFS=,; echo "${CARGO_FEATURES[*]}")"
+        else
+            cargo $(cargo_build_args "${LOCAL_CARGO_OFFLINE}")
+        fi
     )
 fi
 
@@ -79,7 +89,7 @@ if [ "${REMOTE_PREFLIGHT_BUILD}" = "1" ]; then
     echo "Preflight remote git pull and cargo build"
     remote_repo_q="$(shell_quote "${GPU_REPO_DIR}")"
     remote_build_args="$(cargo_build_args "${REMOTE_CARGO_OFFLINE}")"
-    remote_command="cd ${remote_repo_q} && git pull --ff-only && cd rust && cargo ${remote_build_args}"
+    remote_command="cd ${remote_repo_q} && git pull --ff-only && cd rust && if [ -n \"\${LIBTORCH:-}\" ] || [ \"\${HCP_ENABLE_TORCH:-0}\" = \"1\" ]; then cargo ${remote_build_args} --features tch-backend; else cargo ${remote_build_args}; fi"
     run_remote "${remote_command}" 2>&1 | tee "${REPORT_DIR}/remote_preflight.log"
 else
     echo "Preflight remote git pull"
@@ -106,6 +116,7 @@ start_local_node() {
             CARGO_OFFLINE="${LOCAL_CARGO_OFFLINE}" \
             HCP_ENABLE_TORCH="${HCP_ENABLE_TORCH}" \
             HCP_TORCH_DEVICE="${LOCAL_TORCH_DEVICE}" \
+            HCP_TCH_DEVICE="${LOCAL_TCH_DEVICE}" \
             bash scripts/run_rust_remote_cp_node.sh
     ) >"${log_path}" 2>&1 &
     local pid="$!"
@@ -117,7 +128,7 @@ start_local_node() {
 start_remote_node() {
     local log_path="${REPORT_DIR}/launch_node_1.log"
     local remote_repo_q remote_run_id_q remote_bind_q remote_connect_q remote_cargo_offline_q
-    local remote_enable_torch_q remote_torch_device_q remote_command
+    local remote_enable_torch_q remote_torch_device_q remote_tch_device_q remote_command
     remote_repo_q="$(shell_quote "${GPU_REPO_DIR}")"
     remote_run_id_q="$(shell_quote "${RUN_ID}")"
     remote_bind_q="$(shell_quote "0.0.0.0:${GPU_PORT}")"
@@ -125,7 +136,8 @@ start_remote_node() {
     remote_cargo_offline_q="$(shell_quote "${REMOTE_CARGO_OFFLINE}")"
     remote_enable_torch_q="$(shell_quote "${HCP_ENABLE_TORCH}")"
     remote_torch_device_q="$(shell_quote "${GPU_TORCH_DEVICE}")"
-    remote_command="cd ${remote_repo_q} && RUN_ID=${remote_run_id_q} HCP_REMOTE_CP_DOMAINS=3 NODE_INDEX=1 BIND_ADDR=${remote_bind_q} CONNECT_ADDR=${remote_connect_q} CARGO_OFFLINE=${remote_cargo_offline_q} HCP_ENABLE_TORCH=${remote_enable_torch_q} HCP_TORCH_DEVICE=${remote_torch_device_q} bash scripts/run_rust_remote_cp_node.sh"
+    remote_tch_device_q="$(shell_quote "${GPU_TCH_DEVICE}")"
+    remote_command="cd ${remote_repo_q} && RUN_ID=${remote_run_id_q} HCP_REMOTE_CP_DOMAINS=3 NODE_INDEX=1 BIND_ADDR=${remote_bind_q} CONNECT_ADDR=${remote_connect_q} CARGO_OFFLINE=${remote_cargo_offline_q} HCP_ENABLE_TORCH=${remote_enable_torch_q} HCP_TORCH_DEVICE=${remote_torch_device_q} HCP_TCH_DEVICE=${remote_tch_device_q} bash scripts/run_rust_remote_cp_node.sh"
     run_remote "${remote_command}" >"${log_path}" 2>&1 &
     local pid="$!"
     pids+=("${pid}")
