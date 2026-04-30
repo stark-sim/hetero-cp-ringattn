@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 use std::env;
+use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{
@@ -102,6 +103,10 @@ impl LayerNormWeights {
     fn new(hidden_dim: usize) -> Self {
         let gamma: Vec<f32> = (0..hidden_dim).map(|i| 1.0 + i as f32 * 0.001).collect();
         let beta: Vec<f32> = (0..hidden_dim).map(|i| i as f32 * 0.0001).collect();
+        Self { gamma, beta }
+    }
+
+    fn from_vecs(gamma: Vec<f32>, beta: Vec<f32>) -> Self {
         Self { gamma, beta }
     }
 }
@@ -346,6 +351,82 @@ impl ModelLayerWeights {
         }
         output
     }
+
+    fn from_vecs(
+        layer_index: i32,
+        hidden_dim: usize,
+        projection_dim: usize,
+        q_proj: Vec<f32>,
+        k_proj: Vec<f32>,
+        v_proj: Vec<f32>,
+        o_proj: Vec<f32>,
+    ) -> Self {
+        Self {
+            layer_index,
+            hidden_dim,
+            projection_dim,
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ModelWeightsJson {
+    layers: Vec<LayerWeightsJson>,
+}
+
+#[derive(Debug)]
+struct LayerWeightsJson {
+    layer_index: i32,
+    q_proj: Vec<f32>,
+    k_proj: Vec<f32>,
+    v_proj: Vec<f32>,
+    o_proj: Vec<f32>,
+    gamma: Vec<f32>,
+    beta: Vec<f32>,
+}
+
+impl ModelWeightsJson {
+    fn load(path: &str) -> Result<Self, String> {
+        let content = fs::read_to_string(path).map_err(|e| format!("read weight file: {}", e))?;
+        let raw: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| format!("parse weight file: {}", e))?;
+        let layers_raw = raw
+            .get("layers")
+            .and_then(|v| v.as_array())
+            .ok_or("missing 'layers' array")?;
+        let mut layers = Vec::with_capacity(layers_raw.len());
+        for entry in layers_raw {
+            let extract = |key: &str| -> Result<Vec<f32>, String> {
+                let arr = entry
+                    .get(key)
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| format!("missing '{}'", key))?;
+                let mut out = Vec::with_capacity(arr.len());
+                for v in arr {
+                    out.push(v.as_f64().ok_or_else(|| format!("bad number in '{}'", key))? as f32);
+                }
+                Ok(out)
+            };
+            let layer_index = entry
+                .get("layer_index")
+                .and_then(|v| v.as_i64())
+                .ok_or("missing 'layer_index'")? as i32;
+            layers.push(LayerWeightsJson {
+                layer_index,
+                q_proj: extract("q_proj")?,
+                k_proj: extract("k_proj")?,
+                v_proj: extract("v_proj")?,
+                o_proj: extract("o_proj")?,
+                gamma: extract("gamma")?,
+                beta: extract("beta")?,
+            });
+        }
+        Ok(Self { layers })
+    }
 }
 
 fn apply_rope(values: &mut [f32], token_pos: usize, num_heads: usize, head_dim: usize) {
@@ -367,13 +448,35 @@ fn apply_rope(values: &mut [f32], token_pos: usize, num_heads: usize, head_dim: 
 
 impl DomainModelState {
     fn new(domain: &DomainSpec) -> Self {
+        Self::new_with_weights(domain, None)
+    }
+
+    fn new_with_weights(domain: &DomainSpec, weights_json: Option<&ModelWeightsJson>) -> Self {
         let query_len = usize::min(QUERY_CHUNK_LEN, domain.seq_chunk_len);
         let projection_dim = KV_NUM_HEADS * KV_HEAD_DIM;
-        let weights = ModelLayerWeights::new(MODEL_LAYER_INDEX, MODEL_HIDDEN_DIM, projection_dim);
+        let (weights, ln_weights) = if let Some(wj) = weights_json {
+            let l = &wj.layers[0];
+            (
+                ModelLayerWeights::from_vecs(
+                    l.layer_index,
+                    MODEL_HIDDEN_DIM,
+                    projection_dim,
+                    l.q_proj.clone(),
+                    l.k_proj.clone(),
+                    l.v_proj.clone(),
+                    l.o_proj.clone(),
+                ),
+                LayerNormWeights::from_vecs(l.gamma.clone(), l.beta.clone()),
+            )
+        } else {
+            (
+                ModelLayerWeights::new(MODEL_LAYER_INDEX, MODEL_HIDDEN_DIM, projection_dim),
+                LayerNormWeights::new(MODEL_HIDDEN_DIM),
+            )
+        };
         let _output_values = query_len * KV_NUM_HEADS * KV_HEAD_DIM;
         let hidden_states_raw = build_hidden_states(domain, MODEL_HIDDEN_DIM);
         let mut hidden_states = hidden_states_raw.clone();
-        let ln_weights = LayerNormWeights::new(MODEL_HIDDEN_DIM);
         for token_offset in 0..domain.seq_chunk_len {
             let start = token_offset * MODEL_HIDDEN_DIM;
             let end = start + MODEL_HIDDEN_DIM;
@@ -1024,6 +1127,20 @@ pub fn run_protocol_smoke() -> Result<ProtocolSmokeReport, ProtocolError> {
     })
 }
 
+fn maybe_load_weights_json() -> Option<ModelWeightsJson> {
+    let path = env::var("HCP_WEIGHTS_JSON").ok()?;
+    match ModelWeightsJson::load(&path) {
+        Ok(w) => {
+            eprintln!("[weights] loaded {} layers from {}", w.layers.len(), path);
+            Some(w)
+        }
+        Err(e) => {
+            eprintln!("[weights] failed to load {}: {}", path, e);
+            None
+        }
+    }
+}
+
 pub fn run_cp_ring_node_smoke() -> Result<CpRingNodeSmokeReport, ProtocolError> {
     let domains = default_domains()?;
     let domain_count = domains.len();
@@ -1215,7 +1332,8 @@ pub fn run_remote_cp_node(
         });
     }
     let domain_count = domains.len();
-    let mut local_model_state = DomainModelState::new(&domains[node_index]);
+    let weights_json = maybe_load_weights_json();
+    let mut local_model_state = DomainModelState::new_with_weights(&domains[node_index], weights_json.as_ref());
     let source_block_counts = domains
         .iter()
         .map(|domain| block_ranges(domain).count())
@@ -1428,7 +1546,8 @@ fn run_cp_ring_node(
 ) -> Result<CpRingNodeReport, ProtocolError> {
     let domain_count = domains.len();
     let domain = domains[domain_index].clone();
-    let mut model_state = DomainModelState::new(&domain);
+    let weights_json = maybe_load_weights_json();
+    let mut model_state = DomainModelState::new_with_weights(&domain, weights_json.as_ref());
     let inbound_peer = domains[(domain_index + domain_count - 1) % domain_count].clone();
     let outbound_peer = domains[(domain_index + 1) % domain_count].clone();
     let mut accumulator = OnlineSoftmaxAccumulator::new(
