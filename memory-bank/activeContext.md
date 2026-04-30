@@ -77,6 +77,7 @@
 - PyTorch C++ 路径短期优先使用 C++ ATen/libtorch bridge，避免直接 include 全量 `torch/torch.h`。
 - `tch-rs` 的长期接入应优先使用独立/system-wide libtorch；`LIBTORCH_USE_PYTORCH=1` 只作为 fallback 或快速验证路径，避免把核心 Rust 路线重新耦合到 Python 环境。
 - `tch-backend` feature 已接入：只需 `LIBTORCH=/Users/stark_sim/libtorch`，不要同时设 `LIBTORCH_INCLUDE`/`LIBTORCH_LIB`；macOS 运行时需要 `DYLD_LIBRARY_PATH` 包含 `${LIBTORCH}/lib`。
+- 远端 GPU host `~/.profile` 已收敛环境变量配置（`LIBTORCH`、`LD_LIBRARY_PATH`、`PATH`），本地 `scripts/run_rust_remote_cp_3node_smoke.sh` 已移除 `remote_env_exports()` 显式传入，改为完全依赖远端 `bash -l` 加载 `.profile`。
 
 ## 下一步
 

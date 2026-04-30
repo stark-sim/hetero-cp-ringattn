@@ -20,10 +20,8 @@ GPU_TORCH_DEVICE="${GPU_TORCH_DEVICE:-cuda:0}"
 HCP_ENABLE_TORCH="${HCP_ENABLE_TORCH:-1}"
 LOCAL_PREFLIGHT_BUILD="${LOCAL_PREFLIGHT_BUILD:-1}"
 REMOTE_PREFLIGHT_BUILD="${REMOTE_PREFLIGHT_BUILD:-1}"
-REMOTE_CARGO_PATH="${REMOTE_CARGO_PATH:-/home/stark/.cargo/bin}"
-REMOTE_LIBTORCH="${REMOTE_LIBTORCH:-/home/stark/libtorch}"
-REMOTE_LIBTORCH_INCLUDE="${REMOTE_LIBTORCH_INCLUDE:-${REMOTE_LIBTORCH}/include}"
-REMOTE_LIBTORCH_LIB="${REMOTE_LIBTORCH_LIB:-${REMOTE_LIBTORCH}/lib}"
+# Remote environment variables (LIBTORCH, LD_LIBRARY_PATH, PATH with cargo)
+# are expected to be set in the remote user's ~/.profile and loaded by bash -l.
 
 if [ -z "${MAC_NODE_ADDR:-}" ] && [ -n "${MAC_192_ADDR:-}" ]; then
     MAC_NODE_ADDR="${MAC_192_ADDR}"
@@ -53,18 +51,7 @@ cargo_build_args() {
     fi
 }
 
-remote_env_exports() {
-    local cargo_path_q libtorch_q libtorch_include_q libtorch_lib_q
-    cargo_path_q="$(shell_quote "${REMOTE_CARGO_PATH}")"
-    libtorch_q="$(shell_quote "${REMOTE_LIBTORCH}")"
-    libtorch_include_q="$(shell_quote "${REMOTE_LIBTORCH_INCLUDE}")"
-    libtorch_lib_q="$(shell_quote "${REMOTE_LIBTORCH_LIB}")"
-    printf "export PATH=%s:\$PATH; " "${cargo_path_q}"
-    printf "export LIBTORCH=%s; " "${libtorch_q}"
-    printf "export LIBTORCH_INCLUDE=%s; " "${libtorch_include_q}"
-    printf "export LIBTORCH_LIB=%s; " "${libtorch_lib_q}"
-    printf "export LD_LIBRARY_PATH=%s:\${LD_LIBRARY_PATH:-}; " "${libtorch_lib_q}"
-}
+# Remote environment is loaded from ~/.profile via bash -l in run_remote().
 
 run_remote() {
     local command="$1"
@@ -92,12 +79,12 @@ if [ "${REMOTE_PREFLIGHT_BUILD}" = "1" ]; then
     echo "Preflight remote git pull and cargo build"
     remote_repo_q="$(shell_quote "${GPU_REPO_DIR}")"
     remote_build_args="$(cargo_build_args "${REMOTE_CARGO_OFFLINE}")"
-    remote_command="$(remote_env_exports) cd ${remote_repo_q} && git pull --ff-only && cd rust && cargo ${remote_build_args}"
+    remote_command="cd ${remote_repo_q} && git pull --ff-only && cd rust && cargo ${remote_build_args}"
     run_remote "${remote_command}" 2>&1 | tee "${REPORT_DIR}/remote_preflight.log"
 else
     echo "Preflight remote git pull"
     remote_repo_q="$(shell_quote "${GPU_REPO_DIR}")"
-    remote_command="$(remote_env_exports) cd ${remote_repo_q} && git pull --ff-only"
+    remote_command="cd ${remote_repo_q} && git pull --ff-only"
     run_remote "${remote_command}" 2>&1 | tee "${REPORT_DIR}/remote_preflight.log"
 fi
 
@@ -138,7 +125,7 @@ start_remote_node() {
     remote_cargo_offline_q="$(shell_quote "${REMOTE_CARGO_OFFLINE}")"
     remote_enable_torch_q="$(shell_quote "${HCP_ENABLE_TORCH}")"
     remote_torch_device_q="$(shell_quote "${GPU_TORCH_DEVICE}")"
-    remote_command="$(remote_env_exports) cd ${remote_repo_q} && RUN_ID=${remote_run_id_q} HCP_REMOTE_CP_DOMAINS=3 NODE_INDEX=1 BIND_ADDR=${remote_bind_q} CONNECT_ADDR=${remote_connect_q} CARGO_OFFLINE=${remote_cargo_offline_q} HCP_ENABLE_TORCH=${remote_enable_torch_q} HCP_TORCH_DEVICE=${remote_torch_device_q} bash scripts/run_rust_remote_cp_node.sh"
+    remote_command="cd ${remote_repo_q} && RUN_ID=${remote_run_id_q} HCP_REMOTE_CP_DOMAINS=3 NODE_INDEX=1 BIND_ADDR=${remote_bind_q} CONNECT_ADDR=${remote_connect_q} CARGO_OFFLINE=${remote_cargo_offline_q} HCP_ENABLE_TORCH=${remote_enable_torch_q} HCP_TORCH_DEVICE=${remote_torch_device_q} bash scripts/run_rust_remote_cp_node.sh"
     run_remote "${remote_command}" >"${log_path}" 2>&1 &
     local pid="$!"
     pids+=("${pid}")
