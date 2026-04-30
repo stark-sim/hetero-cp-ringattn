@@ -2047,24 +2047,18 @@ fn connect_with_retry(connect_socket: SocketAddr) -> Result<TcpStream, ProtocolE
     })))
 }
 
-fn write_raw_message_frame(
-    stream: &mut TcpStream,
-    message: &RingAttnMessage,
-) -> Result<usize, ProtocolError> {
-    let frame = serialize_message(message)?;
+fn write_frame_to_stream(stream: &mut TcpStream, frame: &[u8]) -> Result<usize, ProtocolError> {
     if frame.len() > MAX_FRAME_BYTES {
         return Err(ProtocolError::FrameTooLarge { bytes: frame.len() });
     }
     let frame_len = u32::try_from(frame.len())
         .map_err(|_| ProtocolError::FrameTooLarge { bytes: frame.len() })?;
     stream.write_all(&frame_len.to_be_bytes())?;
-    stream.write_all(&frame)?;
+    stream.write_all(frame)?;
     Ok(FRAME_LEN_BYTES + frame.len())
 }
 
-fn read_raw_message_frame(
-    stream: &mut TcpStream,
-) -> Result<(RingAttnMessage, usize), ProtocolError> {
+fn read_frame_from_stream(stream: &mut TcpStream) -> Result<Vec<u8>, ProtocolError> {
     let mut len_bytes = [0_u8; FRAME_LEN_BYTES];
     stream.read_exact(&mut len_bytes)?;
     let frame_len = u32::from_be_bytes(len_bytes) as usize;
@@ -2073,6 +2067,21 @@ fn read_raw_message_frame(
     }
     let mut frame = vec![0_u8; frame_len];
     stream.read_exact(&mut frame)?;
+    Ok(frame)
+}
+
+fn write_raw_message_frame(
+    stream: &mut TcpStream,
+    message: &RingAttnMessage,
+) -> Result<usize, ProtocolError> {
+    let frame = serialize_message(message)?;
+    write_frame_to_stream(stream, &frame)
+}
+
+fn read_raw_message_frame(
+    stream: &mut TcpStream,
+) -> Result<(RingAttnMessage, usize), ProtocolError> {
+    let frame = read_frame_from_stream(stream)?;
     Ok((deserialize_message(&frame)?, FRAME_LEN_BYTES + frame.len()))
 }
 
@@ -2157,15 +2166,9 @@ fn write_message_frame(
     summary: &mut RemoteP2pSummary,
 ) -> Result<(), ProtocolError> {
     let frame = serialize_message(message)?;
-    if frame.len() > MAX_FRAME_BYTES {
-        return Err(ProtocolError::FrameTooLarge { bytes: frame.len() });
-    }
-    let frame_len = u32::try_from(frame.len())
-        .map_err(|_| ProtocolError::FrameTooLarge { bytes: frame.len() })?;
-    stream.write_all(&frame_len.to_be_bytes())?;
-    stream.write_all(&frame)?;
+    let bytes = write_frame_to_stream(stream, &frame)?;
     summary.messages_sent += 1;
-    summary.bytes_sent += FRAME_LEN_BYTES + frame.len();
+    summary.bytes_sent += bytes;
     count_remote_message(summary, message);
     Ok(())
 }
@@ -2174,14 +2177,7 @@ fn read_message_frame(
     stream: &mut TcpStream,
     summary: &mut RemoteP2pSummary,
 ) -> Result<RingAttnMessage, ProtocolError> {
-    let mut len_bytes = [0_u8; FRAME_LEN_BYTES];
-    stream.read_exact(&mut len_bytes)?;
-    let frame_len = u32::from_be_bytes(len_bytes) as usize;
-    if frame_len > MAX_FRAME_BYTES {
-        return Err(ProtocolError::FrameTooLarge { bytes: frame_len });
-    }
-    let mut frame = vec![0_u8; frame_len];
-    stream.read_exact(&mut frame)?;
+    let frame = read_frame_from_stream(stream)?;
     let message = deserialize_message(&frame)?;
     summary.messages_received += 1;
     summary.bytes_received += FRAME_LEN_BYTES + frame.len();
