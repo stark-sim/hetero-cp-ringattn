@@ -1839,11 +1839,11 @@ fn torch_query_output_bridge_report(blocks: &[protocol::CpPayloadBlock]) -> Torc
             message = format!("compute_domain={compute_domain} {message}");
             break;
         }
-        if output_values != group_first.output_slot_values() {
+        let expected_output_values = query_len * num_heads * head_dim;
+        if output_values != expected_output_values {
             code = -6;
             message = format!(
-                "compute_domain={compute_domain} output values mismatch expected_slot={} actual={output_values}",
-                group_first.output_slot_values()
+                "compute_domain={compute_domain} output values mismatch expected={expected_output_values} actual={output_values}"
             );
             break;
         }
