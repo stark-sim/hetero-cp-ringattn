@@ -80,6 +80,7 @@
 - [x] [2026-04-30] VPN 三节点 remote CP tch-full 验证通过：`GPU_HOST=100.118.253.68 MAC_NODE_ADDR=100.121.35.138 RUN_ID=rust-remote-cp-tch-full-vpn-20260430 PORT_BASE=29335`，node0/node2 MPS `code=2 12/12`，node1 CUDA `code=3 12/12`；C++ bridge 与 tch bridge 全部通过。
 - [x] [2026-04-30] M2 correctness 扩展完成：7 个 cases（含大 seq 和边界条件）；`max_rel_err` 已添加到 correctness model 和全部 tch bridge；`--stress-test` 支持 5-seed 随机验证。
 - [x] [2026-04-30] M3 protocol 优化完成：TCP frame I/O 统一为 `write_frame_to_stream`/`read_frame_from_stream`；`process_inbound_message` 提取消除 CP node runtime 重复逻辑；SSH ConnectTimeout=30 修复 VPN 远程 smoke 超时。
+- [x] [2026-04-30] M4 异构 runtime 闭环完成：`ComputeRuntime` trait 提取，`TchComputeRuntime` 真实计算，`NoOpComputeRuntime` 仅作 fallback；计算路径与协议逻辑解耦；本地 MPS smoke 和 VPN 三节点 remote CP 验证通过。
 
 ## 进行中
 
@@ -113,6 +114,6 @@
 | M1: 问题定义固定 | 已完成 | [2026-04-24] |
 | M2: 数学闭环 | 已完成 | [2026-04-30] |
 | M3: 协议闭环 | 已完成 | [2026-04-30] |
-| M4: 异构 runtime 闭环 | 未开始 | 待定 |
+| M4: 异构 runtime 闭环 | 已完成 | [2026-04-30] |
 | M5: 远端闭环 | 已完成 | [2026-04-30] |
 | M6: 扩展性论证 | 未开始 | 待定 |
