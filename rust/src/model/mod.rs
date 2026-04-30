@@ -1,5 +1,8 @@
 pub mod config;
+pub mod layers;
 pub mod weights;
+
+pub use weights::{ModelWeights, WeightNames};
 
 use thiserror::Error;
 

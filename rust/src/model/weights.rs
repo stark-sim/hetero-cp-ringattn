@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 #[cfg(feature = "tch-backend")]
-use tch::{Device, Kind, Tensor};
+use tch::{Device, Tensor};
 
 /// A collection of model weights loaded from safetensors files.
 #[derive(Debug)]
