@@ -87,6 +87,8 @@
 - [2026-04-30] 外部权重加载已接入 protocol：`ModelWeightsJson` 支持从 JSON 文件解析 `layers` 数组，每个 layer 包含 `q_proj`/`k_proj`/`v_proj`/`o_proj`/`gamma`/`beta`；`DomainModelState::new_with_weights` 可在有外部权重时替换默认合成权重。
 - [2026-04-30] 权重加载路径验证：本地默认 smoke `tch_compute_output_checksum=1093.59...`；加载 `config/test_weights.json` 后 checksum 变为 `2810.30...`，确认外部权重确实参与计算；非 tch-backend 编译和运行均不受影响。
 - [2026-04-30] VPN 三节点 remote CP tch-full 验证通过：`GPU_HOST=100.118.253.68 MAC_NODE_ADDR=100.121.35.138 RUN_ID=rust-remote-cp-tch-full-vpn-20260430 PORT_BASE=29335`，node0/node2 MPS `code=2 12/12`，node1 CUDA `code=3 12/12`；C++ bridge 与 tch bridge 全部通过，实时 compute checksum 分别为 71.35 / 238.88 / 406.41。
+- [2026-04-30] M2 correctness 扩展完成：cases 从 3 个扩展到 7 个（含大 seq 512+256+256、单 block、unit block）；新增 `max_rel_err` 到 correctness model 和 tch-backend；新增 `--stress-test` CLI flag（5 seeds，自动跳过 seq>256）；本地 MPS smoke 和 VPN 三节点 remote CP 均验证通过。
+- [2026-04-30] M3 protocol 优化完成：统一 TCP frame I/O（`write_frame_to_stream`/`read_frame_from_stream`）；提取 `process_inbound_message` 去重 `run_cp_ring_node` 与 `receive_remote_cp_node_messages` 的消息处理逻辑；SSH ConnectTimeout=30 修复 VPN 远程 smoke 连接超时。
 
 ## 活跃决策
 

@@ -78,6 +78,8 @@
 - [x] [2026-04-30] o_proj + Residual Connection 已接入 protocol，attention output 经 o_proj 映射回 hidden_dim 后与原始 hidden states 相加。
 - [x] [2026-04-30] 外部权重加载已接入 protocol：支持通过 `HCP_WEIGHTS_JSON` 环境变量从 JSON 文件加载 Q/K/V/O projection weights 与 LayerNorm gamma/beta；`DomainModelState::new_with_weights` 在有外部权重时替换默认合成权重；本地 CPU/MPS smoke 均验证通过，checksum 随权重变化。
 - [x] [2026-04-30] VPN 三节点 remote CP tch-full 验证通过：`GPU_HOST=100.118.253.68 MAC_NODE_ADDR=100.121.35.138 RUN_ID=rust-remote-cp-tch-full-vpn-20260430 PORT_BASE=29335`，node0/node2 MPS `code=2 12/12`，node1 CUDA `code=3 12/12`；C++ bridge 与 tch bridge 全部通过。
+- [x] [2026-04-30] M2 correctness 扩展完成：7 个 cases（含大 seq 和边界条件）；`max_rel_err` 已添加到 correctness model 和全部 tch bridge；`--stress-test` 支持 5-seed 随机验证。
+- [x] [2026-04-30] M3 protocol 优化完成：TCP frame I/O 统一为 `write_frame_to_stream`/`read_frame_from_stream`；`process_inbound_message` 提取消除 CP node runtime 重复逻辑；SSH ConnectTimeout=30 修复 VPN 远程 smoke 超时。
 
 ## 进行中
 
@@ -109,8 +111,8 @@
 |--------|------|----------|
 | M0: 独立化完成 | 已完成 | [2026-04-24] |
 | M1: 问题定义固定 | 已完成 | [2026-04-24] |
-| M2: 数学闭环 | 进行中 | 待定 |
-| M3: 协议闭环 | 进行中 | 待定 |
+| M2: 数学闭环 | 已完成 | [2026-04-30] |
+| M3: 协议闭环 | 已完成 | [2026-04-30] |
 | M4: 异构 runtime 闭环 | 未开始 | 待定 |
 | M5: 远端闭环 | 已完成 | [2026-04-30] |
 | M6: 扩展性论证 | 未开始 | 待定 |
