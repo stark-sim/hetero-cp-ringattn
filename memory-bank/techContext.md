@@ -170,7 +170,9 @@ RUN_ID=rust-remote-cp-3node-<timestamp> \
 - `HCP_TCH_DEVICE=cpu|mps|cuda|cuda:N`：选择 tch-rs smoke 设备；成功码 CPU=1、MPS=2、CUDA=3。
 - `LIBTORCH=/path/to/libtorch`：**唯一需要**的环境变量用于 `tch-backend` feature；不要同时设置 `LIBTORCH_INCLUDE`/`LIBTORCH_LIB`，否则 `torch-sys` 会重复追加路径导致 `torch/torch.h` 找不到。
 - 远端 GPU host 环境变量（`LIBTORCH`、`LD_LIBRARY_PATH`、`PATH`）建议写入 `~/.profile`，并通过 `bash -l` 加载；`scripts/run_rust_remote_cp_3node_smoke.sh` 已采用此模式，不再显式 SSH 传入。
-- `tch-backend` feature 下新增 `rust/src/tch_backend.rs`，提供 `run_attention_block_updates()` 等函数；当前已验证 CPU(1)/MPS(2)，CUDA(3) 待远端验证。
+- `tch-backend` feature 下新增 `rust/src/tch_backend.rs`，提供 `run_attention_block_updates()` 等函数；已验证 CPU(1)/MPS(2)/CUDA(3)。
+- `run_rust_ringattn_smoke.sh` 在有 `LIBTORCH` 或 `HCP_ENABLE_TORCH=1` 时自动启用 `--features tch-backend`；无 `LIBTORCH` 时 `tch_attention=disabled`。
+- Linux CUDA 构建需注意：`torch-sys` 的 `libtorch_cuda.so` 可能被 `--as-needed` 丢弃，已通过 `build.rs` 的 `cargo:rustc-link-arg-bins` 强制保留。
 - `HCP_TORCH_DEVICE=cpu|mps|cuda|cuda:N`：选择 ATen smoke 设备；成功码分别为 CPU=1、MPS=2、CUDA=3。
 - `BIND_ADDR`：remote P2P server 监听地址，双机 smoke 使用 `0.0.0.0:29172` 或 GPU 子网地址。
 - `CONNECT_ADDR`：remote P2P client 连接地址，当前 GPU host 为 `192.168.8.172:29172`。
