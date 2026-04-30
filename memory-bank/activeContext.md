@@ -71,6 +71,9 @@
 - [2026-04-30] `run_rust_ringattn_smoke.sh` 已默认在有 `LIBTORCH` 时自动启用 `--features tch-backend`，同时设置 `DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH`；无 `LIBTORCH` 时 `tch_attention=disabled` 不影响现有流程。
 - [2026-04-30] 新增 `docs/TCH_BACKEND_DESIGN.md`，记录架构定位、数据流、构建链接注意事项、验证矩阵和与 C++ bridge 的对应关系。
 - [2026-04-30] `main.rs` 已新增 `tch_attention_bridge` report 字段，CLI summary 同步输出 `tch_attention_status` / `tch_attention_code`；当 `tch-backend` feature 未启用时状态为 `disabled`，不影响 C++ ATen 路径。
+- [2026-04-30] `tch_backend.rs` 已扩展全部 6 个桥接函数：`run_attention_block_updates`、`run_payload_block_smoke`、`run_payload_online_smoke`、`run_payload_chunk_smoke`、`run_query_chunk_smoke`、`run_query_chunk_output_smoke`（通过 `run_query_chunk_smoke` 返回 checksum/max_err/output_values）。
+- [2026-04-30] `main.rs` 已完整接入全部 5 个 tch payload/query 桥接 report：`tch_payload_block_bridge`、`tch_payload_online_bridge`、`tch_payload_chunk_bridge`、`tch_query_chunk_bridge`、`tch_query_output_bridge`。`Report` 和 `RemoteCpNodeRunReport` 均已包含对应字段；`run()` 和 cp-node 路径均已调用并纳入 `status` pass/fail 逻辑；CLI summary 已输出全部 tch 字段；fail message 打印块已补充。
+- [2026-04-30] 本机 CPU tch 全桥接 smoke 通过：`status=pass`，全部 6 个 tch bridge `status=pass code=1`，payload/query 各 `30/30` blocks，query output `groups=3`。
 
 ## 活跃决策
 

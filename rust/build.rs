@@ -160,9 +160,9 @@ fn main() {
     // rustc-link-arg-bins places the flag before -l arguments, so --no-as-needed applies
     // to libraries linked by downstream crates (e.g. torch-sys).
     if env::var("CARGO_FEATURE_TCH_BACKEND").ok().is_some() {
-        if let Some(libtorch) = env::var("LIBTORCH").ok() {
+        if let Ok(libtorch) = env::var("LIBTORCH") {
             let lib_dir = format!("{libtorch}/lib");
-            if has_library(&[lib_dir.clone()], "torch_cuda") && has_library(&[lib_dir], "c10_cuda")
+            if has_library(std::slice::from_ref(&lib_dir), "torch_cuda") && has_library(std::slice::from_ref(&lib_dir), "c10_cuda")
             {
                 if env::var("CARGO_CFG_TARGET_OS").ok().as_deref() == Some("linux") {
                     println!(

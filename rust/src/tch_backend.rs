@@ -1,6 +1,10 @@
+#![allow(dead_code)]
+#![allow(clippy::needless_borrows_for_generic_args)]
+
 #[cfg(feature = "tch-backend")]
 pub mod backend {
     use std::env;
+    use tch::{Kind, Tensor};
 
     #[derive(Debug, Clone)]
     pub struct TchDeviceSelection {
@@ -40,6 +44,43 @@ pub mod backend {
         })
     }
 
+    fn device_matches(tensor: &Tensor, expected: tch::Device) -> bool {
+        let actual = tensor.device();
+        match expected {
+            tch::Device::Cpu => actual == tch::Device::Cpu,
+            tch::Device::Mps => actual == tch::Device::Mps,
+            tch::Device::Cuda(_) => matches!(actual, tch::Device::Cuda(_)),
+            _ => false,
+        }
+    }
+
+    // Q: [num_heads, head_dim]
+    // K: [block_len, num_heads, head_dim]
+    // V: [block_len, num_heads, head_dim]
+    // output: [num_heads, head_dim]
+    fn payload_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Tensor {
+        let scale = 1.0 / (q.size()[1] as f64).sqrt();
+        let k_by_head = k.permute(&[1, 0, 2]);
+        let v_by_head = v.permute(&[1, 0, 2]);
+        let scores = k_by_head.matmul(&q.unsqueeze(2i64)).squeeze_dim(2) * scale;
+        let weights = scores.softmax(-1, Kind::Float);
+        weights.unsqueeze(1i64).matmul(&v_by_head).squeeze_dim(1)
+    }
+
+    // Q: [query_len, num_heads, head_dim]
+    // K: [block_len, num_heads, head_dim]
+    // V: [block_len, num_heads, head_dim]
+    // output: [query_len, num_heads, head_dim]
+    fn payload_chunk_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Tensor {
+        let scale = 1.0 / (q.size()[2] as f64).sqrt();
+        let q_by_head = q.permute(&[1, 0, 2]);
+        let k_by_head = k.permute(&[1, 0, 2]);
+        let v_by_head = v.permute(&[1, 0, 2]);
+        let scores = q_by_head.matmul(&k_by_head.transpose(1, 2)) * scale;
+        let weights = scores.softmax(-1, Kind::Float);
+        weights.matmul(&v_by_head).permute(&[1, 0, 2])
+    }
+
     pub fn run_attention_block_updates(block_updates: i32) -> Result<(i32, String), String> {
         if block_updates <= 0 {
             return Err("block_updates must be positive".to_string());
@@ -49,9 +90,8 @@ pub mod backend {
         let device = selection.device;
 
         let cpu = tch::Device::Cpu;
-        let float = tch::Kind::Float;
+        let float = Kind::Float;
 
-        // Deterministic synthetic data: arange-like via linspace to match C++ bridge spirit
         let q_cpu = tch::Tensor::arange(32, (float, cpu))
             .reshape([4, 8])
             .divide_scalar(17.0);
@@ -72,12 +112,10 @@ pub mod backend {
             let k_update_cpu = &k_cpu + shift / 3.0;
             let v_update_cpu = &v_cpu + shift / 5.0;
 
-            // CPU reference
             let scores_ref = q_update_cpu.matmul(&k_update_cpu.transpose(0, 1)) * scale;
             let probs_ref = scores_ref.softmax(-1, float);
             let reference = probs_ref.matmul(&v_update_cpu);
 
-            // Device compute
             let q = q_update_cpu.to(device);
             let k = k_update_cpu.to(device);
             let v = v_update_cpu.to(device);
@@ -115,20 +153,479 @@ pub mod backend {
         }
     }
 
-    fn device_matches(tensor: &tch::Tensor, expected: tch::Device) -> bool {
-        let actual = tensor.device();
-        match expected {
-            tch::Device::Cpu => actual == tch::Device::Cpu,
-            tch::Device::Mps => actual == tch::Device::Mps,
-            tch::Device::Cuda(_) => matches!(actual, tch::Device::Cuda(_)),
-            _ => false,
+    pub fn run_payload_block_smoke(
+        payload: &[u8],
+        block_len: i32,
+        num_heads: i32,
+        head_dim: i32,
+    ) -> Result<(i32, String), String> {
+        if block_len <= 0 || num_heads <= 0 || head_dim <= 0 {
+            return Err("block_len, num_heads, and head_dim must be positive".to_string());
         }
+        let block = block_len as usize;
+        let heads = num_heads as usize;
+        let dim = head_dim as usize;
+        let values_per_tensor = block * heads * dim;
+        let expected_values = values_per_tensor * 2;
+        let expected_bytes = expected_values * std::mem::size_of::<f32>();
+        if payload.len() != expected_bytes {
+            return Err(format!(
+                "payload byte size mismatch expected={expected_bytes} actual={}",
+                payload.len()
+            ));
+        }
+
+        let selection = select_device()?;
+        let device = selection.device;
+
+        let values: Vec<f32> = payload
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+
+        let kv_cpu = Tensor::from_slice(&values)
+            .reshape([2, block_len as i64, num_heads as i64, head_dim as i64]);
+        let k_cpu = kv_cpu.get(0);
+        let v_cpu = kv_cpu.get(1);
+
+        let q_cpu = (Tensor::arange(num_heads as i64 * head_dim as i64, (Kind::Float, tch::Device::Cpu))
+            .reshape([num_heads as i64, head_dim as i64])
+            / 31.0)
+            + 0.125;
+
+        let reference = payload_attention(&q_cpu, &k_cpu, &v_cpu);
+
+        let q = q_cpu.to(device);
+        let k = k_cpu.to(device);
+        let v = v_cpu.to(device);
+        let output = payload_attention(&q, &k, &v);
+
+        if !device_matches(&output, device) {
+            return Err("payload attention output landed on unexpected device".to_string());
+        }
+        if output.size() != vec![num_heads as i64, head_dim as i64] {
+            return Err("unexpected payload attention output shape".to_string());
+        }
+
+        let output_cpu = output.to(tch::Device::Cpu);
+        let max_abs_err = (&output_cpu - &reference).abs().max().double_value(&[]);
+        let checksum = output_cpu.sum(Kind::Float).double_value(&[]);
+
+        if max_abs_err <= 1.0e-4 {
+            let msg = format!(
+                "ok block_len={block_len} num_heads={num_heads} head_dim={head_dim} max_abs_err={max_abs_err} checksum={checksum}"
+            );
+            Ok((selection.success_code, msg))
+        } else {
+            Err(format!(
+                "payload attention mismatch block_len={block_len} max_abs_err={max_abs_err}"
+            ))
+        }
+    }
+
+    pub fn run_payload_online_smoke(
+        payload: &[u8],
+        block_lens: &[i32],
+        num_heads: i32,
+        head_dim: i32,
+    ) -> Result<(i32, String), String> {
+        if block_lens.is_empty() || num_heads <= 0 || head_dim <= 0 {
+            return Err("block_count, num_heads, and head_dim must be positive".to_string());
+        }
+        let mut token_count = 0usize;
+        for &bl in block_lens {
+            if bl <= 0 {
+                return Err("all block_lens entries must be positive".to_string());
+            }
+            token_count += bl as usize;
+        }
+        let expected_values = token_count * (num_heads as usize) * (head_dim as usize) * 2;
+        let expected_bytes = expected_values * std::mem::size_of::<f32>();
+        if payload.len() != expected_bytes {
+            return Err(format!(
+                "online payload byte size mismatch expected={expected_bytes} actual={}",
+                payload.len()
+            ));
+        }
+
+        let selection = select_device()?;
+        let device = selection.device;
+        let cpu = tch::Device::Cpu;
+        let float = Kind::Float;
+
+        let values: Vec<f32> = payload
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+
+        let q_cpu = (Tensor::arange(num_heads as i64 * head_dim as i64, (float, cpu))
+            .reshape([num_heads as i64, head_dim as i64])
+            / 31.0)
+            + 0.125;
+
+        let q = q_cpu.to(device);
+        let mut running_max =
+            Tensor::full(&[num_heads as i64], f64::NEG_INFINITY, (float, device));
+        let mut running_sum = Tensor::zeros(&[num_heads as i64], (float, device));
+        let mut output = Tensor::zeros(&[num_heads as i64, head_dim as i64], (float, device));
+
+        let mut k_refs: Vec<Tensor> = Vec::new();
+        let mut v_refs: Vec<Tensor> = Vec::new();
+
+        let scale = 1.0 / (head_dim as f64).sqrt();
+        let mut offset = 0usize;
+
+        for &block_len in block_lens {
+            let block_values =
+                (block_len as usize) * (num_heads as usize) * (head_dim as usize) * 2;
+            let kv_cpu = Tensor::from_slice(&values[offset..offset + block_values])
+                .reshape([2, block_len as i64, num_heads as i64, head_dim as i64]);
+            offset += block_values;
+
+            let k_cpu = kv_cpu.get(0);
+            let v_cpu = kv_cpu.get(1);
+            k_refs.push(k_cpu.shallow_clone());
+            v_refs.push(v_cpu.shallow_clone());
+
+            let k = k_cpu.to(device);
+            let v = v_cpu.to(device);
+            let k_by_head = k.permute(&[1, 0, 2]);
+            let v_by_head = v.permute(&[1, 0, 2]);
+            let scores = k_by_head.matmul(&q.unsqueeze(2i64)).squeeze_dim(2) * scale;
+            let (local_max, _) = scores.max_dim(1, false);
+            let weights = (&scores - local_max.unsqueeze(1i64)).exp();
+            let local_sum = weights.sum_dim_intlist(&[1i64][..], false, float);
+            let local_pv = weights.unsqueeze(1i64).matmul(&v_by_head).squeeze_dim(1);
+
+            let new_max = running_max.max_other(&local_max);
+            let exp_prev = (&running_max - &new_max).exp();
+            let exp_local = (&local_max - &new_max).exp();
+            let new_sum = &exp_prev * &running_sum + &exp_local * &local_sum;
+            output = (&exp_prev.unsqueeze(1i64) * &running_sum.unsqueeze(1i64) * &output
+                + &exp_local.unsqueeze(1i64) * &local_pv)
+                / &new_sum.unsqueeze(1i64);
+            running_max = new_max;
+            running_sum = new_sum;
+        }
+
+        if !device_matches(&output, device) {
+            return Err("online output landed on unexpected device".to_string());
+        }
+
+        let k_ref = Tensor::cat(&k_refs, 0);
+        let v_ref = Tensor::cat(&v_refs, 0);
+        let reference = payload_attention(&q_cpu, &k_ref, &v_ref);
+        let output_cpu = output.to(cpu);
+        let max_abs_err = (&output_cpu - &reference).abs().max().double_value(&[]);
+        let checksum = output_cpu.sum(float).double_value(&[]);
+
+        if max_abs_err <= 1.0e-4 {
+            let msg = format!(
+                "ok blocks={} tokens={token_count} max_abs_err={max_abs_err} checksum={checksum}",
+                block_lens.len()
+            );
+            Ok((selection.success_code, msg))
+        } else {
+            Err(format!(
+                "online payload mismatch blocks={} tokens={token_count} max_abs_err={max_abs_err}",
+                block_lens.len()
+            ))
+        }
+    }
+
+    pub fn run_payload_chunk_smoke(
+        payload: &[u8],
+        block_lens: &[i32],
+        query_len: i32,
+        num_heads: i32,
+        head_dim: i32,
+    ) -> Result<(i32, String), String> {
+        if query_len <= 0 || num_heads <= 0 || head_dim <= 0 {
+            return Err("query_len, num_heads, and head_dim must be positive".to_string());
+        }
+        if block_lens.is_empty() {
+            return Err("block_count must be positive".to_string());
+        }
+        let mut token_count = 0usize;
+        for &bl in block_lens {
+            if bl <= 0 {
+                return Err("all block_lens entries must be positive".to_string());
+            }
+            token_count += bl as usize;
+        }
+        let expected_values = token_count * (num_heads as usize) * (head_dim as usize) * 2;
+        let expected_bytes = expected_values * std::mem::size_of::<f32>();
+        if payload.len() != expected_bytes {
+            return Err(format!(
+                "chunk payload byte size mismatch expected={expected_bytes} actual={}",
+                payload.len()
+            ));
+        }
+
+        let selection = select_device()?;
+        let device = selection.device;
+        let cpu = tch::Device::Cpu;
+        let float = Kind::Float;
+
+        let values: Vec<f32> = payload
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+
+        let q_cpu = (Tensor::arange(query_len as i64 * num_heads as i64 * head_dim as i64, (float, cpu))
+            .reshape([query_len as i64, num_heads as i64, head_dim as i64])
+            / 37.0)
+            + 0.0625;
+
+        let q = q_cpu.to(device);
+        let q_by_head = q.permute(&[1, 0, 2]);
+        let mut running_max =
+            Tensor::full(&[num_heads as i64, query_len as i64], f64::NEG_INFINITY, (float, device));
+        let mut running_sum = Tensor::zeros(&[num_heads as i64, query_len as i64], (float, device));
+        let mut output_by_head =
+            Tensor::zeros(&[num_heads as i64, query_len as i64, head_dim as i64], (float, device));
+
+        let mut k_refs: Vec<Tensor> = Vec::new();
+        let mut v_refs: Vec<Tensor> = Vec::new();
+
+        let scale = 1.0 / (head_dim as f64).sqrt();
+        let mut offset = 0usize;
+
+        for &block_len in block_lens {
+            let block_values =
+                (block_len as usize) * (num_heads as usize) * (head_dim as usize) * 2;
+            let kv_cpu = Tensor::from_slice(&values[offset..offset + block_values])
+                .reshape([2, block_len as i64, num_heads as i64, head_dim as i64]);
+            offset += block_values;
+
+            let k_cpu = kv_cpu.get(0);
+            let v_cpu = kv_cpu.get(1);
+            k_refs.push(k_cpu.shallow_clone());
+            v_refs.push(v_cpu.shallow_clone());
+
+            let k = k_cpu.to(device);
+            let v = v_cpu.to(device);
+            let k_by_head = k.permute(&[1, 0, 2]);
+            let v_by_head = v.permute(&[1, 0, 2]);
+            let scores = q_by_head.matmul(&k_by_head.transpose(1, 2)) * scale;
+            let (local_max, _) = scores.max_dim(2, false);
+            let weights = (&scores - local_max.unsqueeze(2i64)).exp();
+            let local_sum = weights.sum_dim_intlist(&[2i64][..], false, float);
+            let local_pv = weights.matmul(&v_by_head);
+
+            let new_max = running_max.max_other(&local_max);
+            let exp_prev = (&running_max - &new_max).exp();
+            let exp_local = (&local_max - &new_max).exp();
+            let new_sum = &exp_prev * &running_sum + &exp_local * &local_sum;
+            output_by_head = (&exp_prev.unsqueeze(2i64) * &running_sum.unsqueeze(2i64) * &output_by_head
+                + &exp_local.unsqueeze(2i64) * &local_pv)
+                / &new_sum.unsqueeze(2i64);
+            running_max = new_max;
+            running_sum = new_sum;
+        }
+
+        let output = output_by_head.permute(&[1, 0, 2]);
+        if !device_matches(&output, device) {
+            return Err("chunk output landed on unexpected device".to_string());
+        }
+
+        let k_ref = Tensor::cat(&k_refs, 0);
+        let v_ref = Tensor::cat(&v_refs, 0);
+        let reference = payload_chunk_attention(&q_cpu, &k_ref, &v_ref);
+        let output_cpu = output.to(cpu);
+        let max_abs_err = (&output_cpu - &reference).abs().max().double_value(&[]);
+        let checksum = tensor_weighted_checksum(&output_cpu);
+
+        if max_abs_err <= 1.0e-4 {
+            let msg = format!(
+                "ok blocks={} query_len={query_len} tokens={token_count} max_abs_err={max_abs_err} checksum={checksum}",
+                block_lens.len()
+            );
+            Ok((selection.success_code, msg))
+        } else {
+            Err(format!(
+                "chunk payload mismatch blocks={} query_len={query_len} tokens={token_count} max_abs_err={max_abs_err}",
+                block_lens.len()
+            ))
+        }
+    }
+
+    pub fn run_query_chunk_smoke(
+        q_payload: &[u8],
+        kv_payload: &[u8],
+        block_lens: &[i32],
+        query_len: i32,
+        num_heads: i32,
+        head_dim: i32,
+    ) -> Result<(i32, String, f64, f64, usize), String> {
+        if query_len <= 0 || num_heads <= 0 || head_dim <= 0 {
+            return Err("query_len, num_heads, and head_dim must be positive".to_string());
+        }
+        let expected_q_values = (query_len as usize) * (num_heads as usize) * (head_dim as usize);
+        let expected_q_bytes = expected_q_values * std::mem::size_of::<f32>();
+        if q_payload.len() != expected_q_bytes {
+            return Err(format!(
+                "q payload byte size mismatch expected={expected_q_bytes} actual={}",
+                q_payload.len()
+            ));
+        }
+
+        let q_values: Vec<f32> = q_payload
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let q_cpu = Tensor::from_slice(&q_values)
+            .reshape([query_len as i64, num_heads as i64, head_dim as i64]);
+
+        let selection = select_device()?;
+        let device = selection.device;
+        let cpu = tch::Device::Cpu;
+        let float = Kind::Float;
+
+        let mut token_count = 0usize;
+        for &bl in block_lens {
+            if bl <= 0 {
+                return Err("all block_lens entries must be positive".to_string());
+            }
+            token_count += bl as usize;
+        }
+        let expected_kv_values = token_count * (num_heads as usize) * (head_dim as usize) * 2;
+        let expected_kv_bytes = expected_kv_values * std::mem::size_of::<f32>();
+        if kv_payload.len() != expected_kv_bytes {
+            return Err(format!(
+                "kv payload byte size mismatch expected={expected_kv_bytes} actual={}",
+                kv_payload.len()
+            ));
+        }
+
+        let kv_values: Vec<f32> = kv_payload
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+
+        let q = q_cpu.to(device);
+        let q_by_head = q.permute(&[1, 0, 2]);
+        let mut running_max =
+            Tensor::full(&[num_heads as i64, query_len as i64], f64::NEG_INFINITY, (float, device));
+        let mut running_sum = Tensor::zeros(&[num_heads as i64, query_len as i64], (float, device));
+        let mut output_by_head =
+            Tensor::zeros(&[num_heads as i64, query_len as i64, head_dim as i64], (float, device));
+
+        let mut k_refs: Vec<Tensor> = Vec::new();
+        let mut v_refs: Vec<Tensor> = Vec::new();
+
+        let scale = 1.0 / (head_dim as f64).sqrt();
+        let mut offset = 0usize;
+
+        for &block_len in block_lens {
+            let block_values =
+                (block_len as usize) * (num_heads as usize) * (head_dim as usize) * 2;
+            let kv_cpu = Tensor::from_slice(&kv_values[offset..offset + block_values])
+                .reshape([2, block_len as i64, num_heads as i64, head_dim as i64]);
+            offset += block_values;
+
+            let k_cpu = kv_cpu.get(0);
+            let v_cpu = kv_cpu.get(1);
+            k_refs.push(k_cpu.shallow_clone());
+            v_refs.push(v_cpu.shallow_clone());
+
+            let k = k_cpu.to(device);
+            let v = v_cpu.to(device);
+            let k_by_head = k.permute(&[1, 0, 2]);
+            let v_by_head = v.permute(&[1, 0, 2]);
+            let scores = q_by_head.matmul(&k_by_head.transpose(1, 2)) * scale;
+            let (local_max, _) = scores.max_dim(2, false);
+            let weights = (&scores - local_max.unsqueeze(2i64)).exp();
+            let local_sum = weights.sum_dim_intlist(&[2i64][..], false, float);
+            let local_pv = weights.matmul(&v_by_head);
+
+            let new_max = running_max.max_other(&local_max);
+            let exp_prev = (&running_max - &new_max).exp();
+            let exp_local = (&local_max - &new_max).exp();
+            let new_sum = &exp_prev * &running_sum + &exp_local * &local_sum;
+            output_by_head = (&exp_prev.unsqueeze(2i64) * &running_sum.unsqueeze(2i64) * &output_by_head
+                + &exp_local.unsqueeze(2i64) * &local_pv)
+                / &new_sum.unsqueeze(2i64);
+            running_max = new_max;
+            running_sum = new_sum;
+        }
+
+        let output = output_by_head.permute(&[1, 0, 2]);
+        if !device_matches(&output, device) {
+            return Err("chunk output landed on unexpected device".to_string());
+        }
+
+        let k_ref = Tensor::cat(&k_refs, 0);
+        let v_ref = Tensor::cat(&v_refs, 0);
+        let reference = payload_chunk_attention(&q_cpu, &k_ref, &v_ref);
+        let output_cpu = output.to(cpu);
+        let max_abs_err = (&output_cpu - &reference).abs().max().double_value(&[]);
+        let checksum = tensor_weighted_checksum(&output_cpu);
+        let output_values = output_cpu.numel() as usize;
+
+        if max_abs_err <= 1.0e-4 {
+            let msg = format!(
+                "ok blocks={} query_len={query_len} tokens={token_count} max_abs_err={max_abs_err} checksum={checksum}",
+                block_lens.len()
+            );
+            Ok((selection.success_code, msg, checksum, max_abs_err, output_values))
+        } else {
+            Err(format!(
+                "chunk payload mismatch blocks={} query_len={query_len} tokens={token_count} max_abs_err={max_abs_err}",
+                block_lens.len()
+            ))
+        }
+    }
+
+    fn tensor_weighted_checksum(tensor: &Tensor) -> f64 {
+        let flat = tensor.contiguous().view([-1]);
+        let values: Vec<f32> = Vec::try_from(&flat).unwrap_or_default();
+        let mut checksum = 0.0;
+        for (i, &v) in values.iter().enumerate() {
+            checksum += (v as f64) * ((i % 997) + 1) as f64;
+        }
+        checksum
     }
 }
 
 #[cfg(not(feature = "tch-backend"))]
 pub mod backend {
     pub fn run_attention_block_updates(_block_updates: i32) -> Result<(i32, String), String> {
+        Err("tch-backend feature is not enabled".to_string())
+    }
+    pub fn run_payload_block_smoke(
+        _payload: &[u8],
+        _block_len: i32,
+        _num_heads: i32,
+        _head_dim: i32,
+    ) -> Result<(i32, String), String> {
+        Err("tch-backend feature is not enabled".to_string())
+    }
+    pub fn run_payload_online_smoke(
+        _payload: &[u8],
+        _block_lens: &[i32],
+        _num_heads: i32,
+        _head_dim: i32,
+    ) -> Result<(i32, String), String> {
+        Err("tch-backend feature is not enabled".to_string())
+    }
+    pub fn run_payload_chunk_smoke(
+        _payload: &[u8],
+        _block_lens: &[i32],
+        _query_len: i32,
+        _num_heads: i32,
+        _head_dim: i32,
+    ) -> Result<(i32, String), String> {
+        Err("tch-backend feature is not enabled".to_string())
+    }
+    pub fn run_query_chunk_smoke(
+        _q_payload: &[u8],
+        _kv_payload: &[u8],
+        _block_lens: &[i32],
+        _query_len: i32,
+        _num_heads: i32,
+        _head_dim: i32,
+    ) -> Result<(i32, String, f64, f64, usize), String> {
         Err("tch-backend feature is not enabled".to_string())
     }
 }

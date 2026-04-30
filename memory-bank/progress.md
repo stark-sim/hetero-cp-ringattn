@@ -65,6 +65,9 @@
 - [x] [2026-04-30] Linux `--as-needed` 导致 `libtorch_cuda.so` 被丢弃的问题已通过 `build.rs` 的 `cargo:rustc-link-arg-bins` 修复。
 - [x] [2026-04-30] `run_rust_ringattn_smoke.sh` 默认在有 `LIBTORCH` 时自动启用 `tch-backend` feature。
 - [x] [2026-04-30] `docs/TCH_BACKEND_DESIGN.md` 已补充架构设计、数据流、构建链接和验证矩阵。
+- [x] [2026-04-30] `tch_backend.rs` 已实现全部 6 个 C++ ATen 桥接对标函数（attention block updates、payload block、payload online、payload chunk、query chunk、query chunk output）。
+- [x] [2026-04-30] `main.rs` 已接入全部 5 个 tch payload/query bridge report，与 C++ bridge 并行；`Report` / `RemoteCpNodeRunReport` / `run()` / cp-node 路径 / CLI summary / fail message 打印均已同步。
+- [x] [2026-04-30] 本机 CPU tch 全桥接 smoke 通过：`status=pass`，全部 6 个 bridge `code=1`，payload/query 各 `30/30`，query output `groups=3`。
 
 ## 进行中
 
