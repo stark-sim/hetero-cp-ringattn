@@ -89,6 +89,31 @@ struct ModelLayerWeights {
     q_proj: Vec<f32>,
     k_proj: Vec<f32>,
     v_proj: Vec<f32>,
+    o_proj: Vec<f32>,
+}
+
+#[derive(Clone, Debug)]
+struct LayerNormWeights {
+    gamma: Vec<f32>,
+    beta: Vec<f32>,
+}
+
+impl LayerNormWeights {
+    fn new(hidden_dim: usize) -> Self {
+        let gamma: Vec<f32> = (0..hidden_dim).map(|i| 1.0 + i as f32 * 0.001).collect();
+        let beta: Vec<f32> = (0..hidden_dim).map(|i| i as f32 * 0.0001).collect();
+        Self { gamma, beta }
+    }
+}
+
+fn layer_norm(hidden: &mut [f32], gamma: &[f32], beta: &[f32], eps: f32) {
+    let n = hidden.len();
+    let mean = hidden.iter().sum::<f32>() / n as f32;
+    let var = hidden.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>() / n as f32;
+    let std = (var + eps).sqrt();
+    for i in 0..n {
+        hidden[i] = (hidden[i] - mean) / std * gamma[i] + beta[i];
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -96,6 +121,7 @@ enum ProjectionKind {
     Query,
     Key,
     Value,
+    Output,
 }
 
 #[derive(Clone, Debug)]
@@ -160,18 +186,23 @@ fn finalize_tch_compute_output(
         let query_len = model_state.query_len();
         let num_heads = model_state.num_heads();
         let head_dim = model_state.head_dim();
-        let mut output_slot = model_state.activation.output_slot.clone();
-        for h in 0..num_heads {
-            for q in 0..query_len {
+        let hidden_dim = model_state.activation.hidden_dim;
+        let mut output_slot = vec![0_u8; query_len * hidden_dim * FLOAT32_BYTES];
+        for q in 0..query_len {
+            let mut attn_out = Vec::with_capacity(num_heads * head_dim);
+            for h in 0..num_heads {
                 for d in 0..head_dim {
                     let src_idx = (h * query_len + q) * head_dim + d;
-                    let dst_idx = (q * num_heads + h) * head_dim + d;
-                    let bytes = FLOAT32_BYTES;
-                    let offset_dst = dst_idx * bytes;
-                    let value = accumulator.output_acc[src_idx];
-                    output_slot[offset_dst..offset_dst + bytes]
-                        .copy_from_slice(&value.to_le_bytes());
+                    attn_out.push(accumulator.output_acc[src_idx]);
                 }
+            }
+            let o_proj_out = model_state.weights.project_output(&attn_out);
+            let residual_start = q * hidden_dim;
+            for d in 0..hidden_dim {
+                let residual = model_state.activation.residual_input[residual_start + d] + o_proj_out[d];
+                let offset = residual_start + d;
+                output_slot[offset * FLOAT32_BYTES..(offset + 1) * FLOAT32_BYTES]
+                    .copy_from_slice(&residual.to_le_bytes());
             }
         }
         model_state.activation.output_slot = output_slot;
@@ -195,6 +226,7 @@ fn finalize_tch_compute_output(
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct LayerActivationState {
     layer_index: i32,
     seq_offset: usize,
@@ -204,6 +236,7 @@ struct LayerActivationState {
     num_heads: usize,
     head_dim: usize,
     hidden_states: Vec<f32>,
+    residual_input: Vec<f32>,
     q_chunk: Vec<u8>,
     k_cache: Vec<u8>,
     v_cache: Vec<u8>,
@@ -263,6 +296,12 @@ impl ModelLayerWeights {
                 projection_dim,
                 ProjectionKind::Value,
             ),
+            o_proj: build_projection_weights(
+                layer_index,
+                projection_dim,
+                hidden_dim,
+                ProjectionKind::Output,
+            ),
         }
     }
 
@@ -271,8 +310,11 @@ impl ModelLayerWeights {
             ProjectionKind::Query => &self.q_proj,
             ProjectionKind::Key => &self.k_proj,
             ProjectionKind::Value => &self.v_proj,
+            ProjectionKind::Output => &self.o_proj,
         }
     }
+
+
 
     fn project_token(&self, hidden: &[f32], kind: ProjectionKind) -> Vec<f32> {
         debug_assert_eq!(hidden.len(), self.hidden_dim);
@@ -288,6 +330,39 @@ impl ModelLayerWeights {
         }
         output
     }
+
+    #[allow(dead_code)]
+    fn project_output(&self, attn_out: &[f32]) -> Vec<f32> {
+        debug_assert_eq!(attn_out.len(), self.projection_dim);
+        let weights = &self.o_proj;
+        let mut output = Vec::with_capacity(self.hidden_dim);
+        for output_index in 0..self.hidden_dim {
+            let mut value = projection_bias(self.layer_index, output_index, ProjectionKind::Output);
+            for hidden_index in 0..self.projection_dim {
+                value += attn_out[hidden_index]
+                    * weights[hidden_index * self.hidden_dim + output_index];
+            }
+            output.push(value);
+        }
+        output
+    }
+}
+
+fn apply_rope(values: &mut [f32], token_pos: usize, num_heads: usize, head_dim: usize) {
+    let theta = 10_000.0_f32;
+    for h in 0..num_heads {
+        let head_offset = h * head_dim;
+        for i in 0..(head_dim / 2) {
+            let freq = 1.0 / theta.powf((2.0 * i as f32) / head_dim as f32);
+            let angle = token_pos as f32 * freq;
+            let cos_a = angle.cos();
+            let sin_a = angle.sin();
+            let x0 = values[head_offset + 2 * i];
+            let x1 = values[head_offset + 2 * i + 1];
+            values[head_offset + 2 * i] = x0 * cos_a - x1 * sin_a;
+            values[head_offset + 2 * i + 1] = x0 * sin_a + x1 * cos_a;
+        }
+    }
 }
 
 impl DomainModelState {
@@ -295,26 +370,33 @@ impl DomainModelState {
         let query_len = usize::min(QUERY_CHUNK_LEN, domain.seq_chunk_len);
         let projection_dim = KV_NUM_HEADS * KV_HEAD_DIM;
         let weights = ModelLayerWeights::new(MODEL_LAYER_INDEX, MODEL_HIDDEN_DIM, projection_dim);
-        let output_values = query_len * KV_NUM_HEADS * KV_HEAD_DIM;
-        let hidden_states = build_hidden_states(domain, MODEL_HIDDEN_DIM);
+        let _output_values = query_len * KV_NUM_HEADS * KV_HEAD_DIM;
+        let hidden_states_raw = build_hidden_states(domain, MODEL_HIDDEN_DIM);
+        let mut hidden_states = hidden_states_raw.clone();
+        let ln_weights = LayerNormWeights::new(MODEL_HIDDEN_DIM);
+        for token_offset in 0..domain.seq_chunk_len {
+            let start = token_offset * MODEL_HIDDEN_DIM;
+            let end = start + MODEL_HIDDEN_DIM;
+            layer_norm(&mut hidden_states[start..end], &ln_weights.gamma, &ln_weights.beta, 1e-5);
+        }
         let mut q_chunk = Vec::with_capacity(query_len * projection_dim * FLOAT32_BYTES);
         let mut k_cache = Vec::with_capacity(domain.seq_chunk_len * projection_dim * FLOAT32_BYTES);
         let mut v_cache = Vec::with_capacity(domain.seq_chunk_len * projection_dim * FLOAT32_BYTES);
 
         for token_offset in 0..query_len {
             let hidden = hidden_token(&hidden_states, token_offset, MODEL_HIDDEN_DIM);
-            append_f32_values(
-                &mut q_chunk,
-                &weights.project_token(hidden, ProjectionKind::Query),
-            );
+            let mut projected = weights.project_token(hidden, ProjectionKind::Query);
+            let global_token = domain.seq_offset + token_offset;
+            apply_rope(&mut projected, global_token, KV_NUM_HEADS, KV_HEAD_DIM);
+            append_f32_values(&mut q_chunk, &projected);
         }
 
         for token_offset in 0..domain.seq_chunk_len {
             let hidden = hidden_token(&hidden_states, token_offset, MODEL_HIDDEN_DIM);
-            append_f32_values(
-                &mut k_cache,
-                &weights.project_token(hidden, ProjectionKind::Key),
-            );
+            let mut projected_k = weights.project_token(hidden, ProjectionKind::Key);
+            let global_token = domain.seq_offset + token_offset;
+            apply_rope(&mut projected_k, global_token, KV_NUM_HEADS, KV_HEAD_DIM);
+            append_f32_values(&mut k_cache, &projected_k);
             append_f32_values(
                 &mut v_cache,
                 &weights.project_token(hidden, ProjectionKind::Value),
@@ -334,10 +416,11 @@ impl DomainModelState {
                 num_heads: KV_NUM_HEADS,
                 head_dim: KV_HEAD_DIM,
                 hidden_states,
+                residual_input: hidden_states_raw,
                 q_chunk,
                 k_cache,
                 v_cache,
-                output_slot: vec![0_u8; output_values * FLOAT32_BYTES],
+                output_slot: vec![0_u8; query_len * MODEL_HIDDEN_DIM * FLOAT32_BYTES],
             },
         }
     }
@@ -2186,6 +2269,7 @@ fn projection_weight_value(
         ProjectionKind::Query => 0.000_31,
         ProjectionKind::Key => 0.000_47,
         ProjectionKind::Value => 0.000_59,
+        ProjectionKind::Output => 0.000_71,
     };
     let layer_bias = (layer_index as f32 + 1.0) * 0.000_019;
     (hidden_index as f32 + 1.0) * 0.000_071
@@ -2199,6 +2283,7 @@ fn projection_bias(layer_index: i32, output_index: usize, kind: ProjectionKind) 
         ProjectionKind::Query => 0.0031,
         ProjectionKind::Key => 0.0047,
         ProjectionKind::Value => 0.0059,
+        ProjectionKind::Output => 0.0071,
     };
     kind_bias + (layer_index as f32 + 1.0) * 0.000_13 + output_index as f32 * 0.000_002
 }
