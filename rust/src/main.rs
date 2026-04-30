@@ -105,6 +105,7 @@ struct Report {
     tch_payload_chunk_bridge: TorchPayloadBlockReport,
     tch_query_chunk_bridge: TorchPayloadBlockReport,
     tch_query_output_bridge: TorchQueryOutputReport,
+    tch_compute_output_checksum: f64,
     cases: Vec<CaseReport>,
 }
 
@@ -122,6 +123,7 @@ struct RemoteCpNodeRunReport {
     tch_payload_chunk_bridge: TorchPayloadBlockReport,
     tch_query_chunk_bridge: TorchPayloadBlockReport,
     tch_query_output_bridge: TorchQueryOutputReport,
+    tch_compute_output_checksum: f64,
 }
 
 #[derive(Serialize)]
@@ -1945,6 +1947,7 @@ fn run() -> Result<Report, RingError> {
     let failed = cases.len() - passed;
     let protocol_smoke = protocol::run_protocol_smoke()?;
     let cp_ring_smoke = protocol::run_cp_ring_node_smoke()?;
+    let tch_compute_output_checksum = cp_ring_smoke.compute_output_checksum();
     let torch_bridge = torch_bridge_report();
     let torch_attention_bridge = torch_attention_bridge_report();
     let tch_attention_bridge = tch_attention_bridge_report();
@@ -2000,6 +2003,7 @@ fn run() -> Result<Report, RingError> {
         },
         protocol_smoke,
         cp_ring_smoke,
+        tch_compute_output_checksum,
         cxx_bridge: CxxBridgeReport {
             status: "ok",
             smoke_domains: unsafe { hcp_ringattn_cxx_smoke_domain_count() },
@@ -2094,6 +2098,7 @@ fn main() -> Result<(), RingError> {
             tch_query_chunk_bridge_report(cp_node.payload_blocks());
         let tch_query_output_bridge =
             tch_query_output_bridge_report(cp_node.payload_blocks());
+        let tch_compute_output_checksum = cp_node.compute_output_checksum();
         let status = if cp_node.status == "pass"
             && torch_payload_block_bridge.status != "fail"
             && torch_payload_online_bridge.status != "fail"
@@ -2123,10 +2128,11 @@ fn main() -> Result<(), RingError> {
             tch_payload_chunk_bridge,
             tch_query_chunk_bridge,
             tch_query_output_bridge,
+            tch_compute_output_checksum,
         };
         write_json_report(&args.report_path, &report)?;
         println!(
-            "[rust-remote-cp-node] status={} role={} transport={} sent={} received={} compute_updates={} torch_payload_block_status={} torch_payload_block_code={} torch_payload_blocks={}/{} torch_payload_online_status={} torch_payload_online_code={} torch_payload_online_blocks={}/{} torch_payload_chunk_status={} torch_payload_chunk_code={} torch_payload_chunk_blocks={}/{} torch_query_chunk_status={} torch_query_chunk_code={} torch_query_chunk_blocks={}/{} torch_query_output_status={} torch_query_output_code={} torch_query_output_groups={} torch_query_output_blocks={}/{} tch_payload_block_status={} tch_payload_block_code={} tch_payload_block_blocks={}/{} tch_payload_online_status={} tch_payload_online_code={} tch_payload_online_blocks={}/{} tch_payload_chunk_status={} tch_payload_chunk_code={} tch_payload_chunk_blocks={}/{} tch_query_chunk_status={} tch_query_chunk_code={} tch_query_chunk_blocks={}/{} tch_query_output_status={} tch_query_output_code={} tch_query_output_groups={} tch_query_output_blocks={}/{} report={}",
+            "[rust-remote-cp-node] status={} role={} transport={} sent={} received={} compute_updates={} torch_payload_block_status={} torch_payload_block_code={} torch_payload_blocks={}/{} torch_payload_online_status={} torch_payload_online_code={} torch_payload_online_blocks={}/{} torch_payload_chunk_status={} torch_payload_chunk_code={} torch_payload_chunk_blocks={}/{} torch_query_chunk_status={} torch_query_chunk_code={} torch_query_chunk_blocks={}/{} torch_query_output_status={} torch_query_output_code={} torch_query_output_groups={} torch_query_output_blocks={}/{} tch_payload_block_status={} tch_payload_block_code={} tch_payload_block_blocks={}/{} tch_payload_online_status={} tch_payload_online_code={} tch_payload_online_blocks={}/{} tch_payload_chunk_status={} tch_payload_chunk_code={} tch_payload_chunk_blocks={}/{} tch_query_chunk_status={} tch_query_chunk_code={} tch_query_chunk_blocks={}/{} tch_query_output_status={} tch_query_output_code={} tch_query_output_groups={} tch_query_output_blocks={}/{} tch_compute_output_checksum={} report={}",
             report.status,
             report.cp_node.role(),
             report.cp_node.transport(),
@@ -2175,6 +2181,7 @@ fn main() -> Result<(), RingError> {
             report.tch_query_output_bridge.output_groups.len(),
             report.tch_query_output_bridge.processed_blocks,
             report.tch_query_output_bridge.requested_blocks,
+            report.tch_compute_output_checksum,
             args.report_path
         );
         if report.torch_payload_block_bridge.status == "fail"
@@ -2240,7 +2247,7 @@ fn main() -> Result<(), RingError> {
     let report = run()?;
     write_json_report(&args.report_path, &report)?;
     println!(
-        "[rust-ringattn] status={} passed={}/{} protocol_status={} protocol_messages={} cp_ring_status={} cp_ring_messages={} cp_ring_compute_updates={} cxx_domains={} torch_status={} torch_device={} torch_code={} torch_attention_status={} torch_attention_code={} tch_attention_status={} tch_attention_code={} torch_block_update_status={} torch_block_update_code={} torch_block_updates={} torch_payload_block_status={} torch_payload_block_code={} torch_payload_blocks={}/{} torch_payload_online_status={} torch_payload_online_code={} torch_payload_online_blocks={}/{} torch_payload_chunk_status={} torch_payload_chunk_code={} torch_payload_chunk_blocks={}/{} torch_query_chunk_status={} torch_query_chunk_code={} torch_query_chunk_blocks={}/{} torch_query_output_status={} torch_query_output_code={} torch_query_output_groups={} torch_query_output_blocks={}/{} tch_payload_block_status={} tch_payload_block_code={} tch_payload_block_blocks={}/{} tch_payload_online_status={} tch_payload_online_code={} tch_payload_online_blocks={}/{} tch_payload_chunk_status={} tch_payload_chunk_code={} tch_payload_chunk_blocks={}/{} tch_query_chunk_status={} tch_query_chunk_code={} tch_query_chunk_blocks={}/{} tch_query_output_status={} tch_query_output_code={} tch_query_output_groups={} tch_query_output_blocks={}/{} torch_compiled={} report={}",
+        "[rust-ringattn] status={} passed={}/{} protocol_status={} protocol_messages={} cp_ring_status={} cp_ring_messages={} cp_ring_compute_updates={} cxx_domains={} torch_status={} torch_device={} torch_code={} torch_attention_status={} torch_attention_code={} tch_attention_status={} tch_attention_code={} torch_block_update_status={} torch_block_update_code={} torch_block_updates={} torch_payload_block_status={} torch_payload_block_code={} torch_payload_blocks={}/{} torch_payload_online_status={} torch_payload_online_code={} torch_payload_online_blocks={}/{} torch_payload_chunk_status={} torch_payload_chunk_code={} torch_payload_chunk_blocks={}/{} torch_query_chunk_status={} torch_query_chunk_code={} torch_query_chunk_blocks={}/{} torch_query_output_status={} torch_query_output_code={} torch_query_output_groups={} torch_query_output_blocks={}/{} tch_payload_block_status={} tch_payload_block_code={} tch_payload_block_blocks={}/{} tch_payload_online_status={} tch_payload_online_code={} tch_payload_online_blocks={}/{} tch_payload_chunk_status={} tch_payload_chunk_code={} tch_payload_chunk_blocks={}/{} tch_query_chunk_status={} tch_query_chunk_code={} tch_query_chunk_blocks={}/{} tch_query_output_status={} tch_query_output_code={} tch_query_output_groups={} tch_query_output_blocks={}/{} tch_compute_output_checksum={} torch_compiled={} report={}",
         report.status,
         report.summary.passed,
         report.summary.cases,
@@ -2302,6 +2309,7 @@ fn main() -> Result<(), RingError> {
         report.tch_query_output_bridge.output_groups.len(),
         report.tch_query_output_bridge.processed_blocks,
         report.tch_query_output_bridge.requested_blocks,
+        report.tch_compute_output_checksum,
         report.torch_bridge.compiled,
         args.report_path
     );

@@ -577,6 +577,128 @@ pub mod backend {
         }
     }
 
+    pub fn compute_chunk_attention_step(
+        q_payload: &[u8],
+        kv_payload: &[u8],
+        block_len: i32,
+        query_len: i32,
+        num_heads: i32,
+        head_dim: i32,
+        running_max: &mut [f32],
+        running_sum: &mut [f32],
+        output_acc: &mut [f32],
+    ) -> Result<(), String> {
+        if block_len <= 0 || query_len <= 0 || num_heads <= 0 || head_dim <= 0 {
+            return Err("block_len, query_len, num_heads, and head_dim must be positive".to_string());
+        }
+        let expected_q_bytes = (query_len as usize) * (num_heads as usize) * (head_dim as usize) * 4;
+        if q_payload.len() != expected_q_bytes {
+            return Err(format!(
+                "q payload size mismatch expected={expected_q_bytes} actual={}",
+                q_payload.len()
+            ));
+        }
+        let expected_kv_bytes = (block_len as usize) * (num_heads as usize) * (head_dim as usize) * 2 * 4;
+        if kv_payload.len() != expected_kv_bytes {
+            return Err(format!(
+                "kv payload size mismatch expected={expected_kv_bytes} actual={}",
+                kv_payload.len()
+            ));
+        }
+        let expected_max_len = (num_heads as usize) * (query_len as usize);
+        if running_max.len() != expected_max_len {
+            return Err(format!(
+                "running_max len mismatch expected={expected_max_len} actual={}",
+                running_max.len()
+            ));
+        }
+        if running_sum.len() != expected_max_len {
+            return Err(format!(
+                "running_sum len mismatch expected={expected_max_len} actual={}",
+                running_sum.len()
+            ));
+        }
+        let expected_out_len = expected_max_len * (head_dim as usize);
+        if output_acc.len() != expected_out_len {
+            return Err(format!(
+                "output_acc len mismatch expected={expected_out_len} actual={}",
+                output_acc.len()
+            ));
+        }
+
+        let selection = select_device()?;
+        let device = selection.device;
+        let float = Kind::Float;
+
+        let q_values: Vec<f32> = q_payload
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let q = Tensor::from_slice(&q_values)
+            .reshape([query_len as i64, num_heads as i64, head_dim as i64])
+            .to(device);
+        let q_by_head = q.permute(&[1, 0, 2]);
+
+        let kv_values: Vec<f32> = kv_payload
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let kv = Tensor::from_slice(&kv_values)
+            .reshape([2, block_len as i64, num_heads as i64, head_dim as i64]);
+        let k = kv.get(0).to(device);
+        let v = kv.get(1).to(device);
+        let k_by_head = k.permute(&[1, 0, 2]);
+        let v_by_head = v.permute(&[1, 0, 2]);
+
+        let mut rm = Tensor::from_slice(running_max)
+            .reshape([num_heads as i64, query_len as i64])
+            .to(device);
+        let mut rs = Tensor::from_slice(running_sum)
+            .reshape([num_heads as i64, query_len as i64])
+            .to(device);
+        let mut obh = Tensor::from_slice(output_acc)
+            .reshape([num_heads as i64, query_len as i64, head_dim as i64])
+            .to(device);
+
+        let scale = 1.0 / (head_dim as f64).sqrt();
+        let scores = q_by_head.matmul(&k_by_head.transpose(1, 2)) * scale;
+        let (local_max, _) = scores.max_dim(2, false);
+        let weights = (&scores - local_max.unsqueeze(2i64)).exp();
+        let local_sum = weights.sum_dim_intlist(&[2i64][..], false, float);
+        let local_pv = weights.matmul(&v_by_head);
+
+        let new_max = rm.max_other(&local_max);
+        let exp_prev = (&rm - &new_max).exp();
+        let exp_local = (&local_max - &new_max).exp();
+        let new_sum = &exp_prev * &rs + &exp_local * &local_sum;
+        obh = (&exp_prev.unsqueeze(2i64) * &rs.unsqueeze(2i64) * &obh
+            + &exp_local.unsqueeze(2i64) * &local_pv)
+            / &new_sum.unsqueeze(2i64);
+        rm = new_max;
+        rs = new_sum;
+
+        let rm_cpu = rm.to(tch::Device::Cpu);
+        let rs_cpu = rs.to(tch::Device::Cpu);
+        let obh_cpu = obh.to(tch::Device::Cpu);
+
+        let rm_flat = rm_cpu.contiguous().view([-1]);
+        let rs_flat = rs_cpu.contiguous().view([-1]);
+        let obh_flat = obh_cpu.contiguous().view([-1]);
+
+        let rm_vec: Vec<f32> = Vec::try_from(&rm_flat)
+            .map_err(|e| format!("failed to copy running_max: {e}"))?;
+        let rs_vec: Vec<f32> = Vec::try_from(&rs_flat)
+            .map_err(|e| format!("failed to copy running_sum: {e}"))?;
+        let obh_vec: Vec<f32> = Vec::try_from(&obh_flat)
+            .map_err(|e| format!("failed to copy output_acc: {e}"))?;
+
+        running_max.copy_from_slice(&rm_vec);
+        running_sum.copy_from_slice(&rs_vec);
+        output_acc.copy_from_slice(&obh_vec);
+
+        Ok(())
+    }
+
     fn tensor_weighted_checksum(tensor: &Tensor) -> f64 {
         let flat = tensor.contiguous().view([-1]);
         let values: Vec<f32> = Vec::try_from(&flat).unwrap_or_default();
@@ -626,6 +748,19 @@ pub mod backend {
         _num_heads: i32,
         _head_dim: i32,
     ) -> Result<(i32, String, f64, f64, usize), String> {
+        Err("tch-backend feature is not enabled".to_string())
+    }
+    pub fn compute_chunk_attention_step(
+        _q_payload: &[u8],
+        _kv_payload: &[u8],
+        _block_len: i32,
+        _query_len: i32,
+        _num_heads: i32,
+        _head_dim: i32,
+        _running_max: &mut [f32],
+        _running_sum: &mut [f32],
+        _output_acc: &mut [f32],
+    ) -> Result<(), String> {
         Err("tch-backend feature is not enabled".to_string())
     }
 }

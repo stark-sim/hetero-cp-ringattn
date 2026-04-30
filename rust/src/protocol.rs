@@ -99,6 +99,102 @@ enum ProjectionKind {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct OnlineSoftmaxAccumulator {
+    running_max: Vec<f32>,
+    running_sum: Vec<f32>,
+    output_acc: Vec<f32>,
+}
+
+impl OnlineSoftmaxAccumulator {
+    fn new(query_len: usize, num_heads: usize, head_dim: usize) -> Self {
+        let qh = query_len * num_heads;
+        Self {
+            running_max: vec![f32::NEG_INFINITY; qh],
+            running_sum: vec![0.0_f32; qh],
+            output_acc: vec![0.0_f32; qh * head_dim],
+        }
+    }
+}
+
+#[cfg(feature = "tch-backend")]
+fn tch_compute_kv_block(
+    model_state: &DomainModelState,
+    message: &RingAttnMessage,
+    accumulator: &mut OnlineSoftmaxAccumulator,
+) -> Result<(), String> {
+    if message.message_kind != RingAttnMessageKind::KvBlock {
+        return Ok(());
+    }
+    let (Some(block), Some(tensor)) = (&message.block, &message.tensor) else {
+        return Ok(());
+    };
+    crate::tch_backend::backend::compute_chunk_attention_step(
+        model_state.query_payload(),
+        &message.payload,
+        i32::try_from(block.block_len).unwrap_or(i32::MAX),
+        i32::try_from(model_state.query_len()).unwrap_or(i32::MAX),
+        i32::try_from(tensor.num_heads).unwrap_or(i32::MAX),
+        i32::try_from(tensor.head_dim).unwrap_or(i32::MAX),
+        &mut accumulator.running_max,
+        &mut accumulator.running_sum,
+        &mut accumulator.output_acc,
+    )
+}
+
+#[cfg(not(feature = "tch-backend"))]
+fn tch_compute_kv_block(
+    _model_state: &DomainModelState,
+    _message: &RingAttnMessage,
+    _accumulator: &mut OnlineSoftmaxAccumulator,
+) -> Result<(), String> {
+    Ok(())
+}
+
+fn finalize_tch_compute_output(
+    model_state: &mut DomainModelState,
+    accumulator: &OnlineSoftmaxAccumulator,
+) -> f64 {
+    #[cfg(feature = "tch-backend")]
+    {
+        let query_len = model_state.query_len();
+        let num_heads = model_state.num_heads();
+        let head_dim = model_state.head_dim();
+        let mut output_slot = model_state.activation.output_slot.clone();
+        for h in 0..num_heads {
+            for q in 0..query_len {
+                for d in 0..head_dim {
+                    let src_idx = (h * query_len + q) * head_dim + d;
+                    let dst_idx = (q * num_heads + h) * head_dim + d;
+                    let bytes = FLOAT32_BYTES;
+                    let offset_dst = dst_idx * bytes;
+                    let value = accumulator.output_acc[src_idx];
+                    output_slot[offset_dst..offset_dst + bytes]
+                        .copy_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+        model_state.activation.output_slot = output_slot;
+        let values: Vec<f32> = model_state
+            .activation
+            .output_slot
+            .chunks_exact(FLOAT32_BYTES)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let mut checksum = 0.0_f64;
+        for (i, &v) in values.iter().enumerate() {
+            checksum += (v as f64) * ((i % 997) + 1) as f64;
+        }
+        checksum
+    }
+    #[cfg(not(feature = "tch-backend"))]
+    {
+        let _ = (model_state, accumulator);
+        0.0
+    }
+}
+
+#[derive(Clone, Debug)]
 struct LayerActivationState {
     layer_index: i32,
     seq_offset: usize,
@@ -287,6 +383,14 @@ impl DomainModelState {
         self.activation.output_slot.len() / FLOAT32_BYTES
     }
 
+    fn num_heads(&self) -> usize {
+        self.activation.num_heads
+    }
+
+    fn head_dim(&self) -> usize {
+        self.activation.head_dim
+    }
+
     fn summary(&self) -> ModelStateSummary {
         ModelStateSummary {
             domain_id: self.domain_id.clone(),
@@ -433,6 +537,10 @@ impl CpRingNodeSmokeReport {
     pub fn payload_blocks(&self) -> &[CpPayloadBlock] {
         &self.payload_blocks
     }
+
+    pub fn compute_output_checksum(&self) -> f64 {
+        self.nodes.iter().map(|n| n.compute_output_checksum).sum()
+    }
 }
 
 #[derive(Serialize)]
@@ -453,6 +561,7 @@ pub struct RemoteCpNodeReport {
     inbound_peer_addr: String,
     summary: RemoteCpNodeSummary,
     first_routes: Vec<CpRingRoutePreview>,
+    compute_output_checksum: f64,
     #[serde(skip_serializing)]
     payload_blocks: Vec<CpPayloadBlock>,
 }
@@ -481,6 +590,10 @@ impl RemoteCpNodeReport {
     pub fn payload_blocks(&self) -> &[CpPayloadBlock] {
         &self.payload_blocks
     }
+
+    pub fn compute_output_checksum(&self) -> f64 {
+        self.compute_output_checksum
+    }
 }
 
 #[derive(Default, Serialize)]
@@ -494,6 +607,7 @@ struct RemoteCpNodeSummary {
     compute_updates: usize,
     bytes_sent: usize,
     bytes_received: usize,
+    compute_output_checksum: f64,
 }
 
 #[derive(Default, Serialize)]
@@ -524,6 +638,7 @@ struct CpRingNodeReport {
     compute_updates: usize,
     bytes_sent: usize,
     bytes_received: usize,
+    compute_output_checksum: f64,
     first_routes: Vec<CpRingRoutePreview>,
     #[serde(skip_serializing)]
     payload_blocks: Vec<CpPayloadBlock>,
@@ -1017,7 +1132,7 @@ pub fn run_remote_cp_node(
         });
     }
     let domain_count = domains.len();
-    let local_model_state = DomainModelState::new(&domains[node_index]);
+    let mut local_model_state = DomainModelState::new(&domains[node_index]);
     let source_block_counts = domains
         .iter()
         .map(|domain| block_ranges(domain).count())
@@ -1041,11 +1156,18 @@ pub fn run_remote_cp_node(
     let outbound_peer_addr = outbound_stream.peer_addr()?.to_string();
     let outbound_stream = Arc::new(Mutex::new(outbound_stream));
 
+    let accumulator = Arc::new(Mutex::new(OnlineSoftmaxAccumulator::new(
+        local_model_state.query_len(),
+        local_model_state.num_heads(),
+        local_model_state.head_dim(),
+    )));
+
     let recv_domains = domains.clone();
     let recv_domain_id = domain.domain_id.clone();
     let recv_model_state = local_model_state.clone();
     let recv_outbound_peer = outbound_peer.clone();
     let recv_outbound_stream = Arc::clone(&outbound_stream);
+    let recv_accumulator = Arc::clone(&accumulator);
     let recv_handle = thread::spawn(move || {
         receive_remote_cp_node_messages(
             node_index,
@@ -1056,6 +1178,7 @@ pub fn run_remote_cp_node(
             expected_inbound_messages,
             recv_outbound_peer,
             recv_outbound_stream,
+            recv_accumulator,
         )
     });
 
@@ -1090,6 +1213,16 @@ pub fn run_remote_cp_node(
         summary.bytes_sent += bytes_sent;
         summary.compute_updates += 1;
         push_payload_block(&mut payload_blocks, &domain, &local_model_state, &message);
+        {
+            let mut acc = accumulator.lock().map_err(|error| ProtocolError::ChannelSend {
+                sender_domain: domain.domain_id.clone(),
+                receiver_domain: outbound_peer.domain_id.clone(),
+                reason: error.to_string(),
+            })?;
+            if let Err(e) = tch_compute_kv_block(&local_model_state, &message, &mut acc) {
+                eprintln!("[tch-compute] remote local block error: {e}");
+            }
+        }
         push_remote_cp_route_preview(&mut first_routes, &message, Some(&outbound_peer.domain_id));
     }
 
@@ -1106,6 +1239,14 @@ pub fn run_remote_cp_node(
     summary.compute_updates += recv_report.compute_updates;
     payload_blocks.extend(recv_report.payload_blocks);
     summary.payload_blocks_captured = payload_blocks.len();
+    summary.compute_output_checksum = {
+        let acc = accumulator.lock().map_err(|error| ProtocolError::ChannelSend {
+            sender_domain: domain.domain_id.clone(),
+            receiver_domain: outbound_peer.domain_id.clone(),
+            reason: error.to_string(),
+        })?;
+        finalize_tch_compute_output(&mut local_model_state, &acc)
+    };
     for route in recv_report.first_routes {
         if first_routes.len() >= 8 {
             break;
@@ -1140,6 +1281,7 @@ pub fn run_remote_cp_node(
         outbound_local_addr,
         outbound_peer_addr,
         inbound_peer_addr: recv_report.inbound_peer_addr,
+        compute_output_checksum: summary.compute_output_checksum,
         summary,
         first_routes,
         payload_blocks,
@@ -1203,9 +1345,14 @@ fn run_cp_ring_node(
 ) -> Result<CpRingNodeReport, ProtocolError> {
     let domain_count = domains.len();
     let domain = domains[domain_index].clone();
-    let model_state = DomainModelState::new(&domain);
+    let mut model_state = DomainModelState::new(&domain);
     let inbound_peer = domains[(domain_index + domain_count - 1) % domain_count].clone();
     let outbound_peer = domains[(domain_index + 1) % domain_count].clone();
+    let mut accumulator = OnlineSoftmaxAccumulator::new(
+        model_state.query_len(),
+        model_state.num_heads(),
+        model_state.head_dim(),
+    );
     let mut report = CpRingNodeReport {
         domain_id: domain.domain_id.clone(),
         role: "listener_and_outbound_peer",
@@ -1219,6 +1366,7 @@ fn run_cp_ring_node(
         compute_updates: 0,
         bytes_sent: 0,
         bytes_received: 0,
+        compute_output_checksum: 0.0,
         first_routes: Vec::new(),
         payload_blocks: Vec::new(),
     };
@@ -1238,6 +1386,9 @@ fn run_cp_ring_node(
         report.source_blocks += 1;
         report.compute_updates += 1;
         push_payload_block(&mut report.payload_blocks, &domain, &model_state, &message);
+        if let Err(e) = tch_compute_kv_block(&model_state, &message, &mut accumulator) {
+            eprintln!("[tch-compute] local block error: {e}");
+        }
         push_cp_route_preview(&mut report, &message, Some(&outbound_peer.domain_id));
     }
 
@@ -1254,6 +1405,9 @@ fn run_cp_ring_node(
         validate_cp_ring_message(domain_index, &domains, &message)?;
         report.compute_updates += 1;
         push_payload_block(&mut report.payload_blocks, &domain, &model_state, &message);
+        if let Err(e) = tch_compute_kv_block(&model_state, &message, &mut accumulator) {
+            eprintln!("[tch-compute] inbound message error: {e}");
+        }
 
         let should_forward = message.ring_step < domain_count - 1;
         if should_forward {
@@ -1264,6 +1418,8 @@ fn run_cp_ring_node(
             push_cp_route_preview(&mut report, &message, None);
         }
     }
+
+    report.compute_output_checksum = finalize_tch_compute_output(&mut model_state, &accumulator);
 
     Ok(report)
 }
@@ -1576,6 +1732,7 @@ fn receive_remote_cp_node_messages(
     expected_messages: usize,
     outbound_peer: DomainSpec,
     outbound_stream: Arc<Mutex<TcpStream>>,
+    accumulator: Arc<Mutex<OnlineSoftmaxAccumulator>>,
 ) -> Result<RemoteCpRecvReport, ProtocolError> {
     let mut stream = accept_with_retry(listener)?;
     configure_stream(&stream)?;
@@ -1602,6 +1759,16 @@ fn receive_remote_cp_node_messages(
             &model_state,
             &message,
         );
+        {
+            let mut acc = accumulator.lock().map_err(|error| ProtocolError::ChannelSend {
+                sender_domain: domains[node_index].domain_id.clone(),
+                receiver_domain: outbound_peer.domain_id.clone(),
+                reason: error.to_string(),
+            })?;
+            if let Err(e) = tch_compute_kv_block(&model_state, &message, &mut acc) {
+                eprintln!("[tch-compute] remote inbound error: {e}");
+            }
+        }
         let should_forward = message.ring_step < domains.len() - 1;
         if should_forward {
             let forwarded = forward_kv_message(&message, &domains[node_index], &outbound_peer);
