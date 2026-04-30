@@ -79,6 +79,10 @@
 - [2026-04-30] 3-node remote CP tch 全桥接 smoke 通过：`RUN_ID=rust-remote-cp-tch-full-20260430 PORT_BASE=29325`，node0/node2 MPS `code=2 12/12`，node1 CUDA `code=3 12/12`；C++ bridge 和 tch bridge 并行全部通过。
 - [2026-04-30] tch-backend 已接入实时 compute 路径：`protocol.rs` 的 `run_cp_ring_node` 和 `run_remote_cp_node` 不再只是 NoOp 计数，而是在每个 K/V block 到达时立即调用 `compute_chunk_attention_step` 更新 online softmax accumulator；ring 结束时 finalize 到 `output_slot`。
 - [2026-04-30] 实时 compute 验证：CPU `tch_compute_output_checksum=1357.6399246966466` 与离线后验 smoke 的 3 个 group checksum 总和完全一致；MPS `checksum=1357.639936434105`，差异 ~1.2e-8。
+- [2026-04-30] RoPE 已接入 protocol：`apply_rope` 在 Q chunk 和 K cache 构建时对每个 token 按 head 应用旋转位置编码。
+- [2026-04-30] LayerNorm 已接入 protocol：`LayerNormWeights` + `layer_norm` 在 projection 之前对 hidden states 做逐 token 归一化。
+- [2026-04-30] o_proj + Residual Connection 已接入 protocol：`ModelLayerWeights.o_proj` 将 attention output `[num_heads, head_dim]` 映射回 `[hidden_dim]`；`finalize_tch_compute_output` 执行 `residual_input + o_proj_out` 写入 `output_slot`。
+- [2026-04-30] 接入 RoPE/LayerNorm/o_proj/Residual 后 CPU/MPS smoke 均通过，checksum 完全一致（`1093.5917292535305`）。
 - [2026-04-30] `scripts/run_rust_remote_cp_node.sh` 已支持自动启用 `tch-backend` feature 并显式指定 `--bin hcp-ringattn-rust`；`scripts/run_rust_remote_cp_3node_smoke.sh` 已传递 `HCP_TCH_DEVICE` 到所有节点并在 preflight build 中启用 tch-backend。
 
 ## 活跃决策

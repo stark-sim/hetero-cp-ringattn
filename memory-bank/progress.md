@@ -73,6 +73,9 @@
 - [x] [2026-04-30] `scripts/run_rust_remote_cp_node.sh` 和 `run_rust_remote_cp_3node_smoke.sh` 已支持自动启用 `tch-backend` feature 并传递 `HCP_TCH_DEVICE`。
 - [x] [2026-04-30] tch-backend 已接入实时 compute 路径：`compute_chunk_attention_step` 在 `run_cp_ring_node` / `run_remote_cp_node` / `receive_remote_cp_node_messages` 中被逐 block 调用；accumulator 通过 `Arc<Mutex<>>` 在 remote CP 的收发线程间共享。
 - [x] [2026-04-30] 实时 compute 验证通过：CPU/MPS 单节点 checksum 与离线后验 smoke 完全一致；`main.rs` CLI 已输出 `tch_compute_output_checksum`。
+- [x] [2026-04-30] RoPE 已接入 protocol，Q/K 逐 token 应用旋转位置编码。
+- [x] [2026-04-30] LayerNorm 已接入 protocol，projection 前对 hidden states 逐 token 归一化。
+- [x] [2026-04-30] o_proj + Residual Connection 已接入 protocol，attention output 经 o_proj 映射回 hidden_dim 后与原始 hidden states 相加。
 
 ## 进行中
 
