@@ -8,3 +8,4 @@ reports/**/*.log
 __pycache__/
 *.pyc
 .DS_Store
+rust/reports/

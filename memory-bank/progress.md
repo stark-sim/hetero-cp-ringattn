@@ -53,10 +53,17 @@
 - [x] [2026-04-27] 临时 VPN remote CP smoke 已通过：`GPU_HOST=100.118.253.68 MAC_NODE_ADDR=100.121.35.138 RUN_ID=rust-remote-cp-modelstate-vpn-20260426` 下 node0/node2 MPS 与 node1 CUDA 均 `sent=8 received=8 compute_updates=12 torch_query_output_blocks=12/12`。
 - [x] [2026-04-29] 已新增 projection-first Q/K/V 路径：`ModelLayerWeights` + domain-local hidden states 生成 Q chunk、K cache、V cache，不再直接公式生成 Q/K/V bytes。
 - [x] [2026-04-29] projection 路径已通过本机和远端验证：`cargo test --offline` 4/4、`cargo clippy --offline -- -D warnings`、本机 MPS smoke `torch_query_output_blocks=30/30`、LAN 3-node remote CP `RUN_ID=rust-remote-cp-projection-lan-20260429` 三节点 `torch_query_output_blocks=12/12`。
+- [x] [2026-04-30] Cargo registry 在线模式已恢复可用（rsproxy-sparse 正常）。
+- [x] [2026-04-30] 已新增 optional `tch = "0.24.0"` 和 `tch-backend` feature gate。
+- [x] [2026-04-30] 已新增 `rust/src/bin/tch_smoke.rs`：matmul + softmax + attention-like 三组 op，与 CPU reference 对比误差，输出 JSON report。
+- [x] [2026-04-30] 已新增 `scripts/run_tch_ringattn_smoke.sh`，自动处理 `LIBTORCH` 与 `DYLD_LIBRARY_PATH`。
+- [x] [2026-04-30] tch-rs CPU smoke 通过：`tch_status=pass tch_device=cpu tch_code=1 ops=3/3`。
+- [x] [2026-04-30] tch-rs MPS smoke 通过：`tch_status=pass tch_device=mps tch_code=2 ops=3/3`。
 
 ## 进行中
 
 - [ ] M2：Rust online softmax correctness report 与 tolerance policy 扩展。
+- [ ] M3-tch：将 Ring Attention block update 迁移到 `tch-backend`，与 C++ ATen bridge 并行存在。
 - [ ] M3：抽出统一 transport trait，减少 local queue / TCP pair / TCP CP node 的重复 frame 与 metrics 逻辑。
 - [ ] M4：heterogeneous runtime stubs 与配置 / 环境纪律。
 - [ ] M5：将 deterministic projection weights 升级为真实权重加载 / layer config，并接入 RoPE、norm/residual 与完整 layer lifecycle。

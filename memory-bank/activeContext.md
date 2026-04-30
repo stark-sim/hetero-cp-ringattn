@@ -60,6 +60,12 @@
 - [2026-04-27] 临时 VPN 路由已验证：CUDA 节点 `100.118.253.68`，Mac 节点 `100.121.35.138`。`RUN_ID=rust-remote-cp-modelstate-vpn-20260426 PORT_BASE=29295 GPU_HOST=100.118.253.68 MAC_NODE_ADDR=100.121.35.138 bash scripts/run_rust_remote_cp_3node_smoke.sh` 三节点通过，node0/node2 MPS `torch_query_output_code=2 12/12`，node1 CUDA `torch_query_output_code=3 12/12`。
 - [2026-04-29] `DomainModelState` 已从直接 Q/K/V fixture 生成推进到 projection 数据流：domain-local hidden states 通过 `ModelLayerWeights` 的 Q/K/V projection 生成 Q chunk、K cache、V cache；当前 projection weights deterministic 初始化，用于可复现 smoke，后续可替换真实权重加载。
 - [2026-04-29] `RUN_ID=rust-remote-cp-projection-lan-20260429 PORT_BASE=29315 GPU_HOST=192.168.8.172 MAC_NODE_ADDR=192.168.8.239 bash scripts/run_rust_remote_cp_3node_smoke.sh` 已通过；远端 CUDA node 从 `ccffedc` fast-forward 到 `46c9e18`，三节点均 `sent=8 received=8 compute_updates=12 torch_query_output_blocks=12/12`。
+- [2026-04-30] `cargo check` 在线模式已确认可用（rsproxy-sparse 可达），之前 memory-bank 记录的 "rsproxy.cn DNS 失败" 为临时问题。
+- [2026-04-30] Rust `Cargo.toml` 已新增 optional `tch = "0.24.0"` 和 `tch-backend` feature gate；`torch-sys` build script 只需要 `LIBTORCH=/Users/stark_sim/libtorch` 环境变量，**不要**同时设置 `LIBTORCH_INCLUDE` 或 `LIBTORCH_LIB`，否则 `torch-sys` 会将其当作 `LIBTORCH` 重复追加 `/include` 导致 `torch/torch.h` 找不到。
+- [2026-04-30] 新增 `rust/src/bin/tch_smoke.rs`：在 `tch-backend` feature 下运行 matmul / softmax / attention-like 三组 op，与 CPU reference 对比 `max_abs_err` / `mean_abs_err`，输出结构化 JSON report。
+- [2026-04-30] 新增 `scripts/run_tch_ringattn_smoke.sh`：自动设置 `LIBTORCH`、`DYLD_LIBRARY_PATH`、`LD_LIBRARY_PATH`，支持 `HCP_TCH_DEVICE=cpu|mps|cuda` 和 `RUN_ID`。
+- [2026-04-30] tch-rs CPU smoke 通过：`tch_status=pass tch_device=cpu tch_code=1 ops=3/3`。
+- [2026-04-30] tch-rs MPS smoke 通过：`tch_status=pass tch_device=mps tch_code=2 ops=3/3`（当前进程可直接访问 Metal device）。
 
 ## 活跃决策
 
@@ -70,6 +76,7 @@
 - Rust + C++ 是后续核心工程路径；`tch-rs` 作为 PyTorch Rust 绑定参考，当前 upstream `tch` crate 为 `0.24.0`，与 PyTorch/libtorch 2.11 路线匹配，但默认构建暂不强依赖 `tch` crate。
 - PyTorch C++ 路径短期优先使用 C++ ATen/libtorch bridge，避免直接 include 全量 `torch/torch.h`。
 - `tch-rs` 的长期接入应优先使用独立/system-wide libtorch；`LIBTORCH_USE_PYTORCH=1` 只作为 fallback 或快速验证路径，避免把核心 Rust 路线重新耦合到 Python 环境。
+- `tch-backend` feature 已接入：只需 `LIBTORCH=/Users/stark_sim/libtorch`，不要同时设 `LIBTORCH_INCLUDE`/`LIBTORCH_LIB`；macOS 运行时需要 `DYLD_LIBRARY_PATH` 包含 `${LIBTORCH}/lib`。
 
 ## 下一步
 
@@ -79,8 +86,8 @@
 - [ ] 将 Rust correctness model 继续拆分为 library + binary，便于后续 protocol / transport 复用。
 - [ ] 抽出统一 transport trait，收敛 `local_p2p_queue`、`cp_ring_node_runtime`、`tcp_remote_pair`、`tcp_remote_cp_node` 的共用 send/recv/frame 语义，并保持当前 message schema / report 字段稳定。
 - [ ] 将 `DomainModelState` 中 deterministic Q/K/V fixtures 升级为真实模型 activation / weight lifecycle，并明确 output buffer ownership。
-- [ ] 在 cargo registry/network 可用后，增加 feature-gated `tch = 0.24.0` backend，并先实现 `tch_smoke`，再迁移 Ring Attention block update。
-- [ ] 在 cargo registry/network 可用后，引入 optional `tch = 0.24.0` 并实现 `tch_smoke`。
+- [x] 引入 optional `tch = 0.24.0` 并实现 `tch_smoke`（CPU/MPS 均已通过）。
+- [ ] 迁移 Ring Attention block update 到 `tch-backend`，与现有 C++ ATen bridge 并行。
 - [ ] 为 `RingAttnMessage` 设计 serialization / deserialization。
 
 ## 重要模式与偏好
@@ -109,7 +116,7 @@
 
 - [2026-04-24] 当前沙箱环境不允许 Python worker 绑定本地端口，完整 Python smoke 会触发 `PermissionError: [Errno 1] Operation not permitted`。
 - [2026-04-24] `ringattn_controller.py` 当前会将 `bytes` 放入 `json.dumps` payload，导致 `TypeError: Object of type bytes is not JSON serializable`。
-- [2026-04-24] 普通 `cargo check` 会尝试访问 `rsproxy.cn` 并因 DNS 失败；当前使用 `cargo --offline` 可正常构建缓存依赖。
+- [2026-04-30] 普通 `cargo check` 已确认可用（rsproxy-sparse 可达），之前 DNS 失败为临时问题；`cargo --offline` 仍保留为安全 fallback。
 - [2026-04-24] PyTorch 2.11.0 在默认沙箱进程中 `mps_available=false`，原因是沙箱内 `MTLCopyAllDevices()` 返回 0；非沙箱进程可枚举 `Apple M1 Pro`，且 `torch.ones(..., device="mps")` 成功。
 - [2026-04-24] 后续所有 Metal/MPS 相关验证必须在非沙箱/授权进程中运行；默认沙箱结果不能作为 MPS 不可用结论。
 - [2026-04-25] GPU 端 `CARGO_OFFLINE=1` 失败且提示 `no matching package named serde_json found` 时，优先判定为 Cargo registry cache miss，不是 CUDA/libtorch 问题。
