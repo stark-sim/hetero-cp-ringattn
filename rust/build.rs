@@ -154,4 +154,25 @@ fn main() {
     }
 
     build.compile("hcp_ringattn_cxx_bridge");
+
+    // When tch-backend feature is enabled, ensure CUDA registration libraries are retained
+    // on Linux just like we do for the C++ ATen bridge path.
+    // rustc-link-arg-bins places the flag before -l arguments, so --no-as-needed applies
+    // to libraries linked by downstream crates (e.g. torch-sys).
+    if env::var("CARGO_FEATURE_TCH_BACKEND").ok().is_some() {
+        if let Some(libtorch) = env::var("LIBTORCH").ok() {
+            let lib_dir = format!("{libtorch}/lib");
+            if has_library(&[lib_dir.clone()], "torch_cuda") && has_library(&[lib_dir], "c10_cuda")
+            {
+                if env::var("CARGO_CFG_TARGET_OS").ok().as_deref() == Some("linux") {
+                    println!(
+                        "cargo:rustc-link-arg-bins=-Wl,--push-state,--no-as-needed,-ltorch_cuda,-lc10_cuda,--pop-state"
+                    );
+                } else {
+                    println!("cargo:rustc-link-arg-bins=-ltorch_cuda");
+                    println!("cargo:rustc-link-arg-bins=-lc10_cuda");
+                }
+            }
+        }
+    }
 }
