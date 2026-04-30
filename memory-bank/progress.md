@@ -71,6 +71,8 @@
 - [x] [2026-04-30] 本机 MPS + 远端 CUDA tch 全桥接 smoke 通过。
 - [x] [2026-04-30] 3-node remote CP tch 全桥接 smoke 通过：node0/node2 MPS `code=2 12/12`，node1 CUDA `code=3 12/12`；C++ bridge 与 tch bridge 并行全部通过。
 - [x] [2026-04-30] `scripts/run_rust_remote_cp_node.sh` 和 `run_rust_remote_cp_3node_smoke.sh` 已支持自动启用 `tch-backend` feature 并传递 `HCP_TCH_DEVICE`。
+- [x] [2026-04-30] tch-backend 已接入实时 compute 路径：`compute_chunk_attention_step` 在 `run_cp_ring_node` / `run_remote_cp_node` / `receive_remote_cp_node_messages` 中被逐 block 调用；accumulator 通过 `Arc<Mutex<>>` 在 remote CP 的收发线程间共享。
+- [x] [2026-04-30] 实时 compute 验证通过：CPU/MPS 单节点 checksum 与离线后验 smoke 完全一致；`main.rs` CLI 已输出 `tch_compute_output_checksum`。
 
 ## 进行中
 
