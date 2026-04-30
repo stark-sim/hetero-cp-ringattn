@@ -11,11 +11,27 @@ echo "=== HCP Rust RingAttn Smoke ==="
 echo "RUN_ID=${RUN_ID}"
 
 cd "${REPO_ROOT}/rust"
+if [ -n "${LIBTORCH:-}" ]; then
+    export DYLD_LIBRARY_PATH="${LIBTORCH}/lib:${DYLD_LIBRARY_PATH:-}"
+    export LD_LIBRARY_PATH="${LIBTORCH}/lib:${LD_LIBRARY_PATH:-}"
+fi
 CARGO_OFFLINE="${CARGO_OFFLINE:-1}"
+FEATURES=""
+if [ "${HCP_ENABLE_TORCH:-0}" = "1" ] || [ -n "${LIBTORCH:-}" ]; then
+    FEATURES="tch-backend"
+fi
 if [ "${CARGO_OFFLINE}" = "1" ]; then
-    CARGO_ARGS=(run --offline)
+    if [ -n "${FEATURES}" ]; then
+        CARGO_ARGS=(run --offline --features "${FEATURES}" --bin hcp-ringattn-rust)
+    else
+        CARGO_ARGS=(run --offline --bin hcp-ringattn-rust)
+    fi
 else
-    CARGO_ARGS=(run)
+    if [ -n "${FEATURES}" ]; then
+        CARGO_ARGS=(run --features "${FEATURES}" --bin hcp-ringattn-rust)
+    else
+        CARGO_ARGS=(run --bin hcp-ringattn-rust)
+    fi
 fi
 set +e
 cargo "${CARGO_ARGS[@]}" -- \
