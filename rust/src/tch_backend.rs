@@ -81,7 +81,7 @@ pub mod backend {
         weights.matmul(&v_by_head).permute(&[1, 0, 2])
     }
 
-    pub fn run_attention_block_updates(block_updates: i32) -> Result<(i32, String), String> {
+    pub fn run_attention_block_updates(block_updates: i32) -> Result<(i32, String, f64), String> {
         if block_updates <= 0 {
             return Err("block_updates must be positive".to_string());
         }
@@ -104,6 +104,7 @@ pub mod backend {
 
         let scale = 1.0 / (8.0_f64).sqrt();
         let mut max_abs_err = 0.0_f64;
+        let mut max_rel_err = 0.0_f64;
         let mut checksum = 0.0_f64;
 
         for update in 0..block_updates {
@@ -133,6 +134,11 @@ pub mod backend {
             if err > max_abs_err {
                 max_abs_err = err;
             }
+            let rel_diff = diff / (reference.abs() + 1e-12);
+            let rel_err = rel_diff.max().double_value(&[]);
+            if rel_err > max_rel_err {
+                max_rel_err = rel_err;
+            }
             checksum += output_cpu.sum(float).double_value(&[]);
 
             let sizes = output_cpu.size();
@@ -141,14 +147,14 @@ pub mod backend {
             }
         }
 
-        if max_abs_err <= 1.0e-4 {
+        if max_abs_err <= 1.0e-4 && max_rel_err <= 1.0e-3 {
             let msg = format!(
-                "ok updates={block_updates} max_abs_err={max_abs_err} checksum={checksum}"
+                "ok updates={block_updates} max_abs_err={max_abs_err} max_rel_err={max_rel_err} checksum={checksum}"
             );
-            Ok((selection.success_code, msg))
+            Ok((selection.success_code, msg, max_rel_err))
         } else {
             Err(format!(
-                "attention mismatch updates={block_updates} max_abs_err={max_abs_err}"
+                "attention mismatch updates={block_updates} max_abs_err={max_abs_err} max_rel_err={max_rel_err}"
             ))
         }
     }
@@ -158,7 +164,7 @@ pub mod backend {
         block_len: i32,
         num_heads: i32,
         head_dim: i32,
-    ) -> Result<(i32, String), String> {
+    ) -> Result<(i32, String, f64), String> {
         if block_len <= 0 || num_heads <= 0 || head_dim <= 0 {
             return Err("block_len, num_heads, and head_dim must be positive".to_string());
         }
@@ -208,17 +214,20 @@ pub mod backend {
         }
 
         let output_cpu = output.to(tch::Device::Cpu);
-        let max_abs_err = (&output_cpu - &reference).abs().max().double_value(&[]);
+        let diff = (&output_cpu - &reference).abs();
+        let max_abs_err = diff.max().double_value(&[]);
+        let rel_diff = &diff / (reference.abs() + 1e-12);
+        let max_rel_err = rel_diff.max().double_value(&[]);
         let checksum = output_cpu.sum(Kind::Float).double_value(&[]);
 
-        if max_abs_err <= 1.0e-4 {
+        if max_abs_err <= 1.0e-4 && max_rel_err <= 1.0e-3 {
             let msg = format!(
-                "ok block_len={block_len} num_heads={num_heads} head_dim={head_dim} max_abs_err={max_abs_err} checksum={checksum}"
+                "ok block_len={block_len} num_heads={num_heads} head_dim={head_dim} max_abs_err={max_abs_err} max_rel_err={max_rel_err} checksum={checksum}"
             );
-            Ok((selection.success_code, msg))
+            Ok((selection.success_code, msg, max_rel_err))
         } else {
             Err(format!(
-                "payload attention mismatch block_len={block_len} max_abs_err={max_abs_err}"
+                "payload attention mismatch block_len={block_len} max_abs_err={max_abs_err} max_rel_err={max_rel_err}"
             ))
         }
     }
@@ -228,7 +237,7 @@ pub mod backend {
         block_lens: &[i32],
         num_heads: i32,
         head_dim: i32,
-    ) -> Result<(i32, String), String> {
+    ) -> Result<(i32, String, f64), String> {
         if block_lens.is_empty() || num_heads <= 0 || head_dim <= 0 {
             return Err("block_count, num_heads, and head_dim must be positive".to_string());
         }
@@ -316,18 +325,21 @@ pub mod backend {
         let v_ref = Tensor::cat(&v_refs, 0);
         let reference = payload_attention(&q_cpu, &k_ref, &v_ref);
         let output_cpu = output.to(cpu);
-        let max_abs_err = (&output_cpu - &reference).abs().max().double_value(&[]);
+        let diff = (&output_cpu - &reference).abs();
+        let max_abs_err = diff.max().double_value(&[]);
+        let rel_diff = &diff / (reference.abs() + 1e-12);
+        let max_rel_err = rel_diff.max().double_value(&[]);
         let checksum = output_cpu.sum(float).double_value(&[]);
 
-        if max_abs_err <= 1.0e-4 {
+        if max_abs_err <= 1.0e-4 && max_rel_err <= 1.0e-3 {
             let msg = format!(
-                "ok blocks={} tokens={token_count} max_abs_err={max_abs_err} checksum={checksum}",
+                "ok blocks={} tokens={token_count} max_abs_err={max_abs_err} max_rel_err={max_rel_err} checksum={checksum}",
                 block_lens.len()
             );
-            Ok((selection.success_code, msg))
+            Ok((selection.success_code, msg, max_rel_err))
         } else {
             Err(format!(
-                "online payload mismatch blocks={} tokens={token_count} max_abs_err={max_abs_err}",
+                "online payload mismatch blocks={} tokens={token_count} max_abs_err={max_abs_err} max_rel_err={max_rel_err}",
                 block_lens.len()
             ))
         }
@@ -339,7 +351,7 @@ pub mod backend {
         query_len: i32,
         num_heads: i32,
         head_dim: i32,
-    ) -> Result<(i32, String), String> {
+    ) -> Result<(i32, String, f64), String> {
         if query_len <= 0 || num_heads <= 0 || head_dim <= 0 {
             return Err("query_len, num_heads, and head_dim must be positive".to_string());
         }
@@ -433,18 +445,21 @@ pub mod backend {
         let v_ref = Tensor::cat(&v_refs, 0);
         let reference = payload_chunk_attention(&q_cpu, &k_ref, &v_ref);
         let output_cpu = output.to(cpu);
-        let max_abs_err = (&output_cpu - &reference).abs().max().double_value(&[]);
+        let diff = (&output_cpu - &reference).abs();
+        let max_abs_err = diff.max().double_value(&[]);
+        let rel_diff = &diff / (reference.abs() + 1e-12);
+        let max_rel_err = rel_diff.max().double_value(&[]);
         let checksum = tensor_weighted_checksum(&output_cpu);
 
-        if max_abs_err <= 1.0e-4 {
+        if max_abs_err <= 1.0e-4 && max_rel_err <= 1.0e-3 {
             let msg = format!(
-                "ok blocks={} query_len={query_len} tokens={token_count} max_abs_err={max_abs_err} checksum={checksum}",
+                "ok blocks={} query_len={query_len} tokens={token_count} max_abs_err={max_abs_err} max_rel_err={max_rel_err} checksum={checksum}",
                 block_lens.len()
             );
-            Ok((selection.success_code, msg))
+            Ok((selection.success_code, msg, max_rel_err))
         } else {
             Err(format!(
-                "chunk payload mismatch blocks={} query_len={query_len} tokens={token_count} max_abs_err={max_abs_err}",
+                "chunk payload mismatch blocks={} query_len={query_len} tokens={token_count} max_abs_err={max_abs_err} max_rel_err={max_rel_err}",
                 block_lens.len()
             ))
         }
@@ -457,7 +472,7 @@ pub mod backend {
         query_len: i32,
         num_heads: i32,
         head_dim: i32,
-    ) -> Result<(i32, String, f64, f64, usize), String> {
+    ) -> Result<(i32, String, f64, f64, f64, usize), String> {
         if query_len <= 0 || num_heads <= 0 || head_dim <= 0 {
             return Err("query_len, num_heads, and head_dim must be positive".to_string());
         }
@@ -559,19 +574,22 @@ pub mod backend {
         let v_ref = Tensor::cat(&v_refs, 0);
         let reference = payload_chunk_attention(&q_cpu, &k_ref, &v_ref);
         let output_cpu = output.to(cpu);
-        let max_abs_err = (&output_cpu - &reference).abs().max().double_value(&[]);
+        let diff = (&output_cpu - &reference).abs();
+        let max_abs_err = diff.max().double_value(&[]);
+        let rel_diff = &diff / (reference.abs() + 1e-12);
+        let max_rel_err = rel_diff.max().double_value(&[]);
         let checksum = tensor_weighted_checksum(&output_cpu);
         let output_values = output_cpu.numel() as usize;
 
-        if max_abs_err <= 1.0e-4 {
+        if max_abs_err <= 1.0e-4 && max_rel_err <= 1.0e-3 {
             let msg = format!(
-                "ok blocks={} query_len={query_len} tokens={token_count} max_abs_err={max_abs_err} checksum={checksum}",
+                "ok blocks={} query_len={query_len} tokens={token_count} max_abs_err={max_abs_err} max_rel_err={max_rel_err} checksum={checksum}",
                 block_lens.len()
             );
-            Ok((selection.success_code, msg, checksum, max_abs_err, output_values))
+            Ok((selection.success_code, msg, checksum, max_abs_err, max_rel_err, output_values))
         } else {
             Err(format!(
-                "chunk payload mismatch blocks={} query_len={query_len} tokens={token_count} max_abs_err={max_abs_err}",
+                "chunk payload mismatch blocks={} query_len={query_len} tokens={token_count} max_abs_err={max_abs_err} max_rel_err={max_rel_err}",
                 block_lens.len()
             ))
         }
@@ -712,7 +730,7 @@ pub mod backend {
 
 #[cfg(not(feature = "tch-backend"))]
 pub mod backend {
-    pub fn run_attention_block_updates(_block_updates: i32) -> Result<(i32, String), String> {
+    pub fn run_attention_block_updates(_block_updates: i32) -> Result<(i32, String, f64), String> {
         Err("tch-backend feature is not enabled".to_string())
     }
     pub fn run_payload_block_smoke(
@@ -720,7 +738,7 @@ pub mod backend {
         _block_len: i32,
         _num_heads: i32,
         _head_dim: i32,
-    ) -> Result<(i32, String), String> {
+    ) -> Result<(i32, String, f64), String> {
         Err("tch-backend feature is not enabled".to_string())
     }
     pub fn run_payload_online_smoke(
@@ -728,7 +746,7 @@ pub mod backend {
         _block_lens: &[i32],
         _num_heads: i32,
         _head_dim: i32,
-    ) -> Result<(i32, String), String> {
+    ) -> Result<(i32, String, f64), String> {
         Err("tch-backend feature is not enabled".to_string())
     }
     pub fn run_payload_chunk_smoke(
@@ -737,7 +755,7 @@ pub mod backend {
         _query_len: i32,
         _num_heads: i32,
         _head_dim: i32,
-    ) -> Result<(i32, String), String> {
+    ) -> Result<(i32, String, f64), String> {
         Err("tch-backend feature is not enabled".to_string())
     }
     pub fn run_query_chunk_smoke(
@@ -747,7 +765,7 @@ pub mod backend {
         _query_len: i32,
         _num_heads: i32,
         _head_dim: i32,
-    ) -> Result<(i32, String, f64, f64, usize), String> {
+    ) -> Result<(i32, String, f64, f64, f64, usize), String> {
         Err("tch-backend feature is not enabled".to_string())
     }
     pub fn compute_chunk_attention_step(

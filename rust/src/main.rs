@@ -199,6 +199,15 @@ struct TorchQueryOutputGroup {
 }
 
 #[derive(Serialize)]
+struct SeedResult {
+    seed: u64,
+    status: &'static str,
+    max_abs_err: f64,
+    mean_abs_err: f64,
+    max_rel_err: f64,
+}
+
+#[derive(Serialize)]
 struct CaseReport {
     name: &'static str,
     status: &'static str,
@@ -207,18 +216,21 @@ struct CaseReport {
     metrics: Metrics,
     config: CaseConfig,
     ring_trace_summary: Vec<DomainTrace>,
+    seed_results: Vec<SeedResult>,
 }
 
 #[derive(Clone, Copy, Serialize)]
 struct Tolerance {
     max_abs_err: f64,
     mean_abs_err: f64,
+    max_rel_err: f64,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Copy, Serialize)]
 struct Metrics {
     max_abs_err: f64,
     mean_abs_err: f64,
+    max_rel_err: f64,
 }
 
 #[derive(Clone, Serialize)]
@@ -236,7 +248,7 @@ struct DomainConfig {
     block_size: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct DomainTrace {
     domain_id: String,
     seq_offset: usize,
@@ -265,6 +277,7 @@ struct CliArgs {
     node_index: Option<usize>,
     bind_addr: Option<String>,
     connect_addr: Option<String>,
+    stress_test: bool,
 }
 
 impl Lcg {
@@ -562,12 +575,12 @@ fn ring_attention_model(
     Ok((output, traces))
 }
 
-fn run_case(
-    name: &'static str,
-    config: CaseConfig,
+fn run_case_single_seed(
+    _name: &'static str,
+    config: &CaseConfig,
     seed: u64,
     tol: Tolerance,
-) -> Result<CaseReport, RingError> {
+) -> Result<(Metrics, &'static str, Vec<DomainTrace>), RingError> {
     let mut rng = Lcg::new(seed);
     let q = Tensor3::random(
         config.global_seq_len,
@@ -592,31 +605,91 @@ fn run_case(
     let (modeled, traces) = ring_attention_model(&q, &k, &v, &config)?;
     let mut max_abs_err = 0.0;
     let mut total_abs_err = 0.0;
+    let mut max_rel_err = 0.0;
     for (lhs, rhs) in reference.data.iter().zip(modeled.data.iter()) {
         let diff = (lhs - rhs).abs();
         if diff > max_abs_err {
             max_abs_err = diff;
         }
         total_abs_err += diff;
+        let ref_mag = lhs.abs();
+        if ref_mag > 1e-12 {
+            let rel = diff / ref_mag;
+            if rel > max_rel_err {
+                max_rel_err = rel;
+            }
+        }
     }
     let mean_abs_err = total_abs_err / reference.data.len() as f64;
-    let status = if max_abs_err <= tol.max_abs_err && mean_abs_err <= tol.mean_abs_err {
+    let status = if max_abs_err <= tol.max_abs_err
+        && mean_abs_err <= tol.mean_abs_err
+        && max_rel_err <= tol.max_rel_err
+    {
         "pass"
     } else {
         "fail"
     };
 
-    Ok(CaseReport {
-        name,
-        status,
-        seed,
-        tolerance: tol,
-        metrics: Metrics {
+    Ok((
+        Metrics {
             max_abs_err,
             mean_abs_err,
+            max_rel_err,
         },
+        status,
+        traces,
+    ))
+}
+
+fn run_case(
+    name: &'static str,
+    config: CaseConfig,
+    seeds: &[u64],
+    tol: Tolerance,
+) -> Result<CaseReport, RingError> {
+    let mut seed_results = Vec::with_capacity(seeds.len());
+    let mut worst_status = "pass";
+    let mut worst_metrics = None;
+    let mut worst_traces = Vec::new();
+    let mut first_seed = 0;
+
+    for (i, &seed) in seeds.iter().enumerate() {
+        let (metrics, status, traces) = run_case_single_seed(name, &config, seed, tol)?;
+        seed_results.push(SeedResult {
+            seed,
+            status,
+            max_abs_err: metrics.max_abs_err,
+            mean_abs_err: metrics.mean_abs_err,
+            max_rel_err: metrics.max_rel_err,
+        });
+        if status == "fail" || worst_metrics.is_none() {
+            worst_status = status;
+            worst_metrics = Some(metrics);
+            worst_traces = traces.clone();
+            first_seed = seed;
+        }
+        if i == 0 {
+            first_seed = seed;
+            worst_metrics = Some(metrics);
+            worst_traces = traces.clone();
+        }
+    }
+
+    let metrics = worst_metrics.unwrap_or(Metrics {
+        max_abs_err: 0.0,
+        mean_abs_err: 0.0,
+        max_rel_err: 0.0,
+    });
+
+    Ok(CaseReport {
+        name,
+        status: worst_status,
+        seed: first_seed,
+        tolerance: tol,
+        metrics,
         config,
-        ring_trace_summary: traces,
+        ring_trace_summary: worst_traces,
+        seed_results,
     })
 }
 
@@ -654,6 +727,22 @@ fn default_cases() -> Vec<(&'static str, CaseConfig)> {
             "4domain_small_tail_blocks",
             case_config(&[32, 64, 48, 48], &[7, 16, 11, 13], 2, 32),
         ),
+        (
+            "3domain_large_seq",
+            case_config(&[512, 256, 256], &[128, 64, 64], 8, 64),
+        ),
+        (
+            "1domain_single_block",
+            case_config(&[64], &[64], 4, 16),
+        ),
+        (
+            "2domain_unit_blocks",
+            case_config(&[16, 16], &[1, 1], 2, 8),
+        ),
+        (
+            "1domain_medium",
+            case_config(&[128], &[32], 4, 16),
+        ),
     ]
 }
 
@@ -664,6 +753,7 @@ fn parse_cli_args() -> Result<CliArgs, RingError> {
     let mut node_index = None;
     let mut bind_addr = None;
     let mut connect_addr = None;
+    let mut stress_test = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--report-path" => {
@@ -684,6 +774,9 @@ fn parse_cli_args() -> Result<CliArgs, RingError> {
             "--connect" => {
                 connect_addr = Some(next_cli_value(&mut args, "--connect")?);
             }
+            "--stress-test" => {
+                stress_test = true;
+            }
             _ => {
                 return Err(RingError::InvalidCli(format!("unknown argument {arg}")));
             }
@@ -695,6 +788,7 @@ fn parse_cli_args() -> Result<CliArgs, RingError> {
         node_index,
         bind_addr,
         connect_addr,
+        stress_test,
     })
 }
 
@@ -781,7 +875,7 @@ fn tch_attention_bridge_report() -> TorchBridgeReport {
         };
     }
     match tch_backend::backend::run_attention_block_updates(1) {
-        Ok((code, message)) => {
+        Ok((code, message, _max_rel_err)) => {
             let device_name = env::var("HCP_TCH_DEVICE")
                 .or_else(|_| env::var("HCP_TORCH_DEVICE"))
                 .unwrap_or_else(|_| "cpu".to_string());
@@ -859,7 +953,7 @@ fn tch_payload_block_bridge_report(
         let num_heads = i32::try_from(block.num_heads()).unwrap_or(i32::MAX);
         let head_dim = i32::try_from(block.head_dim()).unwrap_or(i32::MAX);
         match tch_backend::backend::run_payload_block_smoke(block.payload(), block_len, num_heads, head_dim) {
-            Ok((c, msg)) => {
+            Ok((c, msg, _max_rel_err)) => {
                 code = c;
                 message = msg;
             }
@@ -939,7 +1033,7 @@ fn tch_payload_online_bridge_report(
     let num_heads_i32 = i32::try_from(num_heads).unwrap_or(i32::MAX);
     let head_dim_i32 = i32::try_from(head_dim).unwrap_or(i32::MAX);
     let (code, message) = match tch_backend::backend::run_payload_online_smoke(&payload, &block_lens, num_heads_i32, head_dim_i32) {
-        Ok((c, msg)) => (c, msg),
+        Ok((c, msg, _max_rel_err)) => (c, msg),
         Err(e) => (-1, e),
     };
     let (status, note) = tch_status_note_from_code(code, "tch-rs payload online smoke");
@@ -1007,7 +1101,7 @@ fn tch_payload_chunk_bridge_report(
     let head_dim_i32 = i32::try_from(head_dim).unwrap_or(i32::MAX);
     let query_len = i32::try_from(first_block.query_len()).unwrap_or(i32::MAX);
     let (code, message) = match tch_backend::backend::run_payload_chunk_smoke(&payload, &block_lens, query_len, num_heads_i32, head_dim_i32) {
-        Ok((c, msg)) => (c, msg),
+        Ok((c, msg, _max_rel_err)) => (c, msg),
         Err(e) => (-1, e),
     };
     let (status, note) = tch_status_note_from_code(code, "tch-rs payload chunk smoke");
@@ -1204,7 +1298,7 @@ fn tch_query_output_bridge_report(
             num_heads_i32,
             head_dim_i32,
         ) {
-            Ok((c, msg, output_checksum, max_abs_err, output_values)) => {
+            Ok((c, msg, output_checksum, max_abs_err, _max_rel_err, output_values)) => {
                 code = c;
                 message = msg;
                 let expected_output_values = query_len * num_heads * head_dim;
@@ -1933,15 +2027,24 @@ fn torch_report_from_code(
     }
 }
 
-fn run() -> Result<Report, RingError> {
+fn run(stress_test: bool) -> Result<Report, RingError> {
     let tol = Tolerance {
         max_abs_err: 1e-10,
         mean_abs_err: 1e-12,
+        max_rel_err: 1e-7,
     };
+    let stress_seeds: Vec<u64> = (0..5).map(|i| 42 + i as u64).collect();
     let cases: Vec<CaseReport> = default_cases()
         .into_iter()
         .enumerate()
-        .map(|(index, (name, config))| run_case(name, config, 42 + index as u64, tol))
+        .map(|(index, (name, config))| {
+            let seeds = if stress_test && config.global_seq_len <= 256 {
+                stress_seeds.clone()
+            } else {
+                vec![42 + index as u64]
+            };
+            run_case(name, config, &seeds, tol)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let passed = cases.iter().filter(|case| case.status == "pass").count();
     let failed = cases.len() - passed;
@@ -2244,7 +2347,7 @@ fn main() -> Result<(), RingError> {
         return Ok(());
     }
 
-    let report = run()?;
+    let report = run(args.stress_test)?;
     write_json_report(&args.report_path, &report)?;
     println!(
         "[rust-ringattn] status={} passed={}/{} protocol_status={} protocol_messages={} cp_ring_status={} cp_ring_messages={} cp_ring_compute_updates={} cxx_domains={} torch_status={} torch_device={} torch_code={} torch_attention_status={} torch_attention_code={} tch_attention_status={} tch_attention_code={} torch_block_update_status={} torch_block_update_code={} torch_block_updates={} torch_payload_block_status={} torch_payload_block_code={} torch_payload_blocks={}/{} torch_payload_online_status={} torch_payload_online_code={} torch_payload_online_blocks={}/{} torch_payload_chunk_status={} torch_payload_chunk_code={} torch_payload_chunk_blocks={}/{} torch_query_chunk_status={} torch_query_chunk_code={} torch_query_chunk_blocks={}/{} torch_query_output_status={} torch_query_output_code={} torch_query_output_groups={} torch_query_output_blocks={}/{} tch_payload_block_status={} tch_payload_block_code={} tch_payload_block_blocks={}/{} tch_payload_online_status={} tch_payload_online_code={} tch_payload_online_blocks={}/{} tch_payload_chunk_status={} tch_payload_chunk_code={} tch_payload_chunk_blocks={}/{} tch_query_chunk_status={} tch_query_chunk_code={} tch_query_chunk_blocks={}/{} tch_query_output_status={} tch_query_output_code={} tch_query_output_groups={} tch_query_output_blocks={}/{} tch_compute_output_checksum={} torch_compiled={} report={}",
