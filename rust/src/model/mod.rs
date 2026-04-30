@@ -1,7 +1,12 @@
+pub mod backend;
+pub mod cache;
 pub mod config;
 pub mod layers;
+pub mod model;
 pub mod weights;
 
+pub use cache::KvCache;
+pub use model::LlamaModel;
 pub use weights::{ModelWeights, WeightNames};
 
 use thiserror::Error;
