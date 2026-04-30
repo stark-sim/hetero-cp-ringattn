@@ -1604,14 +1604,15 @@ fn run_cp_ring_node(
         report.bytes_received += frame.len();
         report.messages_received += 1;
         let message = deserialize_message(&frame)?;
-        validate_cp_ring_message(domain_index, &domains, &message)?;
-        report.compute_updates += 1;
-        push_payload_block(&mut report.payload_blocks, &domain, &model_state, &message);
-        if let Err(e) = tch_compute_kv_block(&model_state, &message, &mut accumulator) {
-            eprintln!("[tch-compute] inbound message error: {e}");
-        }
-
-        let should_forward = message.ring_step < domain_count - 1;
+        let should_forward = process_inbound_message(
+            &message,
+            domain_index,
+            &domains,
+            &model_state,
+            &mut accumulator,
+            &mut report.payload_blocks,
+            &mut report.compute_updates,
+        )?;
         if should_forward {
             let forwarded = forward_kv_message(&message, &domain, &outbound_peer);
             push_cp_route_preview(&mut report, &message, Some(&outbound_peer.domain_id));
@@ -1951,27 +1952,24 @@ fn receive_remote_cp_node_messages(
     };
     while report.messages_received < expected_messages {
         let (message, bytes_received) = read_raw_message_frame(&mut stream)?;
-        validate_cp_ring_message(node_index, &domains, &message)?;
         report.messages_received += 1;
-        report.compute_updates += 1;
         report.bytes_received += bytes_received;
-        push_payload_block(
-            &mut report.payload_blocks,
-            &domains[node_index],
-            &model_state,
-            &message,
-        );
-        {
+        let should_forward = {
             let mut acc = accumulator.lock().map_err(|error| ProtocolError::ChannelSend {
                 sender_domain: domains[node_index].domain_id.clone(),
                 receiver_domain: outbound_peer.domain_id.clone(),
                 reason: error.to_string(),
             })?;
-            if let Err(e) = tch_compute_kv_block(&model_state, &message, &mut acc) {
-                eprintln!("[tch-compute] remote inbound error: {e}");
-            }
-        }
-        let should_forward = message.ring_step < domains.len() - 1;
+            process_inbound_message(
+                &message,
+                node_index,
+                &domains,
+                &model_state,
+                &mut acc,
+                &mut report.payload_blocks,
+                &mut report.compute_updates,
+            )?
+        };
         if should_forward {
             let forwarded = forward_kv_message(&message, &domains[node_index], &outbound_peer);
             let bytes_forwarded = {
@@ -2106,6 +2104,26 @@ fn push_remote_cp_route_preview(
         block_len: block.block_len,
         ring_step: message.ring_step,
     });
+}
+
+fn process_inbound_message(
+    message: &RingAttnMessage,
+    node_index: usize,
+    domains: &[DomainSpec],
+    model_state: &DomainModelState,
+    accumulator: &mut OnlineSoftmaxAccumulator,
+    payload_blocks: &mut Vec<CpPayloadBlock>,
+    compute_updates: &mut usize,
+) -> Result<bool, ProtocolError> {
+    validate_cp_ring_message(node_index, domains, message)?;
+    *compute_updates += 1;
+    push_payload_block(payload_blocks, &domains[node_index], model_state, message);
+    if let Err(e) = tch_compute_kv_block(model_state, message, accumulator) {
+        eprintln!("[tch-compute] inbound error: {e}");
+    }
+    let domain_count = domains.len();
+    let should_forward = message.ring_step < domain_count - 1;
+    Ok(should_forward)
 }
 
 fn remote_kv_block_message(client: &DomainSpec, server: &DomainSpec) -> RingAttnMessage {
