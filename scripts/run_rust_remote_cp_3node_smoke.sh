@@ -57,7 +57,7 @@ cargo_build_args() {
 
 run_remote() {
     local command="$1"
-    ssh "${GPU_SSH}" "bash -lc $(shell_quote "${command}")"
+    ssh -o ConnectTimeout=30 "${GPU_SSH}" "bash -lc $(shell_quote "${command}")"
 }
 
 echo "=== HCP Rust Remote CP 3-Node Smoke ==="
