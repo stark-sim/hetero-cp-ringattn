@@ -77,6 +77,7 @@
 - [x] [2026-04-30] LayerNorm 已接入 protocol，projection 前对 hidden states 逐 token 归一化。
 - [x] [2026-04-30] o_proj + Residual Connection 已接入 protocol，attention output 经 o_proj 映射回 hidden_dim 后与原始 hidden states 相加。
 - [x] [2026-04-30] 外部权重加载已接入 protocol：支持通过 `HCP_WEIGHTS_JSON` 环境变量从 JSON 文件加载 Q/K/V/O projection weights 与 LayerNorm gamma/beta；`DomainModelState::new_with_weights` 在有外部权重时替换默认合成权重；本地 CPU/MPS smoke 均验证通过，checksum 随权重变化。
+- [x] [2026-04-30] VPN 三节点 remote CP tch-full 验证通过：`GPU_HOST=100.118.253.68 MAC_NODE_ADDR=100.121.35.138 RUN_ID=rust-remote-cp-tch-full-vpn-20260430 PORT_BASE=29335`，node0/node2 MPS `code=2 12/12`，node1 CUDA `code=3 12/12`；C++ bridge 与 tch bridge 全部通过。
 
 ## 进行中
 
@@ -100,6 +101,7 @@
 - [2026-04-25] 远端 CUDA smoke 历史问题已解决：根因是 Linux 链接阶段未保留 `libtorch_cuda` / `c10_cuda` registration libraries。
 - [2026-04-30] projection weights 已从 deterministic 初始化升级为支持外部 JSON 权重加载（`HCP_WEIGHTS_JSON`）；RoPE、LayerNorm、o_proj、residual 均已接入 protocol；M5 目标已完成。
 - [2026-04-26] 3-node remote CP query chunk smoke 的一次失败根因是 Mac 子网地址从 `192.168.8.204` 变化到 `192.168.8.239`；后续重跑已通过。后续 remote smoke 前应先用 `ifconfig | rg 'inet 192\\.168\\.8\\.'` 确认当前 Mac 地址。
+- [2026-04-30] GPU host 当前 VPN 地址为 `100.118.253.68`，Mac 本机 VPN 地址为 `100.121.35.138`；LAN 地址 `192.168.8.172` / `192.168.8.239` 目前不可达。remote smoke 需使用当前可达地址。
 
 ## 里程碑
 
@@ -110,5 +112,5 @@
 | M2: 数学闭环 | 进行中 | 待定 |
 | M3: 协议闭环 | 进行中 | 待定 |
 | M4: 异构 runtime 闭环 | 未开始 | 待定 |
-| M5: 远端闭环 | 进行中 | 待定 |
+| M5: 远端闭环 | 已完成 | [2026-04-30] |
 | M6: 扩展性论证 | 未开始 | 待定 |

@@ -86,6 +86,7 @@
 - [2026-04-30] `scripts/run_rust_remote_cp_node.sh` 已支持自动启用 `tch-backend` feature 并显式指定 `--bin hcp-ringattn-rust`；`scripts/run_rust_remote_cp_3node_smoke.sh` 已传递 `HCP_TCH_DEVICE` 到所有节点并在 preflight build 中启用 tch-backend。
 - [2026-04-30] 外部权重加载已接入 protocol：`ModelWeightsJson` 支持从 JSON 文件解析 `layers` 数组，每个 layer 包含 `q_proj`/`k_proj`/`v_proj`/`o_proj`/`gamma`/`beta`；`DomainModelState::new_with_weights` 可在有外部权重时替换默认合成权重。
 - [2026-04-30] 权重加载路径验证：本地默认 smoke `tch_compute_output_checksum=1093.59...`；加载 `config/test_weights.json` 后 checksum 变为 `2810.30...`，确认外部权重确实参与计算；非 tch-backend 编译和运行均不受影响。
+- [2026-04-30] VPN 三节点 remote CP tch-full 验证通过：`GPU_HOST=100.118.253.68 MAC_NODE_ADDR=100.121.35.138 RUN_ID=rust-remote-cp-tch-full-vpn-20260430 PORT_BASE=29335`，node0/node2 MPS `code=2 12/12`，node1 CUDA `code=3 12/12`；C++ bridge 与 tch bridge 全部通过，实时 compute checksum 分别为 71.35 / 238.88 / 406.41。
 
 ## 活跃决策
 
@@ -108,6 +109,7 @@
 - [ ] 抽出统一 transport trait，收敛 `local_p2p_queue`、`cp_ring_node_runtime`、`tcp_remote_pair`、`tcp_remote_cp_node` 的共用 send/recv/frame 语义，并保持当前 message schema / report 字段稳定。
 - [x] 将 `DomainModelState` 中 deterministic Q/K/V fixtures 升级为真实模型 activation / weight lifecycle，并明确 output buffer ownership。
 - [x] 外部权重加载：支持通过 `HCP_WEIGHTS_JSON` 环境变量从 JSON 文件加载 Q/K/V/O projection weights 和 LayerNorm gamma/beta；已验证本地 CPU/MPS smoke 均正常，checksum 随权重变化而变化。
+- [x] VPN 三节点 remote CP 验证：MPS + CUDA 异构 domain 通过 C++ bridge 与 tch bridge 全量 smoke；M5 远端闭环已完成。
 - [x] 引入 optional `tch = 0.24.0` 并实现 `tch_smoke`（CPU/MPS 均已通过）。
 - [ ] 迁移 Ring Attention block update 到 `tch-backend`，与现有 C++ ATen bridge 并行。
 - [ ] 为 `RingAttnMessage` 设计 serialization / deserialization。
