@@ -28,7 +28,7 @@ const KV_TENSOR_COUNT: usize = 2;
 const MODEL_HIDDEN_DIM: usize = 16;
 const MODEL_LAYER_INDEX: i32 = 0;
 const QUERY_CHUNK_LEN: usize = 4;
-const FLOAT32_BYTES: usize = 4;
+pub(crate) const FLOAT32_BYTES: usize = 4;
 
 #[derive(Debug, Error)]
 pub enum ProtocolError {
@@ -83,7 +83,7 @@ struct DomainSpec {
 }
 
 #[derive(Clone, Debug)]
-struct ModelLayerWeights {
+pub(crate) struct ModelLayerWeights {
     layer_index: i32,
     hidden_dim: usize,
     projection_dim: usize,
@@ -131,10 +131,10 @@ enum ProjectionKind {
 
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
-struct OnlineSoftmaxAccumulator {
-    running_max: Vec<f32>,
-    running_sum: Vec<f32>,
-    output_acc: Vec<f32>,
+pub(crate) struct OnlineSoftmaxAccumulator {
+    pub(crate) running_max: Vec<f32>,
+    pub(crate) running_sum: Vec<f32>,
+    pub(crate) output_acc: Vec<f32>,
 }
 
 impl OnlineSoftmaxAccumulator {
@@ -148,112 +148,30 @@ impl OnlineSoftmaxAccumulator {
     }
 }
 
-#[cfg(feature = "tch-backend")]
-fn tch_compute_kv_block(
-    model_state: &DomainModelState,
-    message: &RingAttnMessage,
-    accumulator: &mut OnlineSoftmaxAccumulator,
-) -> Result<(), String> {
-    if message.message_kind != RingAttnMessageKind::KvBlock {
-        return Ok(());
-    }
-    let (Some(block), Some(tensor)) = (&message.block, &message.tensor) else {
-        return Ok(());
-    };
-    crate::tch_backend::backend::compute_chunk_attention_step(
-        model_state.query_payload(),
-        &message.payload,
-        i32::try_from(block.block_len).unwrap_or(i32::MAX),
-        i32::try_from(model_state.query_len()).unwrap_or(i32::MAX),
-        i32::try_from(tensor.num_heads).unwrap_or(i32::MAX),
-        i32::try_from(tensor.head_dim).unwrap_or(i32::MAX),
-        &mut accumulator.running_max,
-        &mut accumulator.running_sum,
-        &mut accumulator.output_acc,
-    )
-}
-
-#[cfg(not(feature = "tch-backend"))]
-fn tch_compute_kv_block(
-    _model_state: &DomainModelState,
-    _message: &RingAttnMessage,
-    _accumulator: &mut OnlineSoftmaxAccumulator,
-) -> Result<(), String> {
-    Ok(())
-}
-
-fn finalize_tch_compute_output(
-    model_state: &mut DomainModelState,
-    accumulator: &OnlineSoftmaxAccumulator,
-) -> f64 {
-    #[cfg(feature = "tch-backend")]
-    {
-        let query_len = model_state.query_len();
-        let num_heads = model_state.num_heads();
-        let head_dim = model_state.head_dim();
-        let hidden_dim = model_state.activation.hidden_dim;
-        let mut output_slot = vec![0_u8; query_len * hidden_dim * FLOAT32_BYTES];
-        for q in 0..query_len {
-            let mut attn_out = Vec::with_capacity(num_heads * head_dim);
-            for h in 0..num_heads {
-                for d in 0..head_dim {
-                    let src_idx = (h * query_len + q) * head_dim + d;
-                    attn_out.push(accumulator.output_acc[src_idx]);
-                }
-            }
-            let o_proj_out = model_state.weights.project_output(&attn_out);
-            let residual_start = q * hidden_dim;
-            for d in 0..hidden_dim {
-                let residual = model_state.activation.residual_input[residual_start + d] + o_proj_out[d];
-                let offset = residual_start + d;
-                output_slot[offset * FLOAT32_BYTES..(offset + 1) * FLOAT32_BYTES]
-                    .copy_from_slice(&residual.to_le_bytes());
-            }
-        }
-        model_state.activation.output_slot = output_slot;
-        let values: Vec<f32> = model_state
-            .activation
-            .output_slot
-            .chunks_exact(FLOAT32_BYTES)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect();
-        let mut checksum = 0.0_f64;
-        for (i, &v) in values.iter().enumerate() {
-            checksum += (v as f64) * ((i % 997) + 1) as f64;
-        }
-        checksum
-    }
-    #[cfg(not(feature = "tch-backend"))]
-    {
-        let _ = (model_state, accumulator);
-        0.0
-    }
-}
-
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
-struct LayerActivationState {
-    layer_index: i32,
-    seq_offset: usize,
-    seq_chunk_len: usize,
-    hidden_dim: usize,
-    query_len: usize,
-    num_heads: usize,
-    head_dim: usize,
-    hidden_states: Vec<f32>,
-    residual_input: Vec<f32>,
-    q_chunk: Vec<u8>,
-    k_cache: Vec<u8>,
-    v_cache: Vec<u8>,
-    output_slot: Vec<u8>,
+pub(crate) struct LayerActivationState {
+    pub(crate) layer_index: i32,
+    pub(crate) seq_offset: usize,
+    pub(crate) seq_chunk_len: usize,
+    pub(crate) hidden_dim: usize,
+    pub(crate) query_len: usize,
+    pub(crate) num_heads: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) hidden_states: Vec<f32>,
+    pub(crate) residual_input: Vec<f32>,
+    pub(crate) q_chunk: Vec<u8>,
+    pub(crate) k_cache: Vec<u8>,
+    pub(crate) v_cache: Vec<u8>,
+    pub(crate) output_slot: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
-struct DomainModelState {
-    domain_id: String,
-    device: String,
-    weights: ModelLayerWeights,
-    activation: LayerActivationState,
+pub(crate) struct DomainModelState {
+    pub(crate) domain_id: String,
+    pub(crate) device: String,
+    pub(crate) weights: ModelLayerWeights,
+    pub(crate) activation: LayerActivationState,
 }
 
 #[derive(Clone, Serialize)]
@@ -337,7 +255,7 @@ impl ModelLayerWeights {
     }
 
     #[allow(dead_code)]
-    fn project_output(&self, attn_out: &[f32]) -> Vec<f32> {
+    pub(crate) fn project_output(&self, attn_out: &[f32]) -> Vec<f32> {
         debug_assert_eq!(attn_out.len(), self.projection_dim);
         let weights = &self.o_proj;
         let mut output = Vec::with_capacity(self.hidden_dim);
@@ -549,31 +467,31 @@ impl DomainModelState {
         payload
     }
 
-    fn query_payload(&self) -> &[u8] {
+    pub(crate) fn query_payload(&self) -> &[u8] {
         &self.activation.q_chunk
     }
 
-    fn layer_index(&self) -> i32 {
+    pub(crate) fn layer_index(&self) -> i32 {
         self.activation.layer_index
     }
 
-    fn query_len(&self) -> usize {
+    pub(crate) fn query_len(&self) -> usize {
         self.activation.query_len
     }
 
-    fn output_seq_offset(&self) -> usize {
+    pub(crate) fn output_seq_offset(&self) -> usize {
         self.activation.seq_offset
     }
 
-    fn output_slot_values(&self) -> usize {
+    pub(crate) fn output_slot_values(&self) -> usize {
         self.activation.output_slot.len() / FLOAT32_BYTES
     }
 
-    fn num_heads(&self) -> usize {
+    pub(crate) fn num_heads(&self) -> usize {
         self.activation.num_heads
     }
 
-    fn head_dim(&self) -> usize {
+    pub(crate) fn head_dim(&self) -> usize {
         self.activation.head_dim
     }
 
@@ -602,7 +520,7 @@ impl DomainModelState {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum RingAttnMessageKind {
+pub(crate) enum RingAttnMessageKind {
     KvBlock,
     SoftmaxState,
     Terminate,
@@ -610,42 +528,42 @@ enum RingAttnMessageKind {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum PayloadKind {
+pub(crate) enum PayloadKind {
     KvBlock,
     SoftmaxState,
     Control,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-struct BlockMetadata {
-    global_offset: usize,
-    block_len: usize,
-    source_seq_offset: usize,
+pub(crate) struct BlockMetadata {
+    pub(crate) global_offset: usize,
+    pub(crate) block_len: usize,
+    pub(crate) source_seq_offset: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-struct TensorMetadata {
-    dtype: String,
-    num_heads: usize,
-    head_dim: usize,
-    payload_bytes: usize,
-    checksum: u64,
+pub(crate) struct TensorMetadata {
+    pub(crate) dtype: String,
+    pub(crate) num_heads: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) payload_bytes: usize,
+    pub(crate) checksum: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-struct RingAttnMessage {
-    schema_version: u16,
-    sequence_id: u64,
-    layer_index: i32,
-    ring_step: usize,
-    source_domain: String,
-    sender_domain: String,
-    receiver_domain: String,
-    message_kind: RingAttnMessageKind,
-    payload_kind: PayloadKind,
-    block: Option<BlockMetadata>,
-    tensor: Option<TensorMetadata>,
-    payload: Vec<u8>,
+pub(crate) struct RingAttnMessage {
+    pub(crate) schema_version: u16,
+    pub(crate) sequence_id: u64,
+    pub(crate) layer_index: i32,
+    pub(crate) ring_step: usize,
+    pub(crate) source_domain: String,
+    pub(crate) sender_domain: String,
+    pub(crate) receiver_domain: String,
+    pub(crate) message_kind: RingAttnMessageKind,
+    pub(crate) payload_kind: PayloadKind,
+    pub(crate) block: Option<BlockMetadata>,
+    pub(crate) tensor: Option<TensorMetadata>,
+    pub(crate) payload: Vec<u8>,
 }
 
 #[derive(Serialize)]
@@ -1386,6 +1304,12 @@ pub fn run_remote_cp_node(
     let mut summary = RemoteCpNodeSummary::default();
     let mut first_routes = Vec::new();
     let mut payload_blocks = Vec::new();
+
+    #[cfg(feature = "tch-backend")]
+    let mut runtime = crate::compute_runtime::TchComputeRuntime;
+    #[cfg(not(feature = "tch-backend"))]
+    let mut runtime = crate::compute_runtime::NoOpComputeRuntime;
+
     for (block_index, (block_start, block_stop)) in block_ranges(&domain).enumerate() {
         let message = kv_block_message(
             cp_ring_sequence_id(node_index, block_index),
@@ -1420,8 +1344,8 @@ pub fn run_remote_cp_node(
                 receiver_domain: outbound_peer.domain_id.clone(),
                 reason: error.to_string(),
             })?;
-            if let Err(e) = tch_compute_kv_block(&local_model_state, &message, &mut acc) {
-                eprintln!("[tch-compute] remote local block error: {e}");
+            if let Err(e) = runtime.compute_kv_block(&local_model_state, &message, &mut acc) {
+                eprintln!("[compute-runtime] remote local block error: {e}");
             }
         }
         push_remote_cp_route_preview(&mut first_routes, &message, Some(&outbound_peer.domain_id));
@@ -1446,7 +1370,7 @@ pub fn run_remote_cp_node(
             receiver_domain: outbound_peer.domain_id.clone(),
             reason: error.to_string(),
         })?;
-        finalize_tch_compute_output(&mut local_model_state, &acc)
+        runtime.finalize_output(&mut local_model_state, &acc)
     };
     for route in recv_report.first_routes {
         if first_routes.len() >= 8 {
@@ -1573,6 +1497,11 @@ fn run_cp_ring_node(
         payload_blocks: Vec::new(),
     };
 
+    #[cfg(feature = "tch-backend")]
+    let mut runtime = crate::compute_runtime::TchComputeRuntime;
+    #[cfg(not(feature = "tch-backend"))]
+    let mut runtime = crate::compute_runtime::NoOpComputeRuntime;
+
     for (block_index, (block_start, block_stop)) in block_ranges(&domain).enumerate() {
         let message = kv_block_message(
             cp_ring_sequence_id(domain_index, block_index),
@@ -1588,8 +1517,8 @@ fn run_cp_ring_node(
         report.source_blocks += 1;
         report.compute_updates += 1;
         push_payload_block(&mut report.payload_blocks, &domain, &model_state, &message);
-        if let Err(e) = tch_compute_kv_block(&model_state, &message, &mut accumulator) {
-            eprintln!("[tch-compute] local block error: {e}");
+        if let Err(e) = runtime.compute_kv_block(&model_state, &message, &mut accumulator) {
+            eprintln!("[compute-runtime] local block error: {e}");
         }
         push_cp_route_preview(&mut report, &message, Some(&outbound_peer.domain_id));
     }
@@ -1605,6 +1534,7 @@ fn run_cp_ring_node(
         report.messages_received += 1;
         let message = deserialize_message(&frame)?;
         let should_forward = process_inbound_message(
+            &mut runtime,
             &message,
             domain_index,
             &domains,
@@ -1622,7 +1552,7 @@ fn run_cp_ring_node(
         }
     }
 
-    report.compute_output_checksum = finalize_tch_compute_output(&mut model_state, &accumulator);
+    report.compute_output_checksum = runtime.finalize_output(&mut model_state, &accumulator);
 
     Ok(report)
 }
@@ -1950,6 +1880,12 @@ fn receive_remote_cp_node_messages(
         first_routes: Vec::new(),
         payload_blocks: Vec::new(),
     };
+
+    #[cfg(feature = "tch-backend")]
+    let mut runtime = crate::compute_runtime::TchComputeRuntime;
+    #[cfg(not(feature = "tch-backend"))]
+    let mut runtime = crate::compute_runtime::NoOpComputeRuntime;
+
     while report.messages_received < expected_messages {
         let (message, bytes_received) = read_raw_message_frame(&mut stream)?;
         report.messages_received += 1;
@@ -1961,6 +1897,7 @@ fn receive_remote_cp_node_messages(
                 reason: error.to_string(),
             })?;
             process_inbound_message(
+                &mut runtime,
                 &message,
                 node_index,
                 &domains,
@@ -2107,6 +2044,7 @@ fn push_remote_cp_route_preview(
 }
 
 fn process_inbound_message(
+    runtime: &mut dyn crate::compute_runtime::ComputeRuntime<Error = String>,
     message: &RingAttnMessage,
     node_index: usize,
     domains: &[DomainSpec],
@@ -2118,8 +2056,8 @@ fn process_inbound_message(
     validate_cp_ring_message(node_index, domains, message)?;
     *compute_updates += 1;
     push_payload_block(payload_blocks, &domains[node_index], model_state, message);
-    if let Err(e) = tch_compute_kv_block(model_state, message, accumulator) {
-        eprintln!("[tch-compute] inbound error: {e}");
+    if let Err(e) = runtime.compute_kv_block(model_state, message, accumulator) {
+        eprintln!("[compute-runtime] inbound error: {e}");
     }
     let domain_count = domains.len();
     let should_forward = message.ring_step < domain_count - 1;
