@@ -81,7 +81,7 @@ impl LlamaModel {
         let device = input_ids.device();
 
         // Embedding lookup
-        let mut hidden_states = Tensor::embedding(input_ids, &self.embedding, -1, false, false);
+        let mut hidden_states = Tensor::embedding(&self.embedding, input_ids, -1, false, false);
 
         // Position IDs: [batch, seq_len]
         let position_ids = if seq_len > 1 {

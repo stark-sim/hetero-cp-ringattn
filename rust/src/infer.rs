@@ -9,9 +9,9 @@ pub fn run_inference(model_dir: &str, prompt: &str, max_tokens: usize, temperatu
 
     let device = if tch::Cuda::is_available() {
         Device::Cuda(0)
-    } else if tch::utils::has_mps() {
-        Device::Mps
     } else {
+        // MPS has dtype limitations (no Int64, embedding indices may fail);
+        // default to CPU for inference until resolved.
         Device::Cpu
     };
     println!("[infer] device: {:?}", device);

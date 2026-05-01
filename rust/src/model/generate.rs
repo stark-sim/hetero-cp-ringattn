@@ -36,7 +36,7 @@ impl Generator {
         // Tokenize prompt
         let encoding = self.tokenizer.encode(prompt, true)
             .map_err(|e| ModelError::Tokenizer(e.to_string()))?;
-        let prompt_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
+        let prompt_ids: Vec<i32> = encoding.get_ids().iter().map(|&id| id as i32).collect();
 
         if prompt_ids.is_empty() {
             return Ok(String::new());
@@ -69,7 +69,7 @@ impl Generator {
             }
 
             // Forward single token
-            let next_input = Tensor::from_slice(&[next_token_id as i64])
+            let next_input = Tensor::from_slice(&[next_token_id as i32])
                 .unsqueeze(0)
                 .to_device(self.device);
             logits = self.model.forward(&next_input, &mut kv_caches)?;

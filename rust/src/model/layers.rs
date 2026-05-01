@@ -21,7 +21,8 @@ impl RmsNorm {
 
     pub fn forward(&self, x: &Tensor) -> Tensor {
         let variance = x.pow_tensor_scalar(2i64).mean_dim(&[-1i64][..], true, Kind::Float);
-        x * (variance + self.eps).rsqrt() * &self.weight
+        let eps = Tensor::from(self.eps).to_kind(Kind::Float);
+        x * (variance + eps).rsqrt() * &self.weight
     }
 }
 
@@ -62,8 +63,8 @@ impl RotaryEmbedding {
 
     fn compute_inv_freq(dim: usize, base: f64, device: Device) -> Tensor {
         let half_dim = (dim / 2) as i64;
-        let inv_freq: Vec<f64> = (0..half_dim)
-            .map(|i| 1.0 / base.powf((2.0 * i as f64) / dim as f64))
+        let inv_freq: Vec<f32> = (0..half_dim)
+            .map(|i| 1.0 / base.powf((2.0 * i as f64) / dim as f64) as f32)
             .collect();
         Tensor::from_slice(&inv_freq).to_device(device)
     }
@@ -225,7 +226,8 @@ impl GqaAttention {
         let v = Self::repeat_kv(&v, num_rep);
 
         // Attention scores: [batch, num_heads, seq_len, kv_len]
-        let scores = q.matmul(&k.transpose(2, 3)) * self.scale;
+        let scale = Tensor::from(self.scale).to_kind(Kind::Float);
+        let scores = q.matmul(&k.transpose(2, 3)) * scale;
 
         // Apply attention mask (causal or padding)
         let scores = if let Some(mask) = attention_mask {
@@ -355,3 +357,4 @@ mod tests {
         assert_eq!(out.size(), vec![batch, seq_len, hidden_size]);
     }
 }
+
