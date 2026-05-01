@@ -104,7 +104,7 @@
 - [x] [2026-04-30] M3-tch：`backend.rs` `ring_attention` 统一使用 `process_kv_block` 纯 tensor online softmax，已删除 `compute_chunk_attention_step` 与未使用的 payload 辅助函数；compute 路径已完全内联 tensor 实现。
 - [x] [2026-04-30] `tch-backend` 设为默认 feature，修复全部 clippy 错误，18/18 单元测试通过，clippy 零警告。
 - [ ] M3：抽出统一 transport trait，减少 local queue / TCP pair / TCP CP node 的重复 frame 与 metrics 逻辑。
-- [ ] M4：heterogeneous runtime stubs 与配置 / 环境纪律。
+- [x] [2026-05-01] M4 异构 runtime stub 核心完成：`TchComputeRuntime` 接入设备配置（`select_tch_device_from_env()` 从 `HCP_TCH_DEVICE`/`HCP_TORCH_DEVICE` 解析 cpu/mps/cuda/cuda:N）；移除硬编码 `tch::Device::Cpu`；新增 `TchComputeRuntime::new(device)` 和 `from_env()` 构造函数；protocol.rs 三处 runtime 实例化统一使用 `from_env()`；本地 CPU smoke checksum 1093.59 与重构前一致；本地 MPS smoke（`HCP_TCH_DEVICE=mps`）全部 tch bridge `code=2`，checksum 一致；remote 3-node smoke MPS+CUDA 异构通过，checksum 与重构前一致（71.35/238.88/406.41）；`NoOpComputeRuntime` 保留为无 `tch-backend` feature 时的编译兼容 fallback。
 - [x] M5：将 deterministic projection weights 升级为真实权重加载 / layer config，并接入 RoPE、norm/residual 与完整 layer lifecycle。
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 

@@ -49,6 +49,7 @@ project-root/
 - **reference-first correctness**：Python kernel stub 保留 reference attention，用于与 block-wise online softmax 对照。
 - **报告纪律**：实验产物应落在 `reports/<RUN_ID>/` 下，便于回溯。
 - **分级 tolerance policy**：数值验证不采用单一阈值，而是按测试层级分为三级：`Strict`（同设备算法等价，`rtol=1e-5`）、`Relaxed`（异构设备交叉验证，`rtol=1e-4`）、`EndToEnd`（多层模型累积误差，`rtol=1e-3`）。阈值基于 float32 机器精度（~1.2e-7）和业界框架默认值推导，给 100~1000 倍安全余量。`--tolerance-tier` CLI 参数可在运行时切换，correctness JSON report 包含 `tolerance_tier` 字段以明确当前验证标准。
+- **异构 runtime 配置**：`ComputeRuntime` trait 解耦计算实现与协议逻辑；`TchComputeRuntime` 通过 `HCP_TCH_DEVICE` / `HCP_TORCH_DEVICE` 环境变量选择目标设备（`cpu` / `mps` / `cuda` / `cuda:N`），默认 fallback 到 `cpu`；`NoOpComputeRuntime` 作为无 `tch-backend` feature 时的编译兼容 stub。device 选择不依赖交互 shell 的偶然环境，而是通过统一的环境变量或构造函数参数传入。
 
 ## 组件关系
 
