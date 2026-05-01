@@ -116,7 +116,8 @@
 - [2026-04-30] projection weights 已从 deterministic 初始化升级为支持外部 JSON 权重加载（`HCP_WEIGHTS_JSON`）；RoPE、LayerNorm、o_proj、residual 均已接入 protocol；M5 目标已完成。
 - [2026-04-26] 3-node remote CP query chunk smoke 的一次失败根因是 Mac 子网地址从 `192.168.8.204` 变化到 `192.168.8.239`；后续重跑已通过。后续 remote smoke 前应先用 `ifconfig | rg 'inet 192\\.168\\.8\\.'` 确认当前 Mac 地址。
 - [2026-04-30] GPU host 当前 VPN 地址为 `100.118.253.68`，Mac 本机 VPN 地址为 `100.121.35.138`；LAN 地址 `192.168.8.172` / `192.168.8.239` 目前不可达。remote smoke 需使用当前可达地址。
-- [2026-05-01] 网络环境切换：CUDA 节点通过 `user@sd-1` 访问，Mac 本机当前可达地址为 `100.64.0.95`；remote smoke 参数更新为 `GPU_HOST=sd-1 GPU_USER=user MAC_NODE_ADDR=100.64.0.95`。
+- [2026-05-01] 网络环境切换：CUDA 节点通过 `user@sd-1`（IP `100.64.0.93`）访问，Mac 本机当前可达地址为 `100.64.0.95`；remote smoke 需使用 IP 地址（`GPU_HOST=100.64.0.93`），因为 Rust socket 解析不支持主机名。
+- [2026-05-01] 3-node remote CP smoke 通过：`RUN_ID=rust-remote-cp-sd1-ip2-20260501 PORT_BASE=29430 GPU_HOST=100.64.0.93 GPU_USER=user MAC_NODE_ADDR=100.64.0.95`；node0/node2 MPS 全部 bridge `code=2 12/12`，node1 CUDA 全部 bridge `code=3 12/12`；tch compute checksum 分别为 71.35 / 238.88 / 406.41。
 
 ## 里程碑
 

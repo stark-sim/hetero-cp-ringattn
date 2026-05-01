@@ -106,7 +106,8 @@
 - `tch-rs` 的长期接入应优先使用独立/system-wide libtorch；`LIBTORCH_USE_PYTORCH=1` 只作为 fallback 或快速验证路径，避免把核心 Rust 路线重新耦合到 Python 环境。
 - `tch-backend` feature 已接入：只需 `LIBTORCH=/Users/stark_sim/libtorch`，不要同时设 `LIBTORCH_INCLUDE`/`LIBTORCH_LIB`；macOS 运行时需要 `DYLD_LIBRARY_PATH` 包含 `${LIBTORCH}/lib`。
 - 远端 GPU host `~/.profile` 已收敛环境变量配置（`LIBTORCH`、`LD_LIBRARY_PATH`、`PATH`），本地 `scripts/run_rust_remote_cp_3node_smoke.sh` 已移除 `remote_env_exports()` 显式传入，改为完全依赖远端 `bash -l` 加载 `.profile`。
-- [2026-05-01] 当前网络环境已切换：CUDA 节点通过 `user@sd-1`（SSH 别名/主机名）访问，Mac 本机当前可达地址为 `100.64.0.95`。后续 remote smoke 统一使用 `GPU_HOST=sd-1 GPU_USER=user MAC_NODE_ADDR=100.64.0.95`。
+- [2026-05-01] 当前网络环境已切换：CUDA 节点通过 `user@sd-1`（SSH 别名，HostName `sd-1` → IP `100.64.0.93`）访问，Mac 本机当前可达地址为 `100.64.0.95`。
+- [2026-05-01] 3-node remote CP smoke 已通过：`GPU_HOST=100.64.0.93 GPU_USER=user MAC_NODE_ADDR=100.64.0.95`，node0/node2 MPS `code=2 12/12`，node1 CUDA `code=3 12/12`。注意：`GPU_HOST` 必须用 IP 地址，Rust `SocketAddr` 解析不支持主机名（`sd-1:29410` 会报 `invalid socket address syntax`）。
 
 ## 下一步
 
