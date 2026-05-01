@@ -106,6 +106,7 @@
 - `tch-rs` 的长期接入应优先使用独立/system-wide libtorch；`LIBTORCH_USE_PYTORCH=1` 只作为 fallback 或快速验证路径，避免把核心 Rust 路线重新耦合到 Python 环境。
 - `tch-backend` feature 已接入：只需 `LIBTORCH=/Users/stark_sim/libtorch`，不要同时设 `LIBTORCH_INCLUDE`/`LIBTORCH_LIB`；macOS 运行时需要 `DYLD_LIBRARY_PATH` 包含 `${LIBTORCH}/lib`。
 - 远端 GPU host `~/.profile` 已收敛环境变量配置（`LIBTORCH`、`LD_LIBRARY_PATH`、`PATH`），本地 `scripts/run_rust_remote_cp_3node_smoke.sh` 已移除 `remote_env_exports()` 显式传入，改为完全依赖远端 `bash -l` 加载 `.profile`。
+- [2026-05-01] 当前网络环境已切换：CUDA 节点通过 `user@sd-1`（SSH 别名/主机名）访问，Mac 本机当前可达地址为 `100.64.0.95`。后续 remote smoke 统一使用 `GPU_HOST=sd-1 GPU_USER=user MAC_NODE_ADDR=100.64.0.95`。
 
 ## 下一步
 
@@ -136,8 +137,8 @@
 - 远端 GPU smoke 排查经验：若 `torch_code=-2` 或 `torch_code=-5`，不要怀疑 `cuda:0` 设备名；优先看 `torch_message`，并检查 `LIBTORCH`、`LIBTORCH_LIB`、`LD_LIBRARY_PATH` / rpath、`ldd` 是否显示 `libtorch_cuda.so` / `libc10_cuda.so`。
 - Protocol smoke 纪律：`protocol_status=pass` 需要同时覆盖 K/V block、softmax state、terminate；K/V block message 数应等于 source blocks * (domain_count - 1)。
 - P2P 语义纪律：P2P 表示 point-to-point、非 collective；不要把 HCP protocol 本身等同于 IP/TCP。
-- Remote GPU 纪律：`192.168.8.172` 只通过 git 同步代码；不要在远端直接编辑源码。
-- Remote P2P 纪律：双机验证不能用 `127.0.0.1` 作为结论；server 应监听 `0.0.0.0` 或目标子网地址，client 应连接 `192.168.8.x` 子网内的 GPU host。
+- Remote GPU 纪律：`sd-1`（SSH 主机名，用户 `user`）只通过 git 同步代码；不要在远端直接编辑源码。
+- Remote P2P 纪律：双机验证不能用 `127.0.0.1` 作为结论；server 应监听 `0.0.0.0` 或目标子网地址，client 应连接 `100.64.0.x` 子网内的 GPU host。
 - Report 纪律：`reports/**/*.json` 是生成产物，默认不提交；如需长期记录实验进展，写入 docs 或 memory-bank。
 - Remote CP node 启动纪律：正式 3-node remote CP smoke 优先使用 `scripts/run_rust_remote_cp_3node_smoke.sh`，让 Mac 地址发现、GPU git 同步、preflight build、节点启动和日志路径统一收敛；手工启动只用于排查。
 - Remote CP 地址纪律：Mac 的可达地址可能在 `192.168.8.x` 子网或 `100.x` VPN/overlay 网络之间切换；统一 launcher 使用 `MAC_NODE_ADDR` 覆盖本机可达地址，`GPU_HOST` 覆盖 CUDA host。
