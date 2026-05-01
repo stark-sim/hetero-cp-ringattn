@@ -94,6 +94,12 @@
 - [2026-05-01] 修复 `test_chunk_step_vs_softmax_single_block`：`compute_chunk_attention_step` 输出布局为 `[num_heads, query_len, head_dim]`，但测试代码额外加了 `.permute(&[1, 0, 2])` 导致 `actual` 变为 `[1, query_len, num_heads, head_dim]`，与 expected `[1, num_heads, query_len, head_dim]` 不匹配；去掉 permute 后 diff=2.9e-8。
 - [2026-05-01] 修复 `ring_attention` causal mask 路径：`compute_chunk_attention_step` 内部从 q/k/v payload 重新计算 scores，不感知 causal mask。当 `attention_mask.is_some()` 时，改为在 `ring_attention` 中直接使用已应用 causal mask 的 `scores` tensor 做 online softmax 更新（与 `compute_chunk_attention_step` 数学等价，但尊重 mask）。`test_ring_attention_matches_local_causal` diff=9.4e-7。
 - [2026-05-01] Qwen2-0.5B 权重重新下载完成（942MB），safetensors 验证通过，无全零层。
+- [2026-05-01] 修复 MPS 上 `HcpRingAttentionBackend` 设备不匹配：`ring_attention` 方法中 `output_acc` 从 CPU buffer 通过 `Tensor::from_slice` 重建，导致输出 tensor 留在 CPU；最终与 MPS 上的 `o_proj` matmul 时报 "mat1 is on CPU"。修复：在 `ring_attention` 返回前加 `.to(q.device())`。修复后 MPS `num_domains=2` 输出与 `num_domains=1` 一致（`, theT. \`），16/16 单元测试仍通过。
+- [2026-05-01] 消除 inference 路径中所有 CPU fallback：
+  - `ring_attention` causal prefill 路径改为全程 device tensor online softmax（`rm`/`rs`/`obh` 直接在 MPS 上创建和更新，彻底移除每个 KV block 的 D2H/H2D round-trip）。无 mask 的 protocol smoke 路径保留 `compute_chunk_attention_step` 兼容。
+  - `GqaAttention::forward`、`HcpRingAttentionBackend::local_attention_scores`、`RmsNorm::forward` 中的 `Tensor::from(scale).to_kind(Float)` 和 `Tensor::from(eps).to_kind(Float)` 均改为直接标量乘法/加法，避免创建 CPU 标量 tensor。
+  - 验证 `Tensor::embedding` Int64 on MPS 和 RoPE `index_select` Int64 on MPS 均无需 fallback（之前的 "Placeholder storage" 报错未复现，可能是特定版本或特定条件下的 transient issue）。
+  - MPS `num_domains=1/2/4` 输出一致；16/16 单元测试通过；MPS 全量 smoke（tch_attention + 5 个 payload/query bridge）均通过。
 
 ## 活跃决策
 

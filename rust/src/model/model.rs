@@ -103,6 +103,7 @@ impl LlamaModel {
                 .find_map(|c| c.as_ref().map(|cache| cache.seq_len as i64))
                 .unwrap_or(0);
             Tensor::from_slice(&[cache_len])
+                .to_device(device)
                 .unsqueeze(0)
                 .repeat(&[batch, 1])
         };

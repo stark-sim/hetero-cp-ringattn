@@ -21,8 +21,7 @@ impl RmsNorm {
 
     pub fn forward(&self, x: &Tensor) -> Tensor {
         let variance = x.pow_tensor_scalar(2i64).mean_dim(&[-1i64][..], true, Kind::Float);
-        let eps = Tensor::from(self.eps).to_kind(Kind::Float);
-        x * (variance + eps).rsqrt() * &self.weight
+        x * (variance + self.eps).rsqrt() * &self.weight
     }
 }
 
@@ -84,6 +83,8 @@ impl RotaryEmbedding {
         let num_heads_k = k.size()[1];
 
         let (cos, sin) = if let Some(pos_ids) = position_ids {
+            let batch = pos_ids.size()[0];
+            let seq = pos_ids.size()[1];
             let batch = pos_ids.size()[0];
             let seq = pos_ids.size()[1];
             let pos_flat = pos_ids.view(-1);
@@ -244,8 +245,7 @@ impl GqaAttention {
         let v = Self::repeat_kv(&v, num_rep);
 
         // Attention scores: [batch, num_heads, seq_len, kv_len]
-        let scale = Tensor::from(self.scale).to_kind(Kind::Float);
-        let scores = q.matmul(&k.transpose(2, 3)) * scale;
+        let scores = q.matmul(&k.transpose(2, 3)) * self.scale;
 
         // Apply attention mask (causal or padding)
         let scores = if let Some(mask) = attention_mask {
