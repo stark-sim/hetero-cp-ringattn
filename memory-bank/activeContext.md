@@ -114,6 +114,7 @@
 - 远端 GPU host `~/.profile` 已收敛环境变量配置（`LIBTORCH`、`LD_LIBRARY_PATH`、`PATH`），本地 `scripts/run_rust_remote_cp_3node_smoke.sh` 已移除 `remote_env_exports()` 显式传入，改为完全依赖远端 `bash -l` 加载 `.profile`。
 - [2026-05-01] 当前网络环境已切换：CUDA 节点通过 `user@sd-1`（SSH 别名，HostName `sd-1` → IP `100.64.0.93`）访问，Mac 本机当前可达地址为 `100.64.0.95`。
 - [2026-05-01] 3-node remote CP smoke 已通过：`GPU_HOST=100.64.0.93 GPU_USER=user MAC_NODE_ADDR=100.64.0.95`，node0/node2 MPS `code=2 12/12`，node1 CUDA `code=3 12/12`。注意：`GPU_HOST` 必须用 IP 地址，Rust `SocketAddr` 解析不支持主机名（`sd-1:29410` 会报 `invalid socket address syntax`）。
+- [2026-05-01] **Transport trait 重构后 3-node regression 验证通过**：`PORT_BASE=29250 GPU_HOST=100.64.0.93 GPU_USER=user MAC_NODE_ADDR=100.64.0.95`；node0/node2 MPS `code=2`，node1 CUDA `code=3`；全部 C++ bridge 与 tch bridge `12/12` pass；checksum 分别为 71.35 / 238.88 / 406.41，与重构前完全一致。transport trait 统一未引入 regression。
 
 ## 下一步
 

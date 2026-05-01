@@ -124,6 +124,7 @@
 - [2026-04-30] GPU host 当前 VPN 地址为 `100.118.253.68`，Mac 本机 VPN 地址为 `100.121.35.138`；LAN 地址 `192.168.8.172` / `192.168.8.239` 目前不可达。remote smoke 需使用当前可达地址。
 - [2026-05-01] 网络环境切换：CUDA 节点通过 `user@sd-1`（IP `100.64.0.93`）访问，Mac 本机当前可达地址为 `100.64.0.95`；remote smoke 需使用 IP 地址（`GPU_HOST=100.64.0.93`），因为 Rust socket 解析不支持主机名。
 - [2026-05-01] 3-node remote CP smoke 通过：`RUN_ID=rust-remote-cp-sd1-ip2-20260501 PORT_BASE=29430 GPU_HOST=100.64.0.93 GPU_USER=user MAC_NODE_ADDR=100.64.0.95`；node0/node2 MPS 全部 bridge `code=2 12/12`，node1 CUDA 全部 bridge `code=3 12/12`；tch compute checksum 分别为 71.35 / 238.88 / 406.41。
+- [x] [2026-05-01] Transport trait 重构后 3-node regression 验证通过：`PORT_BASE=29250 GPU_HOST=100.64.0.93 GPU_USER=user MAC_NODE_ADDR=100.64.0.95`；全部节点 `sent=8 received=8 compute_updates=12`，C++ bridge 与 tch bridge 全部 `12/12` pass；checksum 与重构前完全一致（71.35 / 238.88 / 406.41），未引入 regression。
 
 ## 里程碑
 
