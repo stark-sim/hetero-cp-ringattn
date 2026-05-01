@@ -100,6 +100,7 @@
 - [x] [2026-05-01] `test_ring_attention_with_mock_transport` 通过：2-domain distributed causal attention diff=3.6e-8，验证 `HcpRingAttentionBackend` + `MockKvTransport` 的 distributed ring attention 数学正确性。
 - [x] [2026-05-01] Phase 3 Step 3-5 完成：修复 `LinkedMockKvTransport` 自环 bug（`peer_inbox`/`self_inbox` 分离，send 写入对方队列、recv 从自己的队列读取）；修复测试代码 transport 覆盖 bug（`setup_distributed_domain` 循环调用导致所有 layer 共享最后一对 transport，改为预创建每层独立 transport pair）；`test_distributed_llama_model_prefill` 端到端分布式 prefill 通过（2-layer、GQA、seq_len=16 拆成 2 domain），diff=2.79e-6；为 `kv_transport.rs`、`backend.rs`（forward/ring_attention/process_kv_block）、`model.rs`（测试）补充详细中文注释。
 - [x] [2026-05-01] M2：Rust online softmax correctness report 与 tolerance policy 扩展完成。新增 `ToleranceTier` 三级策略（Strict/Relaxed/EndToEnd），`--tolerance-tier` CLI 参数支持运行时切换；correctness JSON report 输出 `tolerance_tier` 和 `tolerance` 字段；`tch_backend.rs` 5 处硬编码 tolerance 统一为模块常量；`model.rs` 端到端断言使用命名常量；全部 18 单元测试通过，clippy 零警告。
+- [x] [2026-05-01] M2 数学闭环正式文档已沉淀：`docs/CORRECTNESS_REPORT.md` 包含验证目标、方法论、7-case 测试矩阵、实测 metrics、分级 tolerance 推导依据（float32 epsilon、FMA、累加顺序、业界 PyTorch/NumPy/ICON-A 参考）和运行方式；`docs/RINGATTN_MODEL.md` 同步更新 case 列表和 tolerance 描述；全部 case 在 Strict tier 下通过，max_rel_err 与 threshold 保持至少 10 倍以上余量。
 - [x] [2026-04-30] M3-tch：`backend.rs` `ring_attention` 统一使用 `process_kv_block` 纯 tensor online softmax，已删除 `compute_chunk_attention_step` 与未使用的 payload 辅助函数；compute 路径已完全内联 tensor 实现。
 - [x] [2026-04-30] `tch-backend` 设为默认 feature，修复全部 clippy 错误，18/18 单元测试通过，clippy 零警告。
 - [ ] M3：抽出统一 transport trait，减少 local queue / TCP pair / TCP CP node 的重复 frame 与 metrics 逻辑。
@@ -111,7 +112,7 @@
 
 - [2026-04-24] 完整 Python smoke 在当前沙箱下无法绑定本地端口。
 - [2026-04-24] `ringattn_controller.py` 存在 `bytes` JSON 序列化问题。
-- [2026-04-24] `ringattn_kernel_stub.py` 已有 correctness JSON report 入口，但还没有整理成正式 M2 report 文档。
+- [x] [2026-05-01] `ringattn_kernel_stub.py` 的 correctness JSON 已进一步整理为正式 M2 report 文档：`docs/CORRECTNESS_REPORT.md`。
 - [2026-04-24] `tch` crate 未在本机 cargo cache 中；system-wide libtorch 已就绪，剩余阻塞是 cargo registry/network 拉取 `tch` / `torch-sys`。
 - [2026-04-24] MPS 排查结论：沙箱进程隐藏 Metal device，非沙箱进程下 PyTorch 2.11.0 的 MPS 可用。
 - [2026-04-25] GPU 远端默认 `CARGO_OFFLINE=1` 时可能因 cargo cache 缺 `serde_json` 等基础依赖失败；这不是 CUDA smoke 结果，需要先在线 fetch 或放开一次 `CARGO_OFFLINE=0`。

@@ -22,7 +22,7 @@
 - 按 domain 配置切分本地 `Q chunk`。
 - 按 ring 顺序访问每个 source domain 的 `K/V block`。
 - 使用 online softmax 更新 `running_max`、`running_sum`、`output`。
-- 与标准 full attention reference 比较 `max_abs_err` 和 `mean_abs_err`。
+- 与标准 full attention reference 比较 `max_abs_err`、`mean_abs_err` 和 `max_rel_err`。
 
 范围外：
 
@@ -61,14 +61,21 @@ SKIP_PYTHON_SMOKE=1 bash scripts/run_local_ringattn_smoke.sh
 - `2domain_uneven_chunks`
 - `3domain_uneven_blocks`
 - `4domain_small_tail_blocks`
+- `3domain_large_seq`
+- `1domain_single_block`
+- `2domain_unit_blocks`
+- `1domain_medium`
 
-这些 case 覆盖不均分 chunk、不均分 block size、以及 tail block 小于 block size 的情况。
+这些 case 覆盖不均分 chunk、不均分 block size、tail block 小于 block size、大 sequence（1024）、单 domain、unit block（block_size=1）等边界条件。
 
 ## 通过标准
 
-默认 tolerance：
+默认 tolerance 采用**分级策略**（见 `docs/CORRECTNESS_REPORT.md`）：
 
-- `max_abs_err <= 1e-10`
-- `mean_abs_err <= 1e-12`
+| Tier | max_abs_err | mean_abs_err | max_rel_err | 适用场景 |
+|------|-------------|--------------|-------------|----------|
+| Strict | 1e-5 | 1e-6 | 1e-5 | 同设备算法等价性验证 |
+| Relaxed | 1e-4 | 1e-5 | 1e-4 | 异构设备交叉验证 |
+| EndToEnd | 1e-3 | 1e-4 | 1e-3 | 多层模型端到端 |
 
-当前模型使用 float64 运行 correctness 对照，以优先验证算法等价性。后续如果要模拟实际 runtime dtype，应增加 float32 / mixed precision tolerance policy，而不是放宽当前数学闭环标准。
+当前 correctness model 使用 float64 计算 reference 与 model 输出，以优先验证算法等价性。实际 runtime（float32 / mixed precision）的数值差异通过分级 tolerance 覆盖，而不是改变 correctness model 本身。

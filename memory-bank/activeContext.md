@@ -118,7 +118,7 @@
 ## 下一步
 
 - [x] 分级 tolerance policy 已落地：`ToleranceTier` 三级（Strict/Relaxed/EndToEnd），`--tolerance-tier` CLI 参数支持切换，correctness report 包含 tier 信息。
-- [ ] 将当前 correctness JSON 进一步整理成正式 report 文档，沉淀 M2 数学闭环结论。
+- [x] M2 数学闭环正式文档已沉淀：`docs/CORRECTNESS_REPORT.md` 包含验证目标、方法论、7-case 测试矩阵、实测 metrics、分级 tolerance 推导依据和运行方式；`docs/RINGATTN_MODEL.md` 同步更新 case 列表和 tolerance 描述。
 - [ ] 将 Rust correctness model 继续拆分为 library + binary，便于后续 protocol / transport 复用。
 - [x] [2026-04-30] 抽出统一 transport trait：`MessageSender` + `MessageReceiver` trait 定义在 protocol.rs 中；`TcpStream`、`mpsc::Sender<Vec<u8>>`、`mpsc::Receiver<Vec<u8>>` 均实现对应 trait；`cp_ring_node_smoke`、`run_remote_cp_node`、`run_remote_p2p_server/client` 全部迁移到新 trait；删除 `send_cp_node_frame`、`write_raw_message_frame`、`read_raw_message_frame` 等重复函数；18/18 测试通过，clippy 零警告，smoke 通过。
 - [x] [2026-05-01] Phase 2 Checkpoint 5 完成：`HcpRingAttentionBackend` 已接入真实推理路径；`LlamaModel` 支持 `num_domains` 切换（`--infer-num-domains` CLI 参数）；Qwen2-0.5B 验证 `num_domains=1/2/4` 输出一致。
