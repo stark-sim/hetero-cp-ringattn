@@ -81,9 +81,20 @@
 - [x] [2026-04-30] M2 correctness 扩展完成：7 个 cases（含大 seq 和边界条件）；`max_rel_err` 已添加到 correctness model 和全部 tch bridge；`--stress-test` 支持 5-seed 随机验证。
 - [x] [2026-04-30] M3 protocol 优化完成：TCP frame I/O 统一为 `write_frame_to_stream`/`read_frame_from_stream`；`process_inbound_message` 提取消除 CP node runtime 重复逻辑；SSH ConnectTimeout=30 修复 VPN 远程 smoke 超时。
 - [x] [2026-04-30] M4 异构 runtime 闭环完成：`ComputeRuntime` trait 提取，`TchComputeRuntime` 真实计算，`NoOpComputeRuntime` 仅作 fallback；计算路径与协议逻辑解耦；本地 MPS smoke 和 VPN 三节点 remote CP 验证通过。
+- [x] [2026-05-01] Phase 1 Checkpoint 1: 新增 `safetensors`/`tokenizers`/`half` 依赖；`ModelConfig` 支持解析 HF `config.json`（Llama/Qwen2/Mistral 家族）；`ModelWeights` 支持从 `.safetensors` 加载并转换 F16/BF16 到 F32。
+- [x] [2026-05-01] Phase 1 Checkpoint 2: `RmsNorm`（替换标准 LayerNorm）、可配置 `RotaryEmbedding`、`SwiGLU` MLP；全部通过单元测试验证输出形状。
+- [x] [2026-05-01] Phase 1 Checkpoint 3: `GqaAttention`（RoPE + GQA + causal mask + KV cache）、`LocalAttentionBackend`（实现 `AttentionBackend` trait）、`DecoderLayer`（完整 Pre/Post-Norm + Residual）、`LlamaModel`（Embedding → N-layer stack → RMSNorm → LM Head）；全部通过单元测试。
+- [x] [2026-05-01] Phase 1 Checkpoint 4: `Generator`（prefill + decode 自回归循环 + temperature 采样）、inference CLI（`--infer-model-dir`/`--infer-prompt`/`--infer-max-tokens`/`--infer-temperature`）；合成 tiny 模型验证 pipeline 端到端跑通。
+- [x] [2026-05-01] 修复 `protocol.rs` 中 `output_slot` 初始化大小 bug（`MODEL_HIDDEN_DIM` → `KV_NUM_HEADS * KV_HEAD_DIM`）；修复 `domain_model_state_projects_qkv_from_hidden_states` 测试未应用 RoPE 的问题。
+- [x] [2026-05-01] 修复 inference pipeline 中 `Tensor::embedding` 参数顺序错误（tch-rs 为 `embedding(weight, indices, ...)`）；修复 MPS float64 限制（RmsNorm eps / RoPE inv_freq / attention scale 全部转为 f32 tensor）。
 
 ## 进行中
 
+- [x] [2026-05-01] Phase 1 Checkpoint 4b: 真实 Qwen2-0.5B 权重已重新下载并验证有效；修复 `make_causal_mask` 中 `0.0 * NEG_INFINITY = NaN` 的 bug（backend.rs 和 model.rs 两处）；推理 pipeline 已能输出有意义文本。
+- [x] [2026-05-01] 修复 `test_chunk_step_vs_softmax_single_block` 中 `actual` tensor 形状构造错误（`permute` 导致 num_heads 与 query_len 维度交换）。
+- [x] [2026-05-01] 修复 `ring_attention` 中 causal mask 未传递给 `compute_chunk_attention_step` 的问题：当 `attention_mask.is_some()` 时，直接使用已 mask 的 `scores` 做 online softmax 更新，而非调用无 mask 的 `compute_chunk_attention_step`。
+- [ ] Phase 2 Checkpoint 5: `HcpRingAttentionBackend` 分布式 attention 实现。
+- [ ] Phase 2 Checkpoint 5: `HcpRingAttentionBackend` 分布式 attention 实现。
 - [ ] M2：Rust online softmax correctness report 与 tolerance policy 扩展。
 - [ ] M3-tch：将 Ring Attention block update 迁移到 `tch-backend`，与 C++ ATen bridge 并行存在。
 - [ ] M3：抽出统一 transport trait，减少 local queue / TCP pair / TCP CP node 的重复 frame 与 metrics 逻辑。

@@ -90,6 +90,10 @@
 - [2026-04-30] M2 correctness 扩展完成：cases 从 3 个扩展到 7 个（含大 seq 512+256+256、单 block、unit block）；新增 `max_rel_err` 到 correctness model 和 tch-backend；新增 `--stress-test` CLI flag（5 seeds，自动跳过 seq>256）；本地 MPS smoke 和 VPN 三节点 remote CP 均验证通过。
 - [2026-04-30] M3 protocol 优化完成：统一 TCP frame I/O（`write_frame_to_stream`/`read_frame_from_stream`）；提取 `process_inbound_message` 去重 `run_cp_ring_node` 与 `receive_remote_cp_node_messages` 的消息处理逻辑；SSH ConnectTimeout=30 修复 VPN 远程 smoke 连接超时。
 - [2026-04-30] M4 异构 runtime 闭环完成：提取 `ComputeRuntime` trait，`TchComputeRuntime` 执行真实 tensor 计算，`NoOpComputeRuntime` 仅作为无 tch-backend feature 时的编译兼容 fallback；计算路径从 protocol 逻辑中完全解耦；本地 MPS smoke 和 VPN 三节点 remote CP 均验证通过，checksum 与重构前完全一致。
+- [2026-05-01] 修复 inference pipeline 中 causal mask 的 NaN bug：`make_causal_mask`（backend.rs 测试用）和 `create_causal_mask`（model.rs prefill 用）均使用 `mask.to_kind(Float) * NEG_INFINITY`，其中 False→0.0 与 NEG_INFINITY 相乘产生 NaN；改为 `zeros(...).masked_fill(&mask, NEG_INFINITY)` 后修复。Qwen2-0.5B 和 tiny model 均从全 "!" / "<unk>" 恢复为有意义的生成输出。
+- [2026-05-01] 修复 `test_chunk_step_vs_softmax_single_block`：`compute_chunk_attention_step` 输出布局为 `[num_heads, query_len, head_dim]`，但测试代码额外加了 `.permute(&[1, 0, 2])` 导致 `actual` 变为 `[1, query_len, num_heads, head_dim]`，与 expected `[1, num_heads, query_len, head_dim]` 不匹配；去掉 permute 后 diff=2.9e-8。
+- [2026-05-01] 修复 `ring_attention` causal mask 路径：`compute_chunk_attention_step` 内部从 q/k/v payload 重新计算 scores，不感知 causal mask。当 `attention_mask.is_some()` 时，改为在 `ring_attention` 中直接使用已应用 causal mask 的 `scores` tensor 做 online softmax 更新（与 `compute_chunk_attention_step` 数学等价，但尊重 mask）。`test_ring_attention_matches_local_causal` diff=9.4e-7。
+- [2026-05-01] Qwen2-0.5B 权重重新下载完成（942MB），safetensors 验证通过，无全零层。
 
 ## 活跃决策
 
@@ -147,3 +151,4 @@
 - [2026-04-24] PyTorch 2.11.0 在默认沙箱进程中 `mps_available=false`，原因是沙箱内 `MTLCopyAllDevices()` 返回 0；非沙箱进程可枚举 `Apple M1 Pro`，且 `torch.ones(..., device="mps")` 成功。
 - [2026-04-24] 后续所有 Metal/MPS 相关验证必须在非沙箱/授权进程中运行；默认沙箱结果不能作为 MPS 不可用结论。
 - [2026-04-25] GPU 端 `CARGO_OFFLINE=1` 失败且提示 `no matching package named serde_json found` 时，优先判定为 Cargo registry cache miss，不是 CUDA/libtorch 问题。
+- [2026-05-01] Qwen2-0.5B 推理输出质量一般（0.5B 小模型正常水平），但已无 NaN/全相同字符问题。后续可考虑 temperature/top-p 采样或量化优化速度。
