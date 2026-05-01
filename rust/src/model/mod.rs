@@ -7,6 +7,9 @@ pub mod layers;
 pub mod model;
 pub mod weights;
 
+#[cfg(feature = "tch-backend")]
+pub use kv_transport::KvTransport;
+
 pub use cache::KvCache;
 pub use model::LlamaModel;
 pub use weights::{ModelWeights, WeightNames};

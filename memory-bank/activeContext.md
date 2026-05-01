@@ -128,6 +128,7 @@
 - [x] 引入 optional `tch = 0.24.0` 并实现 `tch_smoke`（CPU/MPS 均已通过）。
 - [x] [2026-05-01] Phase 3 Step 1 完成：`KvTransport` trait 与 `KvBlock` 创建；`MockKvTransport` 支持 in-memory 测试。
 - [x] [2026-05-01] Phase 3 Step 2 完成：`HcpRingAttentionBackend` 集成 `KvTransport`；`send_local_kv` + `process_peer_block` 实现 distributed ring attention；`global_seq_start` 参数确保 causal mask 使用全局位置；`test_ring_attention_with_mock_transport` diff=3.6e-8 通过。
+- [x] [2026-05-01] Phase 3 Step 3-5 完成：`LinkedMockKvTransport` 修复自环 bug（peer_inbox/self_inbox 分离设计）；测试代码修复 layer transport 覆盖 bug（每层独立 transport pair）；`test_distributed_llama_model_prefill` 端到端分布式 prefill 验证通过，GQA 模式 diff=2.79e-6；关键代码（transport、backend、model 测试）已补充详细中文注释；全部 18 个单元测试通过。
 - [ ] 迁移 Ring Attention block update 到 `tch-backend`，与现有 C++ ATen bridge 并行。
 - [ ] 为 `RingAttnMessage` 设计 serialization / deserialization。
 

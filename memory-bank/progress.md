@@ -98,6 +98,7 @@
 - [x] [2026-05-01] Phase 3 Step 2: `HcpRingAttentionBackend` 集成 `KvTransport`；`send_local_kv` 发送本地 KV block；`process_peer_block` 接收 peer KV 并参与 online softmax；`global_seq_start` 参数确保 distributed causal mask 使用全局位置。
 - [x] [2026-05-01] 修复 `ring_attention` distributed path bug：peer KV blocks 应在 Q chunk 循环外预先接收并缓存，供所有 Q chunks 复用；原实现在每个 Q chunk 迭代中单独 `recv_kv_block`，导致多 chunk 场景下后续 chunks 收不到 peer KV。
 - [x] [2026-05-01] `test_ring_attention_with_mock_transport` 通过：2-domain distributed causal attention diff=3.6e-8，验证 `HcpRingAttentionBackend` + `MockKvTransport` 的 distributed ring attention 数学正确性。
+- [x] [2026-05-01] Phase 3 Step 3-5 完成：修复 `LinkedMockKvTransport` 自环 bug（`peer_inbox`/`self_inbox` 分离，send 写入对方队列、recv 从自己的队列读取）；修复测试代码 transport 覆盖 bug（`setup_distributed_domain` 循环调用导致所有 layer 共享最后一对 transport，改为预创建每层独立 transport pair）；`test_distributed_llama_model_prefill` 端到端分布式 prefill 通过（2-layer、GQA、seq_len=16 拆成 2 domain），diff=2.79e-6；为 `kv_transport.rs`、`backend.rs`（forward/ring_attention/process_kv_block）、`model.rs`（测试）补充详细中文注释。
 - [ ] M2：Rust online softmax correctness report 与 tolerance policy 扩展。
 - [ ] M3-tch：将 Ring Attention block update 迁移到 `tch-backend`，与 C++ ATen bridge 并行存在。
 - [ ] M3：抽出统一 transport trait，减少 local queue / TCP pair / TCP CP node 的重复 frame 与 metrics 逻辑。
