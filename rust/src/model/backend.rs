@@ -2,6 +2,8 @@ use crate::model::{ModelConfig, ModelError};
 
 #[cfg(feature = "tch-backend")]
 use tch::{Kind, Tensor};
+#[cfg(feature = "tch-backend")]
+use crate::model::kv_transport::{KvBlock, KvTransport};
 
 /// Trait for attention computation backends.
 #[cfg(feature = "tch-backend")]
@@ -62,6 +64,10 @@ pub struct HcpRingAttentionBackend {
     head_dim: usize,
     scale: f64,
     num_domains: usize,
+    layer_idx: usize,
+    #[cfg(feature = "tch-backend")]
+    kv_transport: Option<Box<dyn KvTransport>>,
+    local_domain_id: usize,
 }
 
 #[cfg(feature = "tch-backend")]
@@ -90,22 +96,109 @@ impl HcpRingAttentionBackend {
             head_dim: config.head_dim(),
             scale: 1.0 / (config.head_dim() as f64).sqrt(),
             num_domains: num_domains.max(1),
+            layer_idx: layer,
+            kv_transport: None,
+            local_domain_id: 0,
         })
+    }
+
+    #[cfg(feature = "tch-backend")]
+    pub fn set_transport(&mut self, transport: Box<dyn KvTransport>) {
+        self.kv_transport = Some(transport);
+    }
+
+    pub fn set_local_domain_id(&mut self, id: usize) {
+        self.local_domain_id = id;
+    }
+
+    /// Process a single KV block against a Q chunk, updating online softmax state.
+    /// All position arguments are **global** sequence positions.
+    fn process_kv_block(
+        &self,
+        q_chunk: &Tensor,
+        q_global_start: usize,
+        q_global_end: usize,
+        k_chunk: &Tensor,
+        v_chunk: &Tensor,
+        kv_global_start: usize,
+        kv_global_end: usize,
+        rm: &mut Tensor,
+        rs: &mut Tensor,
+        obh: &mut Tensor,
+    ) {
+        let kv_chunk_len = (kv_global_end - kv_global_start) as i64;
+        if kv_chunk_len <= 0 || kv_global_start >= q_global_end {
+            return;
+        }
+
+        let scores = q_chunk.matmul(&k_chunk.transpose(2, 3)) * self.scale;
+
+        // Apply causal mask using global positions
+        let q_pos = Tensor::arange_start(
+            q_global_start as i64,
+            q_global_end as i64,
+            (Kind::Int64, q_chunk.device()),
+        )
+        .unsqueeze(1)
+        .unsqueeze(0)
+        .unsqueeze(0);
+        let k_pos = Tensor::arange_start(
+            kv_global_start as i64,
+            kv_global_end as i64,
+            (Kind::Int64, q_chunk.device()),
+        )
+        .unsqueeze(0)
+        .unsqueeze(0)
+        .unsqueeze(0);
+        let causal = q_pos.ge_tensor(&k_pos);
+        let scores = scores.masked_fill(&causal.logical_not(), f64::NEG_INFINITY);
+
+        // Online softmax update
+        let (local_max, _) = scores.max_dim(3, false); // [batch, num_heads, q_chunk_len]
+        let weights = (&scores - local_max.unsqueeze(3)).exp();
+        let local_sum = weights.sum_dim_intlist(&[3i64][..], false, Kind::Float);
+        let local_pv = weights.matmul(v_chunk); // [batch, num_heads, q_chunk_len, head_dim]
+
+        let new_max = rm.max_other(&local_max);
+        let exp_prev = (&*rm - &new_max).exp();
+        let exp_local = (&local_max - &new_max).exp();
+        let new_sum = &exp_prev * &*rs + &exp_local * &local_sum;
+
+        *obh = (&exp_prev.unsqueeze(3) * &rs.unsqueeze(3) * &*obh
+            + &exp_local.unsqueeze(3) * &local_pv)
+            / &new_sum.unsqueeze(3);
+        *rm = new_max;
+        *rs = new_sum;
     }
 
     /// Compute attention by splitting Q into chunks and K/V into blocks,
     /// applying online softmax across blocks.
     fn ring_attention(
-        &self,
+        &mut self,
         q: &Tensor,
         k: &Tensor,
         v: &Tensor,
         attention_mask: Option<&Tensor>,
+        global_seq_start: usize,
     ) -> Tensor {
         let batch = q.size()[0];
         let num_heads = q.size()[1];
         let seq_len = q.size()[2];
         let head_dim = q.size()[3];
+
+        // Send local KV to next peer before processing (distributed path)
+        if let Some(ref mut transport) = self.kv_transport {
+            let kv_block = KvBlock {
+                layer_idx: self.layer_idx,
+                global_seq_start,
+                global_seq_end: global_seq_start + k.size()[2] as usize,
+                k: k.shallow_clone(),
+                v: v.shallow_clone(),
+            };
+            if let Err(e) = transport.send_kv_block(&kv_block) {
+                eprintln!("[ring_attention] send_kv_block failed: {e}");
+            }
+        }
 
         // For very short sequences, just do local attention
         if seq_len <= 1 || self.num_domains == 1 {
@@ -114,6 +207,24 @@ impl HcpRingAttentionBackend {
 
         let q_chunk_size = ((seq_len as usize + self.num_domains - 1) / self.num_domains).max(1);
         let kv_chunk_size = q_chunk_size;
+
+        // Pre-fetch peer KV blocks once (shared across all Q chunks)
+        let peer_blocks: Vec<super::kv_transport::KvBlock> = if let Some(ref mut transport) = self.kv_transport {
+            let mut blocks = Vec::new();
+            for _ in 0..self.num_domains.saturating_sub(1) {
+                match transport.recv_kv_block() {
+                    Ok(Some(peer_block)) => blocks.push(peer_block),
+                    Ok(None) => break,
+                    Err(e) => {
+                        eprintln!("[ring_attention] recv_kv_block failed: {e}");
+                        break;
+                    }
+                }
+            }
+            blocks
+        } else {
+            Vec::new()
+        };
 
         let mut outputs = Vec::new();
 
@@ -129,7 +240,6 @@ impl HcpRingAttentionBackend {
 
             if attention_mask.is_some() {
                 // Causal prefill path: pure-tensor online softmax on device.
-                // No CPU buffer round-trip.
                 let mut rm = Tensor::full(
                     &[batch, num_heads, q_chunk_len],
                     f64::NEG_INFINITY,
@@ -141,62 +251,34 @@ impl HcpRingAttentionBackend {
                     (Kind::Float, q.device()),
                 );
 
+                // 1. Process local KV blocks
+                let q_global_start = global_seq_start + q_start;
+                let q_global_end = global_seq_start + q_end;
                 for (kv_start, kv_end) in &kv_chunks {
                     let kv_chunk_len = (*kv_end - *kv_start) as i64;
-
-                    // Apply causal mask: skip blocks that are entirely after this Q chunk
-                    if *kv_start >= q_end {
-                        continue;
-                    }
-
                     let k_chunk = k.narrow(2, *kv_start as i64, kv_chunk_len);
                     let v_chunk = v.narrow(2, *kv_start as i64, kv_chunk_len);
+                    self.process_kv_block(
+                        &q_chunk, q_global_start, q_global_end,
+                        &k_chunk, &v_chunk,
+                        global_seq_start + kv_start, global_seq_start + kv_end,
+                        &mut rm, &mut rs, &mut obh,
+                    );
+                }
 
-                    // Build scores for this Q chunk vs K/V chunk
-                    let scores = q_chunk.matmul(&k_chunk.transpose(2, 3)) * self.scale;
-
-                    // Apply causal mask
-                    let q_pos = Tensor::arange_start(
-                        q_start as i64,
-                        q_end as i64,
-                        (Kind::Int64, q.device()),
-                    )
-                    .unsqueeze(1)
-                    .unsqueeze(0)
-                    .unsqueeze(0);
-                    let k_pos = Tensor::arange_start(
-                        *kv_start as i64,
-                        *kv_end as i64,
-                        (Kind::Int64, q.device()),
-                    )
-                    .unsqueeze(0)
-                    .unsqueeze(0)
-                    .unsqueeze(0);
-                    let causal = q_pos.ge_tensor(&k_pos);
-                    let scores = scores.masked_fill(&causal.logical_not(), f64::NEG_INFINITY);
-
-                    // Online softmax update
-                    let (local_max, _) = scores.max_dim(3, false); // [batch, num_heads, q_chunk_len]
-                    let weights = (&scores - local_max.unsqueeze(3)).exp();
-                    let local_sum = weights.sum_dim_intlist(&[3i64][..], false, Kind::Float);
-                    let local_pv = weights.matmul(&v_chunk); // [batch, num_heads, q_chunk_len, head_dim]
-
-                    let new_max = rm.max_other(&local_max);
-                    let exp_prev = (&rm - &new_max).exp();
-                    let exp_local = (&local_max - &new_max).exp();
-                    let new_sum = &exp_prev * &rs + &exp_local * &local_sum;
-
-                    obh = (&exp_prev.unsqueeze(3) * &rs.unsqueeze(3) * &obh
-                        + &exp_local.unsqueeze(3) * &local_pv)
-                        / &new_sum.unsqueeze(3);
-                    rm = new_max;
-                    rs = new_sum;
+                // 2. Process peer KV blocks (shared across Q chunks)
+                for peer_block in &peer_blocks {
+                    self.process_kv_block(
+                        &q_chunk, q_global_start, q_global_end,
+                        &peer_block.k, &peer_block.v,
+                        peer_block.global_seq_start, peer_block.global_seq_end,
+                        &mut rm, &mut rs, &mut obh,
+                    );
                 }
 
                 outputs.push(obh); // [batch, num_heads, q_chunk_len, head_dim]
             } else {
                 // Non-causal path (protocol smoke): use CPU-buffer-based block update
-                // for compatibility with compute_chunk_attention_step payload interface.
                 let qh = (q_chunk_len * num_heads) as usize;
                 let mut running_max = vec![f32::NEG_INFINITY; qh];
                 let mut running_sum = vec![0.0_f32; qh];
@@ -229,16 +311,14 @@ impl HcpRingAttentionBackend {
                     .reshape([num_heads as i64, q_chunk_len, head_dim])
                     .permute(&[1, 0, 2])
                     .unsqueeze(0)
-                    .to(q.device()); // [1, q_chunk_len, num_heads, head_dim]
+                    .to(q.device());
                 outputs.push(out_tensor);
             }
         }
 
         if attention_mask.is_some() {
-            // outputs are [batch, num_heads, q_chunk_len, head_dim]; cat on dim 2
             Tensor::cat(&outputs, 2)
         } else {
-            // outputs are [1, q_chunk_len, num_heads, head_dim]; cat on dim 1, then permute
             Tensor::cat(&outputs, 1).permute(&[0, 2, 1, 3]).to(q.device())
         }
     }
@@ -344,8 +424,16 @@ impl AttentionBackend for HcpRingAttentionBackend {
         let k = if num_rep > 1 { k.repeat(&[1, num_rep as i64, 1, 1]) } else { k };
         let v = if num_rep > 1 { v.repeat(&[1, num_rep as i64, 1, 1]) } else { v };
 
+        // Determine global seq offset for distributed causal masking
+        let global_seq_start = if self.kv_transport.is_some() {
+            let pos_min = position_ids.min().int64_value(&[]);
+            pos_min.max(0) as usize
+        } else {
+            0
+        };
+
         // Ring attention
-        let attn_output = self.ring_attention(&q, &k, &v, attention_mask);
+        let attn_output = self.ring_attention(&q, &k, &v, attention_mask, global_seq_start);
 
         // Reshape back and O-projection
         let attn_output = attn_output.transpose(1, 2).contiguous().view([batch, seq_len, hidden_size]);
@@ -476,7 +564,7 @@ mod tests {
 
         // Create a minimal backend (only needs q/k/v/o_proj for local_attention_scores)
         let rope = super::super::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
-        let backend = HcpRingAttentionBackend {
+        let mut backend = HcpRingAttentionBackend {
             q_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
             k_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
             v_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
@@ -488,9 +576,12 @@ mod tests {
             head_dim: head_dim as usize,
             scale,
             num_domains,
+            layer_idx: 0,
+            kv_transport: None,
+            local_domain_id: 0,
         };
 
-        let actual = backend.ring_attention(&q, &k, &v, None);
+        let actual = backend.ring_attention(&q, &k, &v, None, 0);
 
         let diff = (&expected - &actual).abs().mean(Kind::Float);
         let diff_val: f64 = diff.double_value(&[]);
@@ -522,7 +613,7 @@ mod tests {
         let expected = attn.matmul(&v);
 
         let rope = super::super::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
-        let backend = HcpRingAttentionBackend {
+        let mut backend = HcpRingAttentionBackend {
             q_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
             k_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
             v_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
@@ -534,13 +625,123 @@ mod tests {
             head_dim: head_dim as usize,
             scale,
             num_domains,
+            layer_idx: 0,
+            kv_transport: None,
+            local_domain_id: 0,
         };
 
-        let actual = backend.ring_attention(&q, &k, &v, Some(&mask));
+        let actual = backend.ring_attention(&q, &k, &v, Some(&mask), 0);
 
         let diff = (&expected - &actual).abs().mean(Kind::Float);
         let diff_val: f64 = diff.double_value(&[]);
         println!("Ring vs local causal diff = {}", diff_val);
         assert!(diff_val < 1e-4, "Ring attention differs from local causal: {}", diff_val);
+    }
+
+    /// Verify distributed ring attention with MockKvTransport matches single-process causal attention.
+    #[test]
+    #[cfg(feature = "tch-backend")]
+    fn test_ring_attention_with_mock_transport() {
+        use super::super::kv_transport::MockKvTransport;
+
+        let device = tch::Device::Cpu;
+        let num_heads = 4i64;
+        let head_dim = 8i64;
+        let seq_len = 16i64;
+        let half = seq_len / 2;
+
+        tch::manual_seed(789);
+        let q = Tensor::randn(&[1, num_heads, seq_len, head_dim], (Kind::Float, device));
+        let k = Tensor::randn(&[1, num_heads, seq_len, head_dim], (Kind::Float, device));
+        let v = Tensor::randn(&[1, num_heads, seq_len, head_dim], (Kind::Float, device));
+
+        // Expected: single-process causal attention
+        let scale = 1.0 / (head_dim as f64).sqrt();
+        let scores = q.matmul(&k.transpose(2, 3)) * scale;
+        let mask = make_causal_mask(seq_len, device);
+        let scores_masked = scores + mask.shallow_clone();
+        let attn = scores_masked.softmax(-1, Kind::Float);
+        let expected = attn.matmul(&v);
+
+        // Split into two workers
+        let q0 = q.narrow(2, 0, half);
+        let k0 = k.narrow(2, 0, half);
+        let v0 = v.narrow(2, 0, half);
+        let q1 = q.narrow(2, half, half);
+        let k1 = k.narrow(2, half, half);
+        let v1 = v.narrow(2, half, half);
+
+        let rope = super::super::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
+
+        // Worker 0: receives peer KV from worker 1
+        let mut transport0 = MockKvTransport::new();
+        transport0.push(super::super::kv_transport::KvBlock {
+            layer_idx: 0,
+            global_seq_start: half as usize,
+            global_seq_end: seq_len as usize,
+            k: k1.shallow_clone(),
+            v: v1.shallow_clone(),
+        });
+
+        let mut backend0 = HcpRingAttentionBackend {
+            q_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
+            k_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
+            v_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
+            o_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
+            q_bias: None, k_bias: None, v_bias: None,
+            rope: rope.clone(),
+            num_heads: num_heads as usize,
+            num_kv_heads: num_heads as usize,
+            head_dim: head_dim as usize,
+            scale,
+            num_domains: 2,
+            layer_idx: 0,
+            kv_transport: Some(Box::new(transport0)),
+            local_domain_id: 0,
+        };
+        let out0 = backend0.ring_attention(&q0, &k0, &v0, Some(&mask), 0);
+
+        // Worker 1: receives peer KV from worker 0
+        let mut transport1 = MockKvTransport::new();
+        transport1.push(super::super::kv_transport::KvBlock {
+            layer_idx: 0,
+            global_seq_start: 0,
+            global_seq_end: half as usize,
+            k: k0.shallow_clone(),
+            v: v0.shallow_clone(),
+        });
+
+        let mut backend1 = HcpRingAttentionBackend {
+            q_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
+            k_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
+            v_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
+            o_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
+            q_bias: None, k_bias: None, v_bias: None,
+            rope,
+            num_heads: num_heads as usize,
+            num_kv_heads: num_heads as usize,
+            head_dim: head_dim as usize,
+            scale,
+            num_domains: 2,
+            layer_idx: 0,
+            kv_transport: Some(Box::new(transport1)),
+            local_domain_id: 1,
+        };
+        let out1 = backend1.ring_attention(&q1, &k1, &v1, Some(&mask), half as usize);
+
+        // Compare each worker against expected slice before concatenation
+        let expected0 = expected.narrow(2, 0, half);
+        let expected1 = expected.narrow(2, half, half);
+        let diff0 = (&expected0 - &out0).abs().mean(Kind::Float).double_value(&[]);
+        let diff1 = (&expected1 - &out1).abs().mean(Kind::Float).double_value(&[]);
+        println!("worker0 diff={}, worker1 diff={}", diff0, diff1);
+
+        // Concatenate outputs: out0 [1, num_heads, half, head_dim], out1 [1, num_heads, half, head_dim]
+        let actual = Tensor::cat(&[out0, out1], 2);
+
+        let diff = (&expected - &actual).abs().mean(Kind::Float);
+        let diff_val: f64 = diff.double_value(&[]);
+        println!("Distributed ring attention diff = {}", diff_val);
+        assert!(diff_val < 1e-4, "Distributed ring attention differs from local causal: {}", diff_val);
     }
 }

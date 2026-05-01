@@ -2,6 +2,7 @@ pub mod backend;
 pub mod cache;
 pub mod config;
 pub mod generate;
+pub mod kv_transport;
 pub mod layers;
 pub mod model;
 pub mod weights;
