@@ -134,6 +134,7 @@
 - [x] [2026-04-30] M3-tch Step 3 完成：清理死代码——删除 `tch_backend.rs` 中已无调用点的 `compute_chunk_attention_step`（含 dummy 版本），删除 `backend.rs` 中未使用的 `tensor_to_q_payload` / `tensor_to_kv_payload`。
 - [x] [2026-04-30] `tch-backend` 设为默认 feature：`Cargo.toml` `default = ["tch-backend"]`；修复由此暴露的全部 46 个 clippy 错误（`needless_borrow`、`needless_borrows_for_generic_args`、`too_many_arguments`、dead code 等）；`cargo test --offline` 18/18 通过，`cargo clippy --offline -- -D warnings` 零警告。
 - [x] [2026-04-30] 本地 `cargo test` 与 `cargo clippy` 已验证通过；protocol smoke 与 remote CP smoke 待下次远程运行时最终确认。
+- [x] [2026-04-30] 明确 HCP 与 PyTorch 官方 Context Parallel 的边界：HCP 采用原始 Ring Attention 论文的 P2P 设计，支持异构/非均分；PyTorch 2.7+ CP 是同构 GPU 集群的 collective 优化。已记录于 `systemPatterns.md`。
 - [ ] 为 `RingAttnMessage` 设计 serialization / deserialization。
 
 ## 重要模式与偏好

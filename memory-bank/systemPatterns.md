@@ -75,6 +75,63 @@ project-root/
 6. block 转发给下一个 domain，直到 ring 遍历完成。
 7. 当前 Rust protocol smoke 以本地 P2P queue transport 验证完整 ring 转发路径，以 `cp_ring_node_runtime` 验证每节点双角色并发收发、payload-backed device compute、online state update 和 Rust/domain-side Q payload chunk output，以 `tcp_remote_pair` 验证双进程 / 双机器 send/recv frame，以 `tcp_remote_cp_node` 验证 remote 多节点 forwarding、payload-backed device compute、online state update 和 chunk output。
 
+## 两种 Context Parallel 路径的对比
+
+本项目在 Context Parallel 的通信层选择了 **P2P (point-to-point)** 设计，与 PyTorch 2.7+ 官方 Context Parallel 的 **Collective** 设计形成对照。以下是关键差异。
+
+### 1. 原始 Ring Attention（Liu et al., 2023）— P2P 模式
+
+**通信方式**：每个 host 只与 ring 中的邻居通信——**发送 K/V block 到 next host，同时从 previous host 接收 K/V block**。
+
+**数学基础**：online softmax / blockwise attention 允许 KV block 以**任意顺序**处理，只要正确合并 running max / running sum / output。
+
+**论文原话**：
+> *"The self-attention between a query block and a group of key-value blocks can be computed in any order, as long as the statistics of each block are combined correctly for rescaling."*
+> *"Each host efficiently coordinates by concurrently sending key-value blocks to the next host while receiving key-value blocks from the preceding host."*
+
+**适用场景**：任意互联拓扑（TCP、PCIe、不同子网）、异构设备、非均分 block size。
+
+### 2. PyTorch Context Parallel（2.7+）— Collective 模式
+
+**通信方式**：用 `all-gather` 或 `all-to-all` **collective** 替换 `F.scaled_dot_product_attention`，通过 Python context manager 自动 hook。
+
+**工程动机**：
+- NCCL 的 collective 在 NVIDIA GPU 集群（NVLink / InfiniBand）上有拓扑感知路由优化
+- PyTorch distributed 的 process group 抽象天然面向 collective
+- 目标场景是 Llama3 训练（32-128 张同构 H100）
+
+**限制**：
+- 依赖 NCCL / process group，**不支持异构设备**（如 Mac MPS + Linux CUDA）
+- 通常假设**均分 sequence**（`Sequential sharder` 或 `Round Robin`）
+- 只在 **Python 层**实现，libtorch C++ API 没有暴露
+
+### 3. 对照表
+
+| 维度 | 原始 Ring Attention (P2P) | PyTorch Context Parallel (Collective) | HCP 本项目 |
+|------|--------------------------|--------------------------------------|-----------|
+| **来源** | Liu et al., 2023 | PyTorch 2.7+ `torch.distributed._tensor.experimental.context_parallel` | 独立实现 |
+| **通信语义** | `send` / `recv` P2P | `all-gather` / `all-to-all` collective | `send_kv_block` / `recv_kv_block` P2P |
+| **通信库** | 任意 socket / MPI | NCCL | 自定义 TCP / 本地 queue |
+| **设备假设** | 任意（论文用 TPU/GPU） | 同构 NVIDIA GPU | **异构**（MPS + CUDA） |
+| **分块策略** | 支持非均分 | 均分（Sequential / Round Robin） | **支持非均分**（uneven blocks） |
+| **实现层** | JAX / Python | Python dispatch hook | **Rust + tch-rs**（C++ libtorch） |
+| **Correctness** | online softmax 增量更新 | online softmax 增量更新 | online softmax 增量更新，18 个单元测试验证 |
+| **性能优化** | 计算-通信重叠 | NCCL 拓扑优化 + 计算-通信重叠 | 当前阶段先保证 correctness，性能优化后置 |
+| **与官方关系** | 原始定义 | PyTorch 官方实现 | **不依赖 PyTorch CP**，从头基于底层 tch-rs 算子实现 |
+
+### 4. 为什么 HCP 选择 P2P
+
+1. **异构是刚需**：HCP 的目标场景是跨平台（Apple Silicon + NVIDIA），collective 需要所有设备加入同一个 NCCL process group，这不可能。
+2. **非均分对异构必要**：MPS 和 CUDA 的算力/显存/带宽不同，均分 sequence 会导致负载失衡；P2P 允许每个 domain 根据自己的 capacity 持有不同大小的 block。
+3. **P2P 是论文的原始定义**：PyTorch 的 collective 实现是一种"同构集群特化版"，不是 Ring Attention 的数学必须。
+4. **Rust 层实现**：脱离 Python GIL 和 PyTorch distributed 的 runtime 假设，更适合长期运行的分布式推理服务。
+
+### 5. 代价与风险
+
+- **延迟**：在 NVLink 全互联集群上，P2P 的逐 hop 延迟可能略高于 NCCL collective 的拓扑优化路由。
+- **生态**：无法直接复用 PyTorch FSDP / TP / PP 的组合式并行框架，需要自己处理 multi-dimensional parallelism 的交互。
+- **验证责任**： correctness 完全由我们自己保证，没有 PyTorch 官方背书。当前已通过 `test_ring_attention_matches_local_full`（diff=2.9e-8）和 `test_ring_attention_with_mock_transport`（diff=3.6e-8）验证数学等价性。
+
 ## 架构决策
 
 | 决策 | 理由 | 日期 |
@@ -96,3 +153,4 @@ project-root/
 | 3-node remote CP smoke 使用统一 launcher | 三节点需要同时覆盖本机 MPS、远端 CUDA、git 同步、当前 Mac 子网地址和启动时序；用脚本统一执行比手工命令更可复现 | [2026-04-26] |
 | 用 `LayerActivationState` 表达真实模型层生命周期 | 真实模型推进前必须先明确 Q/K/V cache 与 output buffer ownership，否则设备侧 output digest 无法对应到 domain-local 输出槽 | [2026-04-27] |
 | 先接 projection 数据流，再接权重文件 | Q/K/V 的来源应变成 hidden states + projection weights；权重加载格式可后置，避免把 protocol/runtime 验证与外部模型文件解析耦合 | [2026-04-29] |
+| HCP 采用原始论文 P2P 而非 PyTorch CP Collective | Ring Attention 原始论文（Liu et al. 2023）的通信本就是 P2P send/recv；PyTorch 2.7+ Context Parallel 改用 all-gather/all-to-all 是对同构 NVLink 集群的工程优化，不是数学必须。P2P 支持异构、非均分、任意拓扑，更符合 HCP 定位 | [2026-04-30] |
