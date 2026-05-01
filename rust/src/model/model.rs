@@ -24,7 +24,7 @@ pub struct LlamaModel {
 #[cfg(feature = "tch-backend")]
 impl LlamaModel {
     /// Build model from loaded safetensors weights and config.
-    pub fn from_weights(config: ModelConfig, weights: &ModelWeights, device: Device) -> Result<Self, ModelError> {
+    pub fn from_weights(config: ModelConfig, weights: &ModelWeights, device: Device, num_domains: usize) -> Result<Self, ModelError> {
         let embedding = weights.get(WeightNames::embedding())?.shallow_clone();
 
         let norm = RmsNorm::from_weights(weights, WeightNames::layer_norm(), config.rms_norm_eps)?;
@@ -58,10 +58,18 @@ impl LlamaModel {
             let attention = GqaAttention::from_weights(weights, layer_idx, &config, &rope)?;
             let mlp = Mlp::from_weights(weights, layer_idx)?;
 
+            let backend: Box<dyn crate::model::backend::AttentionBackend> = if num_domains > 1 {
+                Box::new(crate::model::backend::HcpRingAttentionBackend::from_weights(
+                    weights, layer_idx, &config, &rope, num_domains,
+                )?)
+            } else {
+                Box::new(LocalAttentionBackend { attention })
+            };
+
             layers.push(DecoderLayer {
                 input_layernorm: input_ln,
                 post_attention_layernorm: post_attn_ln,
-                attention: Box::new(LocalAttentionBackend { attention }),
+                attention: backend,
                 mlp,
             });
         }

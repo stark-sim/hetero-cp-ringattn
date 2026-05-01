@@ -4,7 +4,7 @@ use crate::model::generate::Generator;
 use std::path::Path;
 
 #[cfg(feature = "tch-backend")]
-pub fn run_inference(model_dir: &str, prompt: &str, max_tokens: usize, temperature: f64) -> Result<String, String> {
+pub fn run_inference(model_dir: &str, prompt: &str, max_tokens: usize, temperature: f64, num_domains: usize) -> Result<String, String> {
     use tch::Device;
 
     let device = if tch::Cuda::is_available() {
@@ -24,7 +24,7 @@ pub fn run_inference(model_dir: &str, prompt: &str, max_tokens: usize, temperatu
     let weights = ModelWeights::from_dir(model_dir, device).map_err(|e: crate::model::ModelError| e.to_string())?;
 
     println!("[infer] building model ({} layers, {} heads)", config.num_layers, config.num_heads);
-    let model = LlamaModel::from_weights(config, &weights, device).map_err(|e: crate::model::ModelError| e.to_string())?;
+    let model = LlamaModel::from_weights(config, &weights, device, num_domains).map_err(|e: crate::model::ModelError| e.to_string())?;
 
     let tokenizer_path = Path::new(model_dir).join("tokenizer.json");
     println!("[infer] loading tokenizer from {:?}", tokenizer_path);
