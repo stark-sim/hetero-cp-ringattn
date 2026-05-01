@@ -1308,7 +1308,8 @@ pub fn run_remote_cp_node(
     let mut payload_blocks = Vec::new();
 
     #[cfg(feature = "tch-backend")]
-    let mut runtime = crate::compute_runtime::TchComputeRuntime;
+    let mut runtime = crate::compute_runtime::TchComputeRuntime::from_env()
+        .unwrap_or_else(|e| panic!("failed to create TchComputeRuntime: {e}"));
     #[cfg(not(feature = "tch-backend"))]
     let mut runtime = crate::compute_runtime::NoOpComputeRuntime;
 
@@ -1500,7 +1501,8 @@ fn run_cp_ring_node(
     };
 
     #[cfg(feature = "tch-backend")]
-    let mut runtime = crate::compute_runtime::TchComputeRuntime;
+    let mut runtime = crate::compute_runtime::TchComputeRuntime::from_env()
+        .unwrap_or_else(|e| panic!("failed to create TchComputeRuntime: {e}"));
     #[cfg(not(feature = "tch-backend"))]
     let mut runtime = crate::compute_runtime::NoOpComputeRuntime;
 
@@ -1861,7 +1863,8 @@ fn receive_remote_cp_node_messages(
     };
 
     #[cfg(feature = "tch-backend")]
-    let mut runtime = crate::compute_runtime::TchComputeRuntime;
+    let mut runtime = crate::compute_runtime::TchComputeRuntime::from_env()
+        .unwrap_or_else(|e| panic!("failed to create TchComputeRuntime: {e}"));
     #[cfg(not(feature = "tch-backend"))]
     let mut runtime = crate::compute_runtime::NoOpComputeRuntime;
 

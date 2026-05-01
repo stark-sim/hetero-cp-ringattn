@@ -3,6 +3,38 @@ use crate::protocol::{DomainModelState, OnlineSoftmaxAccumulator, RingAttnMessag
 #[cfg(feature = "tch-backend")]
 use tch::Tensor;
 
+/// Parse the target compute device from environment variables.
+/// Checks `HCP_TCH_DEVICE`, then `HCP_TORCH_DEVICE`, defaulting to "cpu".
+#[cfg(feature = "tch-backend")]
+pub fn select_tch_device_from_env() -> Result<(tch::Device, i32), String> {
+    let name = std::env::var("HCP_TCH_DEVICE")
+        .or_else(|_| std::env::var("HCP_TORCH_DEVICE"))
+        .unwrap_or_else(|_| "cpu".to_string());
+
+    let (device, success_code) = match name.as_str() {
+        "cpu" => (tch::Device::Cpu, 1),
+        "mps" => (tch::Device::Mps, 2),
+        "cuda" => (tch::Device::Cuda(0), 3),
+        _ => {
+            if let Some(idx) = name.strip_prefix("cuda:") {
+                if let Ok(i) = idx.parse::<usize>() {
+                    (tch::Device::Cuda(i), 3)
+                } else {
+                    return Err(format!(
+                        "unsupported HCP_TCH_DEVICE={name}; expected cpu, mps, cuda, or cuda:N"
+                    ));
+                }
+            } else {
+                return Err(format!(
+                    "unsupported HCP_TCH_DEVICE={name}; expected cpu, mps, cuda, or cuda:N"
+                ));
+            }
+        }
+    };
+
+    Ok((device, success_code))
+}
+
 pub trait ComputeRuntime {
     type Error: std::fmt::Display;
 
@@ -66,10 +98,21 @@ impl ComputeRuntime for NoOpComputeRuntime {
 }
 
 #[cfg(feature = "tch-backend")]
-pub struct TchComputeRuntime;
+pub struct TchComputeRuntime {
+    device: tch::Device,
+}
 
 #[cfg(feature = "tch-backend")]
 impl TchComputeRuntime {
+    pub fn new(device: tch::Device) -> Self {
+        Self { device }
+    }
+
+    pub fn from_env() -> Result<Self, String> {
+        let (device, _) = select_tch_device_from_env()?;
+        Ok(Self::new(device))
+    }
+
     pub fn compute_kv_block(
         &mut self,
         model_state: &DomainModelState,
@@ -113,7 +156,7 @@ impl ComputeRuntime for TchComputeRuntime {
         let query_len = model_state.query_len() as i64;
         let num_heads = tensor.num_heads as i64;
         let head_dim = tensor.head_dim as i64;
-        let device = tch::Device::Cpu;  // protocol 层当前使用 CPU tensor
+        let device = self.device;
 
         // Q: 从 query_payload bytes 解析 f32，shape [query_len, num_heads, head_dim]
         let q_values: Vec<f32> = model_state.query_payload()
