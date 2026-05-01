@@ -93,8 +93,7 @@
 - [x] [2026-05-01] Phase 1 Checkpoint 4b: 真实 Qwen2-0.5B 权重已重新下载并验证有效；修复 `make_causal_mask` 中 `0.0 * NEG_INFINITY = NaN` 的 bug（backend.rs 和 model.rs 两处）；推理 pipeline 已能输出有意义文本。
 - [x] [2026-05-01] 修复 `test_chunk_step_vs_softmax_single_block` 中 `actual` tensor 形状构造错误（`permute` 导致 num_heads 与 query_len 维度交换）。
 - [x] [2026-05-01] 修复 `ring_attention` 中 causal mask 未传递给 `compute_chunk_attention_step` 的问题：当 `attention_mask.is_some()` 时，直接使用已 mask 的 `scores` 做 online softmax 更新，而非调用无 mask 的 `compute_chunk_attention_step`。
-- [ ] Phase 2 Checkpoint 5: `HcpRingAttentionBackend` 分布式 attention 实现。
-- [ ] Phase 2 Checkpoint 5: `HcpRingAttentionBackend` 分布式 attention 实现。
+- [x] [2026-05-01] Phase 2 Checkpoint 5: `HcpRingAttentionBackend` 已接入真实推理路径；`LlamaModel::from_weights` 根据 `num_domains` 选择 `LocalAttentionBackend`（默认）或 `HcpRingAttentionBackend`；新增 `--infer-num-domains` CLI 参数；Qwen2-0.5B 在 `num_domains=1/2/4` 下 greedy decode 输出完全一致。
 - [ ] M2：Rust online softmax correctness report 与 tolerance policy 扩展。
 - [ ] M3-tch：将 Ring Attention block update 迁移到 `tch-backend`，与 C++ ATen bridge 并行存在。
 - [ ] M3：抽出统一 transport trait，减少 local queue / TCP pair / TCP CP node 的重复 frame 与 metrics 逻辑。

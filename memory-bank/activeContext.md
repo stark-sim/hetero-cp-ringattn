@@ -116,7 +116,7 @@
 - [ ] 必要时增加 `max_rel_err` 并明确 tolerance policy。
 - [ ] 将 Rust correctness model 继续拆分为 library + binary，便于后续 protocol / transport 复用。
 - [ ] 抽出统一 transport trait，收敛 `local_p2p_queue`、`cp_ring_node_runtime`、`tcp_remote_pair`、`tcp_remote_cp_node` 的共用 send/recv/frame 语义，并保持当前 message schema / report 字段稳定。
-- [x] 将 `DomainModelState` 中 deterministic Q/K/V fixtures 升级为真实模型 activation / weight lifecycle，并明确 output buffer ownership。
+- [x] [2026-05-01] Phase 2 Checkpoint 5 完成：`HcpRingAttentionBackend` 已接入真实推理路径；`LlamaModel` 支持 `num_domains` 切换（`--infer-num-domains` CLI 参数）；Qwen2-0.5B 验证 `num_domains=1/2/4` 输出一致。
 - [x] 外部权重加载：支持通过 `HCP_WEIGHTS_JSON` 环境变量从 JSON 文件加载 Q/K/V/O projection weights 和 LayerNorm gamma/beta；已验证本地 CPU/MPS smoke 均正常，checksum 随权重变化而变化。
 - [x] VPN 三节点 remote CP 验证：MPS + CUDA 异构 domain 通过 C++ bridge 与 tch bridge 全量 smoke；M5 远端闭环已完成。
 - [x] 引入 optional `tch = 0.24.0` 并实现 `tch_smoke`（CPU/MPS 均已通过）。
