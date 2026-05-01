@@ -1,4 +1,5 @@
 mod compute_runtime;
+mod infer;
 mod model;
 mod protocol;
 mod tch_backend;
@@ -280,6 +281,10 @@ struct CliArgs {
     bind_addr: Option<String>,
     connect_addr: Option<String>,
     stress_test: bool,
+    infer_model_dir: Option<String>,
+    infer_prompt: Option<String>,
+    infer_max_tokens: usize,
+    infer_temperature: f64,
 }
 
 impl Lcg {
@@ -756,6 +761,10 @@ fn parse_cli_args() -> Result<CliArgs, RingError> {
     let mut bind_addr = None;
     let mut connect_addr = None;
     let mut stress_test = false;
+    let mut infer_model_dir = None;
+    let mut infer_prompt = None;
+    let mut infer_max_tokens = 50;
+    let mut infer_temperature = 0.7;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--report-path" => {
@@ -779,6 +788,24 @@ fn parse_cli_args() -> Result<CliArgs, RingError> {
             "--stress-test" => {
                 stress_test = true;
             }
+            "--infer-model-dir" => {
+                infer_model_dir = Some(next_cli_value(&mut args, "--infer-model-dir")?);
+            }
+            "--infer-prompt" => {
+                infer_prompt = Some(next_cli_value(&mut args, "--infer-prompt")?);
+            }
+            "--infer-max-tokens" => {
+                let value = next_cli_value(&mut args, "--infer-max-tokens")?;
+                infer_max_tokens = value.parse().map_err(|e| {
+                    RingError::InvalidCli(format!("invalid --infer-max-tokens: {e}"))
+                })?;
+            }
+            "--infer-temperature" => {
+                let value = next_cli_value(&mut args, "--infer-temperature")?;
+                infer_temperature = value.parse().map_err(|e| {
+                    RingError::InvalidCli(format!("invalid --infer-temperature: {e}"))
+                })?;
+            }
             _ => {
                 return Err(RingError::InvalidCli(format!("unknown argument {arg}")));
             }
@@ -791,6 +818,10 @@ fn parse_cli_args() -> Result<CliArgs, RingError> {
         bind_addr,
         connect_addr,
         stress_test,
+        infer_model_dir,
+        infer_prompt,
+        infer_max_tokens,
+        infer_temperature,
     })
 }
 
@@ -2183,6 +2214,17 @@ fn run_remote_cp_node(args: &CliArgs) -> Result<protocol::RemoteCpNodeReport, Ri
 
 fn main() -> Result<(), RingError> {
     let args = parse_cli_args()?;
+
+    // Inference mode: load real model and generate text
+    if let Some(ref model_dir) = args.infer_model_dir {
+        let prompt = args.infer_prompt.as_deref().unwrap_or("Hello, how are you?");
+        match infer::run_inference(model_dir, prompt, args.infer_max_tokens, args.infer_temperature) {
+            Ok(text) => println!("{}", text),
+            Err(e) => eprintln!("Inference failed: {}", e),
+        }
+        return Ok(());
+    }
+
     if args.remote_p2p_role.as_deref() == Some("cp-node") {
         let cp_node = run_remote_cp_node(&args)?;
         let torch_payload_block_bridge =

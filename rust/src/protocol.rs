@@ -441,7 +441,7 @@ impl DomainModelState {
                 q_chunk,
                 k_cache,
                 v_cache,
-                output_slot: vec![0_u8; query_len * MODEL_HIDDEN_DIM * FLOAT32_BYTES],
+                output_slot: vec![0_u8; query_len * KV_NUM_HEADS * KV_HEAD_DIM * FLOAT32_BYTES],
             },
         }
     }
@@ -2495,13 +2495,21 @@ mod tests {
         let domain = test_domain(4, 8);
         let state = DomainModelState::new(&domain);
         let hidden = hidden_token(&state.activation.hidden_states, 0, MODEL_HIDDEN_DIM);
-        let expected_q0 = state.weights.project_token(hidden, ProjectionKind::Query)[0];
-        let expected_k0 = state.weights.project_token(hidden, ProjectionKind::Key)[0];
+
+        // Q and K are rotated by RoPE; V is not.
+        let mut expected_q = state.weights.project_token(hidden, ProjectionKind::Query);
+        apply_rope(&mut expected_q, domain.seq_offset, KV_NUM_HEADS, KV_HEAD_DIM);
+        let expected_q0 = expected_q[0];
+
+        let mut expected_k = state.weights.project_token(hidden, ProjectionKind::Key);
+        apply_rope(&mut expected_k, domain.seq_offset, KV_NUM_HEADS, KV_HEAD_DIM);
+        let expected_k0 = expected_k[0];
+
         let expected_v0 = state.weights.project_token(hidden, ProjectionKind::Value)[0];
 
-        assert!((read_f32(&state.activation.q_chunk, 0) - expected_q0).abs() < f32::EPSILON);
-        assert!((read_f32(&state.activation.k_cache, 0) - expected_k0).abs() < f32::EPSILON);
-        assert!((read_f32(&state.activation.v_cache, 0) - expected_v0).abs() < f32::EPSILON);
+        assert!((read_f32(&state.activation.q_chunk, 0) - expected_q0).abs() < 1e-5);
+        assert!((read_f32(&state.activation.k_cache, 0) - expected_k0).abs() < 1e-5);
+        assert!((read_f32(&state.activation.v_cache, 0) - expected_v0).abs() < 1e-5);
         assert_ne!(
             expected_q0,
             hidden_state_value(&domain, domain.seq_offset, 0)
