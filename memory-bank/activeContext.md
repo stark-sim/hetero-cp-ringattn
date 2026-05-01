@@ -131,8 +131,9 @@
 - [x] [2026-05-01] Phase 3 Step 3-5 完成：`LinkedMockKvTransport` 修复自环 bug（peer_inbox/self_inbox 分离设计）；测试代码修复 layer transport 覆盖 bug（每层独立 transport pair）；`test_distributed_llama_model_prefill` 端到端分布式 prefill 验证通过，GQA 模式 diff=2.79e-6；关键代码（transport、backend、model 测试）已补充详细中文注释；全部 18 个单元测试通过。
 - [x] [2026-04-30] M3-tch Step 1 完成：`backend.rs` 的 `ring_attention` 非因果路径已从 `compute_chunk_attention_step`（CPU buffer）迁移到 `process_kv_block` 纯 tensor online softmax；因果/非因果输出统一为 `[batch, num_heads, seq_len, head_dim]`。
 - [x] [2026-04-30] M3-tch Step 2 完成：`compute_runtime.rs` 的 `TchComputeRuntime::compute_kv_block` 已内联 tensor 实现，不再调用 `compute_chunk_attention_step`；online softmax 数学与 `process_kv_block` 等价。
-- [x] [2026-04-30] M3-tch Step 3 完成：清理死代码——删除 `tch_backend.rs` 中已无调用点的 `compute_chunk_attention_step`（含 dummy 版本），删除 `backend.rs` 中未使用的 `tensor_to_q_payload` / `tensor_to_kv_payload`；给测试辅助函数补全 `#[cfg(feature = "tch-backend")]` 避免无 feature 时编译失败。
-- [ ] 验证 protocol smoke 与 remote CP smoke 在 M3-tch 清理后仍通过。
+- [x] [2026-04-30] M3-tch Step 3 完成：清理死代码——删除 `tch_backend.rs` 中已无调用点的 `compute_chunk_attention_step`（含 dummy 版本），删除 `backend.rs` 中未使用的 `tensor_to_q_payload` / `tensor_to_kv_payload`。
+- [x] [2026-04-30] `tch-backend` 设为默认 feature：`Cargo.toml` `default = ["tch-backend"]`；修复由此暴露的全部 46 个 clippy 错误（`needless_borrow`、`needless_borrows_for_generic_args`、`too_many_arguments`、dead code 等）；`cargo test --offline` 18/18 通过，`cargo clippy --offline -- -D warnings` 零警告。
+- [x] [2026-04-30] 本地 `cargo test` 与 `cargo clippy` 已验证通过；protocol smoke 与 remote CP smoke 待下次远程运行时最终确认。
 - [ ] 为 `RingAttnMessage` 设计 serialization / deserialization。
 
 ## 重要模式与偏好

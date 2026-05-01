@@ -5,7 +5,7 @@ edition = "2021"
 build = "build.rs"
 
 [features]
-default = []
+default = ["tch-backend"]
 tch-backend = ["dep:tch", "dep:half"]
 
 [dependencies]

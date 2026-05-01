@@ -610,7 +610,7 @@ fn run_case_single_seed(
     );
 
     let reference = full_attention_reference(&q, &k, &v);
-    let (modeled, traces) = ring_attention_model(&q, &k, &v, &config)?;
+    let (modeled, traces) = ring_attention_model(&q, &k, &v, config)?;
     let mut max_abs_err = 0.0;
     let mut total_abs_err = 0.0;
     let mut max_rel_err = 0.0;

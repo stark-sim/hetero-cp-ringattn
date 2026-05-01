@@ -4,19 +4,20 @@ pub mod config;
 pub mod generate;
 pub mod kv_transport;
 pub mod layers;
+#[allow(clippy::module_inception)]
 pub mod model;
 pub mod weights;
 
 #[cfg(feature = "tch-backend")]
 pub use kv_transport::KvTransport;
 
-pub use cache::KvCache;
 pub use model::LlamaModel;
 pub use weights::{ModelWeights, WeightNames};
 
 use thiserror::Error;
 
 #[derive(Error, Debug)]
+#[allow(dead_code)]
 pub enum ModelError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

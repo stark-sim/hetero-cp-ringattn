@@ -24,6 +24,7 @@ use std::path::Path;
 /// - Clone: 支持深拷贝
 /// - Deserialize: 支持从 JSON 自动反序列化（靠 serde 库）
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct ModelConfig {
     /// 【模型架构名称】例如 `["LlamaForCausalLM"]` 或 `["Qwen2ForCausalLM"]`。
     /// Option 表示某些模型可能不填这个字段。
@@ -165,12 +166,14 @@ impl ModelConfig {
 
     /// 【判断是否使用 GQA】
     /// 如果 num_kv_heads < num_heads，说明多个 query head 共享 KV head，是 GQA。
+    #[allow(dead_code)]
     pub fn uses_gqa(&self) -> bool {
         self.num_kv_heads() < self.num_heads
     }
 
     /// 【判断是否使用 SwiGLU】
     /// SwiGLU 是一种门控激活结构，用 silu（也叫 swish）作为门控函数。
+    #[allow(dead_code)]
     pub fn is_swiglu(&self) -> bool {
         matches!(self.hidden_act.as_str(), "silu" | "swish")
     }
@@ -182,7 +185,6 @@ impl ModelConfig {
 }
 
 /// 【默认值函数】serde 在字段缺失时会调用这些函数获取默认值。
-
 fn default_rope_theta() -> f64 {
     10000.0  // 经典 Llama-2 的默认值
 }

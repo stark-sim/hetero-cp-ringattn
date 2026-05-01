@@ -2043,6 +2043,7 @@ fn push_remote_cp_route_preview(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_inbound_message(
     runtime: &mut dyn crate::compute_runtime::ComputeRuntime<Error = String>,
     message: &RingAttnMessage,

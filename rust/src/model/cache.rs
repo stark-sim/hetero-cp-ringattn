@@ -69,6 +69,7 @@ impl KvCache {
     }
 
     /// 【清空缓存】重置为空状态，释放内存。
+    #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.k = None;
         self.v = None;
@@ -76,6 +77,7 @@ impl KvCache {
     }
 
     /// 【判断是否为空】
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.k.is_none()
     }

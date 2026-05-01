@@ -20,8 +20,10 @@ pub trait ComputeRuntime {
     ) -> f64;
 }
 
+#[cfg(not(feature = "tch-backend"))]
 pub struct NoOpComputeRuntime;
 
+#[cfg(not(feature = "tch-backend"))]
 impl NoOpComputeRuntime {
     pub fn compute_kv_block(
         &mut self,
@@ -41,6 +43,7 @@ impl NoOpComputeRuntime {
     }
 }
 
+#[cfg(not(feature = "tch-backend"))]
 impl ComputeRuntime for NoOpComputeRuntime {
     type Error = String;
 
@@ -120,7 +123,7 @@ impl ComputeRuntime for TchComputeRuntime {
         let q = Tensor::from_slice(&q_values)
             .reshape([query_len, num_heads, head_dim])
             .to(device)
-            .permute(&[1, 0, 2]);  // → [num_heads, query_len, head_dim]
+            .permute([1, 0, 2]);  // → [num_heads, query_len, head_dim]
 
         // K/V: 从 message.payload bytes 解析，前一半是 K，后一半是 V
         let kv_values: Vec<f32> = message.payload
@@ -129,8 +132,8 @@ impl ComputeRuntime for TchComputeRuntime {
             .collect();
         let kv = Tensor::from_slice(&kv_values)
             .reshape([2, block_len, num_heads, head_dim]);
-        let k = kv.get(0).to(device).permute(&[1, 0, 2]);  // → [num_heads, block_len, head_dim]
-        let v = kv.get(1).to(device).permute(&[1, 0, 2]);  // → [num_heads, block_len, head_dim]
+        let k = kv.get(0).to(device).permute([1, 0, 2]);  // → [num_heads, block_len, head_dim]
+        let v = kv.get(1).to(device).permute([1, 0, 2]);  // → [num_heads, block_len, head_dim]
 
         // Accumulator: 从 Vec<f32> 重建 tensor
         let mut rm = Tensor::from_slice(&accumulator.running_max)
@@ -199,9 +202,8 @@ impl ComputeRuntime for TchComputeRuntime {
             }
             let o_proj_out = model_state.weights.project_output(&attn_out);
             let residual_start = q * hidden_dim;
-            for d in 0..hidden_dim {
-                let residual = model_state.activation.residual_input[residual_start + d]
-                    + o_proj_out[d];
+            for (d, &val) in o_proj_out.iter().enumerate() {
+                let residual = model_state.activation.residual_input[residual_start + d] + val;
                 let offset = residual_start + d;
                 output_slot[offset * FLOAT32_BYTES..(offset + 1) * FLOAT32_BYTES]
                     .copy_from_slice(&residual.to_le_bytes());

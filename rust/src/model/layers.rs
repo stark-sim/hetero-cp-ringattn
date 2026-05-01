@@ -337,11 +337,11 @@ impl GqaAttention {
         // ====== 第一步：线性投影 ======
         // 用三个权重矩阵把 hidden_states 映射成 Q、K、V。
         let mut q = hidden_states.matmul(&self.q_proj.transpose(0, 1));
-        if let Some(ref bias) = self.q_bias { q = q + bias; }
+        if let Some(ref bias) = self.q_bias { q += bias; }
         let mut k = hidden_states.matmul(&self.k_proj.transpose(0, 1));
-        if let Some(ref bias) = self.k_bias { k = k + bias; }
+        if let Some(ref bias) = self.k_bias { k += bias; }
         let mut v = hidden_states.matmul(&self.v_proj.transpose(0, 1));
-        if let Some(ref bias) = self.v_bias { v = v + bias; }
+        if let Some(ref bias) = self.v_bias { v += bias; }
 
         // ====== 第二步：reshape 成多头格式 ======
         // 从 [batch, seq_len, num_heads * head_dim] → [batch, num_heads, seq_len, head_dim]
@@ -408,7 +408,7 @@ impl GqaAttention {
         if n_rep == 1 {
             return x.shallow_clone();
         }
-        x.repeat(&[1, n_rep as i64, 1, 1])
+        x.repeat([1, n_rep as i64, 1, 1])
     }
 }
 
@@ -475,9 +475,9 @@ mod tests {
     #[cfg(feature = "tch-backend")]
     fn test_rmsnorm_shape() {
         let device = Device::Cpu;
-        let weight = Tensor::ones(&[8], (Kind::Float, device));
+        let weight = Tensor::ones([8], (Kind::Float, device));
         let rms = RmsNorm { weight, eps: 1e-6 };
-        let x = Tensor::randn(&[2, 4, 8], (Kind::Float, device));
+        let x = Tensor::randn([2, 4, 8], (Kind::Float, device));
         let out = rms.forward(&x);
         assert_eq!(out.size(), vec![2, 4, 8]);
     }
@@ -487,8 +487,8 @@ mod tests {
     fn test_rope_shape() {
         let device = Device::Cpu;
         let rope = RotaryEmbedding::new(64, 128, 10000.0, device);
-        let q = Tensor::randn(&[1, 14, 10, 64], (Kind::Float, device));
-        let k = Tensor::randn(&[1, 2, 10, 64], (Kind::Float, device));
+        let q = Tensor::randn([1, 14, 10, 64], (Kind::Float, device));
+        let k = Tensor::randn([1, 2, 10, 64], (Kind::Float, device));
         let (q_rot, k_rot) = rope.apply(&q, &k, None);
         assert_eq!(q_rot.size(), q.size());
         assert_eq!(k_rot.size(), k.size());
@@ -498,11 +498,11 @@ mod tests {
     #[cfg(feature = "tch-backend")]
     fn test_mlp_shape() {
         let device = Device::Cpu;
-        let gate = Tensor::randn(&[32, 8], (Kind::Float, device));
-        let up = Tensor::randn(&[32, 8], (Kind::Float, device));
-        let down = Tensor::randn(&[8, 32], (Kind::Float, device));
+        let gate = Tensor::randn([32, 8], (Kind::Float, device));
+        let up = Tensor::randn([32, 8], (Kind::Float, device));
+        let down = Tensor::randn([8, 32], (Kind::Float, device));
         let mlp = Mlp { gate_proj: gate, up_proj: up, down_proj: down };
-        let x = Tensor::randn(&[1, 4, 8], (Kind::Float, device));
+        let x = Tensor::randn([1, 4, 8], (Kind::Float, device));
         let out = mlp.forward(&x);
         assert_eq!(out.size(), vec![1, 4, 8]);
     }
@@ -517,10 +517,10 @@ mod tests {
         let head_dim = 8usize;
 
         let attn = GqaAttention {
-            q_proj: Tensor::randn(&[(num_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),
-            k_proj: Tensor::randn(&[(num_kv_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),
-            v_proj: Tensor::randn(&[(num_kv_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),
-            o_proj: Tensor::randn(&[hidden_size, (num_heads * head_dim) as i64], (Kind::Float, device)),
+            q_proj: Tensor::randn([(num_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),
+            k_proj: Tensor::randn([(num_kv_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),
+            v_proj: Tensor::randn([(num_kv_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),
+            o_proj: Tensor::randn([hidden_size, (num_heads * head_dim) as i64], (Kind::Float, device)),
             q_bias: None,
             k_bias: None,
             v_bias: None,
@@ -533,7 +533,7 @@ mod tests {
 
         let batch = 1i64;
         let seq_len = 5i64;
-        let hidden = Tensor::randn(&[batch, seq_len, hidden_size], (Kind::Float, device));
+        let hidden = Tensor::randn([batch, seq_len, hidden_size], (Kind::Float, device));
         let pos_ids = Tensor::arange(seq_len, (Kind::Int64, device)).unsqueeze(0);
 
         let out = attn.forward(&hidden, &pos_ids, None, None).unwrap();

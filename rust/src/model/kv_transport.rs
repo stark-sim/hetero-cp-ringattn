@@ -143,14 +143,14 @@ impl KvTransport for TcpKvTransport {
             .iter()
             .map(|v| v.as_i64().ok_or("invalid k_shape"))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("{e}"))?;
+            .map_err(|e| e.to_string())?;
         let v_shape: Vec<i64> = meta["v_shape"]
             .as_array()
             .ok_or("missing v_shape")?
             .iter()
             .map(|v| v.as_i64().ok_or("invalid v_shape"))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("{e}"))?;
+            .map_err(|e| e.to_string())?;
 
         // Read k_bytes
         let mut k_bytes = vec![0u8; k_bytes_len];

@@ -1,4 +1,4 @@
-use crate::model::{ModelConfig, ModelError};
+use crate::model::ModelError;
 
 #[cfg(feature = "tch-backend")]
 use tch::{Kind, Tensor};
@@ -27,6 +27,7 @@ pub trait AttentionBackend {
     /// Optional: configure distributed transport and domain id.
     /// Only `HcpRingAttentionBackend` implements this; others are no-ops.
     #[cfg(feature = "tch-backend")]
+    #[allow(dead_code)]
     fn set_distributed(&mut self, _domain_id: usize, _transport: Option<Box<dyn KvTransport>>) {
         // Local backend 不需要分布式配置，noop
     }
@@ -74,6 +75,7 @@ pub struct HcpRingAttentionBackend {
     layer_idx: usize,
     #[cfg(feature = "tch-backend")]
     kv_transport: Option<Box<dyn KvTransport>>,
+    #[allow(dead_code)]
     local_domain_id: usize,
 }
 
@@ -110,10 +112,12 @@ impl HcpRingAttentionBackend {
     }
 
     #[cfg(feature = "tch-backend")]
+    #[allow(dead_code)]
     pub fn set_transport(&mut self, transport: Box<dyn KvTransport>) {
         self.kv_transport = Some(transport);
     }
 
+    #[allow(dead_code)]
     pub fn set_local_domain_id(&mut self, id: usize) {
         self.local_domain_id = id;
     }
@@ -122,6 +126,7 @@ impl HcpRingAttentionBackend {
     /// 
     /// 所有位置参数都必须是【全局位置】，不能是本地索引。
     /// 例如 domain1 的本地索引 0 对应全局位置 8。
+    #[allow(clippy::too_many_arguments)]
     fn process_kv_block(
         &self,
         q_chunk: &Tensor,            // 当前 Q chunk，shape: [batch, num_heads, q_chunk_len, head_dim]
@@ -323,7 +328,7 @@ impl HcpRingAttentionBackend {
         // 例如 seq_len=8, num_domains=2 → chunk_size = 4。
         // 这意味着 Q 被切成 [0,4) 和 [4,8) 两个 chunk。
         // KV chunk 大小和 Q chunk 相同，保持一致。
-        let q_chunk_size = ((seq_len as usize + self.num_domains - 1) / self.num_domains).max(1);
+        let q_chunk_size = (seq_len as usize).div_ceil(self.num_domains).max(1);
         let kv_chunk_size = q_chunk_size;
 
         // ====== 第三步：预取 peer KV blocks ======
@@ -388,13 +393,13 @@ impl HcpRingAttentionBackend {
                 // - obh (output buffer head): 当前加权累加的输出，shape [batch, num_heads, q_chunk_len, head_dim]
                 //   初始化为 0。
                 let mut rm = Tensor::full(
-                    &[batch, num_heads, q_chunk_len],
+                    [batch, num_heads, q_chunk_len],
                     f64::NEG_INFINITY,
                     (Kind::Float, q.device()),
                 );
-                let mut rs = Tensor::zeros(&[batch, num_heads, q_chunk_len], (Kind::Float, q.device()));
+                let mut rs = Tensor::zeros([batch, num_heads, q_chunk_len], (Kind::Float, q.device()));
                 let mut obh = Tensor::zeros(
-                    &[batch, num_heads, q_chunk_len, head_dim],
+                    [batch, num_heads, q_chunk_len, head_dim],
                     (Kind::Float, q.device()),
                 );
 
@@ -444,13 +449,13 @@ impl HcpRingAttentionBackend {
                 // 之前这里调用 C++ compute_chunk_attention_step（CPU buffer 方式），
                 // 现在改为和因果路径相同的纯 tch tensor online softmax，全程在设备上执行。
                 let mut rm = Tensor::full(
-                    &[batch, num_heads, q_chunk_len],
+                    [batch, num_heads, q_chunk_len],
                     f64::NEG_INFINITY,
                     (Kind::Float, q.device()),
                 );
-                let mut rs = Tensor::zeros(&[batch, num_heads, q_chunk_len], (Kind::Float, q.device()));
+                let mut rs = Tensor::zeros([batch, num_heads, q_chunk_len], (Kind::Float, q.device()));
                 let mut obh = Tensor::zeros(
-                    &[batch, num_heads, q_chunk_len, head_dim],
+                    [batch, num_heads, q_chunk_len, head_dim],
                     (Kind::Float, q.device()),
                 );
 
@@ -507,7 +512,7 @@ impl HcpRingAttentionBackend {
         };
 
         let attn_weights = scores.softmax(-1, Kind::Float);
-        attn_weights.matmul(&v)
+        attn_weights.matmul(v)
     }
 }
 
@@ -542,11 +547,11 @@ impl AttentionBackend for HcpRingAttentionBackend {
         // 数学上：q = hidden_states @ W_q^T
         // matmul 是矩阵乘法，transpose(0, 1) 把权重矩阵转置（因为 PyTorch/HF 格式是 [out, in]）
         let mut q = hidden_states.matmul(&self.q_proj.transpose(0, 1));
-        if let Some(ref bias) = self.q_bias { q = q + bias; }  // 如果有偏置，加上去
+        if let Some(ref bias) = self.q_bias { q += bias; }  // 如果有偏置，加上去
         let mut k = hidden_states.matmul(&self.k_proj.transpose(0, 1));
-        if let Some(ref bias) = self.k_bias { k = k + bias; }
+        if let Some(ref bias) = self.k_bias { k += bias; }
         let mut v = hidden_states.matmul(&self.v_proj.transpose(0, 1));
-        if let Some(ref bias) = self.v_bias { v = v + bias; }
+        if let Some(ref bias) = self.v_bias { v += bias; }
 
         // ====== 第二步：reshape 成多头格式 ======
         // 原始 shape: [batch, seq_len, num_heads * head_dim]
@@ -588,8 +593,8 @@ impl AttentionBackend for HcpRingAttentionBackend {
         // - 为了让矩阵乘法维度匹配，需要把 K/V 在 head 维度上重复 4 次
         // - repeat(&[1, 4, 1, 1]) 表示：batch 不重复，head 重复 4 次，seq_len 不重复，head_dim 不重复
         let num_rep = self.num_heads / self.num_kv_heads;
-        let k = if num_rep > 1 { k.repeat(&[1, num_rep as i64, 1, 1]) } else { k };
-        let v = if num_rep > 1 { v.repeat(&[1, num_rep as i64, 1, 1]) } else { v };
+        let k = if num_rep > 1 { k.repeat([1, num_rep as i64, 1, 1]) } else { k };
+        let v = if num_rep > 1 { v.repeat([1, num_rep as i64, 1, 1]) } else { v };
 
         // ====== 第六步：计算全局序列起始位置 ======
         // 在分布式场景下，domain1 处理的是完整序列的后半段（比如 [8, 16)）。
@@ -631,10 +636,10 @@ mod tests {
         let head_dim = 8usize;
 
         super::super::layers::GqaAttention {
-            q_proj: Tensor::randn(&[(num_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),
-            k_proj: Tensor::randn(&[(num_kv_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),
-            v_proj: Tensor::randn(&[(num_kv_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),
-            o_proj: Tensor::randn(&[hidden_size, (num_heads * head_dim) as i64], (Kind::Float, device)),
+            q_proj: Tensor::randn([(num_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),
+            k_proj: Tensor::randn([(num_kv_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),
+            v_proj: Tensor::randn([(num_kv_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),
+            o_proj: Tensor::randn([hidden_size, (num_heads * head_dim) as i64], (Kind::Float, device)),
             q_bias: None,
             k_bias: None,
             v_bias: None,
@@ -649,10 +654,10 @@ mod tests {
     /// Create a causal mask for local attention testing.
     #[cfg(feature = "tch-backend")]
     fn make_causal_mask(seq_len: i64, device: tch::Device) -> Tensor {
-        let mask = Tensor::ones(&[seq_len, seq_len], (Kind::Float, device))
+        let mask = Tensor::ones([seq_len, seq_len], (Kind::Float, device))
             .triu(1)
             .to_kind(Kind::Bool);
-        Tensor::zeros(&[seq_len, seq_len], (Kind::Float, device))
+        Tensor::zeros([seq_len, seq_len], (Kind::Float, device))
             .masked_fill(&mask, f64::NEG_INFINITY)
             .unsqueeze(0)
             .unsqueeze(0)
@@ -672,9 +677,9 @@ mod tests {
         let head_dim = 8i64;
 
         tch::manual_seed(42);
-        let q = Tensor::randn(&[1, num_heads, query_len, head_dim], (Kind::Float, device));
-        let k = Tensor::randn(&[1, num_heads, block_len, head_dim], (Kind::Float, device));
-        let v = Tensor::randn(&[1, num_heads, block_len, head_dim], (Kind::Float, device));
+        let q = Tensor::randn([1, num_heads, query_len, head_dim], (Kind::Float, device));
+        let k = Tensor::randn([1, num_heads, block_len, head_dim], (Kind::Float, device));
+        let v = Tensor::randn([1, num_heads, block_len, head_dim], (Kind::Float, device));
 
         // 标准 softmax attention（参考值）
         let scale = 1.0 / (head_dim as f64).sqrt();
@@ -685,10 +690,10 @@ mod tests {
         // 用 process_kv_block（非因果模式）计算
         let rope = super::super::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
         let backend = HcpRingAttentionBackend {
-            q_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
-            k_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
-            v_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
-            o_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
+            q_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            k_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            v_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            o_proj: Tensor::randn([1, 1], (Kind::Float, device)),
             q_bias: None, k_bias: None, v_bias: None,
             rope,
             num_heads: num_heads as usize,
@@ -702,13 +707,13 @@ mod tests {
         };
 
         let mut rm = Tensor::full(
-            &[1i64, num_heads, query_len],
+            [1i64, num_heads, query_len],
             f64::NEG_INFINITY,
             (Kind::Float, device),
         );
-        let mut rs = Tensor::zeros(&[1i64, num_heads, query_len], (Kind::Float, device));
+        let mut rs = Tensor::zeros([1i64, num_heads, query_len], (Kind::Float, device));
         let mut obh = Tensor::zeros(
-            &[1i64, num_heads, query_len, head_dim],
+            [1i64, num_heads, query_len, head_dim],
             (Kind::Float, device),
         );
 
@@ -740,7 +745,7 @@ mod tests {
         let mut backend = LocalAttentionBackend { attention: attn };
         let batch = 1i64;
         let seq_len = 5i64;
-        let hidden = Tensor::randn(&[batch, seq_len, hidden_size], (Kind::Float, device));
+        let hidden = Tensor::randn([batch, seq_len, hidden_size], (Kind::Float, device));
         let pos_ids = Tensor::arange(seq_len, (Kind::Int64, device)).unsqueeze(0);
 
         let out = backend.forward(&hidden, &pos_ids, None, None).unwrap();
@@ -759,9 +764,9 @@ mod tests {
         let num_domains = 4usize;
 
         tch::manual_seed(123);
-        let q = Tensor::randn(&[1, num_heads, seq_len, head_dim], (Kind::Float, device));
-        let k = Tensor::randn(&[1, num_heads, seq_len, head_dim], (Kind::Float, device));
-        let v = Tensor::randn(&[1, num_heads, seq_len, head_dim], (Kind::Float, device));
+        let q = Tensor::randn([1, num_heads, seq_len, head_dim], (Kind::Float, device));
+        let k = Tensor::randn([1, num_heads, seq_len, head_dim], (Kind::Float, device));
+        let v = Tensor::randn([1, num_heads, seq_len, head_dim], (Kind::Float, device));
 
         let scale = 1.0 / (head_dim as f64).sqrt();
         let scores = q.matmul(&k.transpose(2, 3)) * scale;
@@ -771,10 +776,10 @@ mod tests {
         // Create a minimal backend (only needs q/k/v/o_proj for local_attention_scores)
         let rope = super::super::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
         let mut backend = HcpRingAttentionBackend {
-            q_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
-            k_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
-            v_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
-            o_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
+            q_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            k_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            v_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            o_proj: Tensor::randn([1, 1], (Kind::Float, device)),
             q_bias: None, k_bias: None, v_bias: None,
             rope,
             num_heads: num_heads as usize,
@@ -806,9 +811,9 @@ mod tests {
         let num_domains = 4usize;
 
         tch::manual_seed(456);
-        let q = Tensor::randn(&[1, num_heads, seq_len, head_dim], (Kind::Float, device));
-        let k = Tensor::randn(&[1, num_heads, seq_len, head_dim], (Kind::Float, device));
-        let v = Tensor::randn(&[1, num_heads, seq_len, head_dim], (Kind::Float, device));
+        let q = Tensor::randn([1, num_heads, seq_len, head_dim], (Kind::Float, device));
+        let k = Tensor::randn([1, num_heads, seq_len, head_dim], (Kind::Float, device));
+        let v = Tensor::randn([1, num_heads, seq_len, head_dim], (Kind::Float, device));
 
         let scale = 1.0 / (head_dim as f64).sqrt();
         let scores = q.matmul(&k.transpose(2, 3)) * scale;
@@ -820,10 +825,10 @@ mod tests {
 
         let rope = super::super::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
         let mut backend = HcpRingAttentionBackend {
-            q_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
-            k_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
-            v_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
-            o_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
+            q_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            k_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            v_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            o_proj: Tensor::randn([1, 1], (Kind::Float, device)),
             q_bias: None, k_bias: None, v_bias: None,
             rope,
             num_heads: num_heads as usize,
@@ -857,9 +862,9 @@ mod tests {
         let half = seq_len / 2;
 
         tch::manual_seed(789);
-        let q = Tensor::randn(&[1, num_heads, seq_len, head_dim], (Kind::Float, device));
-        let k = Tensor::randn(&[1, num_heads, seq_len, head_dim], (Kind::Float, device));
-        let v = Tensor::randn(&[1, num_heads, seq_len, head_dim], (Kind::Float, device));
+        let q = Tensor::randn([1, num_heads, seq_len, head_dim], (Kind::Float, device));
+        let k = Tensor::randn([1, num_heads, seq_len, head_dim], (Kind::Float, device));
+        let v = Tensor::randn([1, num_heads, seq_len, head_dim], (Kind::Float, device));
 
         // Expected: single-process causal attention
         let scale = 1.0 / (head_dim as f64).sqrt();
@@ -890,10 +895,10 @@ mod tests {
         });
 
         let mut backend0 = HcpRingAttentionBackend {
-            q_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
-            k_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
-            v_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
-            o_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
+            q_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            k_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            v_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            o_proj: Tensor::randn([1, 1], (Kind::Float, device)),
             q_bias: None, k_bias: None, v_bias: None,
             rope: rope.clone(),
             num_heads: num_heads as usize,
@@ -918,10 +923,10 @@ mod tests {
         });
 
         let mut backend1 = HcpRingAttentionBackend {
-            q_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
-            k_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
-            v_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
-            o_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
+            q_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            k_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            v_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            o_proj: Tensor::randn([1, 1], (Kind::Float, device)),
             q_bias: None, k_bias: None, v_bias: None,
             rope,
             num_heads: num_heads as usize,

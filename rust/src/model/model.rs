@@ -83,6 +83,7 @@ impl LlamaModel {
     /// Configure distributed transport for all attention backends in this model.
     /// Only affects layers using `HcpRingAttentionBackend`.
     #[cfg(feature = "tch-backend")]
+    #[allow(dead_code)]
     pub fn setup_distributed_domain<F>(&mut self, domain_id: usize, seq_offset: i64, mut transport_factory: F)
     where
         F: FnMut(usize) -> Option<Box<dyn crate::model::KvTransport>>,
@@ -112,7 +113,7 @@ impl LlamaModel {
         let position_ids = if seq_len > 1 {
             // Prefill: sequential positions [seq_offset, seq_offset+1, ..., seq_offset+seq_len-1]
             let base = Tensor::arange(seq_len, (Kind::Int64, device)) + self.seq_offset;
-            base.unsqueeze(0).repeat(&[batch, 1])
+            base.unsqueeze(0).repeat([batch, 1])
         } else {
             // Decode: position = current cache length (prompt_len + already_generated)
             let cache_len = kv_caches.iter()
@@ -121,7 +122,7 @@ impl LlamaModel {
             Tensor::from_slice(&[cache_len])
                 .to_device(device)
                 .unsqueeze(0)
-                .repeat(&[batch, 1])
+                .repeat([batch, 1])
         };
 
         // Causal mask for prefill (not needed for single-token decode)
@@ -154,10 +155,10 @@ impl LlamaModel {
     ///
     /// Shape: `[1, 1, seq_len, seq_len]` — broadcasts over batch and heads.
     fn create_causal_mask(seq_len: i64, device: Device) -> Tensor {
-        let mask = Tensor::ones(&[seq_len, seq_len], (Kind::Float, device))
+        let mask = Tensor::ones([seq_len, seq_len], (Kind::Float, device))
             .triu(1)
             .to_kind(Kind::Bool);
-        Tensor::zeros(&[seq_len, seq_len], (Kind::Float, device))
+        Tensor::zeros([seq_len, seq_len], (Kind::Float, device))
             .masked_fill(&mask, f64::NEG_INFINITY)
             .unsqueeze(0)
             .unsqueeze(0)
@@ -185,22 +186,22 @@ mod tests {
         let num_heads = config.num_heads as i64;
         let num_kv_heads = config.num_kv_heads.unwrap_or(config.num_heads) as i64;
 
-        tensors.insert(WeightNames::embedding().to_string(), Tensor::randn(&[vocab, hidden], (Kind::Float, device)));
-        tensors.insert(WeightNames::layer_norm().to_string(), Tensor::ones(&[hidden], (Kind::Float, device)));
-        tensors.insert(WeightNames::lm_head().to_string(), Tensor::randn(&[vocab, hidden], (Kind::Float, device)));
+        tensors.insert(WeightNames::embedding().to_string(), Tensor::randn([vocab, hidden], (Kind::Float, device)));
+        tensors.insert(WeightNames::layer_norm().to_string(), Tensor::ones([hidden], (Kind::Float, device)));
+        tensors.insert(WeightNames::lm_head().to_string(), Tensor::randn([vocab, hidden], (Kind::Float, device)));
 
         for layer in 0..config.num_layers {
-            tensors.insert(WeightNames::rms_norm_weight(layer), Tensor::ones(&[hidden], (Kind::Float, device)));
-            tensors.insert(WeightNames::post_attn_norm_weight(layer), Tensor::ones(&[hidden], (Kind::Float, device)));
+            tensors.insert(WeightNames::rms_norm_weight(layer), Tensor::ones([hidden], (Kind::Float, device)));
+            tensors.insert(WeightNames::post_attn_norm_weight(layer), Tensor::ones([hidden], (Kind::Float, device)));
             // HF format: q/k/v/o proj weights are [out_features, in_features]
-            tensors.insert(WeightNames::q_proj_weight(layer), Tensor::randn(&[num_heads * head_dim, hidden], (Kind::Float, device)));
-            tensors.insert(WeightNames::k_proj_weight(layer), Tensor::randn(&[num_kv_heads * head_dim, hidden], (Kind::Float, device)));
-            tensors.insert(WeightNames::v_proj_weight(layer), Tensor::randn(&[num_kv_heads * head_dim, hidden], (Kind::Float, device)));
-            tensors.insert(WeightNames::o_proj_weight(layer), Tensor::randn(&[hidden, num_heads * head_dim], (Kind::Float, device)));
+            tensors.insert(WeightNames::q_proj_weight(layer), Tensor::randn([num_heads * head_dim, hidden], (Kind::Float, device)));
+            tensors.insert(WeightNames::k_proj_weight(layer), Tensor::randn([num_kv_heads * head_dim, hidden], (Kind::Float, device)));
+            tensors.insert(WeightNames::v_proj_weight(layer), Tensor::randn([num_kv_heads * head_dim, hidden], (Kind::Float, device)));
+            tensors.insert(WeightNames::o_proj_weight(layer), Tensor::randn([hidden, num_heads * head_dim], (Kind::Float, device)));
             // HF format: gate/up/down proj weights follow nn.Linear(out_features, in_features)
-            tensors.insert(WeightNames::gate_proj_weight(layer), Tensor::randn(&[intermediate, hidden], (Kind::Float, device)));
-            tensors.insert(WeightNames::up_proj_weight(layer), Tensor::randn(&[intermediate, hidden], (Kind::Float, device)));
-            tensors.insert(WeightNames::down_proj_weight(layer), Tensor::randn(&[hidden, intermediate], (Kind::Float, device)));
+            tensors.insert(WeightNames::gate_proj_weight(layer), Tensor::randn([intermediate, hidden], (Kind::Float, device)));
+            tensors.insert(WeightNames::up_proj_weight(layer), Tensor::randn([intermediate, hidden], (Kind::Float, device)));
+            tensors.insert(WeightNames::down_proj_weight(layer), Tensor::randn([hidden, intermediate], (Kind::Float, device)));
         }
 
         ModelWeights { tensors }

@@ -164,7 +164,7 @@ impl ModelWeights {
 
             // 遍历这个文件中的所有 tensor。
             for name in st.names() {
-                let view = st.tensor(&name)
+                let view = st.tensor(name)
                     .map_err(|e| ModelError::Safetensors(e.to_string()))?;
                 // 把 safetensors 的 view 转换为 tch::Tensor。
                 let tensor = tensor_from_view(&view, device)?;
