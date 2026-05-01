@@ -336,6 +336,12 @@ mod tests {
             println!("token {} diff = {}", i, token_diff);
         }
         
-        assert!(diff < 1e-3, "Distributed LlamaModel prefill differs from reference: {}", diff);
+        // End-to-end tolerance tier: mean absolute error threshold for multi-layer model output.
+        const END_TO_END_MEAN_ABS_ERR_TOL: f64 = 1e-3;
+        assert!(
+            diff < END_TO_END_MEAN_ABS_ERR_TOL,
+            "Distributed LlamaModel prefill differs from reference: {}",
+            diff
+        );
     }
 }

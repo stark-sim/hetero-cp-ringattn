@@ -44,6 +44,9 @@ pub mod backend {
         })
     }
 
+    const SMOKE_MAX_ABS_ERR: f64 = 1.0e-4;
+    const SMOKE_MAX_REL_ERR: f64 = 1.0e-3;
+
     fn device_matches(tensor: &Tensor, expected: tch::Device) -> bool {
         let actual = tensor.device();
         match expected {
@@ -147,7 +150,7 @@ pub mod backend {
             }
         }
 
-        if max_abs_err <= 1.0e-4 && max_rel_err <= 1.0e-3 {
+        if max_abs_err <= SMOKE_MAX_ABS_ERR && max_rel_err <= SMOKE_MAX_REL_ERR {
             let msg = format!(
                 "ok updates={block_updates} max_abs_err={max_abs_err} max_rel_err={max_rel_err} checksum={checksum}"
             );
@@ -220,7 +223,7 @@ pub mod backend {
         let max_rel_err = rel_diff.max().double_value(&[]);
         let checksum = output_cpu.sum(Kind::Float).double_value(&[]);
 
-        if max_abs_err <= 1.0e-4 && max_rel_err <= 1.0e-3 {
+        if max_abs_err <= SMOKE_MAX_ABS_ERR && max_rel_err <= SMOKE_MAX_REL_ERR {
             let msg = format!(
                 "ok block_len={block_len} num_heads={num_heads} head_dim={head_dim} max_abs_err={max_abs_err} max_rel_err={max_rel_err} checksum={checksum}"
             );
@@ -331,7 +334,7 @@ pub mod backend {
         let max_rel_err = rel_diff.max().double_value(&[]);
         let checksum = output_cpu.sum(float).double_value(&[]);
 
-        if max_abs_err <= 1.0e-4 && max_rel_err <= 1.0e-3 {
+        if max_abs_err <= SMOKE_MAX_ABS_ERR && max_rel_err <= SMOKE_MAX_REL_ERR {
             let msg = format!(
                 "ok blocks={} tokens={token_count} max_abs_err={max_abs_err} max_rel_err={max_rel_err} checksum={checksum}",
                 block_lens.len()
@@ -451,7 +454,7 @@ pub mod backend {
         let max_rel_err = rel_diff.max().double_value(&[]);
         let checksum = tensor_weighted_checksum(&output_cpu);
 
-        if max_abs_err <= 1.0e-4 && max_rel_err <= 1.0e-3 {
+        if max_abs_err <= SMOKE_MAX_ABS_ERR && max_rel_err <= SMOKE_MAX_REL_ERR {
             let msg = format!(
                 "ok blocks={} query_len={query_len} tokens={token_count} max_abs_err={max_abs_err} max_rel_err={max_rel_err} checksum={checksum}",
                 block_lens.len()
@@ -581,7 +584,7 @@ pub mod backend {
         let checksum = tensor_weighted_checksum(&output_cpu);
         let output_values = output_cpu.numel() as usize;
 
-        if max_abs_err <= 1.0e-4 && max_rel_err <= 1.0e-3 {
+        if max_abs_err <= SMOKE_MAX_ABS_ERR && max_rel_err <= SMOKE_MAX_REL_ERR {
             let msg = format!(
                 "ok blocks={} query_len={query_len} tokens={token_count} max_abs_err={max_abs_err} max_rel_err={max_rel_err} checksum={checksum}",
                 block_lens.len()

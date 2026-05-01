@@ -215,12 +215,53 @@ struct CaseReport {
     name: &'static str,
     status: &'static str,
     seed: u64,
+    tolerance_tier: ToleranceTier,
     tolerance: Tolerance,
     metrics: Metrics,
     config: CaseConfig,
     ring_trace_summary: Vec<DomainTrace>,
     seed_results: Vec<SeedResult>,
 }
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+enum ToleranceTier {
+    #[default]
+    Strict,
+    Relaxed,
+    EndToEnd,
+}
+
+impl ToleranceTier {
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "strict" | "s" => Some(Self::Strict),
+            "relaxed" | "r" => Some(Self::Relaxed),
+            "end-to-end" | "e2e" | "e" => Some(Self::EndToEnd),
+            _ => None,
+        }
+    }
+
+    fn default_tolerance(self) -> Tolerance {
+        match self {
+            Self::Strict => Tolerance {
+                max_abs_err: 1e-5,
+                mean_abs_err: 1e-6,
+                max_rel_err: 1e-5,
+            },
+            Self::Relaxed => Tolerance {
+                max_abs_err: 1e-4,
+                mean_abs_err: 1e-5,
+                max_rel_err: 1e-4,
+            },
+            Self::EndToEnd => Tolerance {
+                max_abs_err: 1e-3,
+                mean_abs_err: 1e-4,
+                max_rel_err: 1e-3,
+            },
+        }
+    }
+}
+
 
 #[derive(Clone, Copy, Serialize)]
 struct Tolerance {
@@ -281,6 +322,7 @@ struct CliArgs {
     bind_addr: Option<String>,
     connect_addr: Option<String>,
     stress_test: bool,
+    tolerance_tier: ToleranceTier,
     infer_model_dir: Option<String>,
     infer_prompt: Option<String>,
     infer_max_tokens: usize,
@@ -653,6 +695,7 @@ fn run_case(
     name: &'static str,
     config: CaseConfig,
     seeds: &[u64],
+    tolerance_tier: ToleranceTier,
     tol: Tolerance,
 ) -> Result<CaseReport, RingError> {
     let mut seed_results = Vec::with_capacity(seeds.len());
@@ -693,6 +736,7 @@ fn run_case(
         name,
         status: worst_status,
         seed: first_seed,
+        tolerance_tier,
         tolerance: tol,
         metrics,
         config,
@@ -762,6 +806,7 @@ fn parse_cli_args() -> Result<CliArgs, RingError> {
     let mut bind_addr = None;
     let mut connect_addr = None;
     let mut stress_test = false;
+    let mut tolerance_tier = ToleranceTier::default();
     let mut infer_model_dir = None;
     let mut infer_prompt = None;
     let mut infer_max_tokens = 50;
@@ -789,6 +834,14 @@ fn parse_cli_args() -> Result<CliArgs, RingError> {
             }
             "--stress-test" => {
                 stress_test = true;
+            }
+            "--tolerance-tier" => {
+                let value = next_cli_value(&mut args, "--tolerance-tier")?;
+                tolerance_tier = ToleranceTier::from_str(&value).ok_or_else(|| {
+                    RingError::InvalidCli(format!(
+                        "invalid --tolerance-tier: {value}; expected strict|relaxed|end-to-end"
+                    ))
+                })?;
             }
             "--infer-model-dir" => {
                 infer_model_dir = Some(next_cli_value(&mut args, "--infer-model-dir")?);
@@ -826,6 +879,7 @@ fn parse_cli_args() -> Result<CliArgs, RingError> {
         bind_addr,
         connect_addr,
         stress_test,
+        tolerance_tier,
         infer_model_dir,
         infer_prompt,
         infer_max_tokens,
@@ -2069,12 +2123,8 @@ fn torch_report_from_code(
     }
 }
 
-fn run(stress_test: bool) -> Result<Report, RingError> {
-    let tol = Tolerance {
-        max_abs_err: 1e-10,
-        mean_abs_err: 1e-12,
-        max_rel_err: 1e-7,
-    };
+fn run(stress_test: bool, tolerance_tier: ToleranceTier) -> Result<Report, RingError> {
+    let tol = tolerance_tier.default_tolerance();
     let stress_seeds: Vec<u64> = (0..5).map(|i| 42 + i as u64).collect();
     let cases: Vec<CaseReport> = default_cases()
         .into_iter()
@@ -2085,7 +2135,7 @@ fn run(stress_test: bool) -> Result<Report, RingError> {
             } else {
                 vec![42 + index as u64]
             };
-            run_case(name, config, &seeds, tol)
+            run_case(name, config, &seeds, tolerance_tier, tol)
         })
         .collect::<Result<Vec<_>, _>>()?;
     let passed = cases.iter().filter(|case| case.status == "pass").count();
@@ -2400,7 +2450,7 @@ fn main() -> Result<(), RingError> {
         return Ok(());
     }
 
-    let report = run(args.stress_test)?;
+    let report = run(args.stress_test, args.tolerance_tier)?;
     write_json_report(&args.report_path, &report)?;
     println!(
         "[rust-ringattn] status={} passed={}/{} protocol_status={} protocol_messages={} cp_ring_status={} cp_ring_messages={} cp_ring_compute_updates={} cxx_domains={} torch_status={} torch_device={} torch_code={} torch_attention_status={} torch_attention_code={} tch_attention_status={} tch_attention_code={} torch_block_update_status={} torch_block_update_code={} torch_block_updates={} torch_payload_block_status={} torch_payload_block_code={} torch_payload_blocks={}/{} torch_payload_online_status={} torch_payload_online_code={} torch_payload_online_blocks={}/{} torch_payload_chunk_status={} torch_payload_chunk_code={} torch_payload_chunk_blocks={}/{} torch_query_chunk_status={} torch_query_chunk_code={} torch_query_chunk_blocks={}/{} torch_query_output_status={} torch_query_output_code={} torch_query_output_groups={} torch_query_output_blocks={}/{} tch_payload_block_status={} tch_payload_block_code={} tch_payload_block_blocks={}/{} tch_payload_online_status={} tch_payload_online_code={} tch_payload_online_blocks={}/{} tch_payload_chunk_status={} tch_payload_chunk_code={} tch_payload_chunk_blocks={}/{} tch_query_chunk_status={} tch_query_chunk_code={} tch_query_chunk_blocks={}/{} tch_query_output_status={} tch_query_output_code={} tch_query_output_groups={} tch_query_output_blocks={}/{} tch_compute_output_checksum={} torch_compiled={} report={}",

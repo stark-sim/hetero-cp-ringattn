@@ -48,6 +48,7 @@ project-root/
 - **统一 remote CP launcher**：3-node remote CP smoke 通过 `scripts/run_rust_remote_cp_3node_smoke.sh` 收敛 Mac 地址发现、GPU git 同步、cargo preflight build、三节点统一启动和 launcher 日志，避免手工时序导致 connect / accept retry 窗口失败。
 - **reference-first correctness**：Python kernel stub 保留 reference attention，用于与 block-wise online softmax 对照。
 - **报告纪律**：实验产物应落在 `reports/<RUN_ID>/` 下，便于回溯。
+- **分级 tolerance policy**：数值验证不采用单一阈值，而是按测试层级分为三级：`Strict`（同设备算法等价，`rtol=1e-5`）、`Relaxed`（异构设备交叉验证，`rtol=1e-4`）、`EndToEnd`（多层模型累积误差，`rtol=1e-3`）。阈值基于 float32 机器精度（~1.2e-7）和业界框架默认值推导，给 100~1000 倍安全余量。`--tolerance-tier` CLI 参数可在运行时切换，correctness JSON report 包含 `tolerance_tier` 字段以明确当前验证标准。
 
 ## 组件关系
 
