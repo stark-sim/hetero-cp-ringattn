@@ -149,15 +149,18 @@ impl Mlp {
 #[cfg(feature = "tch-backend")]
 #[derive(Debug)]
 pub struct GqaAttention {
-    q_proj: Tensor,
-    k_proj: Tensor,
-    v_proj: Tensor,
-    o_proj: Tensor,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    rope: RotaryEmbedding,
-    scale: f64,
+    pub q_proj: Tensor,
+    pub k_proj: Tensor,
+    pub v_proj: Tensor,
+    pub o_proj: Tensor,
+    pub q_bias: Option<Tensor>,
+    pub k_bias: Option<Tensor>,
+    pub v_bias: Option<Tensor>,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub rope: RotaryEmbedding,
+    pub scale: f64,
 }
 
 #[cfg(feature = "tch-backend")]
@@ -168,11 +171,17 @@ impl GqaAttention {
         config: &ModelConfig,
         rope: &RotaryEmbedding,
     ) -> Result<Self, ModelError> {
+        let q_bias = weights.get(&WeightNames::q_proj_bias(layer)).ok().map(|t| t.shallow_clone());
+        let k_bias = weights.get(&WeightNames::k_proj_bias(layer)).ok().map(|t| t.shallow_clone());
+        let v_bias = weights.get(&WeightNames::v_proj_bias(layer)).ok().map(|t| t.shallow_clone());
         Ok(Self {
             q_proj: weights.get(&WeightNames::q_proj_weight(layer))?.shallow_clone(),
             k_proj: weights.get(&WeightNames::k_proj_weight(layer))?.shallow_clone(),
             v_proj: weights.get(&WeightNames::v_proj_weight(layer))?.shallow_clone(),
             o_proj: weights.get(&WeightNames::o_proj_weight(layer))?.shallow_clone(),
+            q_bias,
+            k_bias,
+            v_bias,
             num_heads: config.num_heads,
             num_kv_heads: config.num_kv_heads(),
             head_dim: config.head_dim(),
@@ -197,10 +206,19 @@ impl GqaAttention {
         let seq_len = hidden_states.size()[1];
         let hidden_size = hidden_states.size()[2];
 
-        // Projections
-        let q = hidden_states.matmul(&self.q_proj.transpose(0, 1));
-        let k = hidden_states.matmul(&self.k_proj.transpose(0, 1));
-        let v = hidden_states.matmul(&self.v_proj.transpose(0, 1));
+        // Projections (with optional bias)
+        let mut q = hidden_states.matmul(&self.q_proj.transpose(0, 1));
+        if let Some(ref bias) = self.q_bias {
+            q = q + bias;
+        }
+        let mut k = hidden_states.matmul(&self.k_proj.transpose(0, 1));
+        if let Some(ref bias) = self.k_bias {
+            k = k + bias;
+        }
+        let mut v = hidden_states.matmul(&self.v_proj.transpose(0, 1));
+        if let Some(ref bias) = self.v_bias {
+            v = v + bias;
+        }
 
         // Reshape to [batch, num_heads, seq_len, head_dim]
         let q = q.view([batch, seq_len, self.num_heads as i64, self.head_dim as i64])
@@ -272,11 +290,12 @@ impl DecoderLayer {
         hidden_states: &Tensor,
         position_ids: &Tensor,
         kv_cache: Option<&mut crate::model::cache::KvCache>,
+        attention_mask: Option<&Tensor>,
     ) -> Result<Tensor, ModelError> {
         // Pre-attention residual
         let residual = hidden_states.shallow_clone();
         let hidden_states = self.input_layernorm.forward(hidden_states);
-        let hidden_states = self.attention.forward(&hidden_states, position_ids, kv_cache, None)?;
+        let hidden_states = self.attention.forward(&hidden_states, position_ids, kv_cache, attention_mask)?;
         let hidden_states = &hidden_states + &residual;
 
         // Pre-FFN residual
@@ -341,6 +360,9 @@ mod tests {
             k_proj: Tensor::randn(&[(num_kv_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),
             v_proj: Tensor::randn(&[(num_kv_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),
             o_proj: Tensor::randn(&[hidden_size, (num_heads * head_dim) as i64], (Kind::Float, device)),
+            q_bias: None,
+            k_bias: None,
+            v_bias: None,
             num_heads,
             num_kv_heads,
             head_dim,

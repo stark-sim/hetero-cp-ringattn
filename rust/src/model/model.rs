@@ -85,14 +85,16 @@ impl LlamaModel {
 
         // Position IDs: [batch, seq_len]
         let position_ids = if seq_len > 1 {
-            // Prefill: sequential positions
+            // Prefill: sequential positions [0, 1, ..., seq_len-1]
             Tensor::arange(seq_len, (Kind::Int64, device))
                 .unsqueeze(0)
                 .repeat(&[batch, 1])
         } else {
-            // Decode: each sample uses its current cache length as position
-            // For simplicity, assume single sample or all samples share cache length
-            Tensor::arange(seq_len, (Kind::Int64, device))
+            // Decode: position = current cache length (prompt_len + already_generated)
+            let cache_len = kv_caches.iter()
+                .find_map(|c| c.as_ref().map(|cache| cache.seq_len as i64))
+                .unwrap_or(0);
+            Tensor::from_slice(&[cache_len])
                 .unsqueeze(0)
                 .repeat(&[batch, 1])
         };
@@ -107,15 +109,7 @@ impl LlamaModel {
         // Layer stack
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             let kv_cache = kv_caches.get_mut(layer_idx).and_then(|c| c.as_mut());
-
-            // Pass causal mask only to attention backend
-            let hidden = if let Some(ref mask) = attention_mask {
-                layer.attention.forward(&hidden_states, &position_ids, kv_cache, Some(mask))?
-            } else {
-                layer.forward(&hidden_states, &position_ids, kv_cache)?
-            };
-
-            hidden_states = hidden;
+            hidden_states = layer.forward(&hidden_states, &position_ids, kv_cache, attention_mask.as_ref())?;
         }
 
         // Final norm
@@ -138,8 +132,10 @@ impl LlamaModel {
         let mask = Tensor::ones(&[seq_len, seq_len], (Kind::Float, device))
             .triu(1)
             .to_kind(Kind::Bool);
-        let additive = mask.to_kind(Kind::Float) * f64::NEG_INFINITY;
-        additive.unsqueeze(0).unsqueeze(0)
+        Tensor::zeros(&[seq_len, seq_len], (Kind::Float, device))
+            .masked_fill(&mask, f64::NEG_INFINITY)
+            .unsqueeze(0)
+            .unsqueeze(0)
     }
 
     /// Create fresh KV caches for all layers.

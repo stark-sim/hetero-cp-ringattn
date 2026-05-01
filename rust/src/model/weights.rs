@@ -51,6 +51,18 @@ impl WeightNames {
         format!("model.layers.{layer}.self_attn.v_proj.weight")
     }
 
+    pub fn q_proj_bias(layer: usize) -> String {
+        format!("model.layers.{layer}.self_attn.q_proj.bias")
+    }
+
+    pub fn k_proj_bias(layer: usize) -> String {
+        format!("model.layers.{layer}.self_attn.k_proj.bias")
+    }
+
+    pub fn v_proj_bias(layer: usize) -> String {
+        format!("model.layers.{layer}.self_attn.v_proj.bias")
+    }
+
     pub fn o_proj_weight(layer: usize) -> String {
         format!("model.layers.{layer}.self_attn.o_proj.weight")
     }

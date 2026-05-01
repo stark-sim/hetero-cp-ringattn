@@ -679,20 +679,32 @@ pub mod backend {
             .to(device);
 
         let scale = 1.0 / (head_dim as f64).sqrt();
+        println!("DEBUG tch_backend: q_by_head shape={:?}, k_by_head shape={:?}", q_by_head.size(), k_by_head.size());
         let scores = q_by_head.matmul(&k_by_head.transpose(1, 2)) * scale;
+        println!("DEBUG tch_backend: scores shape={:?}", scores.size());
         let (local_max, _) = scores.max_dim(2, false);
-        let weights = (&scores - local_max.unsqueeze(2i64)).exp();
+        println!("DEBUG tch_backend: local_max shape={:?}", local_max.size());
+        let local_max_unsqueezed = local_max.unsqueeze(2i64);
+        println!("DEBUG tch_backend: local_max_unsqueezed shape={:?}", local_max_unsqueezed.size());
+        let weights = (&scores - local_max_unsqueezed).exp();
         let local_sum = weights.sum_dim_intlist(&[2i64][..], false, float);
         let local_pv = weights.matmul(&v_by_head);
 
+        println!("DEBUG tch_backend: before max_other");
         let new_max = rm.max_other(&local_max);
+        println!("DEBUG tch_backend: before exp_prev");
         let exp_prev = (&rm - &new_max).exp();
+        println!("DEBUG tch_backend: before exp_local");
         let exp_local = (&local_max - &new_max).exp();
+        println!("DEBUG tch_backend: before new_sum");
         let new_sum = &exp_prev * &rs + &exp_local * &local_sum;
+        println!("DEBUG tch_backend: before obh update");
         obh = (&exp_prev.unsqueeze(2i64) * &rs.unsqueeze(2i64) * &obh
             + &exp_local.unsqueeze(2i64) * &local_pv)
             / &new_sum.unsqueeze(2i64);
+        println!("DEBUG tch_backend: before rm= new_max");
         rm = new_max;
+        println!("DEBUG tch_backend: before rs= new_sum");
         rs = new_sum;
 
         let rm_cpu = rm.to(tch::Device::Cpu);
