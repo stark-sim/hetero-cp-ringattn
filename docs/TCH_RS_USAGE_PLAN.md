@@ -42,7 +42,7 @@ Rust HCP model / protocol
 
 1. `tch` 会引入 `torch-sys`，编译和链接成本明显高于当前纯 Rust correctness。
 2. `tch` 依赖 libtorch 版本严格匹配；本仓默认验证不应被外部 Python/torch 环境阻塞，因此应固定独立 libtorch 路径。
-3. 当前 cargo registry 访问曾因 `rsproxy.cn` DNS 失败；默认 smoke 必须保持 `--offline` 可跑。
+3. 环境默认在线（rsproxy-sparse 可达），cargo 命令正常在线执行。
 4. HCP 仍需要明确自己的 protocol / report / transport schema，不能把模型逻辑完全耦合进 PyTorch binding。
 
 ## 应该怎么用好 tch

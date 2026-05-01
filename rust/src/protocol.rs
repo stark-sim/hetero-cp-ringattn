@@ -34,6 +34,8 @@ pub(crate) const FLOAT32_BYTES: usize = 4;
 pub enum ProtocolError {
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("serialization error: {0}")]
+    Serialize(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("domain list must not be empty")]
@@ -2368,11 +2370,13 @@ fn make_softmax_state_payload(source: &DomainSpec) -> Vec<u8> {
 }
 
 fn serialize_message(message: &RingAttnMessage) -> Result<Vec<u8>, ProtocolError> {
-    Ok(serde_json::to_vec(message)?)
+    bincode::serialize(message)
+        .map_err(|e| ProtocolError::Serialize(e.to_string()))
 }
 
 fn deserialize_message(frame: &[u8]) -> Result<RingAttnMessage, ProtocolError> {
-    Ok(serde_json::from_slice(frame)?)
+    bincode::deserialize(frame)
+        .map_err(|e| ProtocolError::Serialize(e.to_string()))
 }
 
 fn validate_message(

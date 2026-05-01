@@ -16,7 +16,7 @@
 - [x] [2026-04-24] 已新增 Rust crate，实现纯 Rust Ring Attention correctness model。
 - [x] [2026-04-24] 已新增 Rust -> C ABI -> C++ runtime bridge，并成功调用 C++ `NoOpRingAttnRuntime`。
 - [x] [2026-04-24] 已验证 `HCP_ENABLE_TORCH=1` 下 Rust -> C++ ATen/libtorch smoke 可编译执行，report 中 `torch_bridge.compiled=true`。
-- [x] [2026-04-24] `cargo clippy --offline -- -D warnings` 通过。
+- [x] [2026-04-24] `cargo clippy -- -D warnings` 通过。
 - [x] [2026-04-24] 已将当前 miniconda Python 环境中的 PyTorch 升级到 stable `torch==2.11.0`，并同步安装 `torchvision==0.26.0`、`torchaudio==2.11.0`。
 - [x] [2026-04-24] 已完成 `tch-rs` 正式接入方案文档，建议作为 optional backend 接入，默认 pure-rust 路径保持可离线验证。
 - [x] [2026-04-24] 已确认独立 libtorch 2.11.0 安装在 `/Users/stark_sim/libtorch`，并更新 Rust build script 优先使用 system-wide libtorch。
@@ -52,7 +52,7 @@
 - [x] [2026-04-27] 已新增 `LayerActivationState` / output slot ownership：每个 domain-local layer state 明确持有 Q chunk、K cache、V cache、output slot，并把 output slot 元数据写入 CP report。
 - [x] [2026-04-27] 临时 VPN remote CP smoke 已通过：`GPU_HOST=100.118.253.68 MAC_NODE_ADDR=100.121.35.138 RUN_ID=rust-remote-cp-modelstate-vpn-20260426` 下 node0/node2 MPS 与 node1 CUDA 均 `sent=8 received=8 compute_updates=12 torch_query_output_blocks=12/12`。
 - [x] [2026-04-29] 已新增 projection-first Q/K/V 路径：`ModelLayerWeights` + domain-local hidden states 生成 Q chunk、K cache、V cache，不再直接公式生成 Q/K/V bytes。
-- [x] [2026-04-29] projection 路径已通过本机和远端验证：`cargo test --offline` 4/4、`cargo clippy --offline -- -D warnings`、本机 MPS smoke `torch_query_output_blocks=30/30`、LAN 3-node remote CP `RUN_ID=rust-remote-cp-projection-lan-20260429` 三节点 `torch_query_output_blocks=12/12`。
+- [x] [2026-04-29] projection 路径已通过本机和远端验证：`cargo test` 4/4、`cargo clippy -- -D warnings`、本机 MPS smoke `torch_query_output_blocks=30/30`、LAN 3-node remote CP `RUN_ID=rust-remote-cp-projection-lan-20260429` 三节点 `torch_query_output_blocks=12/12`。
 - [x] [2026-04-30] Cargo registry 在线模式已恢复可用（rsproxy-sparse 正常）。
 - [x] [2026-04-30] 已新增 optional `tch = "0.24.0"` 和 `tch-backend` feature gate。
 - [x] [2026-04-30] 已新增 `rust/src/bin/tch_smoke.rs`：matmul + softmax + attention-like 三组 op，与 CPU reference 对比误差，输出 JSON report。

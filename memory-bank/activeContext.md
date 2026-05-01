@@ -53,7 +53,7 @@
 - [2026-04-26] 尝试重跑 3-node remote CP query chunk smoke 时，node2 先启动后连接 node0 超时退出；随后 GPU host `192.168.8.172` SSH 返回 `No route to host` / `Host is down`。本机已确认无残留 remote CP/SSH 进程，待网络稳定后重跑 3-node。
 - [2026-04-26] 3-node remote CP query chunk smoke 已重跑通过：失败根因是 Mac 的 `192.168.8.x` 地址从 `192.168.8.204` 变化到 `192.168.8.239`；使用当前地址后 node0/node2 MPS 均通过 `torch_query_chunk_code=2 12/12`，GPU node1 CUDA 通过 `torch_query_chunk_code=3 12/12`。
 - [2026-04-26] Rust protocol 新增 `DomainModelState`：每个 domain 持有本地 Q chunk 与 K/V storage；K/V 消息从 source state 切片生成，compute capture 携带 target state 的 Q payload。`torch_query_chunk_bridge_report` 已按 `compute_domain` 分组，避免不同 domain blocks 混用同一个 Q。
-- [2026-04-26] `DomainModelState` 路径已验证：`cargo test --offline` 通过 2 个 state 单元测试；本机非沙箱 MPS 主 smoke、远端 CUDA 主 smoke、`RUN_ID=rust-remote-cp-modelstate-20260426` 三节点 remote CP smoke 均通过。
+- [2026-04-26] `DomainModelState` 路径已验证：`cargo test` 通过 2 个 state 单元测试；本机非沙箱 MPS 主 smoke、远端 CUDA 主 smoke、`RUN_ID=rust-remote-cp-modelstate-20260426` 三节点 remote CP smoke 均通过。
 - [2026-04-26] 新增 `scripts/run_rust_remote_cp_3node_smoke.sh` 统一 launcher：自动发现当前 Mac `192.168.8.x` 地址、远端 GPU `git pull --ff-only`、本机/远端 cargo preflight build，并统一启动 node0/node2 MPS 与 node1 CUDA。
 - [2026-04-26] `RUN_ID=rust-remote-cp-output-unified-20260426 PORT_BASE=29285 bash scripts/run_rust_remote_cp_3node_smoke.sh` 已通过；三节点均 `sent=8 received=8 compute_updates=12`，MPS nodes `torch_query_output_code=2 12/12`，CUDA node `torch_query_output_code=3 12/12`。
 - [2026-04-27] `DomainModelState` 已拆出 `LayerActivationState`，明确每个 domain-local layer 拥有 Q chunk、K cache、V cache 和 output slot；`torch_query_output_bridge` 会校验 output value 数匹配本地 output slot。
@@ -132,7 +132,7 @@
 - [x] [2026-04-30] M3-tch Step 1 完成：`backend.rs` 的 `ring_attention` 非因果路径已从 `compute_chunk_attention_step`（CPU buffer）迁移到 `process_kv_block` 纯 tensor online softmax；因果/非因果输出统一为 `[batch, num_heads, seq_len, head_dim]`。
 - [x] [2026-04-30] M3-tch Step 2 完成：`compute_runtime.rs` 的 `TchComputeRuntime::compute_kv_block` 已内联 tensor 实现，不再调用 `compute_chunk_attention_step`；online softmax 数学与 `process_kv_block` 等价。
 - [x] [2026-04-30] M3-tch Step 3 完成：清理死代码——删除 `tch_backend.rs` 中已无调用点的 `compute_chunk_attention_step`（含 dummy 版本），删除 `backend.rs` 中未使用的 `tensor_to_q_payload` / `tensor_to_kv_payload`。
-- [x] [2026-04-30] `tch-backend` 设为默认 feature：`Cargo.toml` `default = ["tch-backend"]`；修复由此暴露的全部 46 个 clippy 错误（`needless_borrow`、`needless_borrows_for_generic_args`、`too_many_arguments`、dead code 等）；`cargo test --offline` 18/18 通过，`cargo clippy --offline -- -D warnings` 零警告。
+- [x] [2026-04-30] `tch-backend` 设为默认 feature：`Cargo.toml` `default = ["tch-backend"]`；修复由此暴露的全部 46 个 clippy 错误（`needless_borrow`、`needless_borrows_for_generic_args`、`too_many_arguments`、dead code 等）；`cargo test` 18/18 通过，`cargo clippy -- -D warnings` 零警告。
 - [x] [2026-04-30] 本地 `cargo test` 与 `cargo clippy` 已验证通过；protocol smoke 与 remote CP smoke 待下次远程运行时最终确认。
 - [x] [2026-04-30] 明确 HCP 与 PyTorch 官方 Context Parallel 的边界：HCP 采用原始 Ring Attention 论文的 P2P 设计，支持异构/非均分；PyTorch 2.7+ CP 是同构 GPU 集群的 collective 优化。已记录于 `systemPatterns.md`。
 - [ ] 为 `RingAttnMessage` 设计 serialization / deserialization。
@@ -163,7 +163,7 @@
 
 - [2026-04-24] 当前沙箱环境不允许 Python worker 绑定本地端口，完整 Python smoke 会触发 `PermissionError: [Errno 1] Operation not permitted`。
 - [2026-04-24] `ringattn_controller.py` 当前会将 `bytes` 放入 `json.dumps` payload，导致 `TypeError: Object of type bytes is not JSON serializable`。
-- [2026-04-30] 普通 `cargo check` 已确认可用（rsproxy-sparse 可达），之前 DNS 失败为临时问题；`cargo --offline` 仍保留为安全 fallback。
+- [2026-04-30] 环境默认在线（rsproxy-sparse 可达），`cargo test` / `cargo clippy` / `cargo build` 均在线执行。
 - [2026-04-24] PyTorch 2.11.0 在默认沙箱进程中 `mps_available=false`，原因是沙箱内 `MTLCopyAllDevices()` 返回 0；非沙箱进程可枚举 `Apple M1 Pro`，且 `torch.ones(..., device="mps")` 成功。
 - [2026-04-24] 后续所有 Metal/MPS 相关验证必须在非沙箱/授权进程中运行；默认沙箱结果不能作为 MPS 不可用结论。
 - [2026-04-25] GPU 端 `CARGO_OFFLINE=1` 失败且提示 `no matching package named serde_json found` 时，优先判定为 Cargo registry cache miss，不是 CUDA/libtorch 问题。

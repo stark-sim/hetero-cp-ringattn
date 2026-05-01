@@ -15,7 +15,7 @@ echo "BIND_ADDR=${BIND_ADDR}"
 cd "${REPO_ROOT}/rust"
 CARGO_OFFLINE="${CARGO_OFFLINE:-1}"
 if [ "${CARGO_OFFLINE}" = "1" ]; then
-    CARGO_ARGS=(run --offline)
+    CARGO_ARGS=(run)
 else
     CARGO_ARGS=(run)
 fi
@@ -29,10 +29,6 @@ CARGO_STATUS="${PIPESTATUS[0]}"
 set -e
 
 if [ "${CARGO_STATUS}" -ne 0 ]; then
-    if [ "${CARGO_OFFLINE}" = "1" ] && grep -q "no matching package named" "${REPORT_DIR}/remote_p2p_server.log"; then
-        echo "Cargo offline cache miss detected."
-        echo "Run once with CARGO_OFFLINE=0, or prefetch with: cd ${REPO_ROOT}/rust && cargo fetch --locked"
-    fi
     exit "${CARGO_STATUS}"
 fi
 

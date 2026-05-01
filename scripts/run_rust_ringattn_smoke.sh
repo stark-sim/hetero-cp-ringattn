@@ -22,9 +22,9 @@ if [ "${HCP_ENABLE_TORCH:-0}" = "1" ] || [ -n "${LIBTORCH:-}" ]; then
 fi
 if [ "${CARGO_OFFLINE}" = "1" ]; then
     if [ -n "${FEATURES}" ]; then
-        CARGO_ARGS=(run --offline --features "${FEATURES}" --bin hcp-ringattn-rust)
+        CARGO_ARGS=(run --features "${FEATURES}" --bin hcp-ringattn-rust)
     else
-        CARGO_ARGS=(run --offline --bin hcp-ringattn-rust)
+        CARGO_ARGS=(run --bin hcp-ringattn-rust)
     fi
 else
     if [ -n "${FEATURES}" ]; then
@@ -41,10 +41,6 @@ CARGO_STATUS="${PIPESTATUS[0]}"
 set -e
 
 if [ "${CARGO_STATUS}" -ne 0 ]; then
-    if [ "${CARGO_OFFLINE}" = "1" ] && grep -q "no matching package named" "${REPORT_DIR}/rust_ringattn_correctness.log"; then
-        echo "Cargo offline cache miss detected."
-        echo "Run once with CARGO_OFFLINE=0, or prefetch with: cd ${REPO_ROOT}/rust && cargo fetch --locked"
-    fi
     exit "${CARGO_STATUS}"
 fi
 

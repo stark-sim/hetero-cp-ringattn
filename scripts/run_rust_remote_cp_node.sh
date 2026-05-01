@@ -24,7 +24,7 @@ if [ -n "${LIBTORCH:-}" ] || [ "${HCP_ENABLE_TORCH:-0}" = "1" ]; then
     CARGO_FEATURES+=("tch-backend")
 fi
 if [ "${CARGO_OFFLINE}" = "1" ]; then
-    CARGO_ARGS=(run --offline)
+    CARGO_ARGS=(run)
 else
     CARGO_ARGS=(run)
 fi
@@ -48,10 +48,6 @@ CARGO_STATUS="${PIPESTATUS[0]}"
 set -e
 
 if [ "${CARGO_STATUS}" -ne 0 ]; then
-    if [ "${CARGO_OFFLINE}" = "1" ] && grep -q "no matching package named" "${REPORT_DIR}/remote_cp_node_${NODE_INDEX}.log"; then
-        echo "Cargo offline cache miss detected."
-        echo "Run once with CARGO_OFFLINE=0, or prefetch with: cd ${REPO_ROOT}/rust && cargo fetch --locked"
-    fi
     exit "${CARGO_STATUS}"
 fi
 

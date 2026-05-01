@@ -182,7 +182,7 @@ RUN_ID=rust-remote-cp-3node-<timestamp> \
 - `MAC_NODE_ADDR`：覆盖统一 launcher 自动发现的 Mac node 地址，支持 `192.168.8.x` 和 `100.x` VPN/overlay 地址。
 - `MAC_192_ADDR`：兼容旧命令的别名；如果 `MAC_NODE_ADDR` 未设置且 `MAC_192_ADDR` 存在，launcher 会使用它。
 - `GPU_HOST` / `GPU_USER` / `GPU_REPO_DIR`：覆盖统一 launcher 的远端 GPU 地址、SSH 用户和远端仓库目录；默认分别为 `192.168.8.172`、`stark`、`hetero-cp-ringattn`。
-- `LOCAL_CARGO_OFFLINE` / `REMOTE_CARGO_OFFLINE`：统一 launcher 的本机/远端 cargo offline 开关，默认均为 `0`，避免远端 cache miss 干扰 smoke。
+- 环境默认在线（rsproxy-sparse registry 可达），cargo 命令不使用 `--offline`。
 - remote CP smoke 前应确认当前 Mac 可被 GPU 节点访问的地址。`192.168.8.x` 子网曾出现从 `192.168.8.204` 变为 `192.168.8.239` 的情况；2026-04-27 临时 VPN 路由使用 Mac `100.121.35.138`、CUDA `100.118.253.68`。
 - 本机 Mac hardware smoke 使用 `HCP_TORCH_DEVICE=mps` 并越过普通沙箱；CPU smoke 只用于编译/链接 fallback。
 - 启用 `HCP_ENABLE_TORCH=1` 后，Rust smoke 要求 torch bridge 成功；CLI summary 中 `torch_status=pass` 且设备成功码匹配才算硬件 smoke 通过。

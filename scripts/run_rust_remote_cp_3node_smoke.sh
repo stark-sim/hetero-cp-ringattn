@@ -47,7 +47,7 @@ shell_quote() {
 
 cargo_build_args() {
     if [ "$1" = "1" ]; then
-        printf "build --offline"
+        printf "build"
     else
         printf "build"
     fi
