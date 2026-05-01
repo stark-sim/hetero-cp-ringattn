@@ -1332,7 +1332,7 @@ pub fn run_remote_cp_node(
                         receiver_domain: outbound_peer.domain_id.clone(),
                         reason: error.to_string(),
                     })?;
-            write_raw_message_frame(&mut stream, &message)?
+            stream.send_message(&message)?
         };
         summary.source_blocks += 1;
         summary.initial_messages_sent += 1;
@@ -1466,8 +1466,8 @@ fn ring_links(domains: &[DomainSpec]) -> Vec<LinkReport> {
 fn run_cp_ring_node(
     domain_index: usize,
     domains: Vec<DomainSpec>,
-    receiver: Receiver<Vec<u8>>,
-    next_sender: Sender<Vec<u8>>,
+    mut receiver: Receiver<Vec<u8>>,
+    mut next_sender: Sender<Vec<u8>>,
     expected_inbound_messages: usize,
 ) -> Result<CpRingNodeReport, ProtocolError> {
     let domain_count = domains.len();
@@ -1515,7 +1515,9 @@ fn run_cp_ring_node(
             block_start,
             block_stop,
         );
-        send_cp_node_frame(&next_sender, &message, &mut report, true)?;
+        let bytes_sent = next_sender.send_message(&message)?;
+        report.initial_messages_sent += 1;
+        report.bytes_sent += bytes_sent;
         report.source_blocks += 1;
         report.compute_updates += 1;
         push_payload_block(&mut report.payload_blocks, &domain, &model_state, &message);
@@ -1526,15 +1528,12 @@ fn run_cp_ring_node(
     }
 
     while report.messages_received < expected_inbound_messages {
-        let frame = receiver
-            .recv()
-            .map_err(|error| ProtocolError::ChannelRecv {
-                domain_id: domain.domain_id.clone(),
-                reason: error.to_string(),
-            })?;
-        report.bytes_received += frame.len();
+        let (message, bytes_received) = receiver.recv_message().map_err(|error| ProtocolError::ChannelRecv {
+            domain_id: domain.domain_id.clone(),
+            reason: error.to_string(),
+        })?;
+        report.bytes_received += bytes_received;
         report.messages_received += 1;
-        let message = deserialize_message(&frame)?;
         let should_forward = process_inbound_message(
             &mut runtime,
             &message,
@@ -1548,7 +1547,9 @@ fn run_cp_ring_node(
         if should_forward {
             let forwarded = forward_kv_message(&message, &domain, &outbound_peer);
             push_cp_route_preview(&mut report, &message, Some(&outbound_peer.domain_id));
-            send_cp_node_frame(&next_sender, &forwarded, &mut report, false)?;
+            let bytes_sent = next_sender.send_message(&forwarded)?;
+            report.forwarded_messages_sent += 1;
+            report.bytes_sent += bytes_sent;
         } else {
             push_cp_route_preview(&mut report, &message, None);
         }
@@ -1561,30 +1562,6 @@ fn run_cp_ring_node(
 
 fn cp_ring_sequence_id(domain_index: usize, block_index: usize) -> u64 {
     100_000 + (domain_index as u64) * 10_000 + block_index as u64
-}
-
-fn send_cp_node_frame(
-    sender: &Sender<Vec<u8>>,
-    message: &RingAttnMessage,
-    report: &mut CpRingNodeReport,
-    is_initial_message: bool,
-) -> Result<(), ProtocolError> {
-    let frame = serialize_message(message)?;
-    let frame_len = frame.len();
-    sender
-        .send(frame)
-        .map_err(|error| ProtocolError::ChannelSend {
-            sender_domain: message.sender_domain.clone(),
-            receiver_domain: message.receiver_domain.clone(),
-            reason: error.to_string(),
-        })?;
-    if is_initial_message {
-        report.initial_messages_sent += 1;
-    } else {
-        report.forwarded_messages_sent += 1;
-    }
-    report.bytes_sent += frame_len;
-    Ok(())
 }
 
 fn forward_kv_message(
@@ -1889,7 +1866,7 @@ fn receive_remote_cp_node_messages(
     let mut runtime = crate::compute_runtime::NoOpComputeRuntime;
 
     while report.messages_received < expected_messages {
-        let (message, bytes_received) = read_raw_message_frame(&mut stream)?;
+        let (message, bytes_received) = stream.recv_message()?;
         report.messages_received += 1;
         report.bytes_received += bytes_received;
         let should_forward = {
@@ -1920,7 +1897,7 @@ fn receive_remote_cp_node_messages(
                             receiver_domain: outbound_peer.domain_id.clone(),
                             reason: error.to_string(),
                         })?;
-                write_raw_message_frame(&mut stream, &forwarded)?
+                stream.send_message(&forwarded)?
             };
             report.forwarded_messages_sent += 1;
             report.bytes_forwarded += bytes_forwarded;
@@ -2005,21 +1982,6 @@ fn read_frame_from_stream(stream: &mut TcpStream) -> Result<Vec<u8>, ProtocolErr
     let mut frame = vec![0_u8; frame_len];
     stream.read_exact(&mut frame)?;
     Ok(frame)
-}
-
-fn write_raw_message_frame(
-    stream: &mut TcpStream,
-    message: &RingAttnMessage,
-) -> Result<usize, ProtocolError> {
-    let frame = serialize_message(message)?;
-    write_frame_to_stream(stream, &frame)
-}
-
-fn read_raw_message_frame(
-    stream: &mut TcpStream,
-) -> Result<(RingAttnMessage, usize), ProtocolError> {
-    let frame = read_frame_from_stream(stream)?;
-    Ok((deserialize_message(&frame)?, FRAME_LEN_BYTES + frame.len()))
 }
 
 fn push_remote_cp_route_preview(
@@ -2124,7 +2086,7 @@ fn write_message_frame(
     message: &RingAttnMessage,
     summary: &mut RemoteP2pSummary,
 ) -> Result<(), ProtocolError> {
-    let bytes = write_raw_message_frame(stream, message)?;
+    let bytes = stream.send_message(message)?;
     summary.messages_sent += 1;
     summary.bytes_sent += bytes;
     count_remote_message(summary, message);
@@ -2135,7 +2097,7 @@ fn read_message_frame(
     stream: &mut TcpStream,
     summary: &mut RemoteP2pSummary,
 ) -> Result<RingAttnMessage, ProtocolError> {
-    let (message, bytes_received) = read_raw_message_frame(stream)?;
+    let (message, bytes_received) = stream.recv_message()?;
     summary.messages_received += 1;
     summary.bytes_received += bytes_received;
     count_remote_message(summary, &message);
@@ -2377,6 +2339,60 @@ fn serialize_message(message: &RingAttnMessage) -> Result<Vec<u8>, ProtocolError
 fn deserialize_message(frame: &[u8]) -> Result<RingAttnMessage, ProtocolError> {
     bincode::deserialize(frame)
         .map_err(|e| ProtocolError::Serialize(e.to_string()))
+}
+
+// ====== 统一 Transport Trait ======
+// 将 protocol 层中所有"序列化 + 发送"和"接收 + 反序列化"的重复逻辑
+// 收敛到同一套接口。TcpStream、mpsc::channel 均可实现。
+
+/// 发送端：负责把 RingAttnMessage 序列化后发出，返回实际发出的字节数。
+pub trait MessageSender {
+    fn send_message(&mut self, message: &RingAttnMessage) -> Result<usize, ProtocolError>;
+}
+
+/// 接收端：负责接收 bytes 并反序列化为 RingAttnMessage，返回 (message, bytes_received)。
+pub trait MessageReceiver {
+    fn recv_message(&mut self) -> Result<(RingAttnMessage, usize), ProtocolError>;
+}
+
+impl MessageSender for TcpStream {
+    fn send_message(&mut self, message: &RingAttnMessage) -> Result<usize, ProtocolError> {
+        let frame = serialize_message(message)?;
+        write_frame_to_stream(self, &frame)
+    }
+}
+
+impl MessageReceiver for TcpStream {
+    fn recv_message(&mut self) -> Result<(RingAttnMessage, usize), ProtocolError> {
+        let frame = read_frame_from_stream(self)?;
+        let message = deserialize_message(&frame)?;
+        Ok((message, FRAME_LEN_BYTES + frame.len()))
+    }
+}
+
+impl MessageSender for Sender<Vec<u8>> {
+    fn send_message(&mut self, message: &RingAttnMessage) -> Result<usize, ProtocolError> {
+        let frame = serialize_message(message)?;
+        let len = frame.len();
+        self.send(frame).map_err(|error| ProtocolError::ChannelSend {
+            sender_domain: message.sender_domain.clone(),
+            receiver_domain: message.receiver_domain.clone(),
+            reason: error.to_string(),
+        })?;
+        Ok(len)
+    }
+}
+
+impl MessageReceiver for Receiver<Vec<u8>> {
+    fn recv_message(&mut self) -> Result<(RingAttnMessage, usize), ProtocolError> {
+        let frame = self.recv().map_err(|error| ProtocolError::ChannelRecv {
+            domain_id: "channel".to_string(),
+            reason: error.to_string(),
+        })?;
+        let len = frame.len();
+        let message = deserialize_message(&frame)?;
+        Ok((message, len))
+    }
 }
 
 fn validate_message(

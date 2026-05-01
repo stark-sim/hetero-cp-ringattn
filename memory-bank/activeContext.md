@@ -121,7 +121,7 @@
 - [ ] 扩展 correctness case，覆盖更大的 seq、更多 seed、float32 / mixed precision tolerance policy。
 - [ ] 必要时增加 `max_rel_err` 并明确 tolerance policy。
 - [ ] 将 Rust correctness model 继续拆分为 library + binary，便于后续 protocol / transport 复用。
-- [ ] 抽出统一 transport trait，收敛 `local_p2p_queue`、`cp_ring_node_runtime`、`tcp_remote_pair`、`tcp_remote_cp_node` 的共用 send/recv/frame 语义，并保持当前 message schema / report 字段稳定。
+- [x] [2026-04-30] 抽出统一 transport trait：`MessageSender` + `MessageReceiver` trait 定义在 protocol.rs 中；`TcpStream`、`mpsc::Sender<Vec<u8>>`、`mpsc::Receiver<Vec<u8>>` 均实现对应 trait；`cp_ring_node_smoke`、`run_remote_cp_node`、`run_remote_p2p_server/client` 全部迁移到新 trait；删除 `send_cp_node_frame`、`write_raw_message_frame`、`read_raw_message_frame` 等重复函数；18/18 测试通过，clippy 零警告，smoke 通过。
 - [x] [2026-05-01] Phase 2 Checkpoint 5 完成：`HcpRingAttentionBackend` 已接入真实推理路径；`LlamaModel` 支持 `num_domains` 切换（`--infer-num-domains` CLI 参数）；Qwen2-0.5B 验证 `num_domains=1/2/4` 输出一致。
 - [x] 外部权重加载：支持通过 `HCP_WEIGHTS_JSON` 环境变量从 JSON 文件加载 Q/K/V/O projection weights 和 LayerNorm gamma/beta；已验证本地 CPU/MPS smoke 均正常，checksum 随权重变化而变化。
 - [x] VPN 三节点 remote CP 验证：MPS + CUDA 异构 domain 通过 C++ bridge 与 tch bridge 全量 smoke；M5 远端闭环已完成。
