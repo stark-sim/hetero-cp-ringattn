@@ -1,5 +1,8 @@
 use crate::protocol::{DomainModelState, OnlineSoftmaxAccumulator, RingAttnMessage};
 
+#[cfg(feature = "tch-backend")]
+use tch::Tensor;
+
 pub trait ComputeRuntime {
     type Error: std::fmt::Display;
 
@@ -93,6 +96,7 @@ impl ComputeRuntime for TchComputeRuntime {
         accumulator: &mut OnlineSoftmaxAccumulator,
     ) -> Result<(), Self::Error> {
         use crate::protocol::RingAttnMessageKind;
+        use tch::Kind;
 
         if message.message_kind != RingAttnMessageKind::KvBlock {
             return Ok(());
@@ -100,17 +104,77 @@ impl ComputeRuntime for TchComputeRuntime {
         let (Some(block), Some(tensor)) = (&message.block, &message.tensor) else {
             return Ok(());
         };
-        crate::tch_backend::backend::compute_chunk_attention_step(
-            model_state.query_payload(),
-            &message.payload,
-            i32::try_from(block.block_len).unwrap_or(i32::MAX),
-            i32::try_from(model_state.query_len()).unwrap_or(i32::MAX),
-            i32::try_from(tensor.num_heads).unwrap_or(i32::MAX),
-            i32::try_from(tensor.head_dim).unwrap_or(i32::MAX),
-            &mut accumulator.running_max,
-            &mut accumulator.running_sum,
-            &mut accumulator.output_acc,
-        )
+
+        // ====== 从 bytes 重建 tch Tensor（inline 替代 compute_chunk_attention_step）======
+        let block_len = block.block_len as i64;
+        let query_len = model_state.query_len() as i64;
+        let num_heads = tensor.num_heads as i64;
+        let head_dim = tensor.head_dim as i64;
+        let device = tch::Device::Cpu;  // protocol 层当前使用 CPU tensor
+
+        // Q: 从 query_payload bytes 解析 f32，shape [query_len, num_heads, head_dim]
+        let q_values: Vec<f32> = model_state.query_payload()
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let q = Tensor::from_slice(&q_values)
+            .reshape([query_len, num_heads, head_dim])
+            .to(device)
+            .permute(&[1, 0, 2]);  // → [num_heads, query_len, head_dim]
+
+        // K/V: 从 message.payload bytes 解析，前一半是 K，后一半是 V
+        let kv_values: Vec<f32> = message.payload
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let kv = Tensor::from_slice(&kv_values)
+            .reshape([2, block_len, num_heads, head_dim]);
+        let k = kv.get(0).to(device).permute(&[1, 0, 2]);  // → [num_heads, block_len, head_dim]
+        let v = kv.get(1).to(device).permute(&[1, 0, 2]);  // → [num_heads, block_len, head_dim]
+
+        // Accumulator: 从 Vec<f32> 重建 tensor
+        let mut rm = Tensor::from_slice(&accumulator.running_max)
+            .reshape([num_heads, query_len])
+            .to(device);
+        let mut rs = Tensor::from_slice(&accumulator.running_sum)
+            .reshape([num_heads, query_len])
+            .to(device);
+        let mut obh = Tensor::from_slice(&accumulator.output_acc)
+            .reshape([num_heads, query_len, head_dim])
+            .to(device);
+
+        // Online softmax 计算（与 process_kv_block 数学等价）
+        let scale = 1.0 / (head_dim as f64).sqrt();
+        let scores = q.matmul(&k.transpose(1, 2)) * scale;
+        let (local_max, _) = scores.max_dim(2, false);
+        let weights = (&scores - local_max.unsqueeze(2)).exp();
+        let local_sum = weights.sum_dim_intlist(&[2i64][..], false, Kind::Float);
+        let local_pv = weights.matmul(&v);
+
+        let new_max = rm.max_other(&local_max);
+        let exp_prev = (&rm - &new_max).exp();
+        let exp_local = (&local_max - &new_max).exp();
+        let new_sum = &exp_prev * &rs + &exp_local * &local_sum;
+
+        obh = (&exp_prev.unsqueeze(2) * &rs.unsqueeze(2) * &obh
+            + &exp_local.unsqueeze(2) * &local_pv)
+            / &new_sum.unsqueeze(2);
+        rm = new_max;
+        rs = new_sum;
+
+        // 把结果写回 accumulator（D2H 拷贝）
+        let rm_vec: Vec<f32> = Vec::try_from(&rm.to(tch::Device::Cpu).contiguous().view(-1))
+            .map_err(|e| format!("failed to copy running_max: {e}"))?;
+        let rs_vec: Vec<f32> = Vec::try_from(&rs.to(tch::Device::Cpu).contiguous().view(-1))
+            .map_err(|e| format!("failed to copy running_sum: {e}"))?;
+        let obh_vec: Vec<f32> = Vec::try_from(&obh.to(tch::Device::Cpu).contiguous().view(-1))
+            .map_err(|e| format!("failed to copy output_acc: {e}"))?;
+
+        accumulator.running_max.copy_from_slice(&rm_vec);
+        accumulator.running_sum.copy_from_slice(&rs_vec);
+        accumulator.output_acc.copy_from_slice(&obh_vec);
+
+        Ok(())
     }
 
     fn finalize_output(

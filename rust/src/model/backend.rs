@@ -134,18 +134,21 @@ impl HcpRingAttentionBackend {
         rm: &mut Tensor,             // 【running max】当前见过的最大 score（可变的引用）
         rs: &mut Tensor,             // 【running sum】当前 softmax 分母的累加和
         obh: &mut Tensor,            // 【output buffer】当前加权累加的输出
+        apply_causal_mask: bool,     // 【是否应用因果掩码】true=因果路径, false=非因果路径
     ) {
         let kv_chunk_len = (kv_global_end - kv_global_start) as i64;
 
-        // ====== Early Return 优化 ======
-        // 如果 KV block 完全在当前 Q chunk 的"未来"，就跳过。
-        // 
+        // ====== Early Return 优化（仅因果路径）======
         // 因果 Attention 的规则：当前 token 只能看到自己和过去的 token，不能看到未来的 token。
         // 如果 kv_global_start >= q_global_end，说明这个 KV block 的所有位置都在 Q chunk 的右边，
         // 对当前 Q 来说全部是"未来"，应该被 mask 掉。直接 return 可以省掉一次矩阵乘法。
         // 
-        // 例如 Q=[8,12)，KV=[12,16)：12 >= 12，所以 KV block 对 Q=[8,12) 完全不可见，跳过。
-        if kv_chunk_len <= 0 || kv_global_start >= q_global_end {
+        // 非因果路径（如 protocol smoke）没有"未来"概念，所有 KV 都应该被处理，不能跳过。
+        if apply_causal_mask && (kv_chunk_len <= 0 || kv_global_start >= q_global_end) {
+            return;
+        }
+        // 非因果路径下，空 block 仍然跳过。
+        if kv_chunk_len <= 0 {
             return;
         }
 
@@ -157,47 +160,37 @@ impl HcpRingAttentionBackend {
         // k_chunk.transpose(2, 3) → [batch, num_heads, head_dim, kv_chunk_len]
         // matmul 结果 shape: [batch, num_heads, q_chunk_len, kv_chunk_len]
         // 最后乘 self.scale（即 1/sqrt(head_dim)）做缩放，防止数值过大导致 softmax 梯度消失。
-        let scores = q_chunk.matmul(&k_chunk.transpose(2, 3)) * self.scale;
+        let mut scores = q_chunk.matmul(&k_chunk.transpose(2, 3)) * self.scale;
 
-        // ====== 第二步：应用因果掩码（Causal Mask）======
         // 用全局位置构造因果掩码，确保当前 token 看不到未来的 token。
         // 
         // 原理：对于每个 query 位置 i 和 key 位置 j，如果 i >= j 则允许 attention，否则 mask 为 -inf。
         // 
         // q_pos: 当前 Q chunk 的全局位置，shape [1, 1, q_chunk_len, 1]
-        //   - arange_start(8, 12) → [8, 9, 10, 11]
-        //   - unsqueeze 三次把 shape 变成 [1, 1, 4, 1]，方便广播
-        // 
         // k_pos: 当前 K/V block 的全局位置，shape [1, 1, 1, kv_chunk_len]
-        //   - arange_start(0, 8) → [0, 1, 2, 3, 4, 5, 6, 7]
-        //   - unsqueeze 三次把 shape 变成 [1, 1, 1, 8]，方便广播
-        // 
         // causal = q_pos.ge_tensor(&k_pos): element-wise 比较，返回 bool tensor。
-        //   广播后 shape: [1, 1, q_chunk_len, kv_chunk_len]
-        //   例如 q=8, k=0..7: 8>=0 True, 8>=1 True, ... → 全部 True（全部可见）
-        //   例如 q=8, k=9: 8>=9 False → mask 掉
-        // 
         // masked_fill(&causal.logical_not(), NEG_INFINITY):
-        //   把 causal=False 的位置（即 query < key 的位置）填入负无穷。
-        //   负无穷经过 softmax 后权重变为 0，相当于"看不见"这些 key。
-        let q_pos = Tensor::arange_start(
-            q_global_start as i64,
-            q_global_end as i64,
-            (Kind::Int64, q_chunk.device()),
-        )
-        .unsqueeze(1)
-        .unsqueeze(0)
-        .unsqueeze(0);
-        let k_pos = Tensor::arange_start(
-            kv_global_start as i64,
-            kv_global_end as i64,
-            (Kind::Int64, q_chunk.device()),
-        )
-        .unsqueeze(0)
-        .unsqueeze(0)
-        .unsqueeze(0);
-        let causal = q_pos.ge_tensor(&k_pos);
-        let scores = scores.masked_fill(&causal.logical_not(), f64::NEG_INFINITY);
+        //   把 causal=False 的位置填入负无穷，softmax 后权重变为 0。
+        if apply_causal_mask {
+            let q_pos = Tensor::arange_start(
+                q_global_start as i64,
+                q_global_end as i64,
+                (Kind::Int64, q_chunk.device()),
+            )
+            .unsqueeze(1)
+            .unsqueeze(0)
+            .unsqueeze(0);
+            let k_pos = Tensor::arange_start(
+                kv_global_start as i64,
+                kv_global_end as i64,
+                (Kind::Int64, q_chunk.device()),
+            )
+            .unsqueeze(0)
+            .unsqueeze(0)
+            .unsqueeze(0);
+            let causal = q_pos.ge_tensor(&k_pos);
+            scores = scores.masked_fill(&causal.logical_not(), f64::NEG_INFINITY);
+        }
 
         // ====== 第三步：Online Softmax 更新 ======
         // Ring Attention 的核心技巧：不需要等所有 KV block 都处理完再算 softmax，
@@ -426,6 +419,7 @@ impl HcpRingAttentionBackend {
                         &k_chunk, &v_chunk,
                         global_seq_start + kv_start, global_seq_start + kv_end,
                         &mut rm, &mut rs, &mut obh,
+                        true,  // 因果路径
                     );
                 }
 
@@ -438,92 +432,62 @@ impl HcpRingAttentionBackend {
                         &peer_block.k, &peer_block.v,
                         peer_block.global_seq_start, peer_block.global_seq_end,
                         &mut rm, &mut rs, &mut obh,
+                        true,  // 因果路径
                     );
                 }
 
                 // 这个 Q chunk 的处理完成，obh 就是该 chunk 的 attention 输出。
                 outputs.push(obh); // shape: [batch, num_heads, q_chunk_len, head_dim]
             } else {
-                // ====== 非因果路径（协议 smoke 测试用）======
-                // 这条路径不使用 tensor 运算，而是把数据拷贝到 CPU buffer，
-                // 调用 Rust 原生函数 compute_chunk_attention_step 来计算。
-                // 主要用于验证跨语言（Rust ↔ C++）的数据格式兼容性。
-                let qh = (q_chunk_len * num_heads) as usize;
-                let mut running_max = vec![f32::NEG_INFINITY; qh];
-                let mut running_sum = vec![0.0_f32; qh];
-                let mut output_acc = vec![0.0_f32; qh * head_dim as usize];
+                // ====== 非因果路径（protocol smoke / 全可见 attention）======
+                // 非因果路径意味着每个 Q 都能看到所有 K/V（没有 causal mask）。
+                // 之前这里调用 C++ compute_chunk_attention_step（CPU buffer 方式），
+                // 现在改为和因果路径相同的纯 tch tensor online softmax，全程在设备上执行。
+                let mut rm = Tensor::full(
+                    &[batch, num_heads, q_chunk_len],
+                    f64::NEG_INFINITY,
+                    (Kind::Float, q.device()),
+                );
+                let mut rs = Tensor::zeros(&[batch, num_heads, q_chunk_len], (Kind::Float, q.device()));
+                let mut obh = Tensor::zeros(
+                    &[batch, num_heads, q_chunk_len, head_dim],
+                    (Kind::Float, q.device()),
+                );
 
+                // 非因果路径下，所有本地 KV 和 peer KV 都是可见的。
+                // global_seq_start 对 non-causal 没有实际意义（因为不用 causal mask），
+                // 但为了接口统一，传入 0。
                 for (kv_start, kv_end) in &kv_chunks {
                     let kv_chunk_len = (*kv_end - *kv_start) as i64;
-
                     let k_chunk = k.narrow(2, *kv_start as i64, kv_chunk_len);
                     let v_chunk = v.narrow(2, *kv_start as i64, kv_chunk_len);
-
-                    let q_payload = Self::tensor_to_q_payload(&q_chunk);
-                    let kv_payload = Self::tensor_to_kv_payload(&k_chunk, &v_chunk);
-
-                    crate::tch_backend::backend::compute_chunk_attention_step(
-                        &q_payload,
-                        &kv_payload,
-                        kv_chunk_len as i32,
-                        q_chunk_len as i32,
-                        num_heads as i32,
-                        head_dim as i32,
-                        &mut running_max,
-                        &mut running_sum,
-                        &mut output_acc,
-                    )
-                    .expect("compute_chunk_attention_step failed");
+                    self.process_kv_block(
+                        &q_chunk, 0, seq_len as usize,
+                        &k_chunk, &v_chunk,
+                        0, seq_len as usize,
+                        &mut rm, &mut rs, &mut obh,
+                        false,  // 非因果路径，不应用 causal mask
+                    );
                 }
 
-                let out_tensor = Tensor::from_slice(&output_acc)
-                    .reshape([num_heads as i64, q_chunk_len, head_dim])
-                    .permute(&[1, 0, 2])
-                    .unsqueeze(0)
-                    .to(q.device());
-                outputs.push(out_tensor);
+                for peer_block in &peer_blocks {
+                    self.process_kv_block(
+                        &q_chunk, 0, seq_len as usize,
+                        &peer_block.k, &peer_block.v,
+                        0, seq_len as usize,
+                        &mut rm, &mut rs, &mut obh,
+                        false,  // 非因果路径
+                    );
+                }
+
+                outputs.push(obh);
             }
         }
 
         // ====== 第五步：拼接所有 Q chunk 的输出 ======
-        // causal prefill 路径：outputs 里的每个 tensor shape 是 [batch, num_heads, q_chunk_len, head_dim]
+        // 无论因果还是非因果路径，每个 output 的 shape 都是 [batch, num_heads, q_chunk_len, head_dim]。
         // 在第 2 维（seq_len 维）上拼接，恢复完整的 seq_len。
-        if attention_mask.is_some() {
-            Tensor::cat(&outputs, 2)
-        } else {
-            // 非因果路径：输出维度顺序不同，需要 permute 调整。
-            Tensor::cat(&outputs, 1).permute(&[0, 2, 1, 3]).to(q.device())
-        }
-    }
-
-    /// Convert Q tensor to payload bytes: [query_len, num_heads, head_dim] row-major.
-    #[cfg(feature = "tch-backend")]
-    fn tensor_to_q_payload(q: &Tensor) -> Vec<u8> {
-        // q shape: [batch(1), num_heads, query_len, head_dim]
-        let q_perm = q.permute(&[0, 2, 1, 3]).contiguous(); // [batch, query_len, num_heads, head_dim]
-        let flat = q_perm.view(-1);
-        let values: Vec<f32> = Vec::try_from(&flat).unwrap();
-        values.iter().flat_map(|&v| v.to_le_bytes()).collect()
-    }
-
-    /// Convert K/V tensors to payload bytes: [2, block_len, num_heads, head_dim] row-major.
-    #[cfg(feature = "tch-backend")]
-    fn tensor_to_kv_payload(k: &Tensor, v: &Tensor) -> Vec<u8> {
-        // k/v shape: [batch(1), num_heads, block_len, head_dim]
-        let k_perm = k.permute(&[0, 2, 1, 3]).contiguous(); // [batch, block_len, num_heads, head_dim]
-        let v_perm = v.permute(&[0, 2, 1, 3]).contiguous();
-        let k_flat = k_perm.view(-1);
-        let v_flat = v_perm.view(-1);
-        let k_values: Vec<f32> = Vec::try_from(&k_flat).unwrap();
-        let v_values: Vec<f32> = Vec::try_from(&v_flat).unwrap();
-        let mut payload = Vec::with_capacity((k_values.len() + v_values.len()) * 4);
-        for &v in &k_values {
-            payload.extend_from_slice(&v.to_le_bytes());
-        }
-        for &v in &v_values {
-            payload.extend_from_slice(&v.to_le_bytes());
-        }
-        payload
+        Tensor::cat(&outputs, 2)
     }
 
     /// Standard local attention for short sequences or single-token decode.
@@ -659,6 +623,7 @@ impl AttentionBackend for HcpRingAttentionBackend {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "tch-backend")]
     fn create_test_attention(device: tch::Device) -> super::super::layers::GqaAttention {
         let hidden_size = 64i64;
         let num_heads = 8usize;
@@ -682,6 +647,7 @@ mod tests {
     }
 
     /// Create a causal mask for local attention testing.
+    #[cfg(feature = "tch-backend")]
     fn make_causal_mask(seq_len: i64, device: tch::Device) -> Tensor {
         let mask = Tensor::ones(&[seq_len, seq_len], (Kind::Float, device))
             .triu(1)
@@ -692,6 +658,10 @@ mod tests {
             .unsqueeze(0)
     }
 
+    /// 【验证 process_kv_block 非因果模式与标准 softmax 等价】
+    ///
+    /// 这个测试验证：当 apply_causal_mask=false 时，process_kv_block 的 online softmax
+    /// 输出与直接 softmax(QK^T/sqrt(d))V 完全一致。
     #[test]
     #[cfg(feature = "tch-backend")]
     fn test_chunk_step_vs_softmax_single_block() {
@@ -706,31 +676,53 @@ mod tests {
         let k = Tensor::randn(&[1, num_heads, block_len, head_dim], (Kind::Float, device));
         let v = Tensor::randn(&[1, num_heads, block_len, head_dim], (Kind::Float, device));
 
-        // Local attention
+        // 标准 softmax attention（参考值）
         let scale = 1.0 / (head_dim as f64).sqrt();
         let scores = q.matmul(&k.transpose(2, 3)) * scale;
         let attn = scores.softmax(-1, Kind::Float);
         let expected = attn.matmul(&v);
 
-        // Chunk attention step
-        let q_payload = HcpRingAttentionBackend::tensor_to_q_payload(&q);
-        let kv_payload = HcpRingAttentionBackend::tensor_to_kv_payload(&k, &v);
+        // 用 process_kv_block（非因果模式）计算
+        let rope = super::super::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
+        let backend = HcpRingAttentionBackend {
+            q_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
+            k_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
+            v_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
+            o_proj: Tensor::randn(&[1, 1], (Kind::Float, device)),
+            q_bias: None, k_bias: None, v_bias: None,
+            rope,
+            num_heads: num_heads as usize,
+            num_kv_heads: num_heads as usize,
+            head_dim: head_dim as usize,
+            scale,
+            num_domains: 1,
+            layer_idx: 0,
+            kv_transport: None,
+            local_domain_id: 0,
+        };
 
-        println!("q_payload len={}, kv_payload len={}", q_payload.len(), kv_payload.len());
+        let mut rm = Tensor::full(
+            &[1i64, num_heads, query_len],
+            f64::NEG_INFINITY,
+            (Kind::Float, device),
+        );
+        let mut rs = Tensor::zeros(&[1i64, num_heads, query_len], (Kind::Float, device));
+        let mut obh = Tensor::zeros(
+            &[1i64, num_heads, query_len, head_dim],
+            (Kind::Float, device),
+        );
 
-        let mut running_max = vec![f32::NEG_INFINITY; (query_len * num_heads) as usize];
-        let mut running_sum = vec![0.0_f32; (query_len * num_heads) as usize];
-        let mut output_acc = vec![0.0_f32; (query_len * num_heads * head_dim) as usize];
+        // 非因果模式：所有 Q 都能看到所有 K/V
+        backend.process_kv_block(
+            &q, 0, query_len as usize,
+            &k, &v,
+            0, block_len as usize,
+            &mut rm, &mut rs, &mut obh,
+            false,
+        );
 
-        crate::tch_backend::backend::compute_chunk_attention_step(
-            &q_payload, &kv_payload,
-            block_len as i32, query_len as i32, num_heads as i32, head_dim as i32,
-            &mut running_max, &mut running_sum, &mut output_acc,
-        ).unwrap();
-
-        let actual = Tensor::from_slice(&output_acc)
-            .reshape([num_heads, query_len, head_dim])
-            .unsqueeze(0);
+        // obh 形状: [1, num_heads, query_len, head_dim]
+        let actual = obh;
 
         let diff = (&expected - &actual).abs().mean(Kind::Float);
         let diff_val: f64 = diff.double_value(&[]);

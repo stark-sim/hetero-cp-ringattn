@@ -100,7 +100,7 @@
 - [x] [2026-05-01] `test_ring_attention_with_mock_transport` 通过：2-domain distributed causal attention diff=3.6e-8，验证 `HcpRingAttentionBackend` + `MockKvTransport` 的 distributed ring attention 数学正确性。
 - [x] [2026-05-01] Phase 3 Step 3-5 完成：修复 `LinkedMockKvTransport` 自环 bug（`peer_inbox`/`self_inbox` 分离，send 写入对方队列、recv 从自己的队列读取）；修复测试代码 transport 覆盖 bug（`setup_distributed_domain` 循环调用导致所有 layer 共享最后一对 transport，改为预创建每层独立 transport pair）；`test_distributed_llama_model_prefill` 端到端分布式 prefill 通过（2-layer、GQA、seq_len=16 拆成 2 domain），diff=2.79e-6；为 `kv_transport.rs`、`backend.rs`（forward/ring_attention/process_kv_block）、`model.rs`（测试）补充详细中文注释。
 - [ ] M2：Rust online softmax correctness report 与 tolerance policy 扩展。
-- [ ] M3-tch：将 Ring Attention block update 迁移到 `tch-backend`，与 C++ ATen bridge 并行存在。
+- [x] [2026-04-30] M3-tch：`backend.rs` `ring_attention` 统一使用 `process_kv_block` 纯 tensor online softmax，已删除 `compute_chunk_attention_step` 与未使用的 payload 辅助函数；compute 路径已完全内联 tensor 实现。
 - [ ] M3：抽出统一 transport trait，减少 local queue / TCP pair / TCP CP node 的重复 frame 与 metrics 逻辑。
 - [ ] M4：heterogeneous runtime stubs 与配置 / 环境纪律。
 - [x] M5：将 deterministic projection weights 升级为真实权重加载 / layer config，并接入 RoPE、norm/residual 与完整 layer lifecycle。
