@@ -2122,8 +2122,7 @@ fn write_message_frame(
     message: &RingAttnMessage,
     summary: &mut RemoteP2pSummary,
 ) -> Result<(), ProtocolError> {
-    let frame = serialize_message(message)?;
-    let bytes = write_frame_to_stream(stream, &frame)?;
+    let bytes = write_raw_message_frame(stream, message)?;
     summary.messages_sent += 1;
     summary.bytes_sent += bytes;
     count_remote_message(summary, message);
@@ -2134,10 +2133,9 @@ fn read_message_frame(
     stream: &mut TcpStream,
     summary: &mut RemoteP2pSummary,
 ) -> Result<RingAttnMessage, ProtocolError> {
-    let frame = read_frame_from_stream(stream)?;
-    let message = deserialize_message(&frame)?;
+    let (message, bytes_received) = read_raw_message_frame(stream)?;
     summary.messages_received += 1;
-    summary.bytes_received += FRAME_LEN_BYTES + frame.len();
+    summary.bytes_received += bytes_received;
     count_remote_message(summary, &message);
     Ok(message)
 }
