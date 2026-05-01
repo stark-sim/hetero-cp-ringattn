@@ -94,6 +94,10 @@
 - [x] [2026-05-01] 修复 `test_chunk_step_vs_softmax_single_block` 中 `actual` tensor 形状构造错误（`permute` 导致 num_heads 与 query_len 维度交换）。
 - [x] [2026-05-01] 修复 `ring_attention` 中 causal mask 未传递给 `compute_chunk_attention_step` 的问题：当 `attention_mask.is_some()` 时，直接使用已 mask 的 `scores` 做 online softmax 更新，而非调用无 mask 的 `compute_chunk_attention_step`。
 - [x] [2026-05-01] Phase 2 Checkpoint 5: `HcpRingAttentionBackend` 已接入真实推理路径；`LlamaModel::from_weights` 根据 `num_domains` 选择 `LocalAttentionBackend`（默认）或 `HcpRingAttentionBackend`；新增 `--infer-num-domains` CLI 参数；Qwen2-0.5B 在 `num_domains=1/2/4` 下 greedy decode 输出完全一致。
+- [x] [2026-05-01] Phase 3 Step 1: `KvTransport` trait 与 `KvBlock` 结构体创建；`MockKvTransport` 支持单元测试中的 in-memory KV block 交换。
+- [x] [2026-05-01] Phase 3 Step 2: `HcpRingAttentionBackend` 集成 `KvTransport`；`send_local_kv` 发送本地 KV block；`process_peer_block` 接收 peer KV 并参与 online softmax；`global_seq_start` 参数确保 distributed causal mask 使用全局位置。
+- [x] [2026-05-01] 修复 `ring_attention` distributed path bug：peer KV blocks 应在 Q chunk 循环外预先接收并缓存，供所有 Q chunks 复用；原实现在每个 Q chunk 迭代中单独 `recv_kv_block`，导致多 chunk 场景下后续 chunks 收不到 peer KV。
+- [x] [2026-05-01] `test_ring_attention_with_mock_transport` 通过：2-domain distributed causal attention diff=3.6e-8，验证 `HcpRingAttentionBackend` + `MockKvTransport` 的 distributed ring attention 数学正确性。
 - [ ] M2：Rust online softmax correctness report 与 tolerance policy 扩展。
 - [ ] M3-tch：将 Ring Attention block update 迁移到 `tch-backend`，与 C++ ATen bridge 并行存在。
 - [ ] M3：抽出统一 transport trait，减少 local queue / TCP pair / TCP CP node 的重复 frame 与 metrics 逻辑。

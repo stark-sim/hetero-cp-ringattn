@@ -126,6 +126,8 @@
 - [x] 外部权重加载：支持通过 `HCP_WEIGHTS_JSON` 环境变量从 JSON 文件加载 Q/K/V/O projection weights 和 LayerNorm gamma/beta；已验证本地 CPU/MPS smoke 均正常，checksum 随权重变化而变化。
 - [x] VPN 三节点 remote CP 验证：MPS + CUDA 异构 domain 通过 C++ bridge 与 tch bridge 全量 smoke；M5 远端闭环已完成。
 - [x] 引入 optional `tch = 0.24.0` 并实现 `tch_smoke`（CPU/MPS 均已通过）。
+- [x] [2026-05-01] Phase 3 Step 1 完成：`KvTransport` trait 与 `KvBlock` 创建；`MockKvTransport` 支持 in-memory 测试。
+- [x] [2026-05-01] Phase 3 Step 2 完成：`HcpRingAttentionBackend` 集成 `KvTransport`；`send_local_kv` + `process_peer_block` 实现 distributed ring attention；`global_seq_start` 参数确保 causal mask 使用全局位置；`test_ring_attention_with_mock_transport` diff=3.6e-8 通过。
 - [ ] 迁移 Ring Attention block update 到 `tch-backend`，与现有 C++ ATen bridge 并行。
 - [ ] 为 `RingAttnMessage` 设计 serialization / deserialization。
 
