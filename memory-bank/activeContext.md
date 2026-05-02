@@ -2,16 +2,20 @@
 
 ## 当前焦点
 
-[2026-05-01] Phase B 已完成：分布式 decode 路径打通。核心修改包括：
+[2026-05-01] Phase B/B+ 已完成：分布式 decode 路径打通，端到端 diff 已修复。核心修改包括：
 1. 移除 `seq_len <= 1` 回退，decode 阶段走完整 `ring_attention` 路径
 2. `seq_offset` 传入 `AttentionBackend::set_distributed`，`forward` 使用固定 `seq_offset` 代替 `position_ids.min()`
 3. decode 阶段发送 KV 时排除新 append 的 token，避免 ring 中重复
 4. `kv_chunks` 改用本地 KV 长度而非 Q 的 `seq_len`
 5. `LlamaModel::global_seq_len` 保证 decode position_ids 正确
+6. 修复 `global_seq_len` 被设为本地 `seq_len` 的 bug（domain0=8 而非 16）
+7. 引入 `prefill_kv_len` 字段，多步 decode 时只发送 prefill 分区，防止 peer KV 重复
 
-新增 4 个单元测试（23/23 通过）。`test_distributed_llama_model_decode` 验证 domain0/domain1 输出一致（diff < 1e-6），但端到端与单节点参考有 ~6 的 diff，根因待查。
+新增/扩展 6 个单元测试（25/25 通过）：
+- `test_tcp_kv_transport_roundtrip`：TCP 序列化精度无损（k_diff=0, v_diff=0）
+- `test_distributed_llama_model_multi_step_decode`：4 步连续 decode，每步 diff ~2e-6
 
-当前阻塞：端到端 decode 与单节点参考的 diff 根因未定位。`ring_attention` 数学本身已验证正确（`test_ring_attention_decode_with_peer_kv` diff < 3e-8），问题可能在非 contiguous KV cache 的 chunk 全局位置标注或 layer 间交互。
+当前无阻塞。
 
 ## 近期变化
 
@@ -147,6 +151,7 @@
 - [x] [2026-04-30] 明确 HCP 与 PyTorch 官方 Context Parallel 的边界：HCP 采用原始 Ring Attention 论文的 P2P 设计，支持异构/非均分；PyTorch 2.7+ CP 是同构 GPU 集群的 collective 优化。已记录于 `systemPatterns.md`。
 - [x] [2026-05-01] Phase B 完成：分布式 decode 路径打通。`seq_len <= 1` 回退已移除；`seq_offset` 传入 `set_distributed`；decode 阶段发送 KV 排除新 token；`kv_chunks` 改用本地 KV 长度；`global_seq_len` 保证 decode position 正确。新增 4 个单元测试，23/23 通过，clippy 零警告。
 - [x] [2026-05-01] Phase B+ 完成：修复端到端 distributed decode ~6 diff。根因是 `LlamaModel::forward` prefill 阶段 `global_seq_len` 被错误设为本地 `seq_len`（domain0=8），导致 decode 时 RoPE 应用了错误位置（8 而非 16）。修复后 diff 从 6.7 降至 ~2e-6，与单节点参考一致。
+- [x] [2026-05-01] Phase B++ 完成：A) `test_tcp_kv_transport_roundtrip` 验证 TCP 序列化无损（diff=0）；B) `test_distributed_llama_model_multi_step_decode` 验证 4 步连续分布式 decode，每步 diff ~2e-6。修复多步 decode 根因：`history_len = k.size()[2] - 1` 在多步时会包含之前 decode append 的 token，引入 `prefill_kv_len` 字段确保只发送 prefill 分区。
 - [ ] 为 `RingAttnMessage` 设计 serialization / deserialization。
 
 ## 重要模式与偏好

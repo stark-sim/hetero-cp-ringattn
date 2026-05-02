@@ -498,4 +498,116 @@ mod tests {
             diff01
         );
     }
+
+    /// 【多步分布式 decode 端到端测试】
+    ///
+    /// 验证 prefill 后连续生成多个 token，每一步分布式模型都与单节点参考一致。
+    /// 这是 `test_distributed_llama_model_decode` 的自然延伸：单步对 ≠ 多步对，
+    /// 因为 KV cache 和 position_ids 会在每一步累积和变化。
+    #[test]
+    fn test_distributed_llama_model_multi_step_decode() {
+        let device = Device::Cpu;
+
+        let config = ModelConfig {
+            architectures: Some(vec!["LlamaForCausalLM".to_string()]),
+            hidden_size: 32,
+            num_layers: 2,
+            num_heads: 4,
+            num_kv_heads: Some(1),
+            intermediate_size: 64,
+            vocab_size: 100,
+            rope_theta: 10000.0,
+            rms_norm_eps: 1e-6,
+            tie_word_embeddings: false,
+            torch_dtype: Some("float32".to_string()),
+            hidden_act: "silu".to_string(),
+            max_position_embeddings: Some(128),
+            attention_dropout: 0.0,
+            bos_token_id: None,
+            eos_token_id: None,
+            use_cache: true,
+            sliding_window: None,
+            use_sliding_window: None,
+            partial_rotary_factor: 1.0,
+        };
+
+        let weights = create_synthetic_weights(&config, device);
+
+        let mut ref_model = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+        let mut ring_ref = LlamaModel::from_weights(config.clone(), &weights, device, 2).unwrap();
+        let mut domain0 = LlamaModel::from_weights(config.clone(), &weights, device, 2).unwrap();
+        let mut domain1 = LlamaModel::from_weights(config.clone(), &weights, device, 2).unwrap();
+
+        let num_layers = config.num_layers;
+        let mut transports0 = Vec::with_capacity(num_layers);
+        let mut transports1 = Vec::with_capacity(num_layers);
+        for _ in 0..num_layers {
+            let (t0, t1) = crate::model::kv_transport::LinkedMockKvTransport::create_pair();
+            transports0.push(t0);
+            transports1.push(t1);
+        }
+        ring_ref.setup_distributed_domain(0, 0, |_layer_idx| None::<Box<dyn crate::model::KvTransport>>);
+        domain0.setup_distributed_domain(0, 0, |layer_idx| Some(Box::new(transports0[layer_idx].clone())));
+        domain1.setup_distributed_domain(1, 8, |layer_idx| Some(Box::new(transports1[layer_idx].clone())));
+
+        let seq_len = 16i64;
+        let half = seq_len / 2;
+        let input_ids = Tensor::arange(seq_len, (Kind::Int64, device)).unsqueeze(0);
+
+        // Prefill all models
+        let mut ref_caches = ref_model.create_kv_caches();
+        let ref_logits = ref_model.forward(&input_ids, &mut ref_caches).unwrap();
+
+        let mut ring_ref_caches = ring_ref.create_kv_caches();
+        let _ = ring_ref.forward(&input_ids, &mut ring_ref_caches).unwrap();
+
+        let input_ids0 = input_ids.narrow(1, 0, half);
+        let mut caches0 = domain0.create_kv_caches();
+        let _ = domain0.forward(&input_ids0, &mut caches0).unwrap();
+
+        let input_ids1 = input_ids.narrow(1, half, half);
+        let mut caches1 = domain1.create_kv_caches();
+        let _ = domain1.forward(&input_ids1, &mut caches1).unwrap();
+
+        // Synchronize global_seq_len for decode
+        let global_prompt_len = domain1.global_seq_len;
+        domain0.global_seq_len = global_prompt_len;
+
+        // Sample first token from ref prefill output
+        let mut next_token = ref_logits.narrow(1, seq_len - 1, 1).squeeze()
+            .argmax(-1, false).int64_value(&[]) as i64;
+        println!("multi-step decode first_token = {}", next_token);
+
+        const DECODE_TOL: f64 = 1e-3;
+        const NUM_DECODE_STEPS: usize = 4;
+
+        for step in 0..NUM_DECODE_STEPS {
+            let decode_input = Tensor::from_slice(&[next_token])
+                .unsqueeze(0)
+                .to_device(device);
+
+            let ref_decode_logits = ref_model.forward(&decode_input, &mut ref_caches).unwrap();
+            let ring_ref_decode_logits = ring_ref.forward(&decode_input, &mut ring_ref_caches).unwrap();
+            let decode_logits0 = domain0.forward(&decode_input, &mut caches0).unwrap();
+            let decode_logits1 = domain1.forward(&decode_input, &mut caches1).unwrap();
+
+            let diff_ring = (&ref_decode_logits - &ring_ref_decode_logits).abs().mean(Kind::Float).double_value(&[]);
+            let diff0 = (&ref_decode_logits - &decode_logits0).abs().mean(Kind::Float).double_value(&[]);
+            let diff1 = (&ref_decode_logits - &decode_logits1).abs().mean(Kind::Float).double_value(&[]);
+            let diff01 = (&decode_logits0 - &decode_logits1).abs().mean(Kind::Float).double_value(&[]);
+
+            println!(
+                "step {} diff ring={:.2e} ref0={:.2e} ref1={:.2e} d01={:.2e}",
+                step, diff_ring, diff0, diff1, diff01
+            );
+
+            assert!(diff_ring < DECODE_TOL, "step {} ring_ref diff too large: {}", step, diff_ring);
+            assert!(diff0 < DECODE_TOL, "step {} domain0 diff too large: {}", step, diff0);
+            assert!(diff1 < DECODE_TOL, "step {} domain1 diff too large: {}", step, diff1);
+            assert!(diff01 < DECODE_TOL, "step {} domain0-vs-domain1 diff too large: {}", step, diff01);
+
+            // Sample next token from ref for the following step
+            next_token = ref_decode_logits.squeeze().argmax(-1, false).int64_value(&[]) as i64;
+        }
+    }
 }

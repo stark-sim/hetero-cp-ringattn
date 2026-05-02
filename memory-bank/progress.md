@@ -110,6 +110,8 @@
 - [x] M5：将 deterministic projection weights 升级为真实权重加载 / layer config，并接入 RoPE、norm/residual 与完整 layer lifecycle。
 - [x] [2026-05-01] **Phase B: 分布式 decode 路径打通**：`seq_len <= 1` 回退已移除，decode 阶段走完整 `ring_attention` 路径；`seq_offset` 传入 `AttentionBackend::set_distributed`，`forward` 使用固定 `seq_offset` 代替 `position_ids.min()` 计算 `global_seq_start`；decode 阶段发送 KV 时排除新 append 的 token，避免 ring 中重复；`kv_chunks` 改用本地 KV 长度而非 Q 的 `seq_len`；新增 `LlamaModel::global_seq_len` 保证 decode position_ids 正确。新增 4 个单元测试验证 decode 路径数学正确性；23/23 测试通过，clippy 零警告。
 - [x] [2026-05-01] **修复分布式 decode ~6 diff 根因**：`LlamaModel::forward` 中 prefill 阶段错误地将 `global_seq_len` 设为本地 `seq_len`（domain0=8），导致 decode 时 `position_ids=8` 而非正确的全局位置 16。RoPE 因此应用了错误旋转角度，产生 ~6.7 的系统偏差。修复：prefill 时 `global_seq_len = seq_offset + seq_len`；测试中 prefill 后同步 `domain0.global_seq_len = domain1.global_seq_len`。修复后 diff 从 6.7 降至 ~2e-6，与单节点参考一致；23/23 测试通过，clippy 零警告。
+- [x] [2026-05-01] **TcpKvTransport 精度验证**：新增 `test_tcp_kv_transport_roundtrip`，通过本地 loopback 发送/接收 KV block，验证 float32 原始字节传输后 tensor 值完全一致（k_diff=0, v_diff=0）。
+- [x] [2026-05-01] **多步分布式 decode 验证**：新增 `test_distributed_llama_model_multi_step_decode`，prefill 后连续 4 步 decode，每步 domain0/domain1 与单节点参考 diff 均 ~2e-6。修复多步 decode 根因：`history_len = k.size()[2] - 1` 在多步时会包含之前 decode 步骤 append 的 token，导致 peer 收到重复 KV。引入 `HcpRingAttentionBackend::prefill_kv_len` 字段，decode 阶段只发送 prefill 分区。25/25 测试通过，clippy 零警告。
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 
 ## 已知问题

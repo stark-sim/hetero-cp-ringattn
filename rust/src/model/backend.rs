@@ -78,6 +78,9 @@ pub struct HcpRingAttentionBackend {
     #[allow(dead_code)]
     local_domain_id: usize,
     seq_offset: usize,
+    /// Length of KV cache produced during prefill. In decode phase we only send
+    /// the prefill partition (not decode-appended tokens) to peers.
+    prefill_kv_len: usize,
 }
 
 #[cfg(feature = "tch-backend")]
@@ -110,6 +113,7 @@ impl HcpRingAttentionBackend {
             kv_transport: None,
             local_domain_id: 0,
             seq_offset: 0,
+            prefill_kv_len: 0,
         })
     }
 
@@ -313,17 +317,19 @@ impl HcpRingAttentionBackend {
         // 发送完成后，我们继续处理本地 KV；对方在收到后会把这些 KV 作为 peer blocks 处理。
         //
         // 【decode 阶段特殊处理】seq_len == 1 时，所有节点都计算并 append 了新 token 的 K/V。
-        // 如果发送完整 KV（含新 token），ring 传递后每个节点会收到重复的新 token K/V。
-        // 因此 decode 阶段只发送【历史 KV】（排除最后 append 的新 token），
-        // 新 token 的 K/V 由每个节点本地持有，不通过 ring 传递。
+        // 在多步 decode 中，如果发送 "k.size()[2] - 1"，会把之前 decode 步骤 append 的 token
+        // 也发送给 peer，导致 peer 收到重复的 KV（peer 本地也计算了同一个 token 的 K/V）。
+        // 正确做法：每个节点只发送自己在 prefill 阶段负责的 KV 分区。
+        // prefill 分区的长度记录在 self.prefill_kv_len 中，decode 阶段保持不变。
+        // 新 token 的 K/V 完全由每个节点本地持有，不通过 ring 传递。
         if let Some(ref mut transport) = self.kv_transport {
             let (k_to_send, v_to_send, send_seq_end) = if seq_len == 1 {
-                // decode: 排除最后一个 token（新 append 的）
-                let history_len = k.size()[2] - 1;
+                // decode: 只发送 prefill 阶段产生的 KV 分区
+                let history_len = self.prefill_kv_len as i64;
                 (
                     k.narrow(2, 0, history_len),
                     v.narrow(2, 0, history_len),
-                    global_seq_start + history_len as usize,
+                    global_seq_start + self.prefill_kv_len,
                 )
             } else {
                 // prefill: 发送完整 KV
@@ -611,6 +617,12 @@ impl AttentionBackend for HcpRingAttentionBackend {
             (k.shallow_clone(), v.shallow_clone())
         };
 
+        // 记录 prefill 阶段的 KV 长度。decode 阶段发送 peer KV 时，
+        // 只发送 prefill 分区，不包含 decode 阶段 append 的新 token。
+        if seq_len > 1 {
+            self.prefill_kv_len = k.size()[2] as usize;
+        }
+
         // ====== 第五步：GQA 头重复 ======
         // GQA（Group Query Attention）是一种节省显存的技术：
         // - 标准 MHA：num_kv_heads == num_heads（每个 query head 对应一个 key/value head）
@@ -747,6 +759,7 @@ mod tests {
             kv_transport: None,
             local_domain_id: 0,
             seq_offset: 0,
+            prefill_kv_len: 0,
         };
 
         let mut rm = Tensor::full(
@@ -834,6 +847,7 @@ mod tests {
             kv_transport: None,
             local_domain_id: 0,
             seq_offset: 0,
+            prefill_kv_len: 0,
         };
 
         let actual = backend.ring_attention(&q, &k, &v, None, 0);
@@ -884,6 +898,7 @@ mod tests {
             kv_transport: None,
             local_domain_id: 0,
             seq_offset: 0,
+            prefill_kv_len: 0,
         };
 
         let actual = backend.ring_attention(&q, &k, &v, Some(&mask), 0);
@@ -932,6 +947,7 @@ mod tests {
             kv_transport: None,
             local_domain_id: 0,
             seq_offset: 0,
+            prefill_kv_len: 0,
         };
 
         // Without transport, ring_attention processes only local KV.
@@ -1014,6 +1030,7 @@ mod tests {
             kv_transport: Some(Box::new(transport0)),
             local_domain_id: 0,
             seq_offset: 0,
+            prefill_kv_len: 0,
         };
         let out0 = backend0.ring_attention(&q_all, &k0_local, &v0_local, None, 0);
 
@@ -1043,6 +1060,7 @@ mod tests {
             kv_transport: Some(Box::new(transport1)),
             local_domain_id: 1,
             seq_offset: half as usize,
+            prefill_kv_len: 0,
         };
         let out1 = backend1.ring_attention(&q_all, &k1_local, &v1_local, None, half as usize);
 
@@ -1107,6 +1125,7 @@ mod tests {
             kv_transport: None,
             local_domain_id: 0,
             seq_offset: 0,
+            prefill_kv_len: 0,
         };
 
         // hidden states for decode step
@@ -1193,6 +1212,7 @@ mod tests {
             kv_transport: Some(Box::new(transport0)),
             local_domain_id: 0,
             seq_offset: 0,
+            prefill_kv_len: 0,
         };
         let out0 = backend0.ring_attention(&q0, &k0, &v0, Some(&mask), 0);
 
@@ -1222,6 +1242,7 @@ mod tests {
             kv_transport: Some(Box::new(transport1)),
             local_domain_id: 1,
             seq_offset: half as usize,
+            prefill_kv_len: 0,
         };
         let out1 = backend1.ring_attention(&q1, &k1, &v1, Some(&mask), half as usize);
 
