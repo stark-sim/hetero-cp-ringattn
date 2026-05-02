@@ -408,7 +408,14 @@ impl GqaAttention {
         if n_rep == 1 {
             return x.shallow_clone();
         }
-        x.repeat([1, n_rep as i64, 1, 1])
+        let shape = x.size();
+        let batch = shape[0];
+        let num_kv_heads = shape[1];
+        let slen = shape[2];
+        let head_dim = shape[3];
+        x.unsqueeze(2)
+            .expand([batch, num_kv_heads, n_rep as i64, slen, head_dim], false)
+            .reshape([batch, num_kv_heads * n_rep as i64, slen, head_dim])
     }
 }
 

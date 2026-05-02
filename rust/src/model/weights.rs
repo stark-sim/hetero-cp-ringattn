@@ -328,5 +328,12 @@ mod tests {
         let q_bias_data: Vec<f32> = q_bias.view(-1).try_into().expect("q_bias");
         assert!((q_bias_data[0] - 0.0668945).abs() < 1e-4, "q_bias[0] mismatch: got {}", q_bias_data[0]);
         assert!((q_bias_data[1] + 0.0859375).abs() < 1e-4, "q_bias[1] mismatch: got {}", q_bias_data[1]);
+
+        // Check o_proj.weight for layer 0
+        let o_proj = weights.get("model.layers.0.self_attn.o_proj.weight").expect("get o_proj");
+        let o_proj_data: Vec<f32> = o_proj.get(0).view(-1).try_into().expect("o_proj row 0");
+        assert!((o_proj_data[0] - 0.00744629).abs() < 1e-4, "o_proj[0,0] mismatch: got {}", o_proj_data[0]);
+        assert!((o_proj_data[1] + 0.00055313).abs() < 1e-4, "o_proj[0,1] mismatch: got {}", o_proj_data[1]);
+        assert!((o_proj_data[6] + 0.01135254).abs() < 1e-4, "o_proj[0,6] mismatch: got {}", o_proj_data[6]);
     }
 }

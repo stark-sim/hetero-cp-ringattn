@@ -7,7 +7,24 @@ use std::path::Path;
 pub fn run_inference(model_dir: &str, prompt: &str, max_tokens: usize, temperature: f64, top_p: f64, num_domains: usize) -> Result<String, String> {
     use tch::Device;
 
-    let device = if cfg!(target_os = "macos") && tch::utils::has_mps() {
+    let device = if let Ok(name) = std::env::var("HCP_TORCH_DEVICE").or_else(|_| std::env::var("HCP_TCH_DEVICE")) {
+        match name.as_str() {
+            "cpu" => Device::Cpu,
+            "mps" => Device::Mps,
+            "cuda" => Device::Cuda(0),
+            _ => {
+                if let Some(idx) = name.strip_prefix("cuda:") {
+                    if let Ok(i) = idx.parse::<usize>() {
+                        Device::Cuda(i)
+                    } else {
+                        Device::Cpu
+                    }
+                } else {
+                    Device::Cpu
+                }
+            }
+        }
+    } else if cfg!(target_os = "macos") && tch::utils::has_mps() {
         Device::Mps
     } else if tch::Cuda::is_available() {
         Device::Cuda(0)
