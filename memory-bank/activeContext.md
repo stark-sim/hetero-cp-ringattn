@@ -169,4 +169,5 @@
 - [2026-04-24] 后续所有 Metal/MPS 相关验证必须在非沙箱/授权进程中运行；默认沙箱结果不能作为 MPS 不可用结论。
 - [2026-04-25] GPU 端 `CARGO_OFFLINE=1` 失败且提示 `no matching package named serde_json found` 时，优先判定为 Cargo registry cache miss，不是 CUDA/libtorch 问题。
 - [2026-05-01] Qwen2-0.5B 推理输出已与 Python transformers 完全一致（greedy decode `" I am a 20 year old girl from"`）；temperature/top-p 采样已接入（`--infer-top-p` CLI），可作为后续优化方向。
+- [2026-05-01] **CUDA 推理验证通过**：远端 GPU 节点 (`sd-1`) 使用 `cuda:1` 运行 greedy decode，输出与本地 CPU/MPS 完全一致（`" I am a 20 year old girl from"` / `" The capital of France is Paris."`）；`HCP_TORCH_DEVICE=cuda:1` 环境变量被正确解析。GPU 0 存在显存残留（15.3GB/16GB 被占，无活跃进程），推理需使用 `cuda:1/2/3`。
 - [2026-04-30] **修复 GQA `repeat_kv` 关键 bug**：Rust 原实现使用 `x.repeat([1, n_rep, 1, 1])`，将整组 KV head 循环重复（如 [A,B,A,B,A,B]），而 Python transformers 的 `repeat_kv` 是每个 head 连续重复 n_rep 次（如 [A,A,A,B,B,B]）。这导致 query head 与 key/value head 的对应关系完全错乱，是推理 logits 与 Python 完全不同的根因。修复后改用 `unsqueeze(2).expand(...).reshape(...)`，与 Python 语义一致。修复后 Qwen2-0.5B greedy decode 输出与 Python transformers 完全一致（`" I am a 20 year old girl from"`），CPU 和 MPS 均验证通过；19/19 单元测试通过，clippy 零警告。
