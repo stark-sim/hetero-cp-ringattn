@@ -125,7 +125,10 @@
   - **本地 2-node CPU smoke 通过**：Qwen2-0.5B，prompt "The answer to life, the universe, and everything is"，greedy decode 4 tokens 生成 " in the universe."，与 Python transformers 参考输出 **完全一致**。
   - **远端 2-node CPU+CUDA 验证通过**：sd-1 上 worker0(CPU) + worker1(CUDA:1)，输出与参考一致。
   - **本地 MPS+CPU 混合验证通过**：worker0(Mps) + worker1(Cpu)，输出与参考一致。
-  - **跨机器 MPS+CUDA 验证通过**：本地 Mac MPS worker0 + 远端 sd-1 CUDA:1 worker1，通过 SSH 反向隧道（`-R 9000 -R 9100`）绕过 macOS 入站防火墙，输出与参考 **完全一致**。
+  - **跨机器 MPS+CUDA 验证通过**：本地 Mac MPS worker0 + 远端 sd-1 CUDA:1 worker1，VPN 内网直接 0.0.0.0 bind 互通，输出与参考 **完全一致**。
+  - **3-domain 本地 CPU×3 ring forwarding 验证通过**：`ring_attention` 从单次发送改为逐轮 ring forwarding（num_domains-1 轮，每轮发送 current block 给 next、从 prev 接收新 block、保存并转发），`KvBlock` 新增 `Clone`（`Tensor::shallow_clone`），Worker CLI `--peer-addr` → `--next-peer-addr`。生成结果与参考一致。
+  - **3-domain 跨机器 (MPS+CUDA:1+CUDA:2) 验证通过**：本地 Mac worker0(MPS) + 远端 worker1(CUDA:1) + 远端 worker2(CUDA:2) 形成真正 ring 拓扑，生成结果与参考 **完全一致**。
+  - **性能基准**（Qwen2-0.5B，11 prompt tokens + 20 decode tokens，greedy）：单节点 MPS 2.06s / 单节点 CPU 2.87s / 3-domain 本地 CPU×3 13.20s / 3-domain 跨机器 MPS+CUDA×2 125.46s。
   - 31/31 单元测试通过，clippy 零警告。
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 
