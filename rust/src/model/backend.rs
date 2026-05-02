@@ -24,11 +24,11 @@ pub trait AttentionBackend {
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor, ModelError>;
 
-    /// Optional: configure distributed transport and domain id.
+    /// Optional: configure distributed transport, domain id, and sequence offset.
     /// Only `HcpRingAttentionBackend` implements this; others are no-ops.
     #[cfg(feature = "tch-backend")]
     #[allow(dead_code)]
-    fn set_distributed(&mut self, _domain_id: usize, _transport: Option<Box<dyn KvTransport>>) {
+    fn set_distributed(&mut self, _domain_id: usize, _seq_offset: usize, _transport: Option<Box<dyn KvTransport>>) {
         // Local backend 不需要分布式配置，noop
     }
 }
@@ -77,6 +77,7 @@ pub struct HcpRingAttentionBackend {
     kv_transport: Option<Box<dyn KvTransport>>,
     #[allow(dead_code)]
     local_domain_id: usize,
+    seq_offset: usize,
 }
 
 #[cfg(feature = "tch-backend")]
@@ -108,6 +109,7 @@ impl HcpRingAttentionBackend {
             layer_idx: layer,
             kv_transport: None,
             local_domain_id: 0,
+            seq_offset: 0,
         })
     }
 
@@ -120,6 +122,11 @@ impl HcpRingAttentionBackend {
     #[allow(dead_code)]
     pub fn set_local_domain_id(&mut self, id: usize) {
         self.local_domain_id = id;
+    }
+
+    #[allow(dead_code)]
+    pub fn set_seq_offset(&mut self, offset: usize) {
+        self.seq_offset = offset;
     }
 
     /// 【处理单个 KV block】用一组 Q 去和一组 K/V 做 attention，然后更新 online softmax 状态。
@@ -304,22 +311,40 @@ impl HcpRingAttentionBackend {
         // 
         // 注意：发送是"即发即走"（fire-and-forget），不需要等对方确认。
         // 发送完成后，我们继续处理本地 KV；对方在收到后会把这些 KV 作为 peer blocks 处理。
+        //
+        // 【decode 阶段特殊处理】seq_len == 1 时，所有节点都计算并 append 了新 token 的 K/V。
+        // 如果发送完整 KV（含新 token），ring 传递后每个节点会收到重复的新 token K/V。
+        // 因此 decode 阶段只发送【历史 KV】（排除最后 append 的新 token），
+        // 新 token 的 K/V 由每个节点本地持有，不通过 ring 传递。
         if let Some(ref mut transport) = self.kv_transport {
+            let (k_to_send, v_to_send, send_seq_end) = if seq_len == 1 {
+                // decode: 排除最后一个 token（新 append 的）
+                let history_len = k.size()[2] - 1;
+                (
+                    k.narrow(2, 0, history_len),
+                    v.narrow(2, 0, history_len),
+                    global_seq_start + history_len as usize,
+                )
+            } else {
+                // prefill: 发送完整 KV
+                (k.shallow_clone(), v.shallow_clone(), global_seq_start + k.size()[2] as usize)
+            };
             let kv_block = KvBlock {
                 layer_idx: self.layer_idx,
                 global_seq_start,
-                global_seq_end: global_seq_start + k.size()[2] as usize,
-                k: k.shallow_clone(),
-                v: v.shallow_clone(),
+                global_seq_end: send_seq_end,
+                k: k_to_send,
+                v: v_to_send,
             };
             if let Err(e) = transport.send_kv_block(&kv_block) {
                 eprintln!("[ring_attention] send_kv_block failed: {e}");
             }
         }
 
-        // 如果序列很短（只有一个 token），或者只有一个 domain（非分布式），直接用本地 attention。
-        // 这种情况下不需要切块，避免 overhead。
-        if seq_len <= 1 || self.num_domains == 1 {
+        // 如果只有一个 domain（非分布式），直接用本地 attention。
+        // 注意：decode 阶段（seq_len == 1）在分布式场景下也必须走 ring 路径，
+        // 因为每个 domain 只持有部分 KV cache，需要交换 peer KV 才能计算完整 attention。
+        if self.num_domains == 1 {
             return self.local_attention_scores(q, k, v, attention_mask);
         }
 
@@ -371,10 +396,12 @@ impl HcpRingAttentionBackend {
             let q_chunk = q.narrow(2, q_start as i64, q_chunk_len);
 
             // 把本地 K/V 也切成多个 block，方便逐个处理。
-            // 例如本地 seq_len=8 → kv_chunks = [(0,4), (4,8)]
-            let kv_chunks: Vec<(usize, usize)> = (0..seq_len as usize)
+            // 注意：KV 的长度可能与 Q 不同（decode 阶段 Q len=1，但 KV cache 很长）。
+            // 因此用 k.size()[2]（本地 KV 的 seq_len 维）而不是 q 的 seq_len。
+            let local_kv_len = k.size()[2] as usize;
+            let kv_chunks: Vec<(usize, usize)> = (0..local_kv_len)
                 .step_by(kv_chunk_size)
-                .map(|start| (start, (start + kv_chunk_size).min(seq_len as usize)))
+                .map(|start| (start, (start + kv_chunk_size).min(local_kv_len)))
                 .collect();
 
             // 区分两种路径：
@@ -518,8 +545,9 @@ impl HcpRingAttentionBackend {
 
 #[cfg(feature = "tch-backend")]
 impl AttentionBackend for HcpRingAttentionBackend {
-    fn set_distributed(&mut self, domain_id: usize, transport: Option<Box<dyn KvTransport>>) {
+    fn set_distributed(&mut self, domain_id: usize, seq_offset: usize, transport: Option<Box<dyn KvTransport>>) {
         self.local_domain_id = domain_id;
+        self.seq_offset = seq_offset;
         self.kv_transport = transport;
     }
     fn forward(
@@ -617,12 +645,12 @@ impl AttentionBackend for HcpRingAttentionBackend {
         // 例如 domain1 的 position_ids = [8, 9, ..., 15]，min = 8。
         // global_seq_start = 8 意味着本地索引 0 对应全局位置 8。
         // 如果没有传输层（单进程本地模式），global_seq_start = 0。
-        let global_seq_start = if self.kv_transport.is_some() {
-            let pos_min = position_ids.min().int64_value(&[]);
-            pos_min.max(0) as usize
-        } else {
-            0
-        };
+        // 使用固定的 seq_offset 作为全局序列起始位置。
+        // 在 prefill 阶段，seq_offset = domain_id * chunk_size（如 domain0=0, domain1=8）。
+        // 在 decode 阶段，seq_offset 保持不变（domain0 始终负责全局位置 0..8 的 KV）。
+        // 不能用 position_ids.min()，因为 decode 阶段 position_ids 是当前 token 的全局位置，
+        // 与该 domain 负责的历史 KV 的起始位置不同。
+        let global_seq_start = self.seq_offset;
 
         // ====== 第七步：Ring Attention（核心分布式注意力计算）======
         // 把 Q 切成多个 chunk，逐个处理本地 KV 和 peer KV，用 online softmax 合并结果。
@@ -718,6 +746,7 @@ mod tests {
             layer_idx: 0,
             kv_transport: None,
             local_domain_id: 0,
+            seq_offset: 0,
         };
 
         let mut rm = Tensor::full(
@@ -804,6 +833,7 @@ mod tests {
             layer_idx: 0,
             kv_transport: None,
             local_domain_id: 0,
+            seq_offset: 0,
         };
 
         let actual = backend.ring_attention(&q, &k, &v, None, 0);
@@ -853,6 +883,7 @@ mod tests {
             layer_idx: 0,
             kv_transport: None,
             local_domain_id: 0,
+            seq_offset: 0,
         };
 
         let actual = backend.ring_attention(&q, &k, &v, Some(&mask), 0);
@@ -861,6 +892,244 @@ mod tests {
         let diff_val: f64 = diff.double_value(&[]);
         println!("Ring vs local causal diff = {}", diff_val);
         assert!(diff_val < 1e-4, "Ring attention differs from local causal: {}", diff_val);
+    }
+
+    /// Verify ring attention with seq_len=1 (decode) and long KV cache matches local attention.
+    #[test]
+    #[cfg(feature = "tch-backend")]
+    fn test_ring_attention_decode_matches_local() {
+        let device = tch::Device::Cpu;
+        let num_heads = 4i64;
+        let head_dim = 8i64;
+        let q_len = 1i64;
+        let kv_len = 17i64; // simulate KV cache with 17 tokens
+        let num_domains = 2usize;
+
+        tch::manual_seed(999);
+        let q = Tensor::randn([1, num_heads, q_len, head_dim], (Kind::Float, device));
+        let k = Tensor::randn([1, num_heads, kv_len, head_dim], (Kind::Float, device));
+        let v = Tensor::randn([1, num_heads, kv_len, head_dim], (Kind::Float, device));
+
+        let scale = 1.0 / (head_dim as f64).sqrt();
+        let scores = q.matmul(&k.transpose(2, 3)) * scale;
+        let attn = scores.softmax(-1, Kind::Float);
+        let expected = attn.matmul(&v);
+
+        let rope = super::super::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
+        let mut backend = HcpRingAttentionBackend {
+            q_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            k_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            v_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            o_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            q_bias: None, k_bias: None, v_bias: None,
+            rope,
+            num_heads: num_heads as usize,
+            num_kv_heads: num_heads as usize,
+            head_dim: head_dim as usize,
+            scale,
+            num_domains,
+            layer_idx: 0,
+            kv_transport: None,
+            local_domain_id: 0,
+            seq_offset: 0,
+        };
+
+        // Without transport, ring_attention processes only local KV.
+        // Since local KV = full KV (17 tokens), output should match local_attention_scores.
+        let actual = backend.ring_attention(&q, &k, &v, None, 0);
+
+        let diff = (&expected - &actual).abs().mean(Kind::Float);
+        let diff_val: f64 = diff.double_value(&[]);
+        println!("Decode ring vs local diff = {}", diff_val);
+        assert!(diff_val < 1e-5, "Decode ring attention differs from local: {}", diff_val);
+    }
+
+    /// Verify distributed decode (seq_len=1) with peer KV matches local attention.
+    /// Simulates real decode KV cache where new token is appended after history.
+    #[test]
+    #[cfg(feature = "tch-backend")]
+    fn test_ring_attention_decode_with_peer_kv() {
+        use super::super::kv_transport::MockKvTransport;
+
+        let device = tch::Device::Cpu;
+        let num_heads = 4i64;
+        let head_dim = 8i64;
+        let q_len = 1i64;
+        let kv_len = 17i64; // tokens 0..16
+
+        tch::manual_seed(777);
+        let q_all = Tensor::randn([1, num_heads, q_len, head_dim], (Kind::Float, device));
+        let k_all = Tensor::randn([1, num_heads, kv_len, head_dim], (Kind::Float, device));
+        let v_all = Tensor::randn([1, num_heads, kv_len, head_dim], (Kind::Float, device));
+
+        // Reference: local attention on full KV [0..16]
+        let scale = 1.0 / (head_dim as f64).sqrt();
+        let scores_ref = q_all.matmul(&k_all.transpose(2, 3)) * scale;
+        let attn_ref = scores_ref.softmax(-1, Kind::Float);
+        let expected = attn_ref.matmul(&v_all);
+
+        // Simulate 2-domain distributed decode:
+        // domain0 holds history [0..8) + new token 16
+        // domain1 holds history [8..16) + new token 16
+        let half = (kv_len - 1) / 2; // 8
+
+        // domain0 local KV = [0..7] + [16]
+        let k0_local = Tensor::cat(&[k_all.narrow(2, 0, half), k_all.narrow(2, kv_len - 1, 1)], 2);
+        let v0_local = Tensor::cat(&[v_all.narrow(2, 0, half), v_all.narrow(2, kv_len - 1, 1)], 2);
+        // domain1 local KV = [8..15] + [16]
+        let k1_local = Tensor::cat(&[k_all.narrow(2, half, half), k_all.narrow(2, kv_len - 1, 1)], 2);
+        let v1_local = Tensor::cat(&[v_all.narrow(2, half, half), v_all.narrow(2, kv_len - 1, 1)], 2);
+
+        // History for sending (exclude new token)
+        let k0_hist = k_all.narrow(2, 0, half);
+        let v0_hist = v_all.narrow(2, 0, half);
+        let k1_hist = k_all.narrow(2, half, half);
+        let v1_hist = v_all.narrow(2, half, half);
+
+        let rope = super::super::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
+
+        // Worker 0: receives peer KV [8..15] from worker 1
+        let mut transport0 = MockKvTransport::new();
+        transport0.push(super::super::kv_transport::KvBlock {
+            layer_idx: 0,
+            global_seq_start: half as usize,
+            global_seq_end: kv_len as usize - 1,
+            k: k1_hist.shallow_clone(),
+            v: v1_hist.shallow_clone(),
+        });
+
+        let mut backend0 = HcpRingAttentionBackend {
+            q_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            k_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            v_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            o_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            q_bias: None, k_bias: None, v_bias: None,
+            rope: rope.clone(),
+            num_heads: num_heads as usize,
+            num_kv_heads: num_heads as usize,
+            head_dim: head_dim as usize,
+            scale,
+            num_domains: 2,
+            layer_idx: 0,
+            kv_transport: Some(Box::new(transport0)),
+            local_domain_id: 0,
+            seq_offset: 0,
+        };
+        let out0 = backend0.ring_attention(&q_all, &k0_local, &v0_local, None, 0);
+
+        // Worker 1: receives peer KV [0..7] from worker 0
+        let mut transport1 = MockKvTransport::new();
+        transport1.push(super::super::kv_transport::KvBlock {
+            layer_idx: 0,
+            global_seq_start: 0,
+            global_seq_end: half as usize,
+            k: k0_hist.shallow_clone(),
+            v: v0_hist.shallow_clone(),
+        });
+
+        let mut backend1 = HcpRingAttentionBackend {
+            q_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            k_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            v_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            o_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            q_bias: None, k_bias: None, v_bias: None,
+            rope,
+            num_heads: num_heads as usize,
+            num_kv_heads: num_heads as usize,
+            head_dim: head_dim as usize,
+            scale,
+            num_domains: 2,
+            layer_idx: 0,
+            kv_transport: Some(Box::new(transport1)),
+            local_domain_id: 1,
+            seq_offset: half as usize,
+        };
+        let out1 = backend1.ring_attention(&q_all, &k1_local, &v1_local, None, half as usize);
+
+        let diff0 = (&expected - &out0).abs().mean(Kind::Float).double_value(&[]);
+        let diff1 = (&expected - &out1).abs().mean(Kind::Float).double_value(&[]);
+        let diff01 = (&out0 - &out1).abs().mean(Kind::Float).double_value(&[]);
+        println!("Decode with peer KV diff ref-vs-domain0 = {}", diff0);
+        println!("Decode with peer KV diff ref-vs-domain1 = {}", diff1);
+        println!("Decode with peer KV diff domain0-vs-domain1 = {}", diff01);
+
+        assert!(diff0 < 1e-4, "Decode distributed (domain0) differs from reference: {}", diff0);
+        assert!(diff1 < 1e-4, "Decode distributed (domain1) differs from reference: {}", diff1);
+        assert!(diff01 < 1e-4, "Decode distributed domain0 differs from domain1: {}", diff01);
+    }
+
+    /// Verify HcpRingAttentionBackend::forward matches GqaAttention::forward
+    /// when num_domains=1 (no distributed transport) on decode (seq_len=1).
+    #[test]
+    #[cfg(feature = "tch-backend")]
+    fn test_ring_backend_matches_gqa_on_decode() {
+        let device = tch::Device::Cpu;
+        let hidden_size = 32i64;
+        let num_heads = 4usize;
+        let num_kv_heads = 1usize;
+        let head_dim = 8usize;
+        let seq_len = 1i64;
+        let cache_len = 17i64; // simulate prefill of 16 tokens + 1 decode token
+
+        tch::manual_seed(555);
+
+        // Create GqaAttention
+        let mut gqa = super::super::layers::GqaAttention {
+            q_proj: Tensor::randn([(num_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),
+            k_proj: Tensor::randn([(num_kv_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),
+            v_proj: Tensor::randn([(num_kv_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),
+            o_proj: Tensor::randn([hidden_size, (num_heads * head_dim) as i64], (Kind::Float, device)),
+            q_bias: None,
+            k_bias: None,
+            v_bias: None,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            rope: super::super::layers::RotaryEmbedding::new(head_dim, 128, 10000.0, device),
+            scale: 1.0 / (head_dim as f64).sqrt(),
+        };
+
+        // Create HcpRingAttentionBackend with same weights
+        let rope = gqa.rope.clone();
+        let mut ring_backend = HcpRingAttentionBackend {
+            q_proj: gqa.q_proj.shallow_clone(),
+            k_proj: gqa.k_proj.shallow_clone(),
+            v_proj: gqa.v_proj.shallow_clone(),
+            o_proj: gqa.o_proj.shallow_clone(),
+            q_bias: None, k_bias: None, v_bias: None,
+            rope,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale: gqa.scale,
+            num_domains: 1,
+            layer_idx: 0,
+            kv_transport: None,
+            local_domain_id: 0,
+            seq_offset: 0,
+        };
+
+        // hidden states for decode step
+        let hidden_states = Tensor::randn([1, seq_len, hidden_size], (Kind::Float, device));
+        let position_ids = Tensor::from_slice(&[16i64]).unsqueeze(0); // position 16
+
+        // Pre-populate KV caches with synthetic history (16 tokens)
+        let history_k = Tensor::randn([1, num_kv_heads as i64, cache_len - 1, head_dim as i64], (Kind::Float, device));
+        let history_v = Tensor::randn([1, num_kv_heads as i64, cache_len - 1, head_dim as i64], (Kind::Float, device));
+
+        let mut gqa_cache = super::super::cache::KvCache::new();
+        gqa_cache.update(&history_k, &history_v).unwrap();
+
+        let mut ring_cache = super::super::cache::KvCache::new();
+        ring_cache.update(&history_k, &history_v).unwrap();
+
+        // Run both forwards
+        let gqa_out = gqa.forward(&hidden_states, &position_ids, Some(&mut gqa_cache), None).unwrap();
+        let ring_out = ring_backend.forward(&hidden_states, &position_ids, Some(&mut ring_cache), None).unwrap();
+
+        let diff = (&gqa_out - &ring_out).abs().mean(Kind::Float).double_value(&[]);
+        println!("Ring backend vs GqaAttention decode diff = {}", diff);
+        assert!(diff < 1e-4, "Ring backend differs from GqaAttention on decode: {}", diff);
     }
 
     /// Verify distributed ring attention with MockKvTransport matches single-process causal attention.
@@ -923,6 +1192,7 @@ mod tests {
             layer_idx: 0,
             kv_transport: Some(Box::new(transport0)),
             local_domain_id: 0,
+            seq_offset: 0,
         };
         let out0 = backend0.ring_attention(&q0, &k0, &v0, Some(&mask), 0);
 
@@ -951,6 +1221,7 @@ mod tests {
             layer_idx: 0,
             kv_transport: Some(Box::new(transport1)),
             local_domain_id: 1,
+            seq_offset: half as usize,
         };
         let out1 = backend1.ring_attention(&q1, &k1, &v1, Some(&mask), half as usize);
 
