@@ -26,6 +26,8 @@ struct CoordinatorArgs {
     /// Enable capacity-aware automatic chunk sharding.
     /// Workers report free memory; coordinator allocates proportionally.
     capacity_aware: bool,
+    /// Read prompt from file instead of inline --prompt.
+    prompt_file: Option<String>,
 }
 
 fn parse_args() -> CoordinatorArgs {
@@ -39,6 +41,7 @@ fn parse_args() -> CoordinatorArgs {
     let mut listen_addr = String::new();
     let mut chunk_sizes: Option<Vec<usize>> = None;
     let mut capacity_aware = false;
+    let mut prompt_file = None;
 
     let mut args = std::env::args().skip(1); // skip binary name
     while let Some(arg) = args.next() {
@@ -59,6 +62,7 @@ fn parse_args() -> CoordinatorArgs {
                 chunk_sizes = Some(s.split(',').map(|x| x.parse().unwrap()).collect());
             }
             "--capacity-aware" => capacity_aware = true,
+            "--prompt-file" => prompt_file = Some(args.next().unwrap()),
             _ => eprintln!("[coordinator] unknown arg: {arg}"),
         }
     }
@@ -74,6 +78,7 @@ fn parse_args() -> CoordinatorArgs {
         listen_addr,
         chunk_sizes,
         capacity_aware,
+        prompt_file,
     }
 }
 
@@ -84,8 +89,9 @@ fn accept_with_retry(listener: &TcpListener, attempts: usize, delay_ms: u64) -> 
             Ok((stream, _)) => {
                 let _ = stream.set_nonblocking(false);
                 let _ = stream.set_nodelay(true);
-                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
-                let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
+                // Long timeout for large-seq prefill: workers may need minutes.
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(600)));
+                let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(600)));
                 return Ok(stream);
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -111,8 +117,16 @@ pub fn run() {
     let tokenizer_path = Path::new(&args.model_dir).join("tokenizer.json");
     let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).expect("load tokenizer failed");
 
+    // Load prompt from file or use inline string
+    let prompt_text = if let Some(ref path) = args.prompt_file {
+        std::fs::read_to_string(path).expect("read prompt-file failed")
+    } else {
+        args.prompt.clone()
+    };
+    println!("[coordinator] prompt length: {} chars", prompt_text.len());
+
     // Tokenize prompt
-    let encoding = tokenizer.encode(args.prompt.as_str(), true).expect("encode failed");
+    let encoding = tokenizer.encode(prompt_text.as_str(), true).expect("encode failed");
     let prompt_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
     println!("[coordinator] prompt tokens: {}", prompt_ids.len());
 

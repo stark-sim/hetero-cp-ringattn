@@ -118,6 +118,7 @@
   - `WorkerCommand::Prefill` 扩展为包含 `seq_offset`，worker 动态更新所有 layer backend 的 `seq_offset`，确保 capacity-aware 模式下 causal mask 使用正确的全局位置。
   - `HcpRingAttentionBackend::set_distributed` 仅在显式提供 transport 时才替换 `kv_transport`（`None` 表示保持现有）。
   - **验证**：42/42 单元测试通过，clippy 零警告；本地 2-node CPU smoke 三种模式（baseline even / `--capacity-aware` / `--chunk-sizes 7,4` override）输出均一致（`" in the universe."`）。
+- [x] [2026-05-02] **修复 QUIC KV ring 大 block 死锁**：quinn 默认 `stream_receive_window` (~1.2MB) 不足以容纳 GQA repeat 后的 KV block（~15MB for 2K seq），导致所有 worker 在 `SendStream::write_all` 中阻塞等待 window update，但接收方也在 `write_all` 中发送自己的 block → 分布式死锁。修复：显式设置 `stream_receive_window=32MB`、`receive_window=128MB`；`write_frame` 添加 `flush`。2-domain CPU 4K ✅ 43s、3-domain CPU 4K ✅ 49s、短 prompt regression ✅。
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 
 ## 已知问题

@@ -2,6 +2,31 @@
 
 ## 当前焦点
 
+[2026-05-02] **Phase 3: 大 Seq 工程验证 — 分布式 4K CPU 死锁修复**。
+
+**问题**：3-domain CPU 4K 和 2-domain CPU 4K 分布式测试均出现 workers 卡死、coordinator 超时现象。Worker 进程 CPU 0%，coordinator `recv PrefillDone` 返回 `UnexpectedEof`。
+
+**根因诊断**：
+- Quinn 默认 `stream_receive_window = ~1.2MB`（由 `STREAM_RWND = MAX_STREAM_BANDWIDTH / 1000 * EXPECTED_RTT` 计算得出）。
+- GQA repeat 后每个 KV block 的 frame 大小 = `2 * num_heads * seq_len * head_dim * 4 bytes` + metadata。
+  - 2-domain 2048 tokens: ~14.7 MB
+  - 3-domain 1365 tokens: ~9.8 MB
+- 当 `write_all` 发送的数据超过接收方 stream window 时，quinn 阻塞等待 window update。但接收方也在 `write_all` 中发送自己的 KV block，没有调用 `recv_kv_block` 读取数据 → 经典分布式死锁。
+
+**修复**：
+1. `rust/src/quic_transport.rs`: `create_endpoint` 中显式增大 quinn transport window：
+   - `stream_receive_window(32MB)` — 单 stream 可接收 32MB，覆盖最大 KV block
+   - `receive_window(128MB)` — connection-level 总接收窗口
+2. `rust/src/distributed_protocol.rs`: `write_frame` 添加 `stream.flush()`，确保控制帧及时到达对端。
+3. `scripts/run_distributed_3node_smoke.sh`: 改为 `--release` build（与 2-node 脚本一致），避免 debug build 性能问题。
+
+**验证**：
+- 2-domain CPU 4K: ✅ 43s 完成，输出 `the lazy dog.`
+- 3-domain CPU 4K (capacity-aware): ✅ 49s 完成，输出 `the lazy dog.`
+- 2-domain/3-domain 短 prompt smoke: ✅ 回归通过
+
+---
+
 [2026-05-02] **Phase 2: Capacity-Aware 不均等分片已完成并验证**。
 
 在 Phase 1 手动 `--chunk-sizes` 基础上，实现了自动 capacity 感知分配：

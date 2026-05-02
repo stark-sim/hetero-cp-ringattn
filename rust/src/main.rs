@@ -335,6 +335,7 @@ struct CliArgs {
     tolerance_tier: ToleranceTier,
     infer_model_dir: Option<String>,
     infer_prompt: Option<String>,
+    infer_prompt_file: Option<String>,
     infer_max_tokens: usize,
     infer_temperature: f64,
     infer_top_p: f64,
@@ -821,6 +822,7 @@ fn parse_cli_args() -> Result<CliArgs, RingError> {
     let mut tolerance_tier = ToleranceTier::default();
     let mut infer_model_dir = None;
     let mut infer_prompt = None;
+    let mut infer_prompt_file = None;
     let mut infer_max_tokens = 50;
     let mut infer_temperature = 0.7;
     let mut infer_top_p = 0.9;
@@ -862,6 +864,9 @@ fn parse_cli_args() -> Result<CliArgs, RingError> {
             }
             "--infer-prompt" => {
                 infer_prompt = Some(next_cli_value(&mut args, "--infer-prompt")?);
+            }
+            "--infer-prompt-file" => {
+                infer_prompt_file = Some(next_cli_value(&mut args, "--infer-prompt-file")?);
             }
             "--infer-max-tokens" => {
                 let value = next_cli_value(&mut args, "--infer-max-tokens")?;
@@ -908,6 +913,7 @@ fn parse_cli_args() -> Result<CliArgs, RingError> {
         tolerance_tier,
         infer_model_dir,
         infer_prompt,
+        infer_prompt_file,
         infer_max_tokens,
         infer_temperature,
         infer_top_p,
@@ -2304,8 +2310,14 @@ fn main() -> Result<(), RingError> {
 
     // Inference mode: load real model and generate text
     if let Some(ref model_dir) = args.infer_model_dir {
-        let prompt = args.infer_prompt.as_deref().unwrap_or("Hello, how are you?");
-        match infer::run_inference(model_dir, prompt, args.infer_max_tokens, args.infer_temperature, args.infer_top_p, args.infer_num_domains) {
+        let prompt = if let Some(ref path) = args.infer_prompt_file {
+            std::fs::read_to_string(path)
+                .map_err(|e| RingError::InvalidCli(format!("cannot read --infer-prompt-file {path}: {e}")))?
+        } else {
+            args.infer_prompt.unwrap_or_else(|| "Hello, how are you?".to_string())
+        };
+        println!("[infer] prompt length: {} chars", prompt.len());
+        match infer::run_inference(model_dir, &prompt, args.infer_max_tokens, args.infer_temperature, args.infer_top_p, args.infer_num_domains) {
             Ok(text) => println!("{}", text),
             Err(e) => eprintln!("Inference failed: {}", e),
         }

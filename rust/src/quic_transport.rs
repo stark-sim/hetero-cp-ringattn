@@ -73,6 +73,12 @@ pub fn create_endpoint(listen_addr: SocketAddr) -> Result<Endpoint, String> {
     transport_config.max_concurrent_bidi_streams(256u32.into());
     transport_config.max_concurrent_uni_streams(256u32.into());
     transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(1)));
+    // Increase stream window to accommodate large KV blocks (e.g. 1.3MB for 1365 tokens).
+    // Default ~1.2MB is insufficient for ring-KV exchange deadlocking.
+    // GQA repeat 后 KV block 可达 ~15MB (14 heads * 2048 seq * 64 dim * 4 bytes).
+    // 32MB per stream 保证单轮发送不会阻塞。
+    transport_config.stream_receive_window((32u64 * 1024 * 1024).try_into().unwrap());
+    transport_config.receive_window((128u64 * 1024 * 1024).try_into().unwrap());
 
     let mut endpoint = Endpoint::server(server_config, listen_addr)
         .map_err(|e| format!("bind failed: {e}"))?;

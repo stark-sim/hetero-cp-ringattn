@@ -61,6 +61,9 @@ pub fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> Result<(), String>
     stream
         .write_all(payload)
         .map_err(|e| format!("write_frame payload failed: {e}"))?;
+    stream
+        .flush()
+        .map_err(|e| format!("write_frame flush failed: {e}"))?;
     Ok(())
 }
 
