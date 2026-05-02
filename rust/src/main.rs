@@ -5,6 +5,8 @@ mod distributed_coordinator;
 mod distributed_protocol;
 #[cfg(feature = "tch-backend")]
 mod distributed_worker;
+#[cfg(feature = "tch-backend")]
+mod quic_transport;
 mod infer;
 mod model;
 mod protocol;

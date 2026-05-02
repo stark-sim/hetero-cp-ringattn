@@ -7,8 +7,7 @@
 use crate::distributed_protocol::{recv_command, send_response, WorkerCommand, WorkerResponse};
 use crate::model::model::LlamaModel;
 use crate::model::{ModelConfig, ModelWeights};
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::Write;
 use std::path::Path;
 use tch::{Device, Tensor};
 
@@ -85,9 +84,9 @@ fn select_device() -> Device {
     }
 }
 
-fn connect_with_retry(addr: &str, attempts: usize, delay_ms: u64) -> Result<TcpStream, String> {
+fn connect_with_retry(addr: &str, attempts: usize, delay_ms: u64) -> Result<std::net::TcpStream, String> {
     for i in 0..attempts {
-        match TcpStream::connect(addr) {
+        match std::net::TcpStream::connect(addr) {
             Ok(stream) => {
                 let _ = stream.set_nodelay(true);
                 let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
@@ -105,30 +104,10 @@ fn connect_with_retry(addr: &str, attempts: usize, delay_ms: u64) -> Result<TcpS
     unreachable!()
 }
 
-fn accept_with_retry(listener: &TcpListener, attempts: usize, delay_ms: u64) -> Result<TcpStream, String> {
-    let _ = listener.set_nonblocking(true);
-    for i in 0..attempts {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                let _ = stream.set_nonblocking(false);
-                let _ = stream.set_nodelay(true);
-                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
-                let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
-                return Ok(stream);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if i == attempts - 1 {
-                    return Err(format!("accept timeout after {attempts} attempts"));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-            }
-            Err(e) => return Err(format!("accept failed: {e}")),
-        }
-    }
-    unreachable!()
-}
-
 pub fn run() {
+    // Install rustls ring crypto provider once per process (required by rustls 0.23)
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let args = parse_args();
     println!("[worker {}] starting, seq_offset={}, listen={}, next_peer={}, coordinator={}",
              args.domain_id, args.seq_offset, args.listen_addr, args.next_peer_addr, args.coordinator_addr);
@@ -144,43 +123,96 @@ pub fn run() {
         .expect("build model failed");
     let mut kv_caches = model.create_kv_caches();
 
-    // Start listener for peer KV (ring inbound)
-    let listener = TcpListener::bind(&args.listen_addr).expect("bind listen_addr failed");
-    println!("[worker {}] listening on {}", args.domain_id, args.listen_addr);
+    // Setup QUIC transport for peer KV ring
+    println!("[worker {}] setting up QUIC transport", args.domain_id);
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime failed");
+    let listen_addr: std::net::SocketAddr = args.listen_addr.parse()
+        .expect("invalid listen_addr");
+    let next_peer_addr: std::net::SocketAddr = args.next_peer_addr.parse()
+        .expect("invalid next_peer_addr");
 
-    // Connect to peer (ring outbound) for each layer
-    println!("[worker {}] connecting to next peer {}", args.domain_id, args.next_peer_addr);
+    let domain_id = args.domain_id;
+    let num_domains = args.num_domains;
     let num_layers = config.num_layers;
-    let mut peer_streams = Vec::with_capacity(num_layers);
-    for layer_idx in 0..num_layers {
-        let stream = connect_with_retry(&args.next_peer_addr, 300, 200)
-            .unwrap_or_else(|e| panic!("layer {layer_idx} next peer connect failed: {e}"));
-        peer_streams.push(stream);
-        if layer_idx % 4 == 0 {
-            println!("[worker {}] connected peer layer {}/{}", args.domain_id, layer_idx, num_layers);
-        }
-    }
+    let (mut outbound_streams, mut inbound_streams) = rt.block_on(async move {
+        let endpoint = crate::quic_transport::create_endpoint(listen_addr)
+            .expect("QUIC endpoint bind failed");
+        println!("[worker {domain_id}] QUIC endpoint bound to {listen_addr}");
 
-    // Accept inbound peer connections for each layer
-    println!("[worker {}] waiting for peer inbound connections", args.domain_id);
-    let mut inbound_streams = Vec::with_capacity(num_layers);
-    for layer_idx in 0..num_layers {
-        let stream = accept_with_retry(&listener, 300, 200)
-            .unwrap_or_else(|e| panic!("layer {layer_idx} accept failed: {e}"));
-        inbound_streams.push(stream);
-        if layer_idx % 4 == 0 {
-            println!("[worker {}] accepted peer layer {}/{}", args.domain_id, layer_idx, num_layers);
-        }
-    }
+        // Connect to next peer and accept from prev peer concurrently
+        println!("[worker {domain_id}] connecting to next peer {next_peer_addr}");
+        let dial_fut = endpoint.connect(next_peer_addr, "localhost")
+            .unwrap();
 
-    // Set up distributed domain: each layer gets a TcpKvTransport
-    // For 2-domain ring: we send on peer_streams and receive on inbound_streams.
-    model.setup_distributed_domain(args.domain_id, args.seq_offset, |layer_idx| {
-        let outbound = peer_streams[layer_idx].try_clone().expect("stream clone failed");
-        let inbound = inbound_streams[layer_idx].try_clone().expect("stream clone failed");
-        // Create a bidirectional transport: send uses outbound, recv uses inbound.
-        // TcpKvTransport only supports one direction per instance, so we need a wrapper.
-        Some(Box::new(BidirectionalTcpKvTransport::new(outbound, inbound, device)))
+        let accept_fut = async move {
+            loop {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    endpoint.accept()
+                ).await {
+                    Ok(Some(incoming)) => break incoming.await.expect("prev peer connection failed"),
+                    Ok(None) => panic!("endpoint closed"),
+                    Err(_) => {
+                        println!("[worker {domain_id}] accept timeout, retrying...");
+                        continue;
+                    }
+                }
+            }
+        };
+
+        // For 2-domain ring, next == prev; avoid symmetric connection deadlocks
+        // by only having domain 0 dial and domain 1 accept.
+        let (conn, prev_conn) = if num_domains == 2 {
+            if domain_id == 0 {
+                let c = dial_fut.await.expect("connect to next peer failed");
+                println!("[worker {domain_id}] QUIC connection to next peer established");
+                (c.clone(), c)
+            } else {
+                let c = accept_fut.await;
+                println!("[worker {domain_id}] QUIC connection from prev peer established");
+                (c.clone(), c)
+            }
+        } else {
+            let dial_handle = tokio::spawn(dial_fut);
+            let accept_handle = tokio::spawn(accept_fut);
+            let c = dial_handle.await.expect("dial task panicked")
+                .expect("connect to next peer failed");
+            println!("[worker {domain_id}] QUIC connection to next peer established");
+            let p = accept_handle.await.expect("accept task panicked");
+            println!("[worker {domain_id}] QUIC connection from prev peer established");
+            (c, p)
+        };
+
+        // Open and accept bidirectional streams per layer.
+        // Write a 1-byte dummy after open_bi so the peer's accept_bi can observe
+        // the new stream immediately (quinn only creates the stream on first write).
+        let mut outbound = Vec::with_capacity(num_layers);
+        let mut inbound = Vec::with_capacity(num_layers);
+        for layer_idx in 0..num_layers {
+            let (mut send, recv) = conn.open_bi().await
+                .unwrap_or_else(|e| panic!("layer {layer_idx} open_bi failed: {e}"));
+            send.write_all(b"\x00").await
+                .unwrap_or_else(|e| panic!("layer {layer_idx} dummy write failed: {e}"));
+            let (peer_send, peer_recv) = prev_conn.accept_bi().await
+                .unwrap_or_else(|e| panic!("layer {layer_idx} accept_bi failed: {e}"));
+            outbound.push((send, recv));
+            inbound.push((peer_send, peer_recv));
+            if layer_idx % 4 == 0 {
+                println!("[worker {domain_id}] opened outbound & accepted inbound streams {layer_idx}/{num_layers}");
+            }
+        }
+
+        (outbound, inbound)
+    });
+
+    // Set up distributed domain: each layer gets a QuicKvTransport
+    // We use the send side of outbound connection and recv side of inbound connection.
+    model.setup_distributed_domain(args.domain_id, args.seq_offset, |_layer_idx| {
+        let (out_send, _out_recv) = outbound_streams.remove(0);
+        let (_in_send, in_recv) = inbound_streams.remove(0);
+        Some(Box::new(crate::quic_transport::QuicKvTransport::new(
+            out_send, in_recv, rt.handle().clone(), device,
+        )))
     });
     println!("[worker {}] distributed domain setup complete", args.domain_id);
 
@@ -233,114 +265,4 @@ pub fn run() {
     }
 }
 
-/// A bidirectional KvTransport that sends on one stream and receives on another.
-/// For a 2-domain ring, each worker sends to peer via outbound stream and
-/// receives from peer via inbound stream.
-struct BidirectionalTcpKvTransport {
-    outbound: std::sync::Mutex<TcpStream>,
-    inbound: std::sync::Mutex<TcpStream>,
-    device: Device,
-}
 
-impl BidirectionalTcpKvTransport {
-    fn new(outbound: TcpStream, inbound: TcpStream, device: Device) -> Self {
-        Self {
-            outbound: std::sync::Mutex::new(outbound),
-            inbound: std::sync::Mutex::new(inbound),
-            device,
-        }
-    }
-}
-
-impl crate::model::KvTransport for BidirectionalTcpKvTransport {
-    fn send_kv_block(&mut self, block: &crate::model::kv_transport::KvBlock) -> Result<(), String> {
-        let mut guard = self.outbound.lock().unwrap();
-        // Reuse TcpKvTransport's serialization logic inline
-        let k_bytes = tensor_to_bytes(&block.k)?;
-        let v_bytes = tensor_to_bytes(&block.v)?;
-        let k_shape: Vec<i64> = block.k.size();
-        let v_shape: Vec<i64> = block.v.size();
-
-        let meta = serde_json::json!({
-            "layer_idx": block.layer_idx,
-            "global_seq_start": block.global_seq_start,
-            "global_seq_end": block.global_seq_end,
-            "k_shape": k_shape,
-            "v_shape": v_shape,
-            "k_bytes": k_bytes.len(),
-            "v_bytes": v_bytes.len(),
-        });
-        let meta_bytes = meta.to_string().into_bytes();
-        let meta_len = meta_bytes.len() as u32;
-
-        let mut frame = Vec::with_capacity(4 + meta_bytes.len() + k_bytes.len() + v_bytes.len());
-        frame.extend_from_slice(&meta_len.to_be_bytes());
-        frame.extend_from_slice(&meta_bytes);
-        frame.extend_from_slice(&k_bytes);
-        frame.extend_from_slice(&v_bytes);
-
-        guard.write_all(&frame).map_err(|e| format!("send_kv_block write failed: {e}"))?;
-        Ok(())
-    }
-
-    fn recv_kv_block(&mut self) -> Result<Option<crate::model::kv_transport::KvBlock>, String> {
-        let mut guard = self.inbound.lock().unwrap();
-        let mut len_bytes = [0u8; 4];
-        match guard.read_exact(&mut len_bytes) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(format!("recv_kv_block read meta_len failed: {e}")),
-        }
-        let meta_len = u32::from_be_bytes(len_bytes) as usize;
-
-        let mut meta_bytes = vec![0u8; meta_len];
-        guard.read_exact(&mut meta_bytes).map_err(|e| format!("recv_kv_block read meta failed: {e}"))?;
-        let meta: serde_json::Value = serde_json::from_slice(&meta_bytes)
-            .map_err(|e| format!("recv_kv_block parse meta failed: {e}"))?;
-
-        let layer_idx = meta["layer_idx"].as_u64().ok_or("missing layer_idx")? as usize;
-        let global_seq_start = meta["global_seq_start"].as_u64().ok_or("missing global_seq_start")? as usize;
-        let global_seq_end = meta["global_seq_end"].as_u64().ok_or("missing global_seq_end")? as usize;
-        let k_bytes_len = meta["k_bytes"].as_u64().ok_or("missing k_bytes")? as usize;
-        let v_bytes_len = meta["v_bytes"].as_u64().ok_or("missing v_bytes")? as usize;
-        let k_shape: Vec<i64> = meta["k_shape"].as_array().ok_or("missing k_shape")?
-            .iter().map(|v| v.as_i64().ok_or("invalid k_shape"))
-            .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
-        let v_shape: Vec<i64> = meta["v_shape"].as_array().ok_or("missing v_shape")?
-            .iter().map(|v| v.as_i64().ok_or("invalid v_shape"))
-            .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
-
-        let mut k_bytes = vec![0u8; k_bytes_len];
-        guard.read_exact(&mut k_bytes).map_err(|e| format!("recv_kv_block read k_bytes failed: {e}"))?;
-        let mut v_bytes = vec![0u8; v_bytes_len];
-        guard.read_exact(&mut v_bytes).map_err(|e| format!("recv_kv_block read v_bytes failed: {e}"))?;
-
-        let k = bytes_to_tensor(&k_bytes, &k_shape, self.device)?;
-        let v = bytes_to_tensor(&v_bytes, &v_shape, self.device)?;
-
-        Ok(Some(crate::model::kv_transport::KvBlock {
-            layer_idx,
-            global_seq_start,
-            global_seq_end,
-            k,
-            v,
-        }))
-    }
-}
-
-fn tensor_to_bytes(t: &Tensor) -> Result<Vec<u8>, String> {
-    let flat = t.contiguous().view(-1);
-    let values: Vec<f32> = Vec::try_from(&flat).map_err(|e| format!("tensor to vec failed: {e}"))?;
-    Ok(values.iter().flat_map(|&v| v.to_le_bytes()).collect())
-}
-
-fn bytes_to_tensor(bytes: &[u8], shape: &[i64], device: Device) -> Result<Tensor, String> {
-    let values: Vec<f32> = bytes.chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect();
-    let expected = shape.iter().product::<i64>() as usize;
-    if values.len() != expected {
-        return Err(format!("byte length mismatch: expected {} floats, got {}", expected, values.len()));
-    }
-    Ok(Tensor::from_slice(&values).reshape(shape).to_device(device))
-}

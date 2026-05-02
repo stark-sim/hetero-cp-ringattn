@@ -130,6 +130,14 @@
   - **3-domain 跨机器 (MPS+CUDA:1+CUDA:2) 验证通过**：本地 Mac worker0(MPS) + 远端 worker1(CUDA:1) + 远端 worker2(CUDA:2) 形成真正 ring 拓扑，生成结果与参考 **完全一致**。
   - **性能基准**（Qwen2-0.5B，11 prompt tokens + 20 decode tokens，greedy）：单节点 MPS 2.06s / 单节点 CPU 2.87s / 3-domain 本地 CPU×3 13.20s / 3-domain 跨机器 MPS+CUDA×2 125.46s。
   - 31/31 单元测试通过，clippy 零警告。
+- [x] [2026-04-30] **QUIC Transport 实现与验证**：
+  - 新增依赖：`quinn = "0.11"`、`rustls = { version = "0.23", features = ["ring"] }`、`rcgen = "0.13"`、`tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }`。
+  - 新增 `rust/src/quic_transport.rs`：`QuicKvTransport` 实现 `KvTransport` trait；基于 `quinn` 单 connection + per-layer bidirectional stream；自签名证书 + `SkipServerVerification`；序列化 meta (JSON) + k/v raw bytes。
+  - `KvTransport` trait 从 `model/kv_transport.rs` 提升到 `model/mod.rs` 公共导出。
+  - 修复 rustls `CryptoProvider` 未初始化：`rustls::crypto::ring::default_provider().install_default()` 在 worker 入口调用。
+  - 修复 2-domain symmetric connection 死锁：当 `num_domains == 2` 时，domain 0 负责 dial，domain 1 只 accept，双方共享同一个 QUIC connection handle。
+  - 修复 quinn `open_bi` 不发送 STREAM 帧导致 `accept_bi` 挂起：stream 建立后 sender 写入 1-byte dummy，`recv_kv_block` 首次读取时跳过。
+  - 通过验证：QUIC 2-domain local CPU ✅、QUIC 3-domain local CPU ✅、QUIC 2-domain local MPS+CPU ✅；所有输出与 TCP baseline 及 Python transformers 参考一致。
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 
 ## 已知问题

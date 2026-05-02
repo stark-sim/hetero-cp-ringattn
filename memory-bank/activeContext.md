@@ -2,6 +2,17 @@
 
 ## 当前焦点
 
+[2026-04-30] **QUIC Transport 实现与验证已完成**。
+
+在原有 TCP KV ring transport 基础上，新增 QUIC-based `KvTransport` 实现，作为可替换的底层传输层。核心变更：
+1. 新增 `rust/src/quic_transport.rs`：`QuicKvTransport` 基于 `quinn` 0.11，使用单 QUIC connection + 每层一个 bidirectional stream，替代原来每层一对独立 TCP stream（24 层 = 24 条 TCP connection）。
+2. 自签名证书生成（`rcgen`）+ 客户端跳过证书验证（`rustls::client::danger::SkipServerVerification`），支持无中心化 CA 的快速部署。
+3. `tokio` async runtime 用于 quinn 事件循环；`KvTransport` trait 方法内部用 `block_on` 桥接同步调用。
+4. 修复 rustls 0.23 `CryptoProvider` 未安装默认 provider 的运行时 panic。
+5. 修复 2-domain 对称连接死锁：quinn 在 loopback 上同时 dial/accept 同一地址时可能合并 connection，`domain_id==0` 负责 dial、`domain_id==1` 只 accept，共享同一个 connection handle。
+6. 修复 quinn `open_bi()` 不立即发送 STREAM 帧导致 `accept_bi()` 永远挂起的问题：stream 建立时 sender 先写入 1-byte dummy，receiver 首次 `recv_kv_block` 跳过该 byte。
+7. 验证通过：QUIC 2-domain CPU ✅、QUIC 3-domain CPU ✅、QUIC 2-domain MPS+CPU ✅；生成结果与 TCP baseline 和 Python transformers 参考完全一致。
+
 [2026-04-30] **真实多进程分布式推理（Real Multi-Process Distributed Inference）已完成并验证**。
 
 核心实现：
@@ -176,6 +187,7 @@
 - [x] [2026-05-01] Phase B++ 完成：A) `test_tcp_kv_transport_roundtrip` 验证 TCP 序列化无损（diff=0）；B) `test_distributed_llama_model_multi_step_decode` 验证 4 步连续分布式 decode，每步 diff ~2e-6。修复多步 decode 根因：`history_len = k.size()[2] - 1` 在多步时会包含之前 decode append 的 token，引入 `prefill_kv_len` 字段确保只发送 prefill 分区。
 - [x] [2026-05-01] D 完成：`RingAttnMessage` serialization/deserialization 单元测试覆盖。新增 5 个测试：bincode roundtrip、payload 完整性（256 bytes）、schema version 字段、三种 message kind（KvBlock/SoftmaxState/Terminate）、TCP transport trait 端到端。30/30 测试通过，clippy 零警告。
 - [x] [2026-05-01] C 完成：分布式 Generator `DistributedGenerator`。单进程模拟多 domain CP 推理：prefill 分片到各 domain → 同步 global_seq_len → decode 循环中广播 token 给所有 domain、从任意 domain 采样。新增 `test_distributed_generator_tokens_match_reference`：4 步贪婪 decode，domain0/domain1 token 完全一致，与单节点参考 logits diff ~1e-5。31/31 测试通过，clippy 零警告。
+- [x] [2026-04-30] QUIC Transport 完成：`quic_transport.rs` 实现 `QuicKvTransport`，基于 `quinn` 单 connection + per-layer bidirectional stream；2-domain/3-domain/MPS+CPU 均验证通过，输出与 TCP baseline 一致。
 
 ## 重要模式与偏好
 
