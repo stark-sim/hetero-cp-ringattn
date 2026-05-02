@@ -153,6 +153,7 @@
 - [x] [2026-05-01] Phase B+ 完成：修复端到端 distributed decode ~6 diff。根因是 `LlamaModel::forward` prefill 阶段 `global_seq_len` 被错误设为本地 `seq_len`（domain0=8），导致 decode 时 RoPE 应用了错误位置（8 而非 16）。修复后 diff 从 6.7 降至 ~2e-6，与单节点参考一致。
 - [x] [2026-05-01] Phase B++ 完成：A) `test_tcp_kv_transport_roundtrip` 验证 TCP 序列化无损（diff=0）；B) `test_distributed_llama_model_multi_step_decode` 验证 4 步连续分布式 decode，每步 diff ~2e-6。修复多步 decode 根因：`history_len = k.size()[2] - 1` 在多步时会包含之前 decode append 的 token，引入 `prefill_kv_len` 字段确保只发送 prefill 分区。
 - [x] [2026-05-01] D 完成：`RingAttnMessage` serialization/deserialization 单元测试覆盖。新增 5 个测试：bincode roundtrip、payload 完整性（256 bytes）、schema version 字段、三种 message kind（KvBlock/SoftmaxState/Terminate）、TCP transport trait 端到端。30/30 测试通过，clippy 零警告。
+- [x] [2026-05-01] C 完成：分布式 Generator `DistributedGenerator`。单进程模拟多 domain CP 推理：prefill 分片到各 domain → 同步 global_seq_len → decode 循环中广播 token 给所有 domain、从任意 domain 采样。新增 `test_distributed_generator_tokens_match_reference`：4 步贪婪 decode，domain0/domain1 token 完全一致，与单节点参考 logits diff ~1e-5。31/31 测试通过，clippy 零警告。
 
 ## 重要模式与偏好
 

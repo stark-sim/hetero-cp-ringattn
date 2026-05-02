@@ -113,6 +113,7 @@
 - [x] [2026-05-01] **TcpKvTransport 精度验证**：新增 `test_tcp_kv_transport_roundtrip`，通过本地 loopback 发送/接收 KV block，验证 float32 原始字节传输后 tensor 值完全一致（k_diff=0, v_diff=0）。
 - [x] [2026-05-01] **多步分布式 decode 验证**：新增 `test_distributed_llama_model_multi_step_decode`，prefill 后连续 4 步 decode，每步 domain0/domain1 与单节点参考 diff 均 ~2e-6。修复多步 decode 根因：`history_len = k.size()[2] - 1` 在多步时会包含之前 decode 步骤 append 的 token，导致 peer 收到重复 KV。引入 `HcpRingAttentionBackend::prefill_kv_len` 字段，decode 阶段只发送 prefill 分区。25/25 测试通过，clippy 零警告。
 - [x] [2026-05-01] **`RingAttnMessage` serialization/deserialization 测试覆盖**：新增 5 个 protocol 单元测试——bincode serialize→deserialize roundtrip、256-byte payload 完整性、schema version 字段往返、三种 message kind（KvBlock/SoftmaxState/Terminate）全覆盖、MessageSender/MessageReceiver TCP trait 端到端。30/30 测试通过，clippy 零警告。
+- [x] [2026-05-01] **分布式 Generator `DistributedGenerator`**：单进程模拟多 domain CP 推理。prefill 阶段将 prompt 分片到各 domain；decode 阶段 coordinator 广播 token 给所有 domain，从任意 domain 采样（分布式 decode 输出一致）。核心方法 `generate_tokens` 支持 token-ID 级别的生成；`generate` 包装 tokenizer encode/decode。新增 `test_distributed_generator_tokens_match_reference`：4 步贪婪 decode，domain0/domain1 输出 token 完全一致，与单节点参考 logits diff ~1e-5。31/31 测试通过，clippy 零警告。
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 
 ## 已知问题
