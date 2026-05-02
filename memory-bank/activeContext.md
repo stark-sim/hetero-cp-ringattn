@@ -17,7 +17,10 @@
 - **main.rs CLI passthrough**：原 `parse_cli_args` 不认识 worker/coordinator 私有参数（`--domain-id` 等）并报 "unknown argument"。改为遇到 `--distributed-role` 后 `break`，让子模块自行解析 `std::env::args()`。
 
 验证结果：
-- 本地 2-node CPU smoke（Qwen2-0.5B）：prompt "The answer to life, the universe, and everything is"，greedy decode 4 tokens 生成 " in the universe."，与 Python transformers 参考 **完全一致**。
+- **本地 2-node CPU smoke**：prompt "The answer to life, the universe, and everything is"，greedy decode 4 tokens 生成 " in the universe."，与 Python transformers 参考 **完全一致**。
+- **远端 2-node 多进程（CPU + CUDA:1）**：sd-1 GPU 节点上 coordinator + worker0(CPU) + worker1(CUDA:1) 全部跑通，生成结果同样是 " in the universe."，与参考一致。GPU 0 存在显存残留，worker0 显式使用 CPU 避免 OOM。
+- **本地非沙箱 MPS + CPU 混合**：worker0 使用 Mps 设备，worker1 使用 Cpu 设备，生成结果 " in the universe."，与参考一致。验证了非沙箱 MPS 路径可用。
+- **跨机器 MPS + CUDA:1（SSH 反向隧道）**：本地 Mac MPS worker0 + 远端 sd-1 CUDA:1 worker1，通过 `ssh -R 9000:127.0.0.1:9000 -R 9100:127.0.0.1:9100` 反向端口转发绕过 macOS 入站防火墙限制。coordinator 和 worker0 监听本地 127.0.0.1，远端 worker 通过隧道连接。生成结果 " in the universe."，与参考 **完全一致**。验证了异构跨机器分布式推理端到端可行。
 - `cargo test` 31/31 通过，`cargo clippy --features tch-backend` 零警告。
 
 当前无阻塞。

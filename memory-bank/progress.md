@@ -122,7 +122,10 @@
   - `SyncGlobalSeqLen`：prefill 后 coordinator 广播 max global_seq_len，确保所有 worker decode 从正确位置开始。
   - `BidirectionalTcpKvTransport`：每层独立 outbound+inbound TCP stream 做 ring KV 交换。
   - CLI：`--distributed-role worker|coordinator` 分发到对应入口；`main.rs` 在解析到 `--distributed-role` 后停止解析其余参数，让 worker/coordinator 自行处理私有 flags。
-  - **本地 2-node CPU smoke 通过**：Qwen2-0.5B，prompt "The answer to life, the universe, and everything is"，greedy decode 4 tokens 生成 " in the universe."，与 Python transformers 参考输出 **完全一致**（token [304, 279, 15494, 13]）。
+  - **本地 2-node CPU smoke 通过**：Qwen2-0.5B，prompt "The answer to life, the universe, and everything is"，greedy decode 4 tokens 生成 " in the universe."，与 Python transformers 参考输出 **完全一致**。
+  - **远端 2-node CPU+CUDA 验证通过**：sd-1 上 worker0(CPU) + worker1(CUDA:1)，输出与参考一致。
+  - **本地 MPS+CPU 混合验证通过**：worker0(Mps) + worker1(Cpu)，输出与参考一致。
+  - **跨机器 MPS+CUDA 验证通过**：本地 Mac MPS worker0 + 远端 sd-1 CUDA:1 worker1，通过 SSH 反向隧道（`-R 9000 -R 9100`）绕过 macOS 入站防火墙，输出与参考 **完全一致**。
   - 31/31 单元测试通过，clippy 零警告。
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 
