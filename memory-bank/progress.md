@@ -142,6 +142,8 @@
     - TCP: **107.3s**
     - QUIC: **76.4s**
     - QUIC 比 TCP 快 **~29%**
+- [x] [2026-04-30] **Mask 优化**：分布式 prefill 阶段 `model.rs` 不再创建 `[seq_len, seq_len]` 密集 causal mask（O(seq²) 内存爆炸根因）。`HcpRingAttentionBackend::ring_attention` 已经通过 `global_seq_start` + position 比较实现 causal，从不读取 mask 张量数据。改为：单节点时仍创建完整 mask；分布式（`num_domains > 1`）时传 `[1,1,1,1]` dummy zero tensor 作为 causal 标志。本地 2-domain/3-domain CPU smoke 验证通过，输出一致。
+- [x] [2026-04-30] **动态不均等分片 Phase 1**：Coordinator CLI 新增 `--chunk-sizes`（逗号分隔，如 `7,4` 或 `5,3,3`），显式指定每个 domain 的 prompt chunk 长度。分片逻辑校验：长度必须等于 `num_domains`，总和必须等于 prompt token 数。测试验证：2-domain `7+4=11` ✅、3-domain `5+3+3=11` ✅，生成结果与参考一致。
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 
 ## 已知问题

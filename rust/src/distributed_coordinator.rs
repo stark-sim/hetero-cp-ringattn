@@ -21,6 +21,9 @@ struct CoordinatorArgs {
     num_domains: usize,
     worker_addrs: Vec<String>,
     listen_addr: String,
+    /// Optional explicit chunk sizes for uneven sharding.
+    /// If provided, length must equal num_domains and sum must equal prompt length.
+    chunk_sizes: Option<Vec<usize>>,
 }
 
 fn parse_args() -> CoordinatorArgs {
@@ -32,6 +35,7 @@ fn parse_args() -> CoordinatorArgs {
     let mut num_domains = 2usize;
     let mut worker_addrs = Vec::new();
     let mut listen_addr = String::new();
+    let mut chunk_sizes: Option<Vec<usize>> = None;
 
     let mut args = std::env::args().skip(1); // skip binary name
     while let Some(arg) = args.next() {
@@ -47,6 +51,10 @@ fn parse_args() -> CoordinatorArgs {
                 worker_addrs = args.next().unwrap().split(',').map(|s| s.to_string()).collect();
             }
             "--listen-addr" => listen_addr = args.next().unwrap(),
+            "--chunk-sizes" => {
+                let s = args.next().unwrap();
+                chunk_sizes = Some(s.split(',').map(|x| x.parse().unwrap()).collect());
+            }
             _ => eprintln!("[coordinator] unknown arg: {arg}"),
         }
     }
@@ -60,6 +68,7 @@ fn parse_args() -> CoordinatorArgs {
         num_domains,
         worker_addrs,
         listen_addr,
+        chunk_sizes,
     }
 }
 
@@ -121,12 +130,29 @@ pub fn run() {
 
     // Prefill: split prompt into chunks and send to workers
     let seq_len = prompt_ids.len() as i64;
-    let chunk_size = (seq_len as usize).div_ceil(args.num_domains).max(1) as i64;
+    let chunk_boundaries: Vec<usize> = if let Some(ref sizes) = args.chunk_sizes {
+        assert_eq!(sizes.len(), args.num_domains,
+            "--chunk-sizes length ({}) must match --num-domains ({})",
+            sizes.len(), args.num_domains);
+        let mut boundaries = vec![0usize];
+        for size in sizes {
+            boundaries.push(boundaries.last().unwrap() + size);
+        }
+        assert_eq!(*boundaries.last().unwrap(), seq_len as usize,
+            "--chunk-sizes sum ({}) must equal prompt length ({})",
+            boundaries.last().unwrap(), seq_len);
+        boundaries
+    } else {
+        let chunk_size = (seq_len as usize).div_ceil(args.num_domains).max(1) as i64;
+        (0..=args.num_domains)
+            .map(|i| (i as i64 * chunk_size).min(seq_len) as usize)
+            .collect()
+    };
 
     for (domain_id, stream) in worker_streams.iter_mut().enumerate() {
-        let start = (domain_id as i64 * chunk_size).min(seq_len);
-        let end = ((domain_id as i64 + 1) * chunk_size).min(seq_len);
-        let chunk = &prompt_ids[start as usize..end as usize];
+        let start = chunk_boundaries[domain_id];
+        let end = chunk_boundaries[domain_id + 1];
+        let chunk = &prompt_ids[start..end];
         let cmd = WorkerCommand::Prefill(chunk.to_vec());
         send_command(stream, &cmd).expect("send Prefill failed");
         println!("[coordinator] sent Prefill chunk [{}, {}) to worker {}", start, end, domain_id);

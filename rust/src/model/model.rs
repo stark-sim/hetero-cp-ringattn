@@ -135,8 +135,15 @@ impl LlamaModel {
         };
 
         // Causal mask for prefill (not needed for single-token decode)
+        // For distributed inference, ring_attention only checks is_some() and
+        // implements causality via global position comparison; it never reads
+        // the dense mask tensor. Use a tiny dummy to avoid O(seq_len²) allocation.
         let attention_mask = if seq_len > 1 {
-            Some(Self::create_causal_mask(seq_len, device))
+            if self.num_domains > 1 {
+                Some(Tensor::zeros([1, 1, 1, 1], (Kind::Float, device)))
+            } else {
+                Some(Self::create_causal_mask(seq_len, device))
+            }
         } else {
             None
         };
