@@ -593,8 +593,22 @@ impl AttentionBackend for HcpRingAttentionBackend {
         // - 为了让矩阵乘法维度匹配，需要把 K/V 在 head 维度上重复 4 次
         // - repeat(&[1, 4, 1, 1]) 表示：batch 不重复，head 重复 4 次，seq_len 不重复，head_dim 不重复
         let num_rep = self.num_heads / self.num_kv_heads;
-        let k = if num_rep > 1 { k.repeat([1, num_rep as i64, 1, 1]) } else { k };
-        let v = if num_rep > 1 { v.repeat([1, num_rep as i64, 1, 1]) } else { v };
+        let k = if num_rep > 1 {
+            let shape = k.size();
+            k.unsqueeze(2)
+                .expand([shape[0], shape[1], num_rep as i64, shape[2], shape[3]], false)
+                .reshape([shape[0], shape[1] * num_rep as i64, shape[2], shape[3]])
+        } else {
+            k
+        };
+        let v = if num_rep > 1 {
+            let shape = v.size();
+            v.unsqueeze(2)
+                .expand([shape[0], shape[1], num_rep as i64, shape[2], shape[3]], false)
+                .reshape([shape[0], shape[1] * num_rep as i64, shape[2], shape[3]])
+        } else {
+            v
+        };
 
         // ====== 第六步：计算全局序列起始位置 ======
         // 在分布式场景下，domain1 处理的是完整序列的后半段（比如 [8, 16)）。
