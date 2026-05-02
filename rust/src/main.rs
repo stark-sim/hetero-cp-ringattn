@@ -327,6 +327,7 @@ struct CliArgs {
     infer_prompt: Option<String>,
     infer_max_tokens: usize,
     infer_temperature: f64,
+    infer_top_p: f64,
     infer_num_domains: usize,
 }
 
@@ -811,6 +812,7 @@ fn parse_cli_args() -> Result<CliArgs, RingError> {
     let mut infer_prompt = None;
     let mut infer_max_tokens = 50;
     let mut infer_temperature = 0.7;
+    let mut infer_top_p = 0.9;
     let mut infer_num_domains = 1usize;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -861,6 +863,12 @@ fn parse_cli_args() -> Result<CliArgs, RingError> {
                     RingError::InvalidCli(format!("invalid --infer-temperature: {e}"))
                 })?;
             }
+            "--infer-top-p" => {
+                let value = next_cli_value(&mut args, "--infer-top-p")?;
+                infer_top_p = value.parse().map_err(|e| {
+                    RingError::InvalidCli(format!("invalid --infer-top-p: {e}"))
+                })?;
+            }
             "--infer-num-domains" => {
                 let value = next_cli_value(&mut args, "--infer-num-domains")?;
                 infer_num_domains = value.parse().map_err(|e| {
@@ -884,6 +892,7 @@ fn parse_cli_args() -> Result<CliArgs, RingError> {
         infer_prompt,
         infer_max_tokens,
         infer_temperature,
+        infer_top_p,
         infer_num_domains,
     })
 }
@@ -2277,7 +2286,7 @@ fn main() -> Result<(), RingError> {
     // Inference mode: load real model and generate text
     if let Some(ref model_dir) = args.infer_model_dir {
         let prompt = args.infer_prompt.as_deref().unwrap_or("Hello, how are you?");
-        match infer::run_inference(model_dir, prompt, args.infer_max_tokens, args.infer_temperature, args.infer_num_domains) {
+        match infer::run_inference(model_dir, prompt, args.infer_max_tokens, args.infer_temperature, args.infer_top_p, args.infer_num_domains) {
             Ok(text) => println!("{}", text),
             Err(e) => eprintln!("Inference failed: {}", e),
         }

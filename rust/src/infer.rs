@@ -4,7 +4,7 @@ use crate::model::generate::Generator;
 use std::path::Path;
 
 #[cfg(feature = "tch-backend")]
-pub fn run_inference(model_dir: &str, prompt: &str, max_tokens: usize, temperature: f64, num_domains: usize) -> Result<String, String> {
+pub fn run_inference(model_dir: &str, prompt: &str, max_tokens: usize, temperature: f64, top_p: f64, num_domains: usize) -> Result<String, String> {
     use tch::Device;
 
     let device = if cfg!(target_os = "macos") && tch::utils::has_mps() {
@@ -32,7 +32,7 @@ pub fn run_inference(model_dir: &str, prompt: &str, max_tokens: usize, temperatu
         .map_err(|e: crate::model::ModelError| e.to_string())?;
 
     println!("[infer] generating (max_tokens={}, temperature={})...", max_tokens, temperature);
-    generator.generate(prompt, max_tokens, temperature).map_err(|e: crate::model::ModelError| e.to_string())
+    generator.generate(prompt, max_tokens, temperature, top_p).map_err(|e: crate::model::ModelError| e.to_string())
 }
 
 #[cfg(not(feature = "tch-backend"))]

@@ -299,4 +299,34 @@ mod tests {
         assert!((f16_data[0] - 0.5).abs() < 1e-3);
         assert!((f16_data[5] - 5.5).abs() < 1e-3);
     }
+
+    #[test]
+    #[cfg(feature = "tch-backend")]
+    fn test_qwen_embedding_weight_values() {
+        let model_dir = std::path::PathBuf::from("/Users/stark_sim/models/qwen2-0.5b");
+        if !model_dir.exists() {
+            eprintln!("Skipping test: Qwen2-0.5B model not found at {}", model_dir.display());
+            return;
+        }
+        let weights = ModelWeights::from_dir(&model_dir, Device::Cpu).expect("load qwen weights");
+        let emb = weights.get("model.embed_tokens.weight").expect("get embedding");
+        let emb_shape = emb.size();
+        assert_eq!(emb_shape, vec![151936, 896]);
+
+        // Check first row
+        let first_row: Vec<f32> = emb.get(0).view(-1).try_into().expect("first row");
+        assert!((first_row[0] + 0.0203857).abs() < 1e-4, "first_row[0] mismatch: got {}", first_row[0]);
+        assert!((first_row[1] + 0.0093384).abs() < 1e-4, "first_row[1] mismatch: got {}", first_row[1]);
+
+        // Check token 9707 ("Hello")
+        let hello_row: Vec<f32> = emb.get(9707).view(-1).try_into().expect("hello row");
+        assert!((hello_row[0] + 0.0089722).abs() < 1e-4, "hello_row[0] mismatch: got {}", hello_row[0]);
+        assert!((hello_row[1] - 0.0081177).abs() < 1e-4, "hello_row[1] mismatch: got {}", hello_row[1]);
+
+        // Check q_proj.bias for layer 0
+        let q_bias = weights.get("model.layers.0.self_attn.q_proj.bias").expect("get q_bias");
+        let q_bias_data: Vec<f32> = q_bias.view(-1).try_into().expect("q_bias");
+        assert!((q_bias_data[0] - 0.0668945).abs() < 1e-4, "q_bias[0] mismatch: got {}", q_bias_data[0]);
+        assert!((q_bias_data[1] + 0.0859375).abs() < 1e-4, "q_bias[1] mismatch: got {}", q_bias_data[1]);
+    }
 }
