@@ -2,7 +2,7 @@
 
 ## 当前焦点
 
-[2026-04-30] **QUIC Transport 实现与验证已完成**。
+[2026-04-30] **QUIC Transport 实现、验证与跨机器性能对比已完成**。
 
 在原有 TCP KV ring transport 基础上，新增 QUIC-based `KvTransport` 实现，作为可替换的底层传输层。核心变更：
 1. 新增 `rust/src/quic_transport.rs`：`QuicKvTransport` 基于 `quinn` 0.11，使用单 QUIC connection + 每层一个 bidirectional stream，替代原来每层一对独立 TCP stream（24 层 = 24 条 TCP connection）。
@@ -11,7 +11,11 @@
 4. 修复 rustls 0.23 `CryptoProvider` 未安装默认 provider 的运行时 panic。
 5. 修复 2-domain 对称连接死锁：quinn 在 loopback 上同时 dial/accept 同一地址时可能合并 connection，`domain_id==0` 负责 dial、`domain_id==1` 只 accept，共享同一个 connection handle。
 6. 修复 quinn `open_bi()` 不立即发送 STREAM 帧导致 `accept_bi()` 永远挂起的问题：stream 建立时 sender 先写入 1-byte dummy，receiver 首次 `recv_kv_block` 跳过该 byte。
-7. 验证通过：QUIC 2-domain CPU ✅、QUIC 3-domain CPU ✅、QUIC 2-domain MPS+CPU ✅；生成结果与 TCP baseline 和 Python transformers 参考完全一致。
+7. 本地验证通过：QUIC 2-domain CPU ✅、QUIC 3-domain CPU ✅、QUIC 2-domain MPS+CPU ✅；生成结果与 TCP baseline 和 Python transformers 参考完全一致。
+8. **跨机器性能对比**（Mac MPS + 远端 GPU CUDA:1，Tailscale VPN ~150ms RTT，Qwen2-0.5B 11 prompt + 20 decode tokens greedy）：
+   - TCP KV ring: **107.3s**
+   - QUIC KV ring: **76.4s**
+   - **QUIC 比 TCP 快 ~29%**。高延迟网络下 QUIC 的 0-RTT、内置 TLS 和 connection 复用优势显现。
 
 [2026-04-30] **真实多进程分布式推理（Real Multi-Process Distributed Inference）已完成并验证**。
 

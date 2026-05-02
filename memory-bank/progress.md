@@ -137,7 +137,11 @@
   - 修复 rustls `CryptoProvider` 未初始化：`rustls::crypto::ring::default_provider().install_default()` 在 worker 入口调用。
   - 修复 2-domain symmetric connection 死锁：当 `num_domains == 2` 时，domain 0 负责 dial，domain 1 只 accept，双方共享同一个 QUIC connection handle。
   - 修复 quinn `open_bi` 不发送 STREAM 帧导致 `accept_bi` 挂起：stream 建立后 sender 写入 1-byte dummy，`recv_kv_block` 首次读取时跳过。
-  - 通过验证：QUIC 2-domain local CPU ✅、QUIC 3-domain local CPU ✅、QUIC 2-domain local MPS+CPU ✅；所有输出与 TCP baseline 及 Python transformers 参考一致。
+  - 本地验证：QUIC 2-domain local CPU ✅、QUIC 3-domain local CPU ✅、QUIC 2-domain local MPS+CPU ✅；所有输出与 TCP baseline 及 Python transformers 参考一致。
+  - **跨机器 QUIC vs TCP 性能对比**（Mac MPS + 远端 GPU CUDA:1，VPN ~150ms RTT，Qwen2-0.5B 11 prompt + 20 decode tokens）：
+    - TCP: **107.3s**
+    - QUIC: **76.4s**
+    - QUIC 比 TCP 快 **~29%**
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 
 ## 已知问题
