@@ -118,7 +118,9 @@ impl LlamaModel {
         // Position IDs: [batch, seq_len]
         let position_ids = if seq_len > 1 {
             // Prefill: sequential positions [seq_offset, seq_offset+1, ..., seq_offset+seq_len-1]
-            self.global_seq_len = seq_len as usize;
+            // global_seq_len tracks the rightmost global position this domain has processed.
+            // For distributed decode, all domains must agree on the global prompt length.
+            self.global_seq_len = (self.seq_offset + seq_len) as usize;
             let base = Tensor::arange(seq_len, (Kind::Int64, device)) + self.seq_offset;
             base.unsqueeze(0).repeat([batch, 1])
         } else {
@@ -440,6 +442,11 @@ mod tests {
         let mut caches1 = domain1.create_kv_caches();
         let _logits1_prefill = domain1.forward(&input_ids1, &mut caches1).unwrap();
 
+        // Synchronize global_seq_len across domains for decode.
+        // In a real multi-process setup, the coordinator broadcasts the global prompt length.
+        let global_prompt_len = domain1.global_seq_len; // domain1 has the rightmost position
+        domain0.global_seq_len = global_prompt_len;
+
         // ====== Decode: sample next token from reference model's last position ======
         let last_logits = ref_logits.narrow(1, seq_len - 1, 1).squeeze();
         let next_token = last_logits.argmax(-1, false).int64_value(&[]) as i64;
@@ -469,13 +476,21 @@ mod tests {
         println!("Decode diff ref-vs-domain1 = {}", diff1);
         println!("Decode diff domain0-vs-domain1 = {}", diff01);
 
-        // For now, only assert that distributed nodes agree with each other.
-        // Full ref-match is tracked as a known issue.
         const DECODE_TOL: f64 = 1e-3;
         assert!(
             diff_ring < DECODE_TOL,
             "Ring reference (no transport) differs from local reference: {}",
             diff_ring
+        );
+        assert!(
+            diff0 < DECODE_TOL,
+            "Distributed decode domain0 differs from reference: {}",
+            diff0
+        );
+        assert!(
+            diff1 < DECODE_TOL,
+            "Distributed decode domain1 differs from reference: {}",
+            diff1
         );
         assert!(
             diff01 < DECODE_TOL,

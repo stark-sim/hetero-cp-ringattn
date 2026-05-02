@@ -108,6 +108,8 @@
 - [ ] M3：抽出统一 transport trait，减少 local queue / TCP pair / TCP CP node 的重复 frame 与 metrics 逻辑。
 - [x] [2026-05-01] M4 异构 runtime stub 核心完成：`TchComputeRuntime` 接入设备配置（`select_tch_device_from_env()` 从 `HCP_TCH_DEVICE`/`HCP_TORCH_DEVICE` 解析 cpu/mps/cuda/cuda:N）；移除硬编码 `tch::Device::Cpu`；新增 `TchComputeRuntime::new(device)` 和 `from_env()` 构造函数；protocol.rs 三处 runtime 实例化统一使用 `from_env()`；本地 CPU smoke checksum 1093.59 与重构前一致；本地 MPS smoke（`HCP_TCH_DEVICE=mps`）全部 tch bridge `code=2`，checksum 一致；remote 3-node smoke MPS+CUDA 异构通过，checksum 与重构前一致（71.35/238.88/406.41）；`NoOpComputeRuntime` 保留为无 `tch-backend` feature 时的编译兼容 fallback。
 - [x] M5：将 deterministic projection weights 升级为真实权重加载 / layer config，并接入 RoPE、norm/residual 与完整 layer lifecycle。
+- [x] [2026-05-01] **Phase B: 分布式 decode 路径打通**：`seq_len <= 1` 回退已移除，decode 阶段走完整 `ring_attention` 路径；`seq_offset` 传入 `AttentionBackend::set_distributed`，`forward` 使用固定 `seq_offset` 代替 `position_ids.min()` 计算 `global_seq_start`；decode 阶段发送 KV 时排除新 append 的 token，避免 ring 中重复；`kv_chunks` 改用本地 KV 长度而非 Q 的 `seq_len`；新增 `LlamaModel::global_seq_len` 保证 decode position_ids 正确。新增 4 个单元测试验证 decode 路径数学正确性；23/23 测试通过，clippy 零警告。
+- [x] [2026-05-01] **修复分布式 decode ~6 diff 根因**：`LlamaModel::forward` 中 prefill 阶段错误地将 `global_seq_len` 设为本地 `seq_len`（domain0=8），导致 decode 时 `position_ids=8` 而非正确的全局位置 16。RoPE 因此应用了错误旋转角度，产生 ~6.7 的系统偏差。修复：prefill 时 `global_seq_len = seq_offset + seq_len`；测试中 prefill 后同步 `domain0.global_seq_len = domain1.global_seq_len`。修复后 diff 从 6.7 降至 ~2e-6，与单节点参考一致；23/23 测试通过，clippy 零警告。
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 
 ## 已知问题
@@ -127,6 +129,7 @@
 - [2026-05-01] 网络环境切换：CUDA 节点通过 `user@sd-1`（IP `100.64.0.93`）访问，Mac 本机当前可达地址为 `100.64.0.95`；remote smoke 需使用 IP 地址（`GPU_HOST=100.64.0.93`），因为 Rust socket 解析不支持主机名。
 - [2026-05-01] 3-node remote CP smoke 通过：`RUN_ID=rust-remote-cp-sd1-ip2-20260501 PORT_BASE=29430 GPU_HOST=100.64.0.93 GPU_USER=user MAC_NODE_ADDR=100.64.0.95`；node0/node2 MPS 全部 bridge `code=2 12/12`，node1 CUDA 全部 bridge `code=3 12/12`；tch compute checksum 分别为 71.35 / 238.88 / 406.41。
 - [x] [2026-05-01] Transport trait 重构后 3-node regression 验证通过：`PORT_BASE=29250 GPU_HOST=100.64.0.93 GPU_USER=user MAC_NODE_ADDR=100.64.0.95`；全部节点 `sent=8 received=8 compute_updates=12`，C++ bridge 与 tch bridge 全部 `12/12` pass；checksum 与重构前完全一致（71.35 / 238.88 / 406.41），未引入 regression。
+- [x] [2026-05-01] **已修复：分布式 decode 端到端 logits 与单节点参考的 ~6 diff**。根因是 `LlamaModel::forward` prefill 阶段 `global_seq_len` 被错误设为本地 `seq_len`（8）而非全局位置（16），导致 decode 时 RoPE 应用了错误位置。修复后 diff 降至 ~2e-6。
 
 ## 里程碑
 

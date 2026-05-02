@@ -2,7 +2,16 @@
 
 ## 当前焦点
 
-[2026-04-30] 当前主线是 M3-tch 迁移：将 `ring_attention` 和 protocol compute 路径中所有能用纯 tch tensor 表达的逻辑迁到 Rust tch-backend，逐步精简 C++ buffer 桥接。`backend.rs` 已完成（`process_kv_block` 统一因果/非因果），`compute_runtime.rs` 已内联 tensor 实现替代 `compute_chunk_attention_step`；下一步是清理死代码并验证 smoke。
+[2026-05-01] Phase B 已完成：分布式 decode 路径打通。核心修改包括：
+1. 移除 `seq_len <= 1` 回退，decode 阶段走完整 `ring_attention` 路径
+2. `seq_offset` 传入 `AttentionBackend::set_distributed`，`forward` 使用固定 `seq_offset` 代替 `position_ids.min()`
+3. decode 阶段发送 KV 时排除新 append 的 token，避免 ring 中重复
+4. `kv_chunks` 改用本地 KV 长度而非 Q 的 `seq_len`
+5. `LlamaModel::global_seq_len` 保证 decode position_ids 正确
+
+新增 4 个单元测试（23/23 通过）。`test_distributed_llama_model_decode` 验证 domain0/domain1 输出一致（diff < 1e-6），但端到端与单节点参考有 ~6 的 diff，根因待查。
+
+当前阻塞：端到端 decode 与单节点参考的 diff 根因未定位。`ring_attention` 数学本身已验证正确（`test_ring_attention_decode_with_peer_kv` diff < 3e-8），问题可能在非 contiguous KV cache 的 chunk 全局位置标注或 layer 间交互。
 
 ## 近期变化
 
@@ -136,6 +145,8 @@
 - [x] [2026-04-30] `tch-backend` 设为默认 feature：`Cargo.toml` `default = ["tch-backend"]`；修复由此暴露的全部 46 个 clippy 错误（`needless_borrow`、`needless_borrows_for_generic_args`、`too_many_arguments`、dead code 等）；`cargo test` 18/18 通过，`cargo clippy -- -D warnings` 零警告。
 - [x] [2026-04-30] 本地 `cargo test` 与 `cargo clippy` 已验证通过；protocol smoke 与 remote CP smoke 待下次远程运行时最终确认。
 - [x] [2026-04-30] 明确 HCP 与 PyTorch 官方 Context Parallel 的边界：HCP 采用原始 Ring Attention 论文的 P2P 设计，支持异构/非均分；PyTorch 2.7+ CP 是同构 GPU 集群的 collective 优化。已记录于 `systemPatterns.md`。
+- [x] [2026-05-01] Phase B 完成：分布式 decode 路径打通。`seq_len <= 1` 回退已移除；`seq_offset` 传入 `set_distributed`；decode 阶段发送 KV 排除新 token；`kv_chunks` 改用本地 KV 长度；`global_seq_len` 保证 decode position 正确。新增 4 个单元测试，23/23 通过，clippy 零警告。
+- [x] [2026-05-01] Phase B+ 完成：修复端到端 distributed decode ~6 diff。根因是 `LlamaModel::forward` prefill 阶段 `global_seq_len` 被错误设为本地 `seq_len`（domain0=8），导致 decode 时 RoPE 应用了错误位置（8 而非 16）。修复后 diff 从 6.7 降至 ~2e-6，与单节点参考一致。
 - [ ] 为 `RingAttnMessage` 设计 serialization / deserialization。
 
 ## 重要模式与偏好

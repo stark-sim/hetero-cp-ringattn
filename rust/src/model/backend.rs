@@ -1118,10 +1118,10 @@ mod tests {
         let history_v = Tensor::randn([1, num_kv_heads as i64, cache_len - 1, head_dim as i64], (Kind::Float, device));
 
         let mut gqa_cache = super::super::cache::KvCache::new();
-        gqa_cache.update(&history_k, &history_v).unwrap();
+        let _ = gqa_cache.update(&history_k, &history_v).unwrap();
 
         let mut ring_cache = super::super::cache::KvCache::new();
-        ring_cache.update(&history_k, &history_v).unwrap();
+        let _ = ring_cache.update(&history_k, &history_v).unwrap();
 
         // Run both forwards
         let gqa_out = gqa.forward(&hidden_states, &position_ids, Some(&mut gqa_cache), None).unwrap();
