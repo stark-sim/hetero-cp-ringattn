@@ -2,7 +2,7 @@
 
 ## 当前焦点
 
-[2026-05-02] **Phase 3: 大 Seq 工程验证 — 分布式 4K CPU 死锁修复**。
+[2026-05-02] **Phase 3: 大 Seq 工程验证 — 2K/4K/8K/16K 全矩阵通过**。下一步：32K/64K/128K 验证。
 
 **问题**：3-domain CPU 4K 和 2-domain CPU 4K 分布式测试均出现 workers 卡死、coordinator 超时现象。Worker 进程 CPU 0%，coordinator `recv PrefillDone` 返回 `UnexpectedEof`。
 
@@ -24,6 +24,30 @@
 - 2-domain CPU 4K: ✅ 43s 完成，输出 `the lazy dog.`
 - 3-domain CPU 4K (capacity-aware): ✅ 49s 完成，输出 `the lazy dog.`
 - 2-domain/3-domain 短 prompt smoke: ✅ 回归通过
+
+**后续发现与修复**：
+- 16K 分布式（每 domain 8K）再次卡住。诊断发现：quinn 默认 `send_window = ~10MB`，而 8K seq 的 KV block 约 58MB。发送方写满 10MB 后阻塞等待 ACK，接收方也在 write_all 中发送自己的 block → **死锁**。
+- 修复：`send_window=256MB`（与 `receive_window` 匹配）。
+
+**完整大 seq 验证矩阵**：
+
+| 配置 | Seq | 结果 | 耗时 | 输出 |
+|------|-----|------|------|------|
+| MPS 单节点 | 2K | ✅ | 3.95s | `dog. The quick` |
+| MPS 单节点 | 4K | ✅ | 4.82s | `the lazy dog.` |
+| MPS 单节点 | 8K | ✅ | 16.4s | `brown fox jumps over` |
+| MPS 单节点 | 16K | ❌ OOM | — | `Invalid buffer size: 14.00 GiB` |
+| MPS+CPU 分布式 | 8K | ✅ | 2m40s | `brown fox jumps over` |
+| CUDA 单节点 | 4K | ✅ | 5.10s | `the lazy dog.` |
+| CUDA 单节点 | 8K | ✅ | 6.39s | `brown fox jumps over` |
+| CUDA 分布式 2-domain | 4K | ✅ | 1m11s | `the lazy dog.` |
+| CUDA 分布式 2-domain | 8K | ✅ | 2m19s | `brown fox jumps over` |
+| CUDA 分布式 2-domain | 16K | ✅ | 4m43s | `jumps over the lazy` |
+
+关键结论：
+1. MPS 单节点 16K OOM（attention scores 14GB 超过 MPS allocator 上限），分布式是扩展长 seq 的必需路径。
+2. CUDA 单节点 8K 只需 6.4s，分布式 16K 4m43s（主要耗时在 24 层 × 2 轮 ring KV 交换）。
+3. 所有分布式测试输出与单节点参考一致，验证正确性。
 
 ---
 

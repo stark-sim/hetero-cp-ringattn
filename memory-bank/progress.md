@@ -139,6 +139,10 @@
 - [2026-05-01] 3-node remote CP smoke 通过：`RUN_ID=rust-remote-cp-sd1-ip2-20260501 PORT_BASE=29430 GPU_HOST=100.64.0.93 GPU_USER=user MAC_NODE_ADDR=100.64.0.95`；node0/node2 MPS 全部 bridge `code=2 12/12`，node1 CUDA 全部 bridge `code=3 12/12`；tch compute checksum 分别为 71.35 / 238.88 / 406.41。
 - [x] [2026-05-01] Transport trait 重构后 3-node regression 验证通过：`PORT_BASE=29250 GPU_HOST=100.64.0.93 GPU_USER=user MAC_NODE_ADDR=100.64.0.95`；全部节点 `sent=8 received=8 compute_updates=12`，C++ bridge 与 tch bridge 全部 `12/12` pass；checksum 与重构前完全一致（71.35 / 238.88 / 406.41），未引入 regression。
 - [x] [2026-05-01] **已修复：分布式 decode 端到端 logits 与单节点参考的 ~6 diff**。根因是 `LlamaModel::forward` prefill 阶段 `global_seq_len` 被错误设为本地 `seq_len`（8）而非全局位置（16），导致 decode 时 RoPE 应用了错误位置。修复后 diff 降至 ~2e-6。
+- [x] [2026-05-01] QUIC 大 block 死锁修复：`quinn` 默认 `stream_receive_window=~1.2MB`、`send_window=~10MB` 远小于 GQA repeat 后 KV block frame（16K seq ≈ 117MB），导致所有 worker 在 `write_all` 中阻塞等待 window update → 经典死锁。修复：显式设置 `stream_receive_window=128MB`、`receive_window=128MB`、`send_window=256MB`。`write_frame` 同时增加 `flush()`。
+- [x] [2026-05-02] MPS 单节点大 seq 验证：2K ✅ 3.95s / 4K ✅ 4.82s / 8K ✅ 16.4s / 16K ❌ OOM（14GB attention scores 超过 MPS allocator 单 buffer 上限）。
+- [x] [2026-05-02] CUDA 单节点大 seq 验证：4K ✅ 5.10s / 8K ✅ 6.39s。
+- [x] [2026-05-02] CUDA 分布式大 seq 验证：2-domain 4K ✅ 1m11s / 2-domain 8K ✅ 2m19s / **2-domain 16K ✅ 4m43s**，输出均与单节点参考一致（`jumps over the lazy`）。
 
 ## 里程碑
 
@@ -150,4 +154,4 @@
 | M3: 协议闭环 | 已完成 | [2026-04-30] |
 | M4: 异构 runtime 闭环 | 已完成 | [2026-04-30] |
 | M5: 远端闭环 | 已完成 | [2026-04-30] |
-| M6: 扩展性论证 | 未开始 | 待定 |
+| M6: 扩展性论证 | **进行中** | [2026-05-02] 16K 分布式通过，32K/64K/128K 待验证 |
