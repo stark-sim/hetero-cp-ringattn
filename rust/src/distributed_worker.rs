@@ -18,7 +18,7 @@ struct WorkerArgs {
     seq_offset: i64,
     model_dir: String,
     listen_addr: String,
-    peer_addr: String,
+    next_peer_addr: String,
     coordinator_addr: String,
     num_domains: usize,
 }
@@ -28,7 +28,7 @@ fn parse_args() -> WorkerArgs {
     let mut seq_offset = 0i64;
     let mut model_dir = String::new();
     let mut listen_addr = String::new();
-    let mut peer_addr = String::new();
+    let mut next_peer_addr = String::new();
     let mut coordinator_addr = String::new();
     let mut num_domains = 2usize;
 
@@ -39,7 +39,7 @@ fn parse_args() -> WorkerArgs {
             "--seq-offset" => seq_offset = args.next().unwrap().parse().unwrap(),
             "--model-dir" => model_dir = args.next().unwrap(),
             "--listen-addr" => listen_addr = args.next().unwrap(),
-            "--peer-addr" => peer_addr = args.next().unwrap(),
+            "--next-peer-addr" => next_peer_addr = args.next().unwrap(),
             "--coordinator-addr" => coordinator_addr = args.next().unwrap(),
             "--num-domains" => num_domains = args.next().unwrap().parse().unwrap(),
             _ => eprintln!("[worker] unknown arg: {arg}"),
@@ -51,7 +51,7 @@ fn parse_args() -> WorkerArgs {
         seq_offset,
         model_dir,
         listen_addr,
-        peer_addr,
+        next_peer_addr,
         coordinator_addr,
         num_domains,
     }
@@ -129,8 +129,8 @@ fn accept_with_retry(listener: &TcpListener, attempts: usize, delay_ms: u64) -> 
 
 pub fn run() {
     let args = parse_args();
-    println!("[worker {}] starting, seq_offset={}, listen={}, peer={}, coordinator={}",
-             args.domain_id, args.seq_offset, args.listen_addr, args.peer_addr, args.coordinator_addr);
+    println!("[worker {}] starting, seq_offset={}, listen={}, next_peer={}, coordinator={}",
+             args.domain_id, args.seq_offset, args.listen_addr, args.next_peer_addr, args.coordinator_addr);
 
     let device = select_device();
     println!("[worker {}] device: {:?}", args.domain_id, device);
@@ -148,12 +148,12 @@ pub fn run() {
     println!("[worker {}] listening on {}", args.domain_id, args.listen_addr);
 
     // Connect to peer (ring outbound) for each layer
-    println!("[worker {}] connecting to peer {}", args.domain_id, args.peer_addr);
+    println!("[worker {}] connecting to next peer {}", args.domain_id, args.next_peer_addr);
     let num_layers = config.num_layers;
     let mut peer_streams = Vec::with_capacity(num_layers);
     for layer_idx in 0..num_layers {
-        let stream = connect_with_retry(&args.peer_addr, 300, 200)
-            .unwrap_or_else(|e| panic!("layer {layer_idx} peer connect failed: {e}"));
+        let stream = connect_with_retry(&args.next_peer_addr, 300, 200)
+            .unwrap_or_else(|e| panic!("layer {layer_idx} next peer connect failed: {e}"));
         peer_streams.push(stream);
         if layer_idx % 4 == 0 {
             println!("[worker {}] connected peer layer {}/{}", args.domain_id, layer_idx, num_layers);

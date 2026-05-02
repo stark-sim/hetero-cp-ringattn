@@ -50,7 +50,7 @@ HCP_TORCH_DEVICE="${HCP_TORCH_DEVICE:-cpu}" "$BINARY" --distributed-role worker 
     --seq-offset 0 \
     --model-dir "$MODEL_DIR" \
     --listen-addr "$W0_LISTEN" \
-    --peer-addr "$W1_LISTEN" \
+    --next-peer-addr "$W1_LISTEN" \
     --coordinator-addr "$COORD_LISTEN" \
     --num-domains 2 \
     > "$PROJECT_DIR/reports/worker0.log" 2>&1 &
@@ -63,7 +63,7 @@ HCP_TORCH_DEVICE="${HCP_TORCH_DEVICE:-cpu}" "$BINARY" --distributed-role worker 
     --seq-offset 6 \
     --model-dir "$MODEL_DIR" \
     --listen-addr "$W1_LISTEN" \
-    --peer-addr "$W0_LISTEN" \
+    --next-peer-addr "$W0_LISTEN" \
     --coordinator-addr "$COORD_LISTEN" \
     --num-domains 2 \
     > "$PROJECT_DIR/reports/worker1.log" 2>&1 &

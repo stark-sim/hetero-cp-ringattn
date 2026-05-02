@@ -309,44 +309,6 @@ impl HcpRingAttentionBackend {
         let seq_len = q.size()[2];
         let head_dim = q.size()[3];
 
-        // ====== 第一步：发送本地 KV 给下一个 peer ======
-        // 在分布式 ring 中，每个 domain 处理完本地 KV 后，要把自己的 K/V 发送给下一个 domain。
-        // 例如 domain0 把 K/V [0,8) 发送给 domain1，domain1 收到后就能用这些 K/V 来计算 attention。
-        // 
-        // 注意：发送是"即发即走"（fire-and-forget），不需要等对方确认。
-        // 发送完成后，我们继续处理本地 KV；对方在收到后会把这些 KV 作为 peer blocks 处理。
-        //
-        // 【decode 阶段特殊处理】seq_len == 1 时，所有节点都计算并 append 了新 token 的 K/V。
-        // 在多步 decode 中，如果发送 "k.size()[2] - 1"，会把之前 decode 步骤 append 的 token
-        // 也发送给 peer，导致 peer 收到重复的 KV（peer 本地也计算了同一个 token 的 K/V）。
-        // 正确做法：每个节点只发送自己在 prefill 阶段负责的 KV 分区。
-        // prefill 分区的长度记录在 self.prefill_kv_len 中，decode 阶段保持不变。
-        // 新 token 的 K/V 完全由每个节点本地持有，不通过 ring 传递。
-        if let Some(ref mut transport) = self.kv_transport {
-            let (k_to_send, v_to_send, send_seq_end) = if seq_len == 1 {
-                // decode: 只发送 prefill 阶段产生的 KV 分区
-                let history_len = self.prefill_kv_len as i64;
-                (
-                    k.narrow(2, 0, history_len),
-                    v.narrow(2, 0, history_len),
-                    global_seq_start + self.prefill_kv_len,
-                )
-            } else {
-                // prefill: 发送完整 KV
-                (k.shallow_clone(), v.shallow_clone(), global_seq_start + k.size()[2] as usize)
-            };
-            let kv_block = KvBlock {
-                layer_idx: self.layer_idx,
-                global_seq_start,
-                global_seq_end: send_seq_end,
-                k: k_to_send,
-                v: v_to_send,
-            };
-            if let Err(e) = transport.send_kv_block(&kv_block) {
-                eprintln!("[ring_attention] send_kv_block failed: {e}");
-            }
-        }
-
         // 如果只有一个 domain（非分布式），直接用本地 attention。
         // 注意：decode 阶段（seq_len == 1）在分布式场景下也必须走 ring 路径，
         // 因为每个 domain 只持有部分 KV cache，需要交换 peer KV 才能计算完整 attention。
@@ -354,39 +316,66 @@ impl HcpRingAttentionBackend {
             return self.local_attention_scores(q, k, v, attention_mask);
         }
 
-        // ====== 第二步：确定 chunk 大小 ======
-        // Q chunk 大小 = (seq_len + num_domains - 1) / num_domains，向上取整。
-        // 例如 seq_len=8, num_domains=2 → chunk_size = 4。
-        // 这意味着 Q 被切成 [0,4) 和 [4,8) 两个 chunk。
-        // KV chunk 大小和 Q chunk 相同，保持一致。
-        let q_chunk_size = (seq_len as usize).div_ceil(self.num_domains).max(1);
-        let kv_chunk_size = q_chunk_size;
+        // ====== 第一步 + 第二步：Ring KV 交换 ======
+        // 在真正的 N-domain ring 中，每个 domain 只与 next/prev 两个邻居直接通信。
+        // 每个 domain 把自己的 KV 发给 next，从 prev 接收 KV；收到的 KV 在下一轮再转发给 next。
+        // 经过 num_domains - 1 轮后，每个 domain 都收到了所有其他 domain 的 KV。
+        //
+        // 例如 3-domain (0→1→2→0):
+        //   Round 0: 0 发 K0→1，收 K2；1 发 K1→2，收 K0；2 发 K2→0，收 K1
+        //   Round 1: 0 发 K2→1，收 K1；1 发 K0→2，收 K2；2 发 K1→0，收 K0
+        //   最终每个 domain 持有 K0/K1/K2 全部三块。
+        //
+        // 【decode 阶段特殊处理】seq_len == 1 时，只发送 prefill 阶段产生的 KV 分区
+        //（记录在 self.prefill_kv_len 中），decode 新 token 的 KV 完全由每个节点本地持有。
+        let mut peer_blocks: Vec<super::kv_transport::KvBlock> = Vec::new();
 
-        // ====== 第三步：预取 peer KV blocks ======
-        // 【关键优化】把所有 peer KV block 一次性 recv 到内存中，供所有 Q chunk 共享。
-        // 
-        // 为什么不能放在 Q chunk loop 内部 recv？
-        // 因为如果有多个 Q chunks，loop 会执行多次。第一次 recv 会把队列中的 block 取走，
-        // 第二次 recv 时队列就空了！所以必须在 Q chunk loop 之前一次性预取。
-        // 
-        // num_domains.saturating_sub(1) 表示我们期望收到 (num_domains - 1) 个 peer block。
-        // 例如 2 个 domain 时，只 recv 1 次。
-        let peer_blocks: Vec<super::kv_transport::KvBlock> = if let Some(ref mut transport) = self.kv_transport {
-            let mut blocks = Vec::new();
-            for _ in 0..self.num_domains.saturating_sub(1) {
+        if let Some(ref mut transport) = self.kv_transport {
+            let (k_to_send, v_to_send, send_seq_end) = if seq_len == 1 {
+                let history_len = self.prefill_kv_len as i64;
+                (
+                    k.narrow(2, 0, history_len),
+                    v.narrow(2, 0, history_len),
+                    global_seq_start + self.prefill_kv_len,
+                )
+            } else {
+                (k.shallow_clone(), v.shallow_clone(), global_seq_start + k.size()[2] as usize)
+            };
+
+            let mut current_block = KvBlock {
+                layer_idx: self.layer_idx,
+                global_seq_start,
+                global_seq_end: send_seq_end,
+                k: k_to_send,
+                v: v_to_send,
+            };
+
+            for round in 0..self.num_domains.saturating_sub(1) {
+                if let Err(e) = transport.send_kv_block(&current_block) {
+                    eprintln!("[ring_attention] round {round} send_kv_block failed: {e}");
+                    break;
+                }
+
                 match transport.recv_kv_block() {
-                    Ok(Some(peer_block)) => blocks.push(peer_block),
-                    Ok(None) => break,  // 队列为空，没有更多 peer block
+                    Ok(Some(peer_block)) => {
+                        peer_blocks.push(peer_block.clone());
+                        current_block = peer_block;
+                    }
+                    Ok(None) => {
+                        eprintln!("[ring_attention] round {round} recv_kv_block returned None");
+                        break;
+                    }
                     Err(e) => {
-                        eprintln!("[ring_attention] recv_kv_block failed: {e}");
+                        eprintln!("[ring_attention] round {round} recv_kv_block failed: {e}");
                         break;
                     }
                 }
             }
-            blocks
-        } else {
-            Vec::new()
-        };
+        }
+
+        // ====== 第三步：确定 chunk 大小 ======
+        let q_chunk_size = (seq_len as usize).div_ceil(self.num_domains).max(1);
+        let kv_chunk_size = q_chunk_size;
 
         // 存储每个 Q chunk 的输出，最后 cat 拼接。
         let mut outputs = Vec::new();

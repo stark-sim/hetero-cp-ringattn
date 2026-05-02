@@ -18,6 +18,18 @@ pub struct KvBlock {
     pub v: Tensor,
 }
 
+impl Clone for KvBlock {
+    fn clone(&self) -> Self {
+        Self {
+            layer_idx: self.layer_idx,
+            global_seq_start: self.global_seq_start,
+            global_seq_end: self.global_seq_end,
+            k: self.k.shallow_clone(),
+            v: self.v.shallow_clone(),
+        }
+    }
+}
+
 /// Transport for exchanging KV blocks between distributed attention workers.
 #[cfg(feature = "tch-backend")]
 pub trait KvTransport {
