@@ -9,7 +9,7 @@ use tch::{Device, Kind, Tensor};
 /// - `temperature == 0.0`: greedy argmax.
 /// - `temperature > 0.0`: temperature scaling + optional top-p filtering + multinomial sampling.
 #[cfg(feature = "tch-backend")]
-fn sample_token(logits: &Tensor, temperature: f64, top_p: f64) -> Result<u32, ModelError> {
+pub(crate) fn sample_token(logits: &Tensor, temperature: f64, top_p: f64) -> Result<u32, ModelError> {
     // Greedy decoding
     if temperature <= 0.0 {
         return Ok(logits.argmax(-1, false).int64_value(&[]) as u32);

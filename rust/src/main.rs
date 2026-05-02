@@ -1,4 +1,10 @@
 mod compute_runtime;
+#[cfg(feature = "tch-backend")]
+mod distributed_coordinator;
+#[cfg(feature = "tch-backend")]
+mod distributed_protocol;
+#[cfg(feature = "tch-backend")]
+mod distributed_worker;
 mod infer;
 mod model;
 mod protocol;
@@ -329,6 +335,7 @@ struct CliArgs {
     infer_temperature: f64,
     infer_top_p: f64,
     infer_num_domains: usize,
+    distributed_role: Option<String>,
 }
 
 impl Lcg {
@@ -814,6 +821,7 @@ fn parse_cli_args() -> Result<CliArgs, RingError> {
     let mut infer_temperature = 0.7;
     let mut infer_top_p = 0.9;
     let mut infer_num_domains = 1usize;
+    let mut distributed_role = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--report-path" => {
@@ -875,6 +883,12 @@ fn parse_cli_args() -> Result<CliArgs, RingError> {
                     RingError::InvalidCli(format!("invalid --infer-num-domains: {e}"))
                 })?;
             }
+            "--distributed-role" => {
+                distributed_role = Some(next_cli_value(&mut args, "--distributed-role")?);
+                // Worker / coordinator parse remaining args themselves;
+                // stop parsing here so we don't reject their private flags.
+                break;
+            }
             _ => {
                 return Err(RingError::InvalidCli(format!("unknown argument {arg}")));
             }
@@ -894,6 +908,7 @@ fn parse_cli_args() -> Result<CliArgs, RingError> {
         infer_temperature,
         infer_top_p,
         infer_num_domains,
+        distributed_role,
     })
 }
 
@@ -2291,6 +2306,21 @@ fn main() -> Result<(), RingError> {
             Err(e) => eprintln!("Inference failed: {}", e),
         }
         return Ok(());
+    }
+
+    #[cfg(feature = "tch-backend")]
+    if let Some(ref role) = args.distributed_role {
+        if role == "worker" {
+            distributed_worker::run();
+            return Ok(());
+        } else if role == "coordinator" {
+            distributed_coordinator::run();
+            return Ok(());
+        } else {
+            return Err(RingError::InvalidCli(format!(
+                "invalid --distributed-role: {role}; expected worker|coordinator"
+            )));
+        }
     }
 
     if args.remote_p2p_role.as_deref() == Some("cp-node") {
