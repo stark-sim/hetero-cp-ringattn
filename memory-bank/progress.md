@@ -114,6 +114,16 @@
 - [x] [2026-05-01] **多步分布式 decode 验证**：新增 `test_distributed_llama_model_multi_step_decode`，prefill 后连续 4 步 decode，每步 domain0/domain1 与单节点参考 diff 均 ~2e-6。修复多步 decode 根因：`history_len = k.size()[2] - 1` 在多步时会包含之前 decode 步骤 append 的 token，导致 peer 收到重复 KV。引入 `HcpRingAttentionBackend::prefill_kv_len` 字段，decode 阶段只发送 prefill 分区。25/25 测试通过，clippy 零警告。
 - [x] [2026-05-01] **`RingAttnMessage` serialization/deserialization 测试覆盖**：新增 5 个 protocol 单元测试——bincode serialize→deserialize roundtrip、256-byte payload 完整性、schema version 字段往返、三种 message kind（KvBlock/SoftmaxState/Terminate）全覆盖、MessageSender/MessageReceiver TCP trait 端到端。30/30 测试通过，clippy 零警告。
 - [x] [2026-05-01] **分布式 Generator `DistributedGenerator`**：单进程模拟多 domain CP 推理。prefill 阶段将 prompt 分片到各 domain；decode 阶段 coordinator 广播 token 给所有 domain，从任意 domain 采样（分布式 decode 输出一致）。核心方法 `generate_tokens` 支持 token-ID 级别的生成；`generate` 包装 tokenizer encode/decode。新增 `test_distributed_generator_tokens_match_reference`：4 步贪婪 decode，domain0/domain1 输出 token 完全一致，与单节点参考 logits diff ~1e-5。31/31 测试通过，clippy 零警告。
+- [x] [2026-04-30] **真实多进程分布式推理完成**：新增 `distributed_worker.rs`、`distributed_coordinator.rs`、`distributed_protocol.rs`。
+  - Worker：加载模型权重，连接 peer 做 KV ring 交换，连接 coordinator 接收 Prefill/Decode/Shutdown 命令。
+  - Coordinator：只加载 tokenizer+config，prompt 分片、token 广播、采样；不加载模型权重。
+  - Protocol：`WorkerCommand`/`WorkerResponse` bincode 序列化，4-byte BE length prefix frame I/O。
+  - Handshake：worker 连接 coordinator 后发送 `domain_id`，coordinator 按 domain_id 排序 stream，避免 accept 顺序与 domain 顺序错位。
+  - `SyncGlobalSeqLen`：prefill 后 coordinator 广播 max global_seq_len，确保所有 worker decode 从正确位置开始。
+  - `BidirectionalTcpKvTransport`：每层独立 outbound+inbound TCP stream 做 ring KV 交换。
+  - CLI：`--distributed-role worker|coordinator` 分发到对应入口；`main.rs` 在解析到 `--distributed-role` 后停止解析其余参数，让 worker/coordinator 自行处理私有 flags。
+  - **本地 2-node CPU smoke 通过**：Qwen2-0.5B，prompt "The answer to life, the universe, and everything is"，greedy decode 4 tokens 生成 " in the universe."，与 Python transformers 参考输出 **完全一致**（token [304, 279, 15494, 13]）。
+  - 31/31 单元测试通过，clippy 零警告。
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 
 ## 已知问题

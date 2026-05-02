@@ -2,18 +2,23 @@
 
 ## 当前焦点
 
-[2026-05-01] Phase B/B+ 已完成：分布式 decode 路径打通，端到端 diff 已修复。核心修改包括：
-1. 移除 `seq_len <= 1` 回退，decode 阶段走完整 `ring_attention` 路径
-2. `seq_offset` 传入 `AttentionBackend::set_distributed`，`forward` 使用固定 `seq_offset` 代替 `position_ids.min()`
-3. decode 阶段发送 KV 时排除新 append 的 token，避免 ring 中重复
-4. `kv_chunks` 改用本地 KV 长度而非 Q 的 `seq_len`
-5. `LlamaModel::global_seq_len` 保证 decode position_ids 正确
-6. 修复 `global_seq_len` 被设为本地 `seq_len` 的 bug（domain0=8 而非 16）
-7. 引入 `prefill_kv_len` 字段，多步 decode 时只发送 prefill 分区，防止 peer KV 重复
+[2026-04-30] **真实多进程分布式推理（Real Multi-Process Distributed Inference）已完成并验证**。
 
-新增/扩展 6 个单元测试（25/25 通过）：
-- `test_tcp_kv_transport_roundtrip`：TCP 序列化精度无损（k_diff=0, v_diff=0）
-- `test_distributed_llama_model_multi_step_decode`：4 步连续 decode，每步 diff ~2e-6
+核心实现：
+1. 新增 `distributed_worker.rs`：加载 LlamaModel，连接 peer（每层独立 TCP）做 KV ring 交换，连接 coordinator 执行 Prefill/Decode/Shutdown 命令循环。
+2. 新增 `distributed_coordinator.rs`：加载 tokenizer+config（不加载权重），accept worker 连接（handshake 读取 domain_id 排序），prompt 分片 → 广播 `SyncGlobalSeqLen` → decode 循环广播 token → 采样 → 检查 EOS。
+3. 新增 `distributed_protocol.rs`：`WorkerCommand`（Prefill/Decode/SyncGlobalSeqLen/Shutdown）与 `WorkerResponse`（PrefillDone/DecodeDone/Error）bincode 序列化，4-byte BE length prefix frame I/O。
+4. `main.rs`：新增 `--distributed-role worker|coordinator` CLI 分发；解析到 role 后停止解析其余参数，避免冲突。
+5. `BidirectionalTcpKvTransport`：封装每层一对 outbound/inbound `TcpStream`，实现 `KvTransport` trait。
+
+关键 bug 修复：
+- **Handshake**：worker 连接 coordinator 后发送 domain_id，coordinator 排序后再分配 chunk。否则 accept 顺序与 domain 顺序错位，导致 prefill chunk 发错 worker，生成结果完全错误。
+- **SyncGlobalSeqLen**：prefill 后 coordinator 广播 max global_seq_len。否则 worker0 的 global_seq_len 仅为本地 chunk 长度（6），decode 时 RoPE 位置错误，输出与参考不一致。
+- **main.rs CLI passthrough**：原 `parse_cli_args` 不认识 worker/coordinator 私有参数（`--domain-id` 等）并报 "unknown argument"。改为遇到 `--distributed-role` 后 `break`，让子模块自行解析 `std::env::args()`。
+
+验证结果：
+- 本地 2-node CPU smoke（Qwen2-0.5B）：prompt "The answer to life, the universe, and everything is"，greedy decode 4 tokens 生成 " in the universe."，与 Python transformers 参考 **完全一致**。
+- `cargo test` 31/31 通过，`cargo clippy --features tch-backend` 零警告。
 
 当前无阻塞。
 
@@ -132,7 +137,9 @@
 
 ## 下一步
 
-- [x] 分级 tolerance policy 已落地：`ToleranceTier` 三级（Strict/Relaxed/EndToEnd），`--tolerance-tier` CLI 参数支持切换，correctness report 包含 tier 信息。
+- [ ] 远端多进程分布式验证：在 `sd-1` GPU 节点上启动 worker，Mac 本机启动 coordinator，验证跨机器 TCP ring + 异构设备（MPS coordinator 仅采样，CUDA worker 计算）。
+- [ ] 多 worker launcher 脚本：扩展 `run_distributed_2node_smoke.sh` 支持远程 SSH 启动 worker、统一日志收集。
+- [ ] 分级 tolerance policy 已落地：`ToleranceTier` 三级（Strict/Relaxed/EndToEnd），`--tolerance-tier` CLI 参数支持切换，correctness report 包含 tier 信息。
 - [x] M2 数学闭环正式文档已沉淀：`docs/CORRECTNESS_REPORT.md` 包含验证目标、方法论、7-case 测试矩阵、实测 metrics、分级 tolerance 推导依据和运行方式；`docs/RINGATTN_MODEL.md` 同步更新 case 列表和 tolerance 描述。
 - [ ] 将 Rust correctness model 继续拆分为 library + binary，便于后续 protocol / transport 复用。
 - [x] [2026-04-30] 抽出统一 transport trait：`MessageSender` + `MessageReceiver` trait 定义在 protocol.rs 中；`TcpStream`、`mpsc::Sender<Vec<u8>>`、`mpsc::Receiver<Vec<u8>>` 均实现对应 trait；`cp_ring_node_smoke`、`run_remote_cp_node`、`run_remote_p2p_server/client` 全部迁移到新 trait；删除 `send_cp_node_frame`、`write_raw_message_frame`、`read_raw_message_frame` 等重复函数；18/18 测试通过，clippy 零警告，smoke 通过。
