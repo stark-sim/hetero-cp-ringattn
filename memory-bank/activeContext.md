@@ -2,7 +2,22 @@
 
 ## 当前焦点
 
-[2026-04-30] **QUIC Transport、Mask 优化、动态不均等分片 Phase 1、1-token prefill bug 修复已全部完成并验证**。
+[2026-05-02] **Phase 2: Capacity-Aware 不均等分片已完成并验证**。
+
+在 Phase 1 手动 `--chunk-sizes` 基础上，实现了自动 capacity 感知分配：
+1. **跨平台 capacity 查询**：新建 `rust/src/capacity.rs`。
+   - CUDA：`nvidia-smi --query-gpu=memory.free` 子进程解析。
+   - MPS (macOS)：`sysctl hw.memsize` 总 RAM / 2（unified memory 保守启发式）。
+   - CPU：`/proc/meminfo MemAvailable` (Linux) / `sysctl` (macOS) / 4（CPU 计算慢，故意 under-weight）。
+2. **Largest-remainder 分配算法**：`allocate_by_capacity(L, c[])` 保证 `sum == L`、`min >= 1`、单调性。
+3. **Handshake 协议扩展**：16-byte fixed（domain_id u64 LE + capacity_mb u64 LE）。
+4. **Coordinator 三层优先级**：`--chunk-sizes`（精确手动）> `--capacity-aware`（自动比例）> 均分（默认 fallback）。
+5. **动态 seq_offset 同步**：`WorkerCommand::Prefill` 扩展为包含 `seq_offset`，worker 收到后同时更新 `LlamaModel.seq_offset` 和所有 layer backend 的 `seq_offset`，确保 capacity-aware 模式下 causal mask 使用正确的全局位置。
+6. **验证**：42/42 单元测试通过，clippy 零警告。本地 2-node CPU smoke 三种模式（baseline even / `--capacity-aware` / `--chunk-sizes 7,4` override）输出均一致（`" in the universe."`）。
+
+---
+
+[2026-04-30] **QUIC Transport、Mask 优化、动态不均等分片 Phase 1、1-token prefill bug 修复已完成并验证**。
 
 在原有 TCP KV ring transport 基础上，本阶段完成了四项关键工程改进：
 

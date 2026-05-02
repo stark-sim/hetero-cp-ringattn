@@ -195,3 +195,6 @@ project-root/
 | `is_prefill_done` 标志替代 `seq_len > 1` 区分 prefill/decode | `seq_len > 1` 在 1-token prefill chunk（如 `--chunk-sizes 10,1`）时失效，误判为 decode。`is_prefill_done` 确保第一次 `forward()` 无论 `seq_len` 都走 prefill 路径 | [2026-04-30] |
 | 动态不均等分片 Phase 1：手动 `--chunk-sizes` | Coordinator CLI 新增逗号分隔的 `--chunk-sizes`，显式指定每个 domain 的 chunk 长度。自动校验 `len == num_domains` 且 `sum == prompt_len`。为后续 Phase 2（capacity 感知自动分配）铺垫 | [2026-04-30] |
 | `prefill_kv_len` 字段解决多步 decode 重复发送 KV | 多步 decode 时 `history_len = k.size()[2] - 1` 会包含之前 decode append 的 token，导致 peer 收到重复 KV。`prefill_kv_len` 记录 prefill 阶段 KV 长度，decode 只发送 prefill 分区 | [2026-05-01] |
+| Handshake 扩展 capacity 上报 | Worker 加载模型后查询 device 可用显存/内存，通过 16-byte handshake 上报 coordinator。Coordinator 使用 largest-remainder method 按比例分配 chunk sizes，替代手动 `--chunk-sizes` | [2026-05-02] |
+| Prefill 命令携带动态 seq_offset | Capacity-aware 分配下每个 worker 的 chunk start 可能与其 CLI `--seq-offset` 不一致。Coordinator 在 `WorkerCommand::Prefill` 中携带实际 `seq_offset`，worker 收到后同步更新 `LlamaModel` 和所有 layer backend 的 `seq_offset`，确保 causal mask 使用正确的全局位置 | [2026-05-02] |
+| `set_distributed` 保留现有 transport | 当 `transport` 参数为 `None` 时，`HcpRingAttentionBackend::set_distributed` 只更新 `seq_offset` 和 `domain_id`，不覆盖已有的 `kv_transport`。避免 worker 在更新 seq_offset 时意外丢失 QUIC stream | [2026-05-02] |

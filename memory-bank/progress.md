@@ -110,6 +110,14 @@
 
 ## 进行中
 
+- [x] [2026-05-02] **Phase 2: Capacity-Aware 不均等分片**：
+  - 新建 `rust/src/capacity.rs`：跨平台 device capacity 查询（`nvidia-smi` for CUDA、`sysctl`/`/proc/meminfo` for CPU/MPS）+ largest-remainder 比例分配算法 + 最小 1-token 保证。
+  - 11 个单元测试覆盖 equal/2:1/3:1/zero-capacity/min-token/realistic MPS+CUDA 场景。
+  - Handshake 协议扩展为 16-byte fixed（domain_id + capacity_mb）。
+  - Coordinator 三层分配优先级：`--chunk-sizes` > `--capacity-aware` > 均分。
+  - `WorkerCommand::Prefill` 扩展为包含 `seq_offset`，worker 动态更新所有 layer backend 的 `seq_offset`，确保 capacity-aware 模式下 causal mask 使用正确的全局位置。
+  - `HcpRingAttentionBackend::set_distributed` 仅在显式提供 transport 时才替换 `kv_transport`（`None` 表示保持现有）。
+  - **验证**：42/42 单元测试通过，clippy 零警告；本地 2-node CPU smoke 三种模式（baseline even / `--capacity-aware` / `--chunk-sizes 7,4` override）输出均一致（`" in the universe."`）。
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 
 ## 已知问题
