@@ -11,6 +11,10 @@
 - Python 3
 - NumPy，用于 Python correctness / kernel stub 原型
 - PyTorch / libtorch 2.11.0 可通过独立 libtorch 或 Python 安装提供的 headers/libs 接入 C++ ATen bridge
+- `tch-rs` 0.24.0（optional `tch-backend` feature，默认启用）
+- `quinn` 0.11 + `rustls` 0.23 + `rcgen` 0.13（QUIC transport）
+- `tokio` 1.x（async runtime for QUIC）
+- `safetensors`、`tokenizers`、`half`（真实模型权重加载与推理）
 
 ### Styling
 
@@ -33,6 +37,8 @@
   - Rust CP payload-backed ATen/libtorch block compute smoke
   - Rust `DomainModelState` unit tests for Q/K/V state ownership and K/V block slicing
   - Rust remote P2P pair smoke
+  - Rust remote CP node smoke（2-node / 3-node）
+  - Rust tch-backend smoke（CPU/MPS/CUDA）
   - Python controller / worker placeholder smoke 仅作历史占位
 - 后续应增加 online softmax correctness script / report。
 
@@ -54,6 +60,7 @@
 - Rust / Cargo。
 - Python 3。
 - Python smoke 需要 NumPy。
+- Python 模型推理需要 `safetensors`、`tokenizers`、`torch`。
 - 可选 PyTorch C++ bridge 优先使用独立 libtorch：设置 `LIBTORCH`，或显式设置 `LIBTORCH_INCLUDE` / `LIBTORCH_LIB`。
 - 如果没有独立 libtorch，才 fallback 到 Python 环境中的 `torch.utils.cpp_extension` 发现 include/lib path。
 - 当前验证环境：`torch==2.11.0`、`torchvision==0.26.0`、`torchaudio==2.11.0`。
@@ -175,7 +182,7 @@ RUN_ID=rust-remote-cp-3node-<timestamp> \
 - Linux CUDA 构建需注意：`torch-sys` 的 `libtorch_cuda.so` 可能被 `--as-needed` 丢弃，已通过 `build.rs` 的 `cargo:rustc-link-arg-bins` 强制保留。
 - `HCP_TORCH_DEVICE=cpu|mps|cuda|cuda:N`：选择 ATen smoke 设备；成功码分别为 CPU=1、MPS=2、CUDA=3。
 - `BIND_ADDR`：remote P2P server 监听地址，双机 smoke 使用 `0.0.0.0:29172` 或 GPU 子网地址。
-- `CONNECT_ADDR`：remote P2P client 连接地址，当前 GPU host 为 `192.168.8.172:29172`。
+- `CONNECT_ADDR`：remote P2P client 连接地址，当前 GPU host 为 `192.168.8.172`。
 - `NODE_INDEX`：remote CP node index；当前 `0=mac-mps`，`1=gpu-cuda`。
 - `HCP_REMOTE_CP_DOMAINS=2|3`：remote CP node 拓扑大小，默认 2；设置为 3 时为 `mac-mps -> gpu-cuda -> mac-mps-2 -> mac-mps`。
 - `PORT_BASE`：`run_rust_remote_cp_3node_smoke.sh` 使用的三节点端口基准，默认 `29250`；GPU node1 使用 `PORT_BASE`，node0 使用 `PORT_BASE+1`，node2 使用 `PORT_BASE+2`。
@@ -196,18 +203,82 @@ RUN_ID=rust-remote-cp-3node-<timestamp> \
 - CUDA 请求下 `torch_code=-5` 表示当前 libtorch 进程无 CUDA backend，通常是 CPU-only libtorch 或 `libtorch_cuda` / `c10_cuda` 没有被链接/加载。
 - Linux CUDA libtorch 构建需要保留 `libtorch_cuda` / `c10_cuda` 动态依赖；build script 在检测到这两个库时会用同一个 linker group 传入 `--push-state,--no-as-needed,-ltorch_cuda,-lc10_cuda,--pop-state`。
 - 远端非交互 SSH 默认 PATH 不包含 `/home/stark/.cargo/bin`，也不会自动加载 libtorch 环境；通过 SSH 启动 CUDA Rust smoke 时显式设置 `PATH=/home/stark/.cargo/bin:$PATH`、`LIBTORCH=/home/stark/libtorch`、`LIBTORCH_INCLUDE=/home/stark/libtorch/include`、`LIBTORCH_LIB=/home/stark/libtorch/lib`、`LD_LIBRARY_PATH=/home/stark/libtorch/lib:$LD_LIBRARY_PATH`。
+- `HCP_WEIGHTS_JSON=/path/to/weights.json`：加载外部 JSON 格式权重（Q/K/V/O projection + LayerNorm gamma/beta）。
+- `HCP_TCH_DEVICE=cpu|mps|cuda|cuda:N`：选择 tch-backend compute runtime 设备；与 `HCP_TORCH_DEVICE` 互相兼容。
+- `--chunk-sizes 7,4`：Coordinator CLI 参数，显式指定不均等 prompt 分片（逗号分隔）。
+- `--infer-num-domains N`：Inference CLI 参数，指定分布式推理的 domain 数量（默认 1，即单节点 LocalAttentionBackend）。
+- `--infer-model-dir /path/to/model`：Inference CLI 参数，从 HuggingFace 格式目录加载模型（`config.json` + `model.safetensors` + `tokenizer.json`）。
 
 ## 项目结构
 
 ```text
-include/hcp_ringattn/core/  # 独立公共类型、协议、runtime 抽象
-src/                        # NoOp runtime 与 C++ coordinator smoke
-python/                     # controller、worker、online softmax 原型
-rust/                       # Rust correctness model、report、C++ bridge build
-config/                     # 最小 ring 配置
-scripts/                    # 本地 smoke 入口
-docs/                       # 设计、验证、路线图、产品论证
-reports/                    # 实验报告输出目录
+project-root/
+├── CMakeLists.txt
+├── Cargo.toml / Cargo.lock / build.rs    # Rust workspace
+├── README.md / AGENTS.md
+├── include/hcp_ringattn/core/            # C++ 独立公共类型、协议、runtime 抽象
+│   ├── status.h
+│   ├── tensor_types.h
+│   ├── ringattn_protocol.h
+│   └── ringattn_runtime.h
+├── src/                                  # C++ NoOp runtime 与 coordinator smoke
+│   ├── ringattn_runtime.cc
+│   ├── ringattn_coordinator_smoke_main.cc
+│   └── rust_bridge.cc
+├── python/                               # controller、worker、online softmax 原型
+│   ├── ringattn_controller.py
+│   ├── ringattn_worker.py
+│   └── ringattn_kernel_stub.py
+├── rust/                                 # Rust correctness model、report、C++ bridge build
+│   ├── src/
+│   │   ├── main.rs                       # CLI + smoke 入口
+│   │   ├── lib.rs                        # library 边界
+│   │   ├── protocol.rs                   # RingAttnMessage schema、P2P transport、CP node runtime
+│   │   ├── correctness.rs                # Rust correctness model（7 cases）
+│   │   ├── report.rs                     # 结构化 report 生成
+│   │   ├── tch_backend.rs                # tch-rs 桥接（6 个函数）
+│   │   ├── compute_runtime.rs            # ComputeRuntime trait（Tch/NoOp）
+│   │   ├── kv_transport.rs               # KvTransport trait + Mock/Tcp/Quic 实现
+│   │   ├── quic_transport.rs             # QuicKvTransport（quinn-based）
+│   │   ├── distributed_worker.rs         # 多进程分布式 worker
+│   │   ├── distributed_coordinator.rs    # 多进程分布式 coordinator
+│   │   ├── distributed_protocol.rs       # WorkerCommand/WorkerResponse 协议
+│   │   ├── model/                        # 真实模型实现
+│   │   │   ├── mod.rs
+│   │   │   ├── model.rs                  # LlamaModel、Generator、DecoderLayer
+│   │   │   ├── backend.rs                # AttentionBackend（Local/HcpRingAttention）
+│   │   │   ├── weights.rs                # ModelWeights、ModelConfig（safetensors 加载）
+│   │   │   ├── attention.rs              # GqaAttention、RotaryEmbedding
+│   │   │   └── mlp.rs                    # SwiGLU MLP
+│   │   ├── infer.rs                      # inference CLI（`--infer-model-dir` 等）
+│   │   └── bin/
+│   │       └── tch_smoke.rs              # tch-backend 独立 smoke binary
+│   └── target/
+├── config/                               # 最小 ring 配置、测试权重
+│   └── minimal_2domain_ring.json
+├── scripts/                              # 本地/远程 smoke 入口
+│   ├── run_local_ringattn_smoke.sh
+│   ├── run_rust_ringattn_smoke.sh
+│   ├── run_tch_ringattn_smoke.sh
+│   ├── run_rust_remote_p2p_server.sh
+│   ├── run_rust_remote_p2p_client.sh
+│   ├── run_rust_remote_cp_node.sh
+│   └── run_rust_remote_cp_3node_smoke.sh
+├── docs/                                 # 设计、验证、路线图、产品论证
+│   ├── DESIGN.md
+│   ├── HISTORY_AND_LESSONS.md
+│   ├── HLPP_VS_HCP.md
+│   ├── PRODUCT_THESIS.md
+│   ├── PROTOCOL_SMOKE.md
+│   ├── RINGATTN_MODEL.md
+│   ├── ROADMAP.md
+│   ├── RUST_CPP_TORCH_PLAN.md
+│   ├── TCH_RS_USAGE_PLAN.md
+│   ├── TCH_BACKEND_DESIGN.md
+│   ├── CORRECTNESS_REPORT.md
+│   └── VALIDATION_PLAN.md
+├── reports/                              # 实验报告输出目录
+└── memory-bank/                          # 跨会话上下文
 ```
 
 ## Import Aliases
@@ -217,6 +288,7 @@ reports/                    # 实验报告输出目录
 
 ## 构建与部署
 
-- 本地构建通过 CMake 完成。
+- 本地构建通过 CMake 完成（C++ 部分）。
+- Rust 构建通过 Cargo 完成；`tch-backend` 为默认 feature，需要 `LIBTORCH` 环境变量。
 - 当前没有 CI/CD 或 Docker 配置。
 - `build/` 和 `reports/*` 被 `.gitignore` 忽略，`reports/.gitkeep` 保留目录。

@@ -80,74 +80,36 @@
 - [x] [2026-04-30] VPN 三节点 remote CP tch-full 验证通过：`GPU_HOST=100.118.253.68 MAC_NODE_ADDR=100.121.35.138 RUN_ID=rust-remote-cp-tch-full-vpn-20260430 PORT_BASE=29335`，node0/node2 MPS `code=2 12/12`，node1 CUDA `code=3 12/12`；C++ bridge 与 tch bridge 全部通过。
 - [x] [2026-04-30] M2 correctness 扩展完成：7 个 cases（含大 seq 和边界条件）；`max_rel_err` 已添加到 correctness model 和全部 tch bridge；`--stress-test` 支持 5-seed 随机验证。
 - [x] [2026-04-30] M3 protocol 优化完成：TCP frame I/O 统一为 `write_frame_to_stream`/`read_frame_from_stream`；`process_inbound_message` 提取消除 CP node runtime 重复逻辑；SSH ConnectTimeout=30 修复 VPN 远程 smoke 超时。
+- [x] [2026-04-30] M3-tch Step 1-3 完成：`backend.rs` `ring_attention` 非因果路径已从 `compute_chunk_attention_step` 迁移到 `process_kv_block` 纯 tensor online softmax；因果/非因果输出统一为 `[batch, num_heads, seq_len, head_dim]`；`compute_runtime.rs` `TchComputeRuntime::compute_kv_block` 已内联 tensor 实现；清理死代码（`compute_chunk_attention_step`、`tensor_to_q_payload`、`tensor_to_kv_payload`）。
 - [x] [2026-04-30] M4 异构 runtime 闭环完成：`ComputeRuntime` trait 提取，`TchComputeRuntime` 真实计算，`NoOpComputeRuntime` 仅作 fallback；计算路径与协议逻辑解耦；本地 MPS smoke 和 VPN 三节点 remote CP 验证通过。
-- [x] [2026-05-01] Phase 1 Checkpoint 1: 新增 `safetensors`/`tokenizers`/`half` 依赖；`ModelConfig` 支持解析 HF `config.json`（Llama/Qwen2/Mistral 家族）；`ModelWeights` 支持从 `.safetensors` 加载并转换 F16/BF16 到 F32。
-- [x] [2026-05-01] Phase 1 Checkpoint 2: `RmsNorm`（替换标准 LayerNorm）、可配置 `RotaryEmbedding`、`SwiGLU` MLP；全部通过单元测试验证输出形状。
-- [x] [2026-05-01] Phase 1 Checkpoint 3: `GqaAttention`（RoPE + GQA + causal mask + KV cache）、`LocalAttentionBackend`（实现 `AttentionBackend` trait）、`DecoderLayer`（完整 Pre/Post-Norm + Residual）、`LlamaModel`（Embedding → N-layer stack → RMSNorm → LM Head）；全部通过单元测试。
-- [x] [2026-05-01] Phase 1 Checkpoint 4: `Generator`（prefill + decode 自回归循环 + temperature 采样）、inference CLI（`--infer-model-dir`/`--infer-prompt`/`--infer-max-tokens`/`--infer-temperature`）；合成 tiny 模型验证 pipeline 端到端跑通。
+- [x] [2026-04-30] M3 transport trait 重构完成：`MessageSender` + `MessageReceiver` trait 定义在 `protocol.rs` 中；`TcpStream`、`mpsc::Sender/Receiver<Vec<u8>>` 均实现对应 trait；`cp_ring_node_smoke`、`run_remote_cp_node`、`run_remote_p2p_server/client` 全部迁移；删除 `send_cp_node_frame`、`write_raw_message_frame`、`read_raw_message_frame` 等重复函数；18/18 测试通过，clippy 零警告，smoke 通过。
+- [x] [2026-04-30] `tch-backend` 设为默认 feature：`Cargo.toml` `default = ["tch-backend"]`；修复由此暴露的全部 46 个 clippy 错误；`cargo test` 18/18 通过，`cargo clippy -- -D warnings` 零警告。
+- [x] [2026-04-30] 明确 HCP 与 PyTorch 官方 Context Parallel 的边界：HCP 采用原始 Ring Attention 论文的 P2P 设计，支持异构/非均分；PyTorch 2.7+ CP 是同构 GPU 集群的 collective 优化。已记录于 `systemPatterns.md`。
+- [x] [2026-05-01] Phase 1 Checkpoint 1-4: `safetensors`/`tokenizers`/`half` 依赖；`ModelConfig` 解析 HF `config.json`（Llama/Qwen2/Mistral 家族）；`ModelWeights` 从 `.safetensors` 加载并转换 F16/BF16→F32；`RmsNorm`、可配置 `RotaryEmbedding`、`SwiGLU` MLP；`GqaAttention`（RoPE + GQA + causal mask + KV cache）；`LocalAttentionBackend`（`AttentionBackend` trait）；`DecoderLayer`（Pre/Post-Norm + Residual）；`LlamaModel`（Embedding → N-layer → RMSNorm → LM Head）；`Generator`（prefill + decode 自回归 + temperature 采样）；inference CLI（`--infer-model-dir`/`--infer-prompt`/`--infer-max-tokens`）；合成 tiny 模型验证 pipeline 端到端跑通。
 - [x] [2026-05-01] 修复 `protocol.rs` 中 `output_slot` 初始化大小 bug（`MODEL_HIDDEN_DIM` → `KV_NUM_HEADS * KV_HEAD_DIM`）；修复 `domain_model_state_projects_qkv_from_hidden_states` 测试未应用 RoPE 的问题。
 - [x] [2026-05-01] 修复 inference pipeline 中 `Tensor::embedding` 参数顺序错误（tch-rs 为 `embedding(weight, indices, ...)`）；修复 MPS float64 限制（RmsNorm eps / RoPE inv_freq / attention scale 全部转为 f32 tensor）。
+- [x] [2026-05-01] 修复 inference pipeline 中 causal mask NaN bug：`make_causal_mask`/`create_causal_mask` 原用 `mask.to_kind(Float) * NEG_INFINITY` 产生 NaN，改为 `zeros(...).masked_fill(&mask, NEG_INFINITY)`。
+- [x] [2026-05-01] 修复 `test_chunk_step_vs_softmax_single_block` 中 `actual` tensor 形状构造错误（多余 `permute` 导致维度交换）。
+- [x] [2026-05-01] 修复 `ring_attention` causal mask 未传递给 `compute_chunk_attention_step` 的问题：当 `attention_mask.is_some()` 时，直接使用已 mask 的 `scores` 做 online softmax 更新。
+- [x] [2026-05-01] Phase 2 Checkpoint 5: `HcpRingAttentionBackend` 接入真实推理路径；`LlamaModel::from_weights` 根据 `num_domains` 选择 `LocalAttentionBackend`（默认）或 `HcpRingAttentionBackend`；新增 `--infer-num-domains` CLI 参数；Qwen2-0.5B 在 `num_domains=1/2/4` 下 greedy decode 输出完全一致。
+- [x] [2026-05-01] 修复 GQA `repeat_kv` 关键 bug：Rust 原实现 `x.repeat([1, n_rep, 1, 1])` 与 Python transformers 的 `repeat_kv`（expand+reshape，每个 head 连续重复）语义不一致。修复后 Qwen2-0.5B greedy decode 与 Python transformers 输出完全一致；19/19 测试通过，clippy 零警告。
+- [x] [2026-05-01] CUDA 推理验证通过：远端 `sd-1` GPU 节点使用 `cuda:1` 运行 Qwen2-0.5B greedy decode，输出与本地 CPU/MPS 完全一致；`HCP_TORCH_DEVICE=cuda:1` 环境变量被 `infer.rs` 正确解析。
+- [x] [2026-05-01] M2：Rust online softmax correctness report 与 tolerance policy 扩展完成。新增 `ToleranceTier` 三级策略（Strict/Relaxed/EndToEnd），`--tolerance-tier` CLI 参数支持运行时切换；correctness JSON report 输出 `tolerance_tier` 和 `tolerance` 字段；`tch_backend.rs` 5 处硬编码 tolerance 统一为模块常量；`model.rs` 端到端断言使用命名常量；全部 18 单元测试通过，clippy 零警告。
+- [x] [2026-05-01] M2 数学闭环正式文档已沉淀：`docs/CORRECTNESS_REPORT.md` 包含验证目标、方法论、7-case 测试矩阵、实测 metrics、分级 tolerance 推导依据（float32 epsilon、FMA、累加顺序、业界 PyTorch/NumPy/ICON-A 参考）和运行方式；`docs/RINGATTN_MODEL.md` 同步更新 case 列表和 tolerance 描述；全部 case 在 Strict tier 下通过，max_rel_err 与 threshold 保持至少 10 倍以上余量。
+- [x] [2026-05-01] Phase B: 分布式 decode 路径打通。`seq_len <= 1` 回退已移除，decode 阶段走完整 `ring_attention` 路径；`seq_offset` 传入 `AttentionBackend::set_distributed`，`forward` 使用固定 `seq_offset` 代替 `position_ids.min()` 计算 `global_seq_start`；decode 阶段发送 KV 时排除新 append 的 token，避免 ring 中重复；`kv_chunks` 改用本地 KV 长度而非 Q 的 `seq_len`；新增 `LlamaModel::global_seq_len` 保证 decode position_ids 正确。新增 4 个单元测试验证 decode 路径数学正确性；23/23 测试通过，clippy 零警告。
+- [x] [2026-05-01] 修复分布式 decode ~6 diff 根因：`LlamaModel::forward` 中 prefill 阶段错误地将 `global_seq_len` 设为本地 `seq_len`（domain0=8），导致 decode 时 `position_ids=8` 而非正确的全局位置 16。修复后 diff 从 6.7 降至 ~2e-6，与单节点参考一致。
+- [x] [2026-05-01] Phase B++: A) `test_tcp_kv_transport_roundtrip` 验证 TCP 序列化无损（k_diff=0, v_diff=0）；B) `test_distributed_llama_model_multi_step_decode` 验证 4 步连续分布式 decode，每步 diff ~2e-6。修复多步 decode 根因：`history_len = k.size()[2] - 1` 在多步时会包含之前 decode append 的 token，引入 `prefill_kv_len` 字段确保只发送 prefill 分区。
+- [x] [2026-05-01] Phase C: 分布式 Generator `DistributedGenerator`。单进程模拟多 domain CP 推理：prefill 分片到各 domain → 同步 global_seq_len → decode 循环广播 token → 采样。`test_distributed_generator_tokens_match_reference`：4 步贪婪 decode，domain0/domain1 token 完全一致，与单节点参考 logits diff ~1e-5。31/31 测试通过，clippy 零警告。
+- [x] [2026-05-01] Phase D: `RingAttnMessage` serialization/deserialization 测试覆盖。新增 5 个测试：bincode roundtrip、payload 完整性（256 bytes）、schema version 字段、三种 message kind 全覆盖、TCP transport trait 端到端。30/30 测试通过，clippy 零警告。
+- [x] [2026-05-01] Phase 3 Step 1-5: `KvTransport` trait 与 `KvBlock` 创建；`MockKvTransport` 支持 in-memory 测试；`HcpRingAttentionBackend` 集成 `KvTransport`（`send_local_kv` + `process_peer_block` + `global_seq_start`）；`LinkedMockKvTransport` 修复自环 bug（`peer_inbox`/`self_inbox` 分离）；测试代码修复 layer transport 覆盖 bug（每层独立 transport pair）；`test_distributed_llama_model_prefill` 端到端分布式 prefill 通过（2-layer、GQA、seq_len=16 拆成 2 domain），diff=2.79e-6；关键代码已补充详细中文注释。
+- [x] [2026-04-30] **真实多进程分布式推理（Real Multi-Process Distributed Inference）完成**：`distributed_worker.rs`、`distributed_coordinator.rs`、`distributed_protocol.rs` 创建；Worker 加载模型权重做 KV ring 交换，Coordinator 加载 tokenizer+config 做 prompt 分片和 token 广播；Handshake（domain_id 排序）、`SyncGlobalSeqLen` 广播、`BidirectionalTcpKvTransport` 每层独立 TCP stream。本地 2-node CPU ✅、远端 CPU+CUDA:1 ✅、本地 MPS+CPU ✅、跨机器 MPS+CUDA:1 ✅、3-domain 本地 CPU×3 ✅、3-domain 跨机器 MPS+CUDA×2 ✅。性能基准见 `activeContext.md`。
+- [x] [2026-04-30] **QUIC Transport 实现与验证**：新增 `quinn`/`rustls`/`rcgen`/`tokio` 依赖；`rust/src/quic_transport.rs` 实现 `QuicKvTransport`（单 connection + per-layer bidirectional stream）；修复 rustls `CryptoProvider` 未初始化、2-domain 对称连接死锁、quinn `open_bi` 不发送 STREAM 帧导致 `accept_bi` 挂起（1-byte dummy workaround）。本地 2-domain/3-domain/MPS+CPU 均通过，输出与 TCP baseline 一致。**跨机器 QUIC vs TCP 性能对比**（Mac MPS + 远端 CUDA:1，VPN ~150ms RTT，Qwen2-0.5B 11 prompt + 20 decode tokens）：TCP 107.3s，QUIC 76.4s，QUIC 快 **~29%**。
+- [x] [2026-04-30] **Mask 优化**：分布式 prefill 阶段 `model.rs` 不再创建 `[seq_len, seq_len]` 密集 causal mask。`ring_attention` 已通过 `global_seq_start` + position 比较实现 causal，从不读取 mask 张量数据。改为：单节点时仍创建完整 mask；分布式（`num_domains > 1`）时传 `[1,1,1,1]` dummy zero tensor 作为 causal 标志。本地 2-domain/3-domain CPU smoke 验证通过，输出一致。
+- [x] [2026-04-30] **动态不均等分片 Phase 1**：Coordinator CLI 新增 `--chunk-sizes`（逗号分隔，如 `7,4` 或 `5,3,3`），显式指定每个 domain 的 prompt chunk 长度。分片逻辑校验：长度必须等于 `num_domains`，总和必须等于 prompt token 数。测试验证：2-domain `7+4=11` ✅、3-domain `5+3+3=11` ✅，生成结果与参考一致。
+- [x] [2026-04-30] **修复 1-token prefill 边界 bug**：原代码用 `seq_len > 1` 区分 prefill/decode，chunk=1 时被误判为 decode（如 `--chunk-sizes 10,1`）。`LlamaModel` 和 `HcpRingAttentionBackend` 均新增 `is_prefill_done` 标志，第一次 `forward` 无论 `seq_len` 都走 prefill 路径。验证矩阵：2-domain (6,5/7,4/8,3/9,2/10,1)、3-domain (4,4,3/5,3,3/6,3,2/7,2,2)、4-domain (3,3,3,2/4,3,2,2) 全部通过，输出与参考一致。31/31 单元测试通过，clippy 零警告。
 
 ## 进行中
 
-- [x] [2026-05-01] Phase 1 Checkpoint 4b: 真实 Qwen2-0.5B 权重已重新下载并验证有效；修复 `make_causal_mask` 中 `0.0 * NEG_INFINITY = NaN` 的 bug（backend.rs 和 model.rs 两处）；推理 pipeline 已能输出有意义文本。
-- [x] [2026-05-01] 修复 `test_chunk_step_vs_softmax_single_block` 中 `actual` tensor 形状构造错误（`permute` 导致 num_heads 与 query_len 维度交换）。
-- [x] [2026-05-01] 修复 `ring_attention` 中 causal mask 未传递给 `compute_chunk_attention_step` 的问题：当 `attention_mask.is_some()` 时，直接使用已 mask 的 `scores` 做 online softmax 更新，而非调用无 mask 的 `compute_chunk_attention_step`。
-- [x] [2026-05-01] Phase 2 Checkpoint 5: `HcpRingAttentionBackend` 已接入真实推理路径；`LlamaModel::from_weights` 根据 `num_domains` 选择 `LocalAttentionBackend`（默认）或 `HcpRingAttentionBackend`；新增 `--infer-num-domains` CLI 参数；Qwen2-0.5B 在 `num_domains=1/2/4` 下 greedy decode 输出完全一致。
-- [x] [2026-05-01] Phase 3 Step 1: `KvTransport` trait 与 `KvBlock` 结构体创建；`MockKvTransport` 支持单元测试中的 in-memory KV block 交换。
-- [x] [2026-05-01] Phase 3 Step 2: `HcpRingAttentionBackend` 集成 `KvTransport`；`send_local_kv` 发送本地 KV block；`process_peer_block` 接收 peer KV 并参与 online softmax；`global_seq_start` 参数确保 distributed causal mask 使用全局位置。
-- [x] [2026-05-01] 修复 `ring_attention` distributed path bug：peer KV blocks 应在 Q chunk 循环外预先接收并缓存，供所有 Q chunks 复用；原实现在每个 Q chunk 迭代中单独 `recv_kv_block`，导致多 chunk 场景下后续 chunks 收不到 peer KV。
-- [x] [2026-05-01] `test_ring_attention_with_mock_transport` 通过：2-domain distributed causal attention diff=3.6e-8，验证 `HcpRingAttentionBackend` + `MockKvTransport` 的 distributed ring attention 数学正确性。
-- [x] [2026-05-01] Phase 3 Step 3-5 完成：修复 `LinkedMockKvTransport` 自环 bug（`peer_inbox`/`self_inbox` 分离，send 写入对方队列、recv 从自己的队列读取）；修复测试代码 transport 覆盖 bug（`setup_distributed_domain` 循环调用导致所有 layer 共享最后一对 transport，改为预创建每层独立 transport pair）；`test_distributed_llama_model_prefill` 端到端分布式 prefill 通过（2-layer、GQA、seq_len=16 拆成 2 domain），diff=2.79e-6；为 `kv_transport.rs`、`backend.rs`（forward/ring_attention/process_kv_block）、`model.rs`（测试）补充详细中文注释。
-- [x] [2026-04-30] **修复 GQA `repeat_kv` 关键 bug**：Rust 原实现 `x.repeat([1, n_rep, 1, 1])` 与 Python transformers 的 `repeat_kv`（expand+reshape，每个 head 连续重复）语义不一致，导致 query/key/value head 对应关系错乱，是推理 logits 与 Python 完全不同的根因。修复后 Qwen2-0.5B greedy decode 与 Python transformers 输出完全一致；19/19 测试通过，clippy 零警告。
-- [x] [2026-05-01] **CUDA 推理验证通过**：远端 `sd-1` GPU 节点使用 `cuda:1` 运行 Qwen2-0.5B greedy decode，输出与本地 CPU/MPS 完全一致；`HCP_TORCH_DEVICE=cuda:1` 环境变量被 `infer.rs` 正确解析。
-- [x] [2026-05-01] M2：Rust online softmax correctness report 与 tolerance policy 扩展完成。新增 `ToleranceTier` 三级策略（Strict/Relaxed/EndToEnd），`--tolerance-tier` CLI 参数支持运行时切换；correctness JSON report 输出 `tolerance_tier` 和 `tolerance` 字段；`tch_backend.rs` 5 处硬编码 tolerance 统一为模块常量；`model.rs` 端到端断言使用命名常量；全部 18 单元测试通过，clippy 零警告。
-- [x] [2026-05-01] M2 数学闭环正式文档已沉淀：`docs/CORRECTNESS_REPORT.md` 包含验证目标、方法论、7-case 测试矩阵、实测 metrics、分级 tolerance 推导依据（float32 epsilon、FMA、累加顺序、业界 PyTorch/NumPy/ICON-A 参考）和运行方式；`docs/RINGATTN_MODEL.md` 同步更新 case 列表和 tolerance 描述；全部 case 在 Strict tier 下通过，max_rel_err 与 threshold 保持至少 10 倍以上余量。
-- [x] [2026-04-30] M3-tch：`backend.rs` `ring_attention` 统一使用 `process_kv_block` 纯 tensor online softmax，已删除 `compute_chunk_attention_step` 与未使用的 payload 辅助函数；compute 路径已完全内联 tensor 实现。
-- [x] [2026-04-30] `tch-backend` 设为默认 feature，修复全部 clippy 错误，18/18 单元测试通过，clippy 零警告。
-- [ ] M3：抽出统一 transport trait，减少 local queue / TCP pair / TCP CP node 的重复 frame 与 metrics 逻辑。
-- [x] [2026-05-01] M4 异构 runtime stub 核心完成：`TchComputeRuntime` 接入设备配置（`select_tch_device_from_env()` 从 `HCP_TCH_DEVICE`/`HCP_TORCH_DEVICE` 解析 cpu/mps/cuda/cuda:N）；移除硬编码 `tch::Device::Cpu`；新增 `TchComputeRuntime::new(device)` 和 `from_env()` 构造函数；protocol.rs 三处 runtime 实例化统一使用 `from_env()`；本地 CPU smoke checksum 1093.59 与重构前一致；本地 MPS smoke（`HCP_TCH_DEVICE=mps`）全部 tch bridge `code=2`，checksum 一致；remote 3-node smoke MPS+CUDA 异构通过，checksum 与重构前一致（71.35/238.88/406.41）；`NoOpComputeRuntime` 保留为无 `tch-backend` feature 时的编译兼容 fallback。
-- [x] M5：将 deterministic projection weights 升级为真实权重加载 / layer config，并接入 RoPE、norm/residual 与完整 layer lifecycle。
-- [x] [2026-05-01] **Phase B: 分布式 decode 路径打通**：`seq_len <= 1` 回退已移除，decode 阶段走完整 `ring_attention` 路径；`seq_offset` 传入 `AttentionBackend::set_distributed`，`forward` 使用固定 `seq_offset` 代替 `position_ids.min()` 计算 `global_seq_start`；decode 阶段发送 KV 时排除新 append 的 token，避免 ring 中重复；`kv_chunks` 改用本地 KV 长度而非 Q 的 `seq_len`；新增 `LlamaModel::global_seq_len` 保证 decode position_ids 正确。新增 4 个单元测试验证 decode 路径数学正确性；23/23 测试通过，clippy 零警告。
-- [x] [2026-05-01] **修复分布式 decode ~6 diff 根因**：`LlamaModel::forward` 中 prefill 阶段错误地将 `global_seq_len` 设为本地 `seq_len`（domain0=8），导致 decode 时 `position_ids=8` 而非正确的全局位置 16。RoPE 因此应用了错误旋转角度，产生 ~6.7 的系统偏差。修复：prefill 时 `global_seq_len = seq_offset + seq_len`；测试中 prefill 后同步 `domain0.global_seq_len = domain1.global_seq_len`。修复后 diff 从 6.7 降至 ~2e-6，与单节点参考一致；23/23 测试通过，clippy 零警告。
-- [x] [2026-05-01] **TcpKvTransport 精度验证**：新增 `test_tcp_kv_transport_roundtrip`，通过本地 loopback 发送/接收 KV block，验证 float32 原始字节传输后 tensor 值完全一致（k_diff=0, v_diff=0）。
-- [x] [2026-05-01] **多步分布式 decode 验证**：新增 `test_distributed_llama_model_multi_step_decode`，prefill 后连续 4 步 decode，每步 domain0/domain1 与单节点参考 diff 均 ~2e-6。修复多步 decode 根因：`history_len = k.size()[2] - 1` 在多步时会包含之前 decode 步骤 append 的 token，导致 peer 收到重复 KV。引入 `HcpRingAttentionBackend::prefill_kv_len` 字段，decode 阶段只发送 prefill 分区。25/25 测试通过，clippy 零警告。
-- [x] [2026-05-01] **`RingAttnMessage` serialization/deserialization 测试覆盖**：新增 5 个 protocol 单元测试——bincode serialize→deserialize roundtrip、256-byte payload 完整性、schema version 字段往返、三种 message kind（KvBlock/SoftmaxState/Terminate）全覆盖、MessageSender/MessageReceiver TCP trait 端到端。30/30 测试通过，clippy 零警告。
-- [x] [2026-05-01] **分布式 Generator `DistributedGenerator`**：单进程模拟多 domain CP 推理。prefill 阶段将 prompt 分片到各 domain；decode 阶段 coordinator 广播 token 给所有 domain，从任意 domain 采样（分布式 decode 输出一致）。核心方法 `generate_tokens` 支持 token-ID 级别的生成；`generate` 包装 tokenizer encode/decode。新增 `test_distributed_generator_tokens_match_reference`：4 步贪婪 decode，domain0/domain1 输出 token 完全一致，与单节点参考 logits diff ~1e-5。31/31 测试通过，clippy 零警告。
-- [x] [2026-04-30] **真实多进程分布式推理完成**：新增 `distributed_worker.rs`、`distributed_coordinator.rs`、`distributed_protocol.rs`。
-  - Worker：加载模型权重，连接 peer 做 KV ring 交换，连接 coordinator 接收 Prefill/Decode/Shutdown 命令。
-  - Coordinator：只加载 tokenizer+config，prompt 分片、token 广播、采样；不加载模型权重。
-  - Protocol：`WorkerCommand`/`WorkerResponse` bincode 序列化，4-byte BE length prefix frame I/O。
-  - Handshake：worker 连接 coordinator 后发送 `domain_id`，coordinator 按 domain_id 排序 stream，避免 accept 顺序与 domain 顺序错位。
-  - `SyncGlobalSeqLen`：prefill 后 coordinator 广播 max global_seq_len，确保所有 worker decode 从正确位置开始。
-  - `BidirectionalTcpKvTransport`：每层独立 outbound+inbound TCP stream 做 ring KV 交换。
-  - CLI：`--distributed-role worker|coordinator` 分发到对应入口；`main.rs` 在解析到 `--distributed-role` 后停止解析其余参数，让 worker/coordinator 自行处理私有 flags。
-  - **本地 2-node CPU smoke 通过**：Qwen2-0.5B，prompt "The answer to life, the universe, and everything is"，greedy decode 4 tokens 生成 " in the universe."，与 Python transformers 参考输出 **完全一致**。
-  - **远端 2-node CPU+CUDA 验证通过**：sd-1 上 worker0(CPU) + worker1(CUDA:1)，输出与参考一致。
-  - **本地 MPS+CPU 混合验证通过**：worker0(Mps) + worker1(Cpu)，输出与参考一致。
-  - **跨机器 MPS+CUDA 验证通过**：本地 Mac MPS worker0 + 远端 sd-1 CUDA:1 worker1，VPN 内网直接 0.0.0.0 bind 互通，输出与参考 **完全一致**。
-  - **3-domain 本地 CPU×3 ring forwarding 验证通过**：`ring_attention` 从单次发送改为逐轮 ring forwarding（num_domains-1 轮，每轮发送 current block 给 next、从 prev 接收新 block、保存并转发），`KvBlock` 新增 `Clone`（`Tensor::shallow_clone`），Worker CLI `--peer-addr` → `--next-peer-addr`。生成结果与参考一致。
-  - **3-domain 跨机器 (MPS+CUDA:1+CUDA:2) 验证通过**：本地 Mac worker0(MPS) + 远端 worker1(CUDA:1) + 远端 worker2(CUDA:2) 形成真正 ring 拓扑，生成结果与参考 **完全一致**。
-  - **性能基准**（Qwen2-0.5B，11 prompt tokens + 20 decode tokens，greedy）：单节点 MPS 2.06s / 单节点 CPU 2.87s / 3-domain 本地 CPU×3 13.20s / 3-domain 跨机器 MPS+CUDA×2 125.46s。
-  - 31/31 单元测试通过，clippy 零警告。
-- [x] [2026-04-30] **QUIC Transport 实现与验证**：
-  - 新增依赖：`quinn = "0.11"`、`rustls = { version = "0.23", features = ["ring"] }`、`rcgen = "0.13"`、`tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }`。
-  - 新增 `rust/src/quic_transport.rs`：`QuicKvTransport` 实现 `KvTransport` trait；基于 `quinn` 单 connection + per-layer bidirectional stream；自签名证书 + `SkipServerVerification`；序列化 meta (JSON) + k/v raw bytes。
-  - `KvTransport` trait 从 `model/kv_transport.rs` 提升到 `model/mod.rs` 公共导出。
-  - 修复 rustls `CryptoProvider` 未初始化：`rustls::crypto::ring::default_provider().install_default()` 在 worker 入口调用。
-  - 修复 2-domain symmetric connection 死锁：当 `num_domains == 2` 时，domain 0 负责 dial，domain 1 只 accept，双方共享同一个 QUIC connection handle。
-  - 修复 quinn `open_bi` 不发送 STREAM 帧导致 `accept_bi` 挂起：stream 建立后 sender 写入 1-byte dummy，`recv_kv_block` 首次读取时跳过。
-  - 本地验证：QUIC 2-domain local CPU ✅、QUIC 3-domain local CPU ✅、QUIC 2-domain local MPS+CPU ✅；所有输出与 TCP baseline 及 Python transformers 参考一致。
-  - **跨机器 QUIC vs TCP 性能对比**（Mac MPS + 远端 GPU CUDA:1，VPN ~150ms RTT，Qwen2-0.5B 11 prompt + 20 decode tokens）：
-    - TCP: **107.3s**
-    - QUIC: **76.4s**
-    - QUIC 比 TCP 快 **~29%**
-- [x] [2026-04-30] **Mask 优化**：分布式 prefill 阶段 `model.rs` 不再创建 `[seq_len, seq_len]` 密集 causal mask（O(seq²) 内存爆炸根因）。`HcpRingAttentionBackend::ring_attention` 已经通过 `global_seq_start` + position 比较实现 causal，从不读取 mask 张量数据。改为：单节点时仍创建完整 mask；分布式（`num_domains > 1`）时传 `[1,1,1,1]` dummy zero tensor 作为 causal 标志。本地 2-domain/3-domain CPU smoke 验证通过，输出一致。
-- [x] [2026-04-30] **动态不均等分片 Phase 1**：Coordinator CLI 新增 `--chunk-sizes`（逗号分隔，如 `7,4` 或 `5,3,3`），显式指定每个 domain 的 prompt chunk 长度。分片逻辑校验：长度必须等于 `num_domains`，总和必须等于 prompt token 数。测试验证：2-domain `7+4=11` ✅、3-domain `5+3+3=11` ✅，生成结果与参考一致。
-- [x] [2026-04-30] **修复 1-token prefill 边界 bug**：当某个 domain 的 chunk 只有 1 个 token（如 `--chunk-sizes 10,1`）时，原代码用 `seq_len > 1` 区分 prefill/decode，导致 1-token prefill 被误判为 decode。修复：
-  - `LlamaModel` 和 `HcpRingAttentionBackend` 均新增 `is_prefill_done` 标志，第一次 `forward` 无论 `seq_len` 是多少都走 prefill 路径。
-  - `prefill_kv_len` 同样用 `is_prefill_done` 判断，避免 1-token prefill 时 `prefill_kv_len` 保持为 0。
-  - 验证矩阵：2-domain (6,5/7,4/8,3/9,2/10,1)、3-domain (4,4,3/5,3,3/6,3,2/7,2,2)、4-domain (3,3,3,2/4,3,2,2) 全部通过，输出与参考一致。31/31 单元测试通过，clippy 零警告。
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 
 ## 已知问题
@@ -162,7 +124,7 @@
 - [2026-04-25] 旧版 CLI 只打印 `torch_compiled=true`，不能证明 CUDA/MPS 实际执行；需使用包含 `torch_status` / `torch_code` 的新版 smoke。
 - [2026-04-25] 远端 CUDA smoke 历史问题已解决：根因是 Linux 链接阶段未保留 `libtorch_cuda` / `c10_cuda` registration libraries。
 - [2026-04-30] projection weights 已从 deterministic 初始化升级为支持外部 JSON 权重加载（`HCP_WEIGHTS_JSON`）；RoPE、LayerNorm、o_proj、residual 均已接入 protocol；M5 目标已完成。
-- [2026-04-26] 3-node remote CP query chunk smoke 的一次失败根因是 Mac 子网地址从 `192.168.8.204` 变化到 `192.168.8.239`；后续重跑已通过。后续 remote smoke 前应先用 `ifconfig | rg 'inet 192\\.168\\.8\\.'` 确认当前 Mac 地址。
+- [2026-04-26] 3-node remote CP query chunk smoke 的一次失败根因是 Mac 子网地址从 `192.168.8.204` 变化到 `192.168.8.239`；后续重跑已通过。后续 remote smoke 前应先用 `ifconfig | rg 'inet 192\.168\.8\.'` 确认当前 Mac 地址。
 - [2026-04-30] GPU host 当前 VPN 地址为 `100.118.253.68`，Mac 本机 VPN 地址为 `100.121.35.138`；LAN 地址 `192.168.8.172` / `192.168.8.239` 目前不可达。remote smoke 需使用当前可达地址。
 - [2026-05-01] 网络环境切换：CUDA 节点通过 `user@sd-1`（IP `100.64.0.93`）访问，Mac 本机当前可达地址为 `100.64.0.95`；remote smoke 需使用 IP 地址（`GPU_HOST=100.64.0.93`），因为 Rust socket 解析不支持主机名。
 - [2026-05-01] 3-node remote CP smoke 通过：`RUN_ID=rust-remote-cp-sd1-ip2-20260501 PORT_BASE=29430 GPU_HOST=100.64.0.93 GPU_USER=user MAC_NODE_ADDR=100.64.0.95`；node0/node2 MPS 全部 bridge `code=2 12/12`，node1 CUDA 全部 bridge `code=3 12/12`；tch compute checksum 分别为 71.35 / 238.88 / 406.41。
