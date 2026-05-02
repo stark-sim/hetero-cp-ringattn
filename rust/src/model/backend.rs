@@ -546,7 +546,10 @@ impl AttentionBackend for HcpRingAttentionBackend {
     fn set_distributed(&mut self, domain_id: usize, seq_offset: usize, transport: Option<Box<dyn KvTransport>>) {
         self.local_domain_id = domain_id;
         self.seq_offset = seq_offset;
-        self.kv_transport = transport;
+        // Only replace transport if explicitly provided (None means "keep existing").
+        if let Some(t) = transport {
+            self.kv_transport = Some(t);
+        }
     }
     fn forward(
         &mut self,

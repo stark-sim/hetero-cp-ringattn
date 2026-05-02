@@ -11,7 +11,11 @@ use std::time::Duration;
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub enum WorkerCommand {
     /// Run prefill on the given token IDs.
-    Prefill(Vec<i64>),
+    /// `seq_offset` is the global start position of this chunk (domain0=0, domain1=chunk0_len, etc.)
+    Prefill {
+        chunk: Vec<i64>,
+        seq_offset: i64,
+    },
     /// Run single-token decode.
     Decode(i64),
     /// Synchronize global sequence length before decode.
@@ -99,6 +103,51 @@ pub fn send_response(stream: &mut TcpStream, resp: &WorkerResponse) -> Result<()
 pub fn recv_response(stream: &mut TcpStream) -> Result<WorkerResponse, String> {
     let bytes = read_frame(stream)?;
     deserialize(&bytes)
+}
+
+/// Handshake payload sent by worker immediately after connecting to coordinator.
+///
+/// Fixed 16-byte layout (little-endian):
+/// - bytes [0..8): domain_id (u64)
+/// - bytes [8..16): capacity_score in MB (u64)
+#[derive(Debug, Clone, Copy)]
+pub struct WorkerHandshake {
+    pub domain_id: u64,
+    pub capacity_mb: u64,
+}
+
+impl WorkerHandshake {
+    pub const SIZE: usize = 16;
+
+    pub fn to_bytes(self) -> [u8; Self::SIZE] {
+        let mut buf = [0u8; Self::SIZE];
+        buf[0..8].copy_from_slice(&self.domain_id.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.capacity_mb.to_le_bytes());
+        buf
+    }
+
+    pub fn from_bytes(bytes: &[u8; Self::SIZE]) -> Self {
+        Self {
+            domain_id: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+            capacity_mb: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+        }
+    }
+}
+
+/// Write a handshake to a stream.
+pub fn write_handshake(stream: &mut TcpStream, handshake: &WorkerHandshake) -> Result<(), String> {
+    stream
+        .write_all(&handshake.to_bytes())
+        .map_err(|e| format!("write_handshake failed: {e}"))
+}
+
+/// Read a handshake from a stream.
+pub fn read_handshake(stream: &mut TcpStream) -> Result<WorkerHandshake, String> {
+    let mut buf = [0u8; WorkerHandshake::SIZE];
+    stream
+        .read_exact(&mut buf)
+        .map_err(|e| format!("read_handshake failed: {e}"))?;
+    Ok(WorkerHandshake::from_bytes(&buf))
 }
 
 /// Connect to an address with retry.

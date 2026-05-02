@@ -1,5 +1,7 @@
 mod compute_runtime;
 #[cfg(feature = "tch-backend")]
+mod capacity;
+#[cfg(feature = "tch-backend")]
 mod distributed_coordinator;
 #[cfg(feature = "tch-backend")]
 mod distributed_protocol;

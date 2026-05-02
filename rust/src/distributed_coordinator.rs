@@ -6,7 +6,6 @@
 use crate::distributed_protocol::{recv_response, send_command, WorkerCommand, WorkerResponse};
 use crate::model::config::ModelConfig;
 use crate::model::generate::sample_token;
-use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use tch::Tensor;
@@ -24,6 +23,9 @@ struct CoordinatorArgs {
     /// Optional explicit chunk sizes for uneven sharding.
     /// If provided, length must equal num_domains and sum must equal prompt length.
     chunk_sizes: Option<Vec<usize>>,
+    /// Enable capacity-aware automatic chunk sharding.
+    /// Workers report free memory; coordinator allocates proportionally.
+    capacity_aware: bool,
 }
 
 fn parse_args() -> CoordinatorArgs {
@@ -36,6 +38,7 @@ fn parse_args() -> CoordinatorArgs {
     let mut worker_addrs = Vec::new();
     let mut listen_addr = String::new();
     let mut chunk_sizes: Option<Vec<usize>> = None;
+    let mut capacity_aware = false;
 
     let mut args = std::env::args().skip(1); // skip binary name
     while let Some(arg) = args.next() {
@@ -55,6 +58,7 @@ fn parse_args() -> CoordinatorArgs {
                 let s = args.next().unwrap();
                 chunk_sizes = Some(s.split(',').map(|x| x.parse().unwrap()).collect());
             }
+            "--capacity-aware" => capacity_aware = true,
             _ => eprintln!("[coordinator] unknown arg: {arg}"),
         }
     }
@@ -69,6 +73,7 @@ fn parse_args() -> CoordinatorArgs {
         worker_addrs,
         listen_addr,
         chunk_sizes,
+        capacity_aware,
     }
 }
 
@@ -115,45 +120,71 @@ pub fn run() {
     let listener = TcpListener::bind(&args.listen_addr).expect("bind listen_addr failed");
     println!("[coordinator] listening on {}", args.listen_addr);
 
-    let mut worker_handshakes: Vec<(usize, TcpStream)> = Vec::with_capacity(args.num_domains);
+    let mut worker_handshakes: Vec<(usize, u64, TcpStream)> = Vec::with_capacity(args.num_domains);
     for i in 0..args.num_domains {
         let mut stream = accept_with_retry(&listener, 300, 200)
             .unwrap_or_else(|e| panic!("accept worker {i} failed: {e}"));
-        let mut handshake = [0u8; 8];
-        stream.read_exact(&mut handshake).expect("handshake read failed");
-        let domain_id = u64::from_le_bytes(handshake) as usize;
-        println!("[coordinator] worker {domain_id} connected (accept order {i})");
-        worker_handshakes.push((domain_id, stream));
+        let handshake = crate::distributed_protocol::read_handshake(&mut stream)
+            .expect("handshake read failed");
+        println!("[coordinator] worker {} connected (accept order {i}), capacity={} MB",
+                 handshake.domain_id, handshake.capacity_mb);
+        worker_handshakes.push((handshake.domain_id as usize, handshake.capacity_mb, stream));
     }
-    worker_handshakes.sort_by_key(|(domain_id, _)| *domain_id);
-    let mut worker_streams: Vec<TcpStream> = worker_handshakes.into_iter().map(|(_, s)| s).collect();
+    worker_handshakes.sort_by_key(|(domain_id, _, _)| *domain_id);
+    let worker_capacities: Vec<u64> = worker_handshakes.iter().map(|(_, cap, _)| *cap).collect();
+    let mut worker_streams: Vec<TcpStream> = worker_handshakes.into_iter().map(|(_, _, s)| s).collect();
 
     // Prefill: split prompt into chunks and send to workers
     let seq_len = prompt_ids.len() as i64;
-    let chunk_boundaries: Vec<usize> = if let Some(ref sizes) = args.chunk_sizes {
+
+    // Three-tier allocation priority:
+    //   1. --chunk-sizes (exact manual override)
+    //   2. --capacity-aware (proportional to worker free memory)
+    //   3. even sharding (default fallback)
+    let chunk_sizes: Vec<usize> = if let Some(ref sizes) = args.chunk_sizes {
         assert_eq!(sizes.len(), args.num_domains,
             "--chunk-sizes length ({}) must match --num-domains ({})",
             sizes.len(), args.num_domains);
-        let mut boundaries = vec![0usize];
-        for size in sizes {
-            boundaries.push(boundaries.last().unwrap() + size);
-        }
-        assert_eq!(*boundaries.last().unwrap(), seq_len as usize,
+        let sum: usize = sizes.iter().sum();
+        assert_eq!(sum, seq_len as usize,
             "--chunk-sizes sum ({}) must equal prompt length ({})",
-            boundaries.last().unwrap(), seq_len);
-        boundaries
+            sum, seq_len);
+        sizes.clone()
+    } else if args.capacity_aware {
+        let chunks = crate::capacity::allocate_by_capacity(seq_len as usize, &worker_capacities);
+        println!("[coordinator] capacity-aware chunks: {:?} (capacities: {:?} MB)",
+                 chunks, worker_capacities);
+        chunks
     } else {
-        let chunk_size = (seq_len as usize).div_ceil(args.num_domains).max(1) as i64;
-        (0..=args.num_domains)
-            .map(|i| (i as i64 * chunk_size).min(seq_len) as usize)
-            .collect()
+        let chunk_size = (seq_len as usize).div_ceil(args.num_domains).max(1);
+        let mut chunks = Vec::with_capacity(args.num_domains);
+        let mut offset = 0usize;
+        for i in 0..args.num_domains {
+            let end = if i == args.num_domains - 1 {
+                seq_len as usize
+            } else {
+                (offset + chunk_size).min(seq_len as usize)
+            };
+            chunks.push(end - offset);
+            offset = end;
+        }
+        chunks
     };
+
+    // Build boundary offsets from chunk sizes
+    let mut chunk_boundaries = vec![0usize];
+    for size in &chunk_sizes {
+        chunk_boundaries.push(chunk_boundaries.last().unwrap() + size);
+    }
 
     for (domain_id, stream) in worker_streams.iter_mut().enumerate() {
         let start = chunk_boundaries[domain_id];
         let end = chunk_boundaries[domain_id + 1];
         let chunk = &prompt_ids[start..end];
-        let cmd = WorkerCommand::Prefill(chunk.to_vec());
+        let cmd = WorkerCommand::Prefill {
+            chunk: chunk.to_vec(),
+            seq_offset: start as i64,
+        };
         send_command(stream, &cmd).expect("send Prefill failed");
         println!("[coordinator] sent Prefill chunk [{}, {}) to worker {}", start, end, domain_id);
     }

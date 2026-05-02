@@ -7,7 +7,6 @@
 use crate::distributed_protocol::{recv_command, send_response, WorkerCommand, WorkerResponse};
 use crate::model::model::LlamaModel;
 use crate::model::{ModelConfig, ModelWeights};
-use std::io::Write;
 use std::path::Path;
 use tch::{Device, Tensor};
 
@@ -216,22 +215,38 @@ pub fn run() {
     });
     println!("[worker {}] distributed domain setup complete", args.domain_id);
 
+    // Query device capacity after loading model (so the value reflects
+    // memory remaining *after* weights are loaded).
+    let capacity_mb = crate::capacity::query_device_capacity_mb(device);
+    println!("[worker {}] capacity: {} MB", args.domain_id, capacity_mb);
+
     // Connect to coordinator
     println!("[worker {}] connecting to coordinator {}", args.domain_id, args.coordinator_addr);
     let mut coord_stream = connect_with_retry(&args.coordinator_addr, 300, 200)
         .expect("coordinator connect failed");
     println!("[worker {}] connected to coordinator", args.domain_id);
 
-    // Handshake: send domain_id so coordinator knows who we are
-    let handshake = (args.domain_id as u64).to_le_bytes();
-    coord_stream.write_all(&handshake).expect("handshake write failed");
+    // Handshake: send domain_id + capacity so coordinator can do capacity-aware sharding
+    let handshake = crate::distributed_protocol::WorkerHandshake {
+        domain_id: args.domain_id as u64,
+        capacity_mb,
+    };
+    crate::distributed_protocol::write_handshake(&mut coord_stream, &handshake)
+        .expect("handshake write failed");
 
     // Command loop
     loop {
         let cmd = recv_command(&mut coord_stream).expect("recv_command failed");
         match cmd {
-            WorkerCommand::Prefill(chunk_ids) => {
-                let input = Tensor::from_slice(&chunk_ids).unsqueeze(0).to_device(device);
+            WorkerCommand::Prefill { chunk, seq_offset } => {
+                model.seq_offset = seq_offset;
+                // Update seq_offset in all layer backends so causal mask uses the
+                // correct global position (coordinator may assign a different offset
+                // than the worker's original --seq-offset CLI arg in capacity-aware mode).
+                for layer in model.layers.iter_mut() {
+                    layer.attention.set_distributed(args.domain_id, seq_offset as usize, None);
+                }
+                let input = Tensor::from_slice(&chunk).unsqueeze(0).to_device(device);
                 let logits = model.forward(&input, &mut kv_caches).expect("prefill forward failed");
                 // Extract last token logits
                 let last_logits = logits.narrow(1, logits.size()[1] - 1, 1).squeeze();
