@@ -28,6 +28,9 @@ pub struct LlamaModel {
     /// Global sequence length (prefill + generated tokens).
     /// Used for correct position_ids in distributed decode.
     pub global_seq_len: usize,
+    /// Whether the first forward (prefill) has been completed.
+    /// Distinguishes prefill from decode even when prefill chunk length is 1.
+    pub is_prefill_done: bool,
 }
 
 #[cfg(feature = "tch-backend")]
@@ -83,7 +86,7 @@ impl LlamaModel {
             });
         }
 
-        Ok(Self { config, embedding, layers, norm, lm_head, seq_offset: 0, num_domains, global_seq_len: 0 })
+        Ok(Self { config, embedding, layers, norm, lm_head, seq_offset: 0, num_domains, global_seq_len: 0, is_prefill_done: false })
     }
 
     /// Configure distributed transport for all attention backends in this model.
@@ -116,11 +119,13 @@ impl LlamaModel {
         let mut hidden_states = Tensor::embedding(&self.embedding, input_ids, -1, false, false);
 
         // Position IDs: [batch, seq_len]
-        let position_ids = if seq_len > 1 {
+        let is_prefill = !self.is_prefill_done;
+        let position_ids = if is_prefill {
             // Prefill: sequential positions [seq_offset, seq_offset+1, ..., seq_offset+seq_len-1]
             // global_seq_len tracks the rightmost global position this domain has processed.
             // For distributed decode, all domains must agree on the global prompt length.
             self.global_seq_len = (self.seq_offset + seq_len) as usize;
+            self.is_prefill_done = true;
             let base = Tensor::arange(seq_len, (Kind::Int64, device)) + self.seq_offset;
             base.unsqueeze(0).repeat([batch, 1])
         } else {
@@ -154,8 +159,8 @@ impl LlamaModel {
             hidden_states = layer.forward(&hidden_states, &position_ids, kv_cache, attention_mask.as_ref())?;
         }
 
-        // Increment global_seq_len after decode step
-        if seq_len == 1 {
+        // Increment global_seq_len after decode step only
+        if !is_prefill {
             self.global_seq_len += 1;
         }
 

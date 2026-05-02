@@ -144,6 +144,10 @@
     - QUIC 比 TCP 快 **~29%**
 - [x] [2026-04-30] **Mask 优化**：分布式 prefill 阶段 `model.rs` 不再创建 `[seq_len, seq_len]` 密集 causal mask（O(seq²) 内存爆炸根因）。`HcpRingAttentionBackend::ring_attention` 已经通过 `global_seq_start` + position 比较实现 causal，从不读取 mask 张量数据。改为：单节点时仍创建完整 mask；分布式（`num_domains > 1`）时传 `[1,1,1,1]` dummy zero tensor 作为 causal 标志。本地 2-domain/3-domain CPU smoke 验证通过，输出一致。
 - [x] [2026-04-30] **动态不均等分片 Phase 1**：Coordinator CLI 新增 `--chunk-sizes`（逗号分隔，如 `7,4` 或 `5,3,3`），显式指定每个 domain 的 prompt chunk 长度。分片逻辑校验：长度必须等于 `num_domains`，总和必须等于 prompt token 数。测试验证：2-domain `7+4=11` ✅、3-domain `5+3+3=11` ✅，生成结果与参考一致。
+- [x] [2026-04-30] **修复 1-token prefill 边界 bug**：当某个 domain 的 chunk 只有 1 个 token（如 `--chunk-sizes 10,1`）时，原代码用 `seq_len > 1` 区分 prefill/decode，导致 1-token prefill 被误判为 decode。修复：
+  - `LlamaModel` 和 `HcpRingAttentionBackend` 均新增 `is_prefill_done` 标志，第一次 `forward` 无论 `seq_len` 是多少都走 prefill 路径。
+  - `prefill_kv_len` 同样用 `is_prefill_done` 判断，避免 1-token prefill 时 `prefill_kv_len` 保持为 0。
+  - 验证矩阵：2-domain (6,5/7,4/8,3/9,2/10,1)、3-domain (4,4,3/5,3,3/6,3,2/7,2,2)、4-domain (3,3,3,2/4,3,2,2) 全部通过，输出与参考一致。31/31 单元测试通过，clippy 零警告。
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 
 ## 已知问题

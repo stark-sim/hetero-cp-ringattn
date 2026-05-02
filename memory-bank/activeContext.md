@@ -18,6 +18,7 @@
    - **QUIC 比 TCP 快 ~29%**。高延迟网络下 QUIC 的 0-RTT、内置 TLS 和 connection 复用优势显现。
 9. **Mask 优化**：分布式 prefill 不再分配 `[seq_len, seq_len]` 密集 causal mask。`ring_attention` 已用 `global_seq_start` + position 比较实现 causal，mask 张量数据从未被读取。改为单节点时创建完整 mask，分布式时传 `[1,1,1,1]` dummy 作 causal 标志。本地 2-domain/3-domain CPU smoke 验证通过。
 10. **动态不均等分片 Phase 1**：Coordinator CLI 新增 `--chunk-sizes`（如 `7,4`、`5,3,3`），显式指定每个 domain 的 prompt chunk 长度，解决均分分片无法适配异构设备不同内存容量的问题。2-domain 和 3-domain uneven smoke 均验证通过，输出与参考一致。
+11. **修复 1-token prefill 边界 bug**：`seq_len > 1` 作为 prefill/decode 区分条件在 chunk=1 时失效（如 `--chunk-sizes 10,1`）。`LlamaModel` 和 `HcpRingAttentionBackend` 均引入 `is_prefill_done` 标志，第一次 `forward` 无论 `seq_len` 均走 prefill 路径。验证矩阵覆盖 2/3/4-domain 全部 uneven 组合，含极端 `10,1`，全部通过。
 
 [2026-04-30] **真实多进程分布式推理（Real Multi-Process Distributed Inference）已完成并验证**。
 

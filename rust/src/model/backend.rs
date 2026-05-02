@@ -81,6 +81,8 @@ pub struct HcpRingAttentionBackend {
     /// Length of KV cache produced during prefill. In decode phase we only send
     /// the prefill partition (not decode-appended tokens) to peers.
     prefill_kv_len: usize,
+    /// Whether the first forward (prefill) has completed.
+    is_prefill_done: bool,
 }
 
 #[cfg(feature = "tch-backend")]
@@ -114,6 +116,7 @@ impl HcpRingAttentionBackend {
             local_domain_id: 0,
             seq_offset: 0,
             prefill_kv_len: 0,
+            is_prefill_done: false,
         })
     }
 
@@ -608,8 +611,9 @@ impl AttentionBackend for HcpRingAttentionBackend {
 
         // 记录 prefill 阶段的 KV 长度。decode 阶段发送 peer KV 时，
         // 只发送 prefill 分区，不包含 decode 阶段 append 的新 token。
-        if seq_len > 1 {
+        if !self.is_prefill_done {
             self.prefill_kv_len = k.size()[2] as usize;
+            self.is_prefill_done = true;
         }
 
         // ====== 第五步：GQA 头重复 ======
@@ -749,6 +753,7 @@ mod tests {
             local_domain_id: 0,
             seq_offset: 0,
             prefill_kv_len: 0,
+            is_prefill_done: false,
         };
 
         let mut rm = Tensor::full(
@@ -837,6 +842,7 @@ mod tests {
             local_domain_id: 0,
             seq_offset: 0,
             prefill_kv_len: 0,
+            is_prefill_done: false,
         };
 
         let actual = backend.ring_attention(&q, &k, &v, None, 0);
@@ -888,6 +894,7 @@ mod tests {
             local_domain_id: 0,
             seq_offset: 0,
             prefill_kv_len: 0,
+            is_prefill_done: false,
         };
 
         let actual = backend.ring_attention(&q, &k, &v, Some(&mask), 0);
@@ -937,6 +944,7 @@ mod tests {
             local_domain_id: 0,
             seq_offset: 0,
             prefill_kv_len: 0,
+            is_prefill_done: false,
         };
 
         // Without transport, ring_attention processes only local KV.
@@ -1020,6 +1028,7 @@ mod tests {
             local_domain_id: 0,
             seq_offset: 0,
             prefill_kv_len: 0,
+            is_prefill_done: false,
         };
         let out0 = backend0.ring_attention(&q_all, &k0_local, &v0_local, None, 0);
 
@@ -1050,6 +1059,7 @@ mod tests {
             local_domain_id: 1,
             seq_offset: half as usize,
             prefill_kv_len: 0,
+            is_prefill_done: false,
         };
         let out1 = backend1.ring_attention(&q_all, &k1_local, &v1_local, None, half as usize);
 
@@ -1115,6 +1125,7 @@ mod tests {
             local_domain_id: 0,
             seq_offset: 0,
             prefill_kv_len: 0,
+            is_prefill_done: false,
         };
 
         // hidden states for decode step
@@ -1202,6 +1213,7 @@ mod tests {
             local_domain_id: 0,
             seq_offset: 0,
             prefill_kv_len: 0,
+            is_prefill_done: false,
         };
         let out0 = backend0.ring_attention(&q0, &k0, &v0, Some(&mask), 0);
 
@@ -1232,6 +1244,7 @@ mod tests {
             local_domain_id: 1,
             seq_offset: half as usize,
             prefill_kv_len: 0,
+            is_prefill_done: false,
         };
         let out1 = backend1.ring_attention(&q1, &k1, &v1, Some(&mask), half as usize);
 
