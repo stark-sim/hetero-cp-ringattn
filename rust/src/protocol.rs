@@ -2547,4 +2547,125 @@ mod tests {
             bytes[start + 3],
         ])
     }
+
+    /// 构造一个完整的 RingAttnMessage（KV block 类型），用于序列化测试。
+    fn sample_kv_message() -> RingAttnMessage {
+        RingAttnMessage {
+            schema_version: SCHEMA_VERSION,
+            sequence_id: 42,
+            layer_index: 3,
+            ring_step: 2,
+            source_domain: "domain-a".to_string(),
+            sender_domain: "domain-b".to_string(),
+            receiver_domain: "domain-c".to_string(),
+            message_kind: RingAttnMessageKind::KvBlock,
+            payload_kind: PayloadKind::KvBlock,
+            block: Some(BlockMetadata {
+                global_offset: 16,
+                block_len: 8,
+                source_seq_offset: 16,
+            }),
+            tensor: Some(TensorMetadata {
+                dtype: "float32".to_string(),
+                num_heads: 4,
+                head_dim: 16,
+                payload_bytes: 1024,
+                checksum: 0xDEAD_BEEF,
+            }),
+            payload: vec![0x01, 0x02, 0x03, 0x04, 0x05],
+        }
+    }
+
+    /// 验证 bincode serialize → deserialize 往返后消息完全一致。
+    #[test]
+    fn test_serialize_deserialize_roundtrip() {
+        let original = sample_kv_message();
+        let bytes = serialize_message(&original).unwrap();
+        let restored = deserialize_message(&bytes).unwrap();
+        assert_eq!(original, restored);
+    }
+
+    /// 验证 KV block 的 payload bytes 在序列化后不丢失。
+    #[test]
+    fn test_serialize_deserialize_payload_integrity() {
+        let mut original = sample_kv_message();
+        // 用更大的 payload 验证二进制完整性
+        original.payload = (0..256u16)
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        original.tensor = Some(TensorMetadata {
+            dtype: "float32".to_string(),
+            num_heads: 4,
+            head_dim: 16,
+            payload_bytes: original.payload.len(),
+            checksum: 0,
+        });
+
+        let bytes = serialize_message(&original).unwrap();
+        let restored = deserialize_message(&bytes).unwrap();
+        assert_eq!(restored.payload, original.payload);
+    }
+
+    /// 验证 schema version 不匹配时，反序列化本身不会失败（bincode 不校验语义），
+    /// 但 restored 消息的 schema_version 字段可以被调用方正确检查。
+    #[test]
+    fn test_schema_version_field_roundtrip() {
+        let mut original = sample_kv_message();
+        original.schema_version = 999;
+        let bytes = serialize_message(&original).unwrap();
+        let restored = deserialize_message(&bytes).unwrap();
+        assert_eq!(restored.schema_version, 999);
+        assert_ne!(restored.schema_version, SCHEMA_VERSION);
+    }
+
+    /// 验证三种消息类型（KvBlock / SoftmaxState / Terminate）都能正确往返。
+    #[test]
+    fn test_all_message_kinds_roundtrip() {
+        let base = sample_kv_message();
+
+        let kinds = vec![
+            (RingAttnMessageKind::KvBlock, PayloadKind::KvBlock),
+            (RingAttnMessageKind::SoftmaxState, PayloadKind::SoftmaxState),
+            (RingAttnMessageKind::Terminate, PayloadKind::Control),
+        ];
+
+        for (msg_kind, payload_kind) in kinds {
+            let mut msg = base.clone();
+            msg.message_kind = msg_kind;
+            msg.payload_kind = payload_kind;
+            let bytes = serialize_message(&msg).unwrap();
+            let restored = deserialize_message(&bytes).unwrap();
+            assert_eq!(msg, restored);
+        }
+    }
+
+    /// 验证 MessageSender / MessageReceiver trait 通过本地 TCP 端到端工作正常。
+    #[test]
+    fn test_message_sender_receiver_tcp_roundtrip() {
+        use std::net::{TcpListener, TcpStream};
+        use std::thread;
+
+        let original = sample_kv_message();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let expected = original.clone();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut receiver: TcpStream = stream;
+            let (msg, _bytes) = MessageReceiver::recv_message(&mut receiver).unwrap();
+            msg
+        });
+
+        let client = thread::spawn(move || {
+            let stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+            let mut sender: TcpStream = stream;
+            MessageSender::send_message(&mut sender, &expected).unwrap();
+        });
+
+        client.join().unwrap();
+        let received = server.join().unwrap();
+
+        assert_eq!(original, received);
+    }
 }

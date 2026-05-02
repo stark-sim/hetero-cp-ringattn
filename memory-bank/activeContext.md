@@ -152,7 +152,7 @@
 - [x] [2026-05-01] Phase B 完成：分布式 decode 路径打通。`seq_len <= 1` 回退已移除；`seq_offset` 传入 `set_distributed`；decode 阶段发送 KV 排除新 token；`kv_chunks` 改用本地 KV 长度；`global_seq_len` 保证 decode position 正确。新增 4 个单元测试，23/23 通过，clippy 零警告。
 - [x] [2026-05-01] Phase B+ 完成：修复端到端 distributed decode ~6 diff。根因是 `LlamaModel::forward` prefill 阶段 `global_seq_len` 被错误设为本地 `seq_len`（domain0=8），导致 decode 时 RoPE 应用了错误位置（8 而非 16）。修复后 diff 从 6.7 降至 ~2e-6，与单节点参考一致。
 - [x] [2026-05-01] Phase B++ 完成：A) `test_tcp_kv_transport_roundtrip` 验证 TCP 序列化无损（diff=0）；B) `test_distributed_llama_model_multi_step_decode` 验证 4 步连续分布式 decode，每步 diff ~2e-6。修复多步 decode 根因：`history_len = k.size()[2] - 1` 在多步时会包含之前 decode append 的 token，引入 `prefill_kv_len` 字段确保只发送 prefill 分区。
-- [ ] 为 `RingAttnMessage` 设计 serialization / deserialization。
+- [x] [2026-05-01] D 完成：`RingAttnMessage` serialization/deserialization 单元测试覆盖。新增 5 个测试：bincode roundtrip、payload 完整性（256 bytes）、schema version 字段、三种 message kind（KvBlock/SoftmaxState/Terminate）、TCP transport trait 端到端。30/30 测试通过，clippy 零警告。
 
 ## 重要模式与偏好
 
