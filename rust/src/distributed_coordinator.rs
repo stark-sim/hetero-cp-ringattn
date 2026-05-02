@@ -33,9 +33,10 @@ fn parse_args() -> CoordinatorArgs {
     let mut worker_addrs = Vec::new();
     let mut listen_addr = String::new();
 
-    let mut args = std::env::args().skip(2); // skip binary name + "coordinator"
+    let mut args = std::env::args().skip(1); // skip binary name
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--distributed-role" => { let _ = args.next(); } // consumed by main.rs, skip here
             "--model-dir" => model_dir = args.next().unwrap(),
             "--prompt" => prompt = args.next().unwrap(),
             "--max-tokens" => max_tokens = args.next().unwrap().parse().unwrap(),

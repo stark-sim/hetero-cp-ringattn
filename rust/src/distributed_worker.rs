@@ -32,9 +32,10 @@ fn parse_args() -> WorkerArgs {
     let mut coordinator_addr = String::new();
     let mut num_domains = 2usize;
 
-    let mut args = std::env::args().skip(2); // skip binary name + "worker"
+    let mut args = std::env::args().skip(1); // skip binary name
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--distributed-role" => { let _ = args.next(); } // consumed by main.rs, skip here
             "--domain-id" => domain_id = args.next().unwrap().parse().unwrap(),
             "--seq-offset" => seq_offset = args.next().unwrap().parse().unwrap(),
             "--model-dir" => model_dir = args.next().unwrap(),
