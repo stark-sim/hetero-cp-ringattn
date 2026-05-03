@@ -50,6 +50,21 @@ This project uses a Memory Bank system in `memory-bank/` for cross-session conte
 - `memory bank status` / `memory bank durumu` -> Show current status summary
 - `memory bank read` / `memory bank oku` -> Read all files and present context
 
+### Optimization Trade-off Discipline:
+Whenever proposing an optimization, you MUST analyze the trade-off before implementing:
+1. **Why the default exists**: What problem does the current (non-optimized) approach solve?
+2. **What is sacrificed**: What capability, correctness guarantee, or flexibility does the optimization discard?
+3. **What the sacrificed thing does**: What is its intrinsic purpose in the general case?
+4. **What it means for this project**: Why does that sacrifice matter (or not matter) specifically here?
+
+Do NOT treat "faster / less memory" as an unqualified win. Record the analysis in the commit message or memory-bank.
+
+**Example — "last token only" LM head optimization:**
+- **Why default computes full logits**: `LlamaModel::forward` returns `[batch, seq, vocab]` so that callers can inspect logits at *any* position (e.g., perplexity evaluation, contrastive search, speculative decoding verification, training loss). It is the canonical transformer output contract.
+- **What is sacrificed**: The ability to compute per-token loss, do beam-search over intermediate positions, or use the model as a general scoring function (e.g., reward model). The forward signature semantics change from "full sequence logits" to "last position only (unless flagged otherwise)".
+- **What the sacrificed thing does**: Per-position logits are needed for (a) training (cross-entropy over all positions), (b) evaluation (perplexity), (c) advanced decoding (contrastive search compares multiple position scores), (d) speculative decoding (draft model needs to score all draft tokens).
+- **What it means for this project**: HCP is **inference-only** (90% inference, 10% training per product thesis). For greedy/temperature sampling decode, only the last token matters. However, our distributed correctness tests currently compare *all* positions (`ref_logits.narrow(1, i, 1)` vs `dist_logits.narrow(1, i, 1)`). "Last token only" would break those tests unless we add a `return_full_logits: bool` flag. The flag adds API surface complexity. Given that prefill is a one-time cost and decode is the loop, the win is limited to prefill phase only. **Conclusion: skip for now, revisit if prefill becomes the bottleneck.**
+
 ### NEVER:
 - Modify `memory-bank/RULES.md` (it's immutable)
 - Write secrets (API keys, tokens, passwords) to memory bank files
