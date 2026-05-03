@@ -53,14 +53,43 @@ pub fn deserialize<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, St
 
 /// Write a length-prefixed frame to a stream.
 /// Frame format: [4-byte BE length][payload bytes]
+///
+/// Uses a manual retry loop instead of `write_all` to handle
+/// `ErrorKind::WouldBlock` / `ErrorKind::Interrupted` on high-latency
+/// links where TCP send buffers may temporarily stall.
 pub fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> Result<(), String> {
     let len = payload.len() as u32;
-    stream
-        .write_all(&len.to_be_bytes())
-        .map_err(|e| format!("write_frame length failed: {e}"))?;
-    stream
-        .write_all(payload)
-        .map_err(|e| format!("write_frame payload failed: {e}"))?;
+    let mut buf = Vec::with_capacity(4 + payload.len());
+    buf.extend_from_slice(&len.to_be_bytes());
+    buf.extend_from_slice(payload);
+
+    let mut written = 0usize;
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(600);
+
+    while written < buf.len() {
+        if start.elapsed() > timeout {
+            return Err(format!("write_frame timeout after {:?}", timeout));
+        }
+        match stream.write(&buf[written..]) {
+            Ok(0) => {
+                return Err("write_frame: peer closed connection".to_string());
+            }
+            Ok(n) => {
+                written += n;
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                continue;
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
+            Err(e) => {
+                return Err(format!("write_frame failed: {e}"));
+            }
+        }
+    }
     stream
         .flush()
         .map_err(|e| format!("write_frame flush failed: {e}"))?;

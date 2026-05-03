@@ -157,8 +157,24 @@ fn connect_with_retry(addr: &str, attempts: usize, delay_ms: u64) -> Result<std:
         match std::net::TcpStream::connect(addr) {
             Ok(stream) => {
                 let _ = stream.set_nodelay(true);
-                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
-                let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
+                let rto = stream.set_read_timeout(Some(std::time::Duration::from_secs(600)));
+                let wto = stream.set_write_timeout(Some(std::time::Duration::from_secs(600)));
+                println!("[worker connect] read_timeout={:?} write_timeout={:?}", rto, wto);
+                // Increase TCP buffer sizes for high-latency VPN links.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::io::AsRawFd;
+                    let fd = stream.as_raw_fd();
+                    let size: i32 = 4 * 1024 * 1024;
+                    unsafe {
+                        let _ = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF,
+                            &size as *const _ as *const libc::c_void,
+                            std::mem::size_of::<i32>() as libc::socklen_t);
+                        let _ = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF,
+                            &size as *const _ as *const libc::c_void,
+                            std::mem::size_of::<i32>() as libc::socklen_t);
+                    }
+                }
                 return Ok(stream);
             }
             Err(e) => {
@@ -281,6 +297,13 @@ fn domain_worker_loop(
     let mut coord_stream = connect_with_retry(&coordinator_addr, 300, 200)
         .expect("coordinator connect failed");
     println!("[worker {domain_id}] connected to coordinator");
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = coord_stream.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
+        println!("[worker {domain_id}] socket flags={} nonblock={}", flags, flags & libc::O_NONBLOCK != 0);
+    }
 
     let handshake = crate::distributed_protocol::WorkerHandshake {
         domain_id: domain_id as u64,

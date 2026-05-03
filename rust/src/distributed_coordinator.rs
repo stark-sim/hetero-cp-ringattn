@@ -136,7 +136,7 @@ pub fn run() {
 
     let mut worker_handshakes: Vec<(usize, u64, TcpStream)> = Vec::with_capacity(args.num_domains);
     for i in 0..args.num_domains {
-        let mut stream = accept_with_retry(&listener, 300, 200)
+        let mut stream = accept_with_retry(&listener, 3000, 200)
             .unwrap_or_else(|e| panic!("accept worker {i} failed: {e}"));
         let handshake = crate::distributed_protocol::read_handshake(&mut stream)
             .expect("handshake read failed");

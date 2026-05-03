@@ -647,6 +647,7 @@ dependencies = [
  "bytemuck",
  "cc",
  "half",
+ "libc",
  "quinn",
  "rcgen",
  "rustls",
