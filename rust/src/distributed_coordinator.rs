@@ -3,10 +3,12 @@
 //! Orchestrates prefill and decode across multiple workers.
 //! Does NOT load model weights; only needs tokenizer and config.
 
-use crate::distributed_protocol::{recv_response, send_command, WorkerCommand, WorkerResponse};
+use crate::distributed_protocol::{
+    recv_response_quic, send_command_quic, WorkerCommand, WorkerResponse,
+};
 use crate::model::config::ModelConfig;
 use crate::model::generate::sample_token;
-use std::net::{TcpListener, TcpStream};
+use std::net::SocketAddr;
 use std::path::Path;
 use tch::Tensor;
 
@@ -82,31 +84,10 @@ fn parse_args() -> CoordinatorArgs {
     }
 }
 
-fn accept_with_retry(listener: &TcpListener, attempts: usize, delay_ms: u64) -> Result<TcpStream, String> {
-    listener.set_nonblocking(true).map_err(|e| format!("set_nonblocking failed: {e}"))?;
-    for i in 0..attempts {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                let _ = stream.set_nonblocking(false);
-                let _ = stream.set_nodelay(true);
-                // Long timeout for large-seq prefill: workers may need minutes.
-                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(600)));
-                let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(600)));
-                return Ok(stream);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if i == attempts - 1 {
-                    return Err(format!("accept timeout after {attempts} attempts"));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-            }
-            Err(e) => return Err(format!("accept failed: {e}")),
-        }
-    }
-    unreachable!()
-}
-
 pub fn run() {
+    // Install rustls ring crypto provider once per process (required by rustls 0.23)
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let args = parse_args();
     println!("[coordinator] starting, num_domains={}, workers={:?}, listen={}",
              args.num_domains, args.worker_addrs, args.listen_addr);
@@ -130,23 +111,53 @@ pub fn run() {
     let prompt_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
     println!("[coordinator] prompt tokens: {}", prompt_ids.len());
 
-    // Start listener and wait for workers to connect
-    let listener = TcpListener::bind(&args.listen_addr).expect("bind listen_addr failed");
-    println!("[coordinator] listening on {}", args.listen_addr);
+    // Create QUIC endpoint and wait for workers to connect
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime failed");
+    let listen_addr: SocketAddr = args.listen_addr.parse().expect("invalid listen_addr");
 
-    let mut worker_handshakes: Vec<(usize, u64, TcpStream)> = Vec::with_capacity(args.num_domains);
+    let endpoint = rt.block_on(async {
+        crate::quic_transport::create_endpoint(listen_addr)
+    }).expect("create_endpoint failed");
+    println!("[coordinator] QUIC endpoint listening on {}", args.listen_addr);
+
+    let mut worker_handshakes: Vec<(usize, u64, quinn::SendStream, quinn::RecvStream)> =
+        Vec::with_capacity(args.num_domains);
     for i in 0..args.num_domains {
-        let mut stream = accept_with_retry(&listener, 3000, 200)
-            .unwrap_or_else(|e| panic!("accept worker {i} failed: {e}"));
-        let handshake = crate::distributed_protocol::read_handshake(&mut stream)
+        let (send, mut recv) = rt.block_on(async {
+            let incoming = loop {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(600),
+                    endpoint.accept()
+                ).await {
+                    Ok(Some(incoming)) => break incoming,
+                    Ok(None) => return Err("endpoint closed".to_string()),
+                    Err(_) => return Err("accept timeout after 600s".to_string()),
+                }
+            };
+            let conn = incoming.await.map_err(|e| format!("connection failed: {e}"))?;
+            println!("[coordinator] worker connection established (accept order {i})");
+            let (send, recv) = conn.accept_bi().await
+                .map_err(|e| format!("accept_bi failed: {e}"))?;
+            Ok::<_, String>((send, recv))
+        }).unwrap_or_else(|e| panic!("accept worker {i} failed: {e}"));
+
+        let handshake = crate::distributed_protocol::read_handshake_quic(&mut recv, rt.handle())
             .expect("handshake read failed");
         println!("[coordinator] worker {} connected (accept order {i}), capacity={} MB",
                  handshake.domain_id, handshake.capacity_mb);
-        worker_handshakes.push((handshake.domain_id as usize, handshake.capacity_mb, stream));
+        worker_handshakes.push((
+            handshake.domain_id as usize,
+            handshake.capacity_mb,
+            send,
+            recv,
+        ));
     }
-    worker_handshakes.sort_by_key(|(domain_id, _, _)| *domain_id);
-    let worker_capacities: Vec<u64> = worker_handshakes.iter().map(|(_, cap, _)| *cap).collect();
-    let mut worker_streams: Vec<TcpStream> = worker_handshakes.into_iter().map(|(_, _, s)| s).collect();
+    worker_handshakes.sort_by_key(|(domain_id, _, _, _)| *domain_id);
+    let worker_capacities: Vec<u64> = worker_handshakes.iter().map(|(_, cap, _, _)| *cap).collect();
+    let mut worker_streams: Vec<(quinn::SendStream, quinn::RecvStream)> = worker_handshakes
+        .into_iter()
+        .map(|(_, _, send, recv)| (send, recv))
+        .collect();
 
     // Prefill: split prompt into chunks and send to workers
     let seq_len = prompt_ids.len() as i64;
@@ -191,7 +202,7 @@ pub fn run() {
         chunk_boundaries.push(chunk_boundaries.last().unwrap() + size);
     }
 
-    for (domain_id, stream) in worker_streams.iter_mut().enumerate() {
+    for (domain_id, (send, _recv)) in worker_streams.iter_mut().enumerate() {
         let start = chunk_boundaries[domain_id];
         let end = chunk_boundaries[domain_id + 1];
         let chunk = &prompt_ids[start..end];
@@ -199,15 +210,15 @@ pub fn run() {
             chunk: chunk.to_vec(),
             seq_offset: start as i64,
         };
-        send_command(stream, &cmd).expect("send Prefill failed");
+        send_command_quic(send, &cmd, rt.handle()).expect("send Prefill failed");
         println!("[coordinator] sent Prefill chunk [{}, {}) to worker {}", start, end, domain_id);
     }
 
     // Collect prefill responses
     let mut max_global_seq_len = 0usize;
     let mut last_logits_bytes: Vec<u8> = Vec::new();
-    for (domain_id, stream) in worker_streams.iter_mut().enumerate() {
-        let resp = recv_response(stream).expect("recv PrefillDone failed");
+    for (domain_id, (_send, recv)) in worker_streams.iter_mut().enumerate() {
+        let resp = recv_response_quic(recv, rt.handle()).expect("recv PrefillDone failed");
         match resp {
             WorkerResponse::PrefillDone { last_logits_bytes: bytes, global_seq_len } => {
                 println!("[coordinator] worker {} prefill done, global_seq_len={}", domain_id, global_seq_len);
@@ -223,9 +234,9 @@ pub fn run() {
 
     // Sync global_seq_len to all workers
     println!("[coordinator] max_global_seq_len = {}", max_global_seq_len);
-    for stream in worker_streams.iter_mut() {
+    for (send, _recv) in worker_streams.iter_mut() {
         let cmd = WorkerCommand::SyncGlobalSeqLen(max_global_seq_len);
-        send_command(stream, &cmd).expect("send SyncGlobalSeqLen failed");
+        send_command_quic(send, &cmd, rt.handle()).expect("send SyncGlobalSeqLen failed");
     }
 
     // Deserialize last logits and sample first token
@@ -254,13 +265,14 @@ pub fn run() {
         }
 
         // Broadcast token to all workers
-        for stream in worker_streams.iter_mut() {
+        for (send, _recv) in worker_streams.iter_mut() {
             let cmd = WorkerCommand::Decode(next_token);
-            send_command(stream, &cmd).expect("send Decode failed");
+            send_command_quic(send, &cmd, rt.handle()).expect("send Decode failed");
         }
 
         // Receive decode response from first worker (all should be identical)
-        let resp = recv_response(&mut worker_streams[0]).expect("recv DecodeDone failed");
+        let resp = recv_response_quic(&mut worker_streams[0].1, rt.handle())
+            .expect("recv DecodeDone failed");
         let logits_bytes = match resp {
             WorkerResponse::DecodeDone { logits_bytes } => logits_bytes,
             WorkerResponse::Error(e) => panic!("worker 0 decode error: {e}"),
@@ -268,8 +280,8 @@ pub fn run() {
         };
 
         // Optionally drain responses from other workers to keep streams in sync
-        for stream in worker_streams.iter_mut().skip(1) {
-            let _ = recv_response(stream).expect("recv DecodeDone failed");
+        for (_send, recv) in worker_streams.iter_mut().skip(1) {
+            let _ = recv_response_quic(recv, rt.handle()).expect("recv DecodeDone failed");
         }
 
         let decode_logits: Vec<f32> = logits_bytes.chunks_exact(4)
@@ -281,8 +293,8 @@ pub fn run() {
     }
 
     // Shutdown workers
-    for stream in worker_streams.iter_mut() {
-        let _ = send_command(stream, &WorkerCommand::Shutdown);
+    for (send, _recv) in worker_streams.iter_mut() {
+        let _ = send_command_quic(send, &WorkerCommand::Shutdown, rt.handle());
     }
 
     // Decode to text

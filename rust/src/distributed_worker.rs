@@ -8,7 +8,9 @@
 //! A process-wide Mutex serializes forward() calls across domains to avoid
 //! GPU memory contention when multiple domains share the same physical card.
 
-use crate::distributed_protocol::{recv_command, send_response, WorkerCommand, WorkerResponse};
+use crate::distributed_protocol::{
+    recv_command_quic, send_response_quic, WorkerCommand, WorkerResponse,
+};
 use crate::model::model::LlamaModel;
 use crate::model::{ModelConfig, ModelWeights};
 use std::path::Path;
@@ -152,42 +154,6 @@ fn select_device() -> Device {
     }
 }
 
-fn connect_with_retry(addr: &str, attempts: usize, delay_ms: u64) -> Result<std::net::TcpStream, String> {
-    for i in 0..attempts {
-        match std::net::TcpStream::connect(addr) {
-            Ok(stream) => {
-                let _ = stream.set_nodelay(true);
-                let rto = stream.set_read_timeout(Some(std::time::Duration::from_secs(600)));
-                let wto = stream.set_write_timeout(Some(std::time::Duration::from_secs(600)));
-                println!("[worker connect] read_timeout={:?} write_timeout={:?}", rto, wto);
-                // Increase TCP buffer sizes for high-latency VPN links.
-                #[cfg(unix)]
-                {
-                    use std::os::unix::io::AsRawFd;
-                    let fd = stream.as_raw_fd();
-                    let size: i32 = 4 * 1024 * 1024;
-                    unsafe {
-                        let _ = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF,
-                            &size as *const _ as *const libc::c_void,
-                            std::mem::size_of::<i32>() as libc::socklen_t);
-                        let _ = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF,
-                            &size as *const _ as *const libc::c_void,
-                            std::mem::size_of::<i32>() as libc::socklen_t);
-                    }
-                }
-                return Ok(stream);
-            }
-            Err(e) => {
-                if i == attempts - 1 {
-                    return Err(format!("failed to connect to {addr} after {attempts} attempts: {e}"));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-            }
-        }
-    }
-    unreachable!()
-}
-
 /// Run a single domain's command loop.
 fn domain_worker_loop(
     domain_config: DomainConfig,
@@ -209,18 +175,21 @@ fn domain_worker_loop(
         .expect("build model failed");
     let mut kv_caches = model.create_kv_caches();
 
-    // Setup QUIC transport for peer KV ring
+    // Setup QUIC transport for peer KV ring and coordinator control plane
     println!("[worker {domain_id}] setting up QUIC transport");
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime failed");
     let listen_addr: std::net::SocketAddr = domain_config.listen_addr.parse()
         .expect("invalid listen_addr");
     let next_peer_addr: std::net::SocketAddr = domain_config.next_peer_addr.parse()
         .expect("invalid next_peer_addr");
+    let coord_addr: std::net::SocketAddr = coordinator_addr.parse()
+        .expect("invalid coordinator_addr");
 
     let num_layers = config.num_layers;
-    let (mut outbound_streams, mut inbound_streams) = rt.block_on(async move {
+    let (mut outbound_streams, mut inbound_streams, mut coord_send, mut coord_recv) = rt.block_on(async move {
         let endpoint = crate::quic_transport::create_endpoint(listen_addr)
             .expect("QUIC endpoint bind failed");
+        let endpoint_for_accept = endpoint.clone();
         println!("[worker {domain_id}] QUIC endpoint bound to {listen_addr}");
 
         let dial_fut = endpoint.connect(next_peer_addr, "localhost").unwrap();
@@ -229,7 +198,7 @@ fn domain_worker_loop(
             loop {
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(3),
-                    endpoint.accept()
+                    endpoint_for_accept.accept()
                 ).await {
                     Ok(Some(incoming)) => break incoming.await.expect("prev peer connection failed"),
                     Ok(None) => panic!("endpoint closed"),
@@ -278,7 +247,17 @@ fn domain_worker_loop(
             }
         }
 
-        (outbound, inbound)
+        // Connect to coordinator via QUIC
+        println!("[worker {domain_id}] connecting to coordinator {coordinator_addr}");
+        let coord_conn = endpoint.connect(coord_addr, "localhost")
+            .expect("connect to coordinator failed")
+            .await
+            .expect("coordinator connection failed");
+        println!("[worker {domain_id}] QUIC connection to coordinator established");
+        let (cs, cr) = coord_conn.open_bi().await
+            .expect("open_bi to coordinator failed");
+
+        (outbound, inbound, cs, cr)
     });
 
     model.setup_distributed_domain(domain_id, 0, |_layer_idx| {
@@ -293,28 +272,17 @@ fn domain_worker_loop(
     let capacity_mb = crate::capacity::query_device_capacity_mb(device);
     println!("[worker {domain_id}] capacity: {} MB", capacity_mb);
 
-    println!("[worker {domain_id}] connecting to coordinator {coordinator_addr}");
-    let mut coord_stream = connect_with_retry(&coordinator_addr, 300, 200)
-        .expect("coordinator connect failed");
-    println!("[worker {domain_id}] connected to coordinator");
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        let fd = coord_stream.as_raw_fd();
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
-        println!("[worker {domain_id}] socket flags={} nonblock={}", flags, flags & libc::O_NONBLOCK != 0);
-    }
-
     let handshake = crate::distributed_protocol::WorkerHandshake {
         domain_id: domain_id as u64,
         capacity_mb,
     };
-    crate::distributed_protocol::write_handshake(&mut coord_stream, &handshake)
+    crate::distributed_protocol::write_handshake_quic(&mut coord_send, &handshake, rt.handle())
         .expect("handshake write failed");
+    println!("[worker {domain_id}] handshake sent to coordinator");
 
     loop {
         println!("[worker {domain_id}] waiting for command...");
-        let cmd = recv_command(&mut coord_stream).expect("recv_command failed");
+        let cmd = recv_command_quic(&mut coord_recv, rt.handle()).expect("recv_command failed");
         println!("[worker {domain_id}] received command");
         match cmd {
             WorkerCommand::Prefill { chunk, seq_offset } => {
@@ -334,7 +302,7 @@ fn domain_worker_loop(
                     last_logits_bytes: logits_bytes,
                     global_seq_len: model.global_seq_len,
                 };
-                send_response(&mut coord_stream, &resp).expect("send_response failed");
+                send_response_quic(&mut coord_send, &resp, rt.handle()).expect("send_response failed");
             }
             WorkerCommand::Decode(token) => {
                 let input = Tensor::from_slice(&[token]).unsqueeze(0).to_device(device);
@@ -343,7 +311,7 @@ fn domain_worker_loop(
                 let logits_bytes: Vec<u8> = logits_vec.iter().flat_map(|&v| v.to_le_bytes()).collect();
 
                 let resp = WorkerResponse::DecodeDone { logits_bytes };
-                send_response(&mut coord_stream, &resp).expect("send_response failed");
+                send_response_quic(&mut coord_send, &resp, rt.handle()).expect("send_response failed");
             }
             WorkerCommand::SyncGlobalSeqLen(len) => {
                 model.global_seq_len = len;

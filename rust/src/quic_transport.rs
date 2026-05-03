@@ -204,7 +204,7 @@ impl KvTransport for QuicKvTransport {
 }
 
 #[derive(Debug)]
-enum ReadExactError {
+pub enum ReadExactError {
     Closed,
     ReadError(quinn::ReadError),
 }
@@ -218,7 +218,7 @@ impl std::fmt::Display for ReadExactError {
     }
 }
 
-async fn read_exact(stream: &mut RecvStream, buf: &mut [u8]) -> Result<(), ReadExactError> {
+pub async fn read_exact(stream: &mut RecvStream, buf: &mut [u8]) -> Result<(), ReadExactError> {
     let mut offset = 0;
     while offset < buf.len() {
         match stream.read(&mut buf[offset..]).await {

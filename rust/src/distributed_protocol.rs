@@ -1,11 +1,13 @@
 //! Control protocol for distributed multi-process inference.
 //!
 //! Defines messages exchanged between coordinator and workers,
-//! plus frame I/O helpers (length-prefixed bytes over TcpStream).
+//! plus frame I/O helpers (length-prefixed bytes over TcpStream or QUIC streams).
 
+use quinn::{RecvStream, SendStream};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
+use tokio::runtime::Handle;
 
 /// Control messages sent from coordinator to worker.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
@@ -179,6 +181,94 @@ pub fn read_handshake(stream: &mut TcpStream) -> Result<WorkerHandshake, String>
     stream
         .read_exact(&mut buf)
         .map_err(|e| format!("read_handshake failed: {e}"))?;
+    Ok(WorkerHandshake::from_bytes(&buf))
+}
+
+// ---------------------------------------------------------------------------
+// QUIC variants
+// ---------------------------------------------------------------------------
+
+/// Write a length-prefixed frame to a QUIC send stream.
+pub fn write_frame_quic(send: &mut SendStream, payload: &[u8], rt: &Handle) -> Result<(), String> {
+    let len = payload.len() as u32;
+    let mut buf = Vec::with_capacity(4 + payload.len());
+    buf.extend_from_slice(&len.to_be_bytes());
+    buf.extend_from_slice(payload);
+
+    rt.block_on(async {
+        send.write_all(&buf).await
+            .map_err(|e| format!("write_frame_quic failed: {e}"))
+    })
+}
+
+/// Read a length-prefixed frame from a QUIC recv stream.
+pub fn read_frame_quic(recv: &mut RecvStream, rt: &Handle) -> Result<Vec<u8>, String> {
+    let mut len_bytes = [0u8; 4];
+    rt.block_on(async {
+        crate::quic_transport::read_exact(recv, &mut len_bytes).await
+            .map_err(|e| format!("read_frame_quic length failed: {e}"))?;
+        let len = u32::from_be_bytes(len_bytes) as usize;
+        if len > 64 * 1024 * 1024 {
+            return Err(format!("read_frame_quic: frame too large ({len} bytes)"));
+        }
+        let mut payload = vec![0u8; len];
+        crate::quic_transport::read_exact(recv, &mut payload).await
+            .map_err(|e| format!("read_frame_quic payload failed: {e}"))?;
+        Ok(payload)
+    })
+}
+
+/// Send a command over a QUIC send stream.
+pub fn send_command_quic(
+    send: &mut SendStream,
+    cmd: &WorkerCommand,
+    rt: &Handle,
+) -> Result<(), String> {
+    let bytes = serialize(cmd)?;
+    write_frame_quic(send, &bytes, rt)
+}
+
+/// Receive a command from a QUIC recv stream.
+pub fn recv_command_quic(recv: &mut RecvStream, rt: &Handle) -> Result<WorkerCommand, String> {
+    let bytes = read_frame_quic(recv, rt)?;
+    deserialize(&bytes)
+}
+
+/// Send a response over a QUIC send stream.
+pub fn send_response_quic(
+    send: &mut SendStream,
+    resp: &WorkerResponse,
+    rt: &Handle,
+) -> Result<(), String> {
+    let bytes = serialize(resp)?;
+    write_frame_quic(send, &bytes, rt)
+}
+
+/// Receive a response from a QUIC recv stream.
+pub fn recv_response_quic(recv: &mut RecvStream, rt: &Handle) -> Result<WorkerResponse, String> {
+    let bytes = read_frame_quic(recv, rt)?;
+    deserialize(&bytes)
+}
+
+/// Write a handshake to a QUIC send stream.
+pub fn write_handshake_quic(
+    send: &mut SendStream,
+    handshake: &WorkerHandshake,
+    rt: &Handle,
+) -> Result<(), String> {
+    rt.block_on(async {
+        send.write_all(&handshake.to_bytes()).await
+            .map_err(|e| format!("write_handshake_quic failed: {e}"))
+    })
+}
+
+/// Read a handshake from a QUIC recv stream.
+pub fn read_handshake_quic(recv: &mut RecvStream, rt: &Handle) -> Result<WorkerHandshake, String> {
+    let mut buf = [0u8; WorkerHandshake::SIZE];
+    rt.block_on(async {
+        crate::quic_transport::read_exact(recv, &mut buf).await
+            .map_err(|e| format!("read_handshake_quic failed: {e}"))
+    })?;
     Ok(WorkerHandshake::from_bytes(&buf))
 }
 
