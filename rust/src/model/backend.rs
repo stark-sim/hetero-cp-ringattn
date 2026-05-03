@@ -7,7 +7,7 @@ use crate::model::kv_transport::{KvBlock, KvTransport};
 
 /// Trait for attention computation backends.
 #[cfg(feature = "tch-backend")]
-pub trait AttentionBackend {
+pub trait AttentionBackend: Send {
     /// Forward pass: compute attention output for the given hidden states.
     ///
     /// `hidden_states`: `[batch, seq_len, hidden_size]`

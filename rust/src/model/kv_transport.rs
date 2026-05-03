@@ -32,7 +32,7 @@ impl Clone for KvBlock {
 
 /// Transport for exchanging KV blocks between distributed attention workers.
 #[cfg(feature = "tch-backend")]
-pub trait KvTransport {
+pub trait KvTransport: Send {
     /// Send a KV block to the next peer in the ring.
     fn send_kv_block(&mut self, block: &KvBlock) -> Result<(), String>;
 
