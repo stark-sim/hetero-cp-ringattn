@@ -2,6 +2,26 @@
 
 ## 当前焦点
 
+[2026-05-03] **统一 QUIC 控制面已完成并验证通过**（commit `7d62b46`）。Worker-coordinator 控制面从 TCP 迁移到 QUIC，与 KV ring 共用同一链路，享受 256MB window + 流控优化。
+
+**本地验证**：2-domain CPU smoke ✅，`generated: . The lazy dog is`
+**远程验证**：4090 CUDA 8K smoke ✅，`generated:  lazy dog. The quick`
+
+**核心实现**（commit `7d62b46`）：
+1. `distributed_protocol.rs`：新增 QUIC 版 frame I/O（`write_frame_quic`/`read_frame_quic`/`send_command_quic`/`recv_command_quic`/`write_handshake_quic`/`read_handshake_quic`）
+2. `distributed_coordinator.rs`：Coordinator 从 TCP listener 改为 QUIC endpoint，`accept` incoming connections
+3. `distributed_worker.rs`：Worker 从 TCP connect 改为 QUIC connect 到 coordinator
+4. `quic_transport.rs`：导出 `read_exact` 供 protocol 复用
+
+**前后对比**：
+| 链路 | 之前 | 现在 |
+|------|------|------|
+| Worker ↔ Coordinator 控制面 | TCP（高延迟下 EAGAIN） | QUIC（256MB window） |
+| Worker ↔ Worker KV ring | QUIC | QUIC |
+| 全链路协议 | 混合（TCP+QUIC） | **统一 QUIC** |
+
+---
+
 [2026-05-02] **单进程多 domain worker（Multi-Domain Worker）已实现并本地验证通过**。下一步：远程 GPU 恢复后验证 CUDA，然后尝试 32K/64K。
 
 **核心实现**（commit `8c1b4d0`）：
@@ -336,8 +356,7 @@
 
 ## 当前阻塞
 
-- [2026-05-02] **远程 GPU 主机离线**：`100.64.0.93` SSH 超时，推测因单节点 32K OOM（56GB 申请）导致系统不稳定/重启。需等待恢复后验证 CUDA。
-- [2026-05-02] **GPU 0 显存泄漏**：15.3GB 残留（无可见进程），`nvidia-smi --gpu-reset` 不支持该卡，`rmmod nvidia` 因模块在用失败。需主机重启才能释放。
+- [2026-05-03] **无阻塞**。远程 4090 已恢复，统一 QUIC 控制面 + 单进程多 domain worker 均已验证通过（8K seq）。下一步：32K/64K 扩展验证。
 - [2026-05-02] **单卡多 worker 显存上限不变**：权重共享只能省一份权重 (~4.6GB)，但 LM head output 和 KV cache 仍按 domain 数倍增。2 domain × 8K 同卡 ≈ 2×(4.64GB LM head + KV) + 4.6GB 权重 ≈ 14GB+，仍可能 OOM。大 seq 必须多卡分布。
 - [2026-04-24] 当前沙箱环境不允许 Python worker 绑定本地端口，完整 Python smoke 会触发 `PermissionError: [Errno 1] Operation not permitted`。
 - [2026-04-24] `ringattn_controller.py` 当前会将 `bytes` 放入 `json.dumps` payload，导致 `TypeError: Object of type bytes is not JSON serializable`。

@@ -123,7 +123,7 @@
 
 ## 已知问题
 
-- [2026-05-02] 远程 GPU 主机 `100.64.0.93` 离线（SSH 超时），推测 OOM 导致系统重启中；GPU 0 显存泄漏 15.3GB 需重启释放。
+- [2026-05-03] 远程 4090 已恢复并通过验证（统一 QUIC 控制面 + 单进程多 domain worker，8K seq）。
 - [2026-05-02] 单卡多 worker 虽共享权重，但 LM head + KV cache 仍按 domain 数倍增，不能突破单卡显存上限。生产默认 1 worker/GPU，开发环境可尝试 2 worker/GPU。
 - [2026-04-24] 完整 Python smoke 在当前沙箱下无法绑定本地端口。
 - [2026-04-24] `ringattn_controller.py` 存在 `bytes` JSON 序列化问题。
@@ -146,6 +146,7 @@
 - [x] [2026-05-02] CUDA 单节点大 seq 验证：4K ✅ 5.10s / 8K ✅ 6.39s。
 - [x] [2026-05-02] CUDA 分布式大 seq 验证：2-domain 4K ✅ 1m11s / 2-domain 8K ✅ 2m19s / **2-domain 16K ✅ 4m43s**，输出均与单节点参考一致（`jumps over the lazy`）。
 - [x] [2026-05-02] **单进程多 domain worker 实现**：`distributed_worker.rs` 支持 `--local-domain-ids 0,1`（同进程多 domain），权重只加载一次（`Arc<ModelWeights>` + `shallow_clone`），每个 domain 独立 LlamaModel + KV cache + coordinator stream + QUIC endpoint。`KvTransport` trait 添加 `Send` bound。移除了 `forward_lock`（会导致 ring attention 死锁），依赖 `no_grad` + 自然 CUDA stream 串行化。本地 2-domain/4-domain CPU smoke 均通过。
+- [x] [2026-05-03] **统一 QUIC 控制面**：`distributed_protocol.rs` 新增 QUIC 版 frame I/O；`distributed_coordinator.rs` 从 TCP listener 改为 QUIC endpoint；`distributed_worker.rs` 从 TCP connect 改为 QUIC connect。本地 2-domain CPU smoke ✅（`generated: . The lazy dog is`），远程 4090 CUDA 8K smoke ✅（`generated:  lazy dog. The quick`）。全链路统一 QUIC，消除 TCP 高延迟下的 EAGAIN 问题。
 
 ## 里程碑
 
@@ -158,4 +159,5 @@
 | M4: 异构 runtime 闭环 | 已完成 | [2026-04-30] |
 | M5: 远端闭环 | 已完成 | [2026-04-30] |
 | M5+: 单进程多 domain worker | 已完成 | [2026-05-02] 本地 CPU 验证通过 |
-| M6: 扩展性论证 | **进行中** | [2026-05-02] 16K 分布式通过，32K/64K/128K 待远程 GPU 恢复后验证 |
+| M5++: 统一 QUIC 控制面 | 已完成 | [2026-05-03] 本地 CPU + 远程 4090 CUDA 验证通过 |
+| M6: 扩展性论证 | **进行中** | [2026-05-03] 16K 分布式通过，8K 远程 4090 通过，32K/64K/128K 待验证 |

@@ -209,6 +209,8 @@ RUN_ID=rust-remote-cp-3node-<timestamp> \
 - `--infer-num-domains N`：Inference CLI 参数，指定分布式推理的 domain 数量（默认 1，即单节点 LocalAttentionBackend）。
 - `--infer-model-dir /path/to/model`：Inference CLI 参数，从 HuggingFace 格式目录加载模型（`config.json` + `model.safetensors` + `tokenizer.json`）。
 - `--local-domain-ids 0,1`：Worker CLI 参数（替代 `--domain-id`），单进程内运行多个 domain。权重只加载一次，各 domain 独立 KV cache + coordinator stream + QUIC endpoint。需同时提供对应数量的 `--listen-addrs` 和 `--next-peer-addrs`。
+- `--listen-addr 0.0.0.0:29450`：Coordinator CLI 参数，QUIC endpoint 监听地址。
+- `--coordinator-addr 127.0.0.1:29450`：Worker CLI 参数，QUIC 连接 coordinator 的地址。
 - `--listen-addrs 0.0.0.0:29190,0.0.0.0:29191`：与 `--local-domain-ids` 配合，每个 domain 一个监听地址。
 - `--next-peer-addrs 127.0.0.1:29192,127.0.0.1:29193`：与 `--local-domain-ids` 配合，每个 domain 一个下游 peer 地址。
 
@@ -272,9 +274,9 @@ project-root/
 │   │   ├── compute_runtime.rs            # ComputeRuntime trait（Tch/NoOp）
 │   │   ├── kv_transport.rs               # KvTransport trait + Mock/Tcp/Quic 实现
 │   │   ├── quic_transport.rs             # QuicKvTransport（quinn-based）
-│   │   ├── distributed_worker.rs         # 多进程分布式 worker（支持 `--local-domain-ids` 单进程多 domain）
-│   │   ├── distributed_coordinator.rs    # 多进程分布式 coordinator
-│   │   ├── distributed_protocol.rs       # WorkerCommand/WorkerResponse 协议
+│   │   ├── distributed_worker.rs         # 多进程分布式 worker（QUIC 连接 coordinator，支持 `--local-domain-ids` 单进程多 domain）
+│   │   ├── distributed_coordinator.rs    # 多进程分布式 coordinator（QUIC endpoint 接受 workers）
+│   │   ├── distributed_protocol.rs       # WorkerCommand/WorkerResponse 协议（QUIC/TCP 双版本 frame I/O）
 │   │   ├── model/                        # 真实模型实现
 │   │   │   ├── mod.rs
 │   │   │   ├── model.rs                  # LlamaModel、Generator、DecoderLayer
