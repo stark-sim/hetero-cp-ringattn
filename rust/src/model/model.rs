@@ -1,5 +1,6 @@
 use crate::model::{
-    backend::LocalAttentionBackend,
+    // LocalAttentionBackend removed: all paths now use HcpRingAttentionBackend
+    // with fixed chunk-size上限 to avoid O(seq²) scores materialization.
     cache::{create_kv_caches, KvCaches},
     config::ModelConfig,
     layers::{DecoderLayer, GqaAttention, Mlp, RmsNorm, RotaryEmbedding},
@@ -70,13 +71,13 @@ impl LlamaModel {
             let attention = GqaAttention::from_weights(weights, layer_idx, &config, &rope)?;
             let mlp = Mlp::from_weights(weights, layer_idx)?;
 
-            let backend: Box<dyn crate::model::backend::AttentionBackend> = if num_domains > 1 {
+            // Always use HcpRingAttentionBackend (even for single-node).
+            // It implements online softmax with fixed chunk-size上限,
+            // avoiding the O(seq²) scores materialization in GqaAttention::forward.
+            let backend: Box<dyn crate::model::backend::AttentionBackend> =
                 Box::new(crate::model::backend::HcpRingAttentionBackend::from_weights(
                     weights, layer_idx, &config, &rope, num_domains,
-                )?)
-            } else {
-                Box::new(LocalAttentionBackend { attention })
-            };
+                )?);
 
             layers.push(DecoderLayer {
                 input_layernorm: input_ln,
@@ -295,10 +296,8 @@ mod tests {
         // ====== 创建三个模型实例 ======
         // 三个模型共享同一组权重，所以它们的参数完全相同。
         // 
-        // ref_model: num_domains=1，使用 LocalAttentionBackend（标准 GQA）。
+        // ref_model: num_domains=1，使用 HcpRingAttentionBackend（分块 online softmax）。
         // domain0/domain1: num_domains=2，使用 HcpRingAttentionBackend（ring attention）。
-        // Use HcpRingAttentionBackend with num_domains=1 as reference to isolate
-        // any differences between LocalAttentionBackend and HcpRingAttentionBackend.
         let mut ref_model = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
         let mut domain0 = LlamaModel::from_weights(config.clone(), &weights, device, 2).unwrap();
         let mut domain1 = LlamaModel::from_weights(config.clone(), &weights, device, 2).unwrap();

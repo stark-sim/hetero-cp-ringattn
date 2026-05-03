@@ -312,13 +312,6 @@ impl HcpRingAttentionBackend {
         let seq_len = q.size()[2];
         let head_dim = q.size()[3];
 
-        // 如果只有一个 domain（非分布式），直接用本地 attention。
-        // 注意：decode 阶段（seq_len == 1）在分布式场景下也必须走 ring 路径，
-        // 因为每个 domain 只持有部分 KV cache，需要交换 peer KV 才能计算完整 attention。
-        if self.num_domains == 1 {
-            return self.local_attention_scores(q, k, v, attention_mask);
-        }
-
         // ====== 第一步 + 第二步：Ring KV 交换 ======
         // 在真正的 N-domain ring 中，每个 domain 只与 next/prev 两个邻居直接通信。
         // 每个 domain 把自己的 KV 发给 next，从 prev 接收 KV；收到的 KV 在下一轮再转发给 next。
@@ -377,7 +370,13 @@ impl HcpRingAttentionBackend {
         }
 
         // ====== 第三步：确定 chunk 大小 ======
-        let q_chunk_size = (seq_len as usize).div_ceil(self.num_domains).max(1);
+        // 限制 q_chunk_size 上限，避免单 domain 时一次性处理过长序列导致 OOM。
+        // 2048 是一个保守值：scores [batch, 14, 2048, 2048] × 4B ≈ 234MB，加上 exp 等
+        // 中间 tensor 峰值约 500MB-1GB，可轻松放入 16GB 显存。
+        let q_chunk_size = (seq_len as usize)
+            .div_ceil(self.num_domains)
+            .max(1)
+            .min(2048);
         let kv_chunk_size = q_chunk_size;
 
         // 存储每个 Q chunk 的输出，最后 cat 拼接。
