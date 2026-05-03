@@ -111,6 +111,11 @@ impl LlamaModel {
     ///
     /// Returns logits: `[batch, seq_len, vocab_size]`
     pub fn forward(&mut self, input_ids: &Tensor, kv_caches: &mut KvCaches) -> Result<Tensor, ModelError> {
+        // Disable gradient computation for inference. Without this, PyTorch
+        // retains the entire computation graph across all 24 layers, which
+        // balloons memory usage by several GB (especially for long sequences).
+        let _no_grad = tch::no_grad_guard();
+
         let batch = input_ids.size()[0];
         let seq_len = input_ids.size()[1];
         let device = input_ids.device();
