@@ -208,6 +208,38 @@ RUN_ID=rust-remote-cp-3node-<timestamp> \
 - `--chunk-sizes 7,4`：Coordinator CLI 参数，显式指定不均等 prompt 分片（逗号分隔）。
 - `--infer-num-domains N`：Inference CLI 参数，指定分布式推理的 domain 数量（默认 1，即单节点 LocalAttentionBackend）。
 - `--infer-model-dir /path/to/model`：Inference CLI 参数，从 HuggingFace 格式目录加载模型（`config.json` + `model.safetensors` + `tokenizer.json`）。
+- `--local-domain-ids 0,1`：Worker CLI 参数（替代 `--domain-id`），单进程内运行多个 domain。权重只加载一次，各 domain 独立 KV cache + coordinator stream + QUIC endpoint。需同时提供对应数量的 `--listen-addrs` 和 `--next-peer-addrs`。
+- `--listen-addrs 0.0.0.0:29190,0.0.0.0:29191`：与 `--local-domain-ids` 配合，每个 domain 一个监听地址。
+- `--next-peer-addrs 127.0.0.1:29192,127.0.0.1:29193`：与 `--local-domain-ids` 配合，每个 domain 一个下游 peer 地址。
+
+## 显存模型与部署策略
+
+### Qwen2-0.5B 显存分解（F32）
+
+| 组件 | 公式 | 8K 大小 |
+|------|------|---------|
+| 模型权重 | ~ | ~4.6 GB |
+| KV cache | 2 x layers x kv_heads x seq x head_dim x 4B | ~0.6 GB |
+| LM head output | batch x seq x vocab x 4B | 4.64 GB |
+| Attention intermediate | heads x q_chunk x kv_chunk x 4B | <= 234 MB |
+
+### 单卡上限（16GB RTX 4080 SUPER）
+
+| 配置 | 估算显存 | 可行性 |
+|------|---------|--------|
+| 单节点 8K | 4.6 + 0.6 + 4.64 ~= 9.8 GB | 充裕 |
+| 单节点 16K | 4.6 + 1.2 + 9.27 ~= 15.1 GB | 紧张 |
+| 单节点 32K | 4.6 + 2.4 + 18.55 ~= 25.6 GB | 超上限 |
+| 2-domain x 8K 同卡 | 4.6 + 2*(0.6+4.64) ~= 15.1 GB | 紧张 |
+| 2-domain x 16K 同卡 | 4.6 + 2*(1.2+9.27) ~= 25.5 GB | 超上限 |
+
+### 部署策略
+
+- **生产默认 1 worker / 1 GPU**：最稳定，显存最可控，无 inter-domain 资源竞争。
+- **开发环境可尝试 2 worker / 1 GPU**：验证权重共享逻辑，小 seq（<=8K）可行。
+- **大 seq 必须多卡分布**：
+  - 32K -> 4-domain（2 workers x 2 GPUs 或 4 workers x 1 GPU 如果显存够）
+  - 64K -> 8-domain（4 workers x 2 GPUs 或 8 workers x 4 GPUs）
 
 ## 项目结构
 
@@ -240,7 +272,7 @@ project-root/
 │   │   ├── compute_runtime.rs            # ComputeRuntime trait（Tch/NoOp）
 │   │   ├── kv_transport.rs               # KvTransport trait + Mock/Tcp/Quic 实现
 │   │   ├── quic_transport.rs             # QuicKvTransport（quinn-based）
-│   │   ├── distributed_worker.rs         # 多进程分布式 worker
+│   │   ├── distributed_worker.rs         # 多进程分布式 worker（支持 `--local-domain-ids` 单进程多 domain）
 │   │   ├── distributed_coordinator.rs    # 多进程分布式 coordinator
 │   │   ├── distributed_protocol.rs       # WorkerCommand/WorkerResponse 协议
 │   │   ├── model/                        # 真实模型实现

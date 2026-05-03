@@ -2,6 +2,38 @@
 
 ## 当前焦点
 
+[2026-05-02] **单进程多 domain worker（Multi-Domain Worker）已实现并本地验证通过**。下一步：远程 GPU 恢复后验证 CUDA，然后尝试 32K/64K。
+
+**核心实现**（commit `8c1b4d0`）：
+1. `distributed_worker.rs` 新增 `--local-domain-ids 0,1` 参数，单个进程内加载权重一次，通过 `Arc<ModelWeights>` + `shallow_clone` 共享给多个 domain thread。
+2. 每个 domain thread 独立持有：
+   - 自己的 `LlamaModel` 实例（权重 shallow_clone 共享底层 tensor）
+   - 自己的 KV cache（不共享）
+   - 自己的 coordinator TCP stream
+   - 自己的 QUIC endpoint（per-domain）
+3. `KvTransport` trait 添加 `Send` bound，支持跨线程使用。
+4. **移除了 `forward_lock`**（原用于串行化 GPU 访问），原因是 ring attention 中 domain0 在 `recv_kv_block` 阻塞等待 domain1，但 domain1 被 lock 挡在外面 → 死锁。替代方案：`no_grad_guard()` + 自然 CUDA stream 串行化（推理时不保存计算图，MPS/CUDA 天然按 stream 顺序执行）。
+
+**验证**：
+- 本地 2-domain CPU smoke ✅ 通过，输出与参考一致（` in the universe.`）。
+- 本地 4-domain CPU smoke ✅ 通过。
+
+**显存模型分析**（单卡多 worker 的限制）：
+- 权重共享：1 份 ~4.6GB（Qwen2-0.5B F32）
+- 每 domain KV cache：`2 × num_layers × num_kv_heads × seq_len × head_dim × 4B`
+- 每 domain LM head output：`batch × seq_len × vocab_size × 4B`（最大显存 spike）
+  - 8K seq → 4.64GB ✅
+  - 16K seq → 9.27GB（16GB 卡紧张）
+  - 32K seq → 18.55GB ❌（超过单卡上限）
+- **结论**：32K 必须 4-domain+（每 domain ≤8K），64K 必须 8-domain+。单卡双 worker 只能节省一份权重，但 LM head 和 KV cache 仍按 domain 数倍增，不能突破单卡显存上限。
+
+**默认策略**：
+- **生产默认 1 worker / 1 GPU**（最稳定、显存最可控）
+- **开发环境可尝试 2 worker / 1 GPU**（权重共享省 ~4.6GB，适合小 seq 验证）
+- **大 seq 场景必须多卡**：4-domain 32K 用 2 workers × 2 cards，8-domain 64K 用 4 workers × 2 cards 或 8 workers × 4 cards
+
+---
+
 [2026-05-02] **Phase 3: 大 Seq 工程验证 — 2K/4K/8K/16K 全矩阵通过**。下一步：32K/64K/128K 验证。
 
 **问题**：3-domain CPU 4K 和 2-domain CPU 4K 分布式测试均出现 workers 卡死、coordinator 超时现象。Worker 进程 CPU 0%，coordinator `recv PrefillDone` 返回 `UnexpectedEof`。
@@ -267,6 +299,10 @@
 
 ## 下一步
 
+- [ ] 远程 GPU 恢复后验证：
+  - 4-domain 32K CUDA（2 workers × 2 GPUs，或 4 workers × 1 GPU 测试上限）
+  - 8-domain 64K CUDA（4 workers × 2 GPUs）
+- [ ] 多 worker launcher 脚本：扩展 `run_rust_remote_cp_3node_smoke.sh` 支持 `--local-domain-ids` 参数传递
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 - [ ] 动态不均等分片 Phase 2：worker handshake 上报 `free_vram_mb`，coordinator 按 capacity 比例自动分配 chunk sizes（替代手动 `--chunk-sizes`）。
 - [ ] KV 传输压缩：当前 KV 以原始 float32 传输，大 seq 场景（32K+/64K+/128K）带宽压力巨大。探索量化（INT8/FP8）或差分编码。
@@ -300,6 +336,9 @@
 
 ## 当前阻塞
 
+- [2026-05-02] **远程 GPU 主机离线**：`100.64.0.93` SSH 超时，推测因单节点 32K OOM（56GB 申请）导致系统不稳定/重启。需等待恢复后验证 CUDA。
+- [2026-05-02] **GPU 0 显存泄漏**：15.3GB 残留（无可见进程），`nvidia-smi --gpu-reset` 不支持该卡，`rmmod nvidia` 因模块在用失败。需主机重启才能释放。
+- [2026-05-02] **单卡多 worker 显存上限不变**：权重共享只能省一份权重 (~4.6GB)，但 LM head output 和 KV cache 仍按 domain 数倍增。2 domain × 8K 同卡 ≈ 2×(4.64GB LM head + KV) + 4.6GB 权重 ≈ 14GB+，仍可能 OOM。大 seq 必须多卡分布。
 - [2026-04-24] 当前沙箱环境不允许 Python worker 绑定本地端口，完整 Python smoke 会触发 `PermissionError: [Errno 1] Operation not permitted`。
 - [2026-04-24] `ringattn_controller.py` 当前会将 `bytes` 放入 `json.dumps` payload，导致 `TypeError: Object of type bytes is not JSON serializable`。
 - [2026-04-30] 环境默认在线（rsproxy-sparse 可达），`cargo test` / `cargo clippy` / `cargo build` 均在线执行。

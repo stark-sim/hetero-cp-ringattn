@@ -198,3 +198,6 @@ project-root/
 | Handshake 扩展 capacity 上报 | Worker 加载模型后查询 device 可用显存/内存，通过 16-byte handshake 上报 coordinator。Coordinator 使用 largest-remainder method 按比例分配 chunk sizes，替代手动 `--chunk-sizes` | [2026-05-02] |
 | Prefill 命令携带动态 seq_offset | Capacity-aware 分配下每个 worker 的 chunk start 可能与其 CLI `--seq-offset` 不一致。Coordinator 在 `WorkerCommand::Prefill` 中携带实际 `seq_offset`，worker 收到后同步更新 `LlamaModel` 和所有 layer backend 的 `seq_offset`，确保 causal mask 使用正确的全局位置 | [2026-05-02] |
 | `set_distributed` 保留现有 transport | 当 `transport` 参数为 `None` 时，`HcpRingAttentionBackend::set_distributed` 只更新 `seq_offset` 和 `domain_id`，不覆盖已有的 `kv_transport`。避免 worker 在更新 seq_offset 时意外丢失 QUIC stream | [2026-05-02] |
+| 单进程多 domain worker | 单个 OS 进程内通过 `std::thread::spawn` 运行多个 domain，共享 `Arc<ModelWeights>`（权重 shallow_clone），每 domain 独立 LlamaModel/KV cache/coordinator/QUIC。减少 per-card 权重内存占用，但 KV cache 和 LM head output 仍按 domain 数倍增 | [2026-05-02] |
+| 移除 `forward_lock`，改用 `no_grad` + 自然 stream 串行化 | `forward_lock` 在 ring attention 中导致死锁：domain0 在 `recv_kv_block` 阻塞等待 domain1，但 domain1 被 lock 挡在外面。推理时 `no_grad_guard()` 已禁用梯度图，MPS/CUDA 天然按 stream 顺序执行，无需额外互斥 | [2026-05-02] |
+| 默认 1 worker / 1 GPU，开发可尝试 2 worker / 1 GPU | 生产环境单 worker 最稳定、显存最可控；开发环境双 worker 可验证权重共享逻辑，但不能突破单卡显存上限（LM head + KV cache 仍倍增） | [2026-05-02] |
