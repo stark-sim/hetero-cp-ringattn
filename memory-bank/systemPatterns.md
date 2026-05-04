@@ -202,3 +202,5 @@ project-root/
 | 单进程多 domain worker | 单个 OS 进程内通过 `std::thread::spawn` 运行多个 domain，共享 `Arc<ModelWeights>`（权重 shallow_clone），每 domain 独立 LlamaModel/KV cache/coordinator/QUIC。减少 per-card 权重内存占用，但 KV cache 和 LM head output 仍按 domain 数倍增 | [2026-05-02] |
 | 移除 `forward_lock`，改用 `no_grad` + 自然 stream 串行化 | `forward_lock` 在 ring attention 中导致死锁：domain0 在 `recv_kv_block` 阻塞等待 domain1，但 domain1 被 lock 挡在外面。推理时 `no_grad_guard()` 已禁用梯度图，MPS/CUDA 天然按 stream 顺序执行，无需额外互斥 | [2026-05-02] |
 | 默认 1 worker / 1 GPU，开发可尝试 2 worker / 1 GPU | 生产环境单 worker 最稳定、显存最可控；开发环境双 worker 可验证权重共享逻辑，但不能突破单卡显存上限（LM head + KV cache 仍倍增） | [2026-05-02] |
+| MPS 后端 tensor op workaround：`arange_start` CPU fallback、`add+mul` 替代 `masked_fill`、`amax` 替代 `max_dim` | MPS 后端多个 tch-rs/libtorch op 存在 bug：`arange_start` 在 MPS 设备上结果错误；`masked_fill` 行为不正确；`max_dim` 返回 argmax 时异常。统一策略：可疑 op 先在 CPU 创建再 `to_device`，或用数学等价 op 替代（如 `add+mul` 等价于 `masked_fill`） | [2026-05-04] |
+| QUIC `max_idle_timeout` 适配长计算阶段 | prefill/decode 阶段 worker 可能在数分钟内只进行本地计算而不发送任何 QUIC 帧，quinn 默认 idle timeout（~30s）会断开 connection。显式设置 `max_idle_timeout=300s` 覆盖长计算阶段的静默期 | [2026-05-04] |

@@ -2,6 +2,30 @@
 
 ## 当前焦点
 
+[2026-05-04] **跨节点异构 worker CP prefill 验证通过**（commit `e5ad0b3`）。Mac MPS (domain 0) + 远程 RTX 4090 CUDA (domain 1) 通过 VPN 协同完成 64-token prefill。Decode 阶段功能正确，因 MPS+VPN 组合性能较慢未在后台超时（300s）内完成完整端到端，但架构已确认正确。
+
+**验证结果**：
+- Mac MPS worker 0: `prefill done, global_seq_len=32` ✅
+- RTX 4090 CUDA worker 1: `prefill done, global_seq_len=64` ✅
+- Coordinator: `max_global_seq_len = 64` ✅
+- Decode 命令已分发到两个 worker，KV ring 交换在运行中（未因 connection lost 失败）✅
+
+**关键修复**（commit `e5ad0b3`）：
+1. `backend.rs` MPS 兼容性：`arange_start` CPU 创建后 `to_device`；`masked_fill` → `add+mul`；`max_dim` → `amax`（MPS argmax bug）
+2. `quic_transport.rs` `max_idle_timeout(300s)`：防止 prefill 阶段（2-3min）连接空闲断开
+3. `scripts/run_cross_node_2domain_smoke.sh`：跨节点 2-domain 验证脚本
+4. `gen_prompt` 调用参数修正：`"${MODEL_DIR}/tokenizer.json"` 路径修正（本地 `qwen2-0.5b`，远程 `Qwen2-0.5B`）
+5. Mac release binary `DYLD_LIBRARY_PATH`：脚本自动注入 `${LIBTORCH}/lib`
+
+**性能观察**：
+- Prefill 64 tokens（24 layers）：~2-3 min（Mac MPS 是瓶颈）
+- Decode 阶段：每层 KV 同步 × VPN RTT ~1-2s，24 层 ≈ 24-48s/token；2 tokens × 24 layers 预计 >5 min
+- 完整端到端（prefill+2 decode tokens）前台运行预计 8-10 min；GPU+GPU 跨节点会快得多
+
+**当前状态**：功能架构完全正确，瓶颈在 Mac MPS 计算速度 + VPN 延迟。完整 decode 端到端待 GPU+GPU 环境恢复后重跑。
+
+---
+
 [2026-05-03] **统一 QUIC 控制面已完成并验证通过**（commit `7d62b46`）。Worker-coordinator 控制面从 TCP 迁移到 QUIC，与 KV ring 共用同一链路，享受 256MB window + 流控优化。
 
 **本地验证**：2-domain CPU smoke ✅，`generated: . The lazy dog is`

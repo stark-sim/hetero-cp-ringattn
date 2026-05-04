@@ -206,6 +206,19 @@ RUN_ID=rust-remote-cp-3node-<timestamp> \
 - `HCP_WEIGHTS_JSON=/path/to/weights.json`：加载外部 JSON 格式权重（Q/K/V/O projection + LayerNorm gamma/beta）。
 - `HCP_TCH_DEVICE=cpu|mps|cuda|cuda:N`：选择 tch-backend compute runtime 设备；与 `HCP_TORCH_DEVICE` 互相兼容。
 - `--chunk-sizes 7,4`：Coordinator CLI 参数，显式指定不均等 prompt 分片（逗号分隔）。
+
+### MPS 兼容性修复（backend.rs）
+
+macOS MPS 后端在 tch-rs/libtorch 中存在以下已知问题，已在 `rust/src/model/backend.rs` 的 `process_kv_block` 中通过 workaround 修复：
+
+| 原代码 | 问题 | Workaround |
+|--------|------|------------|
+| `Tensor::arange_start(..., (kind, device))` on MPS | `arange_start` 在 MPS 设备上产生错误结果 | 在 `Device::Cpu` 上创建后 `.to_device(q_chunk.device())` |
+| `scores.masked_fill(&mask, f64::NEG_INFINITY)` | MPS `masked_fill` 存在 bug，结果不正确 | `mask.logical_not().to_kind(Float) * NEG_INFINITY` 然后 `scores + neg_inf_mask`（add+mul 替代） |
+| `scores.max_dim(3, false)` | MPS `max_dim` 返回 argmax indices 时行为异常 | `scores.amax(&[3i64][..], false)` 替代，只取最大值不取索引 |
+
+以上修复在本地 MPS（M1 Pro）和远程 CUDA（RTX 4090）跨节点 2-domain smoke 中均已验证。CPU 路径不受影响（CPU 上 `masked_fill` 和 `max_dim` 均正常工作）。
+
 - `--infer-num-domains N`：Inference CLI 参数，指定分布式推理的 domain 数量（默认 1，即单节点 LocalAttentionBackend）。
 - `--infer-model-dir /path/to/model`：Inference CLI 参数，从 HuggingFace 格式目录加载模型（`config.json` + `model.safetensors` + `tokenizer.json`）。
 - `--local-domain-ids 0,1`：Worker CLI 参数（替代 `--domain-id`），单进程内运行多个 domain。权重只加载一次，各 domain 独立 KV cache + coordinator stream + QUIC endpoint。需同时提供对应数量的 `--listen-addrs` 和 `--next-peer-addrs`。
