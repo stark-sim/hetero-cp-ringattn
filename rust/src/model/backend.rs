@@ -1,7 +1,7 @@
 use crate::model::ModelError;
 
 #[cfg(feature = "tch-backend")]
-use tch::{Kind, Tensor};
+use tch::{Device, Kind, Tensor};
 #[cfg(feature = "tch-backend")]
 use crate::model::kv_transport::{KvBlock, KvTransport};
 
@@ -191,24 +191,30 @@ impl HcpRingAttentionBackend {
         // masked_fill(&causal.logical_not(), NEG_INFINITY):
         //   把 causal=False 的位置填入负无穷，softmax 后权重变为 0。
         if apply_causal_mask {
+            // MPS backend has bugs with masked_fill and arange on device.
+            // Build position tensors on CPU then move to device; use add+mul instead of masked_fill.
             let q_pos = Tensor::arange_start(
                 q_global_start as i64,
                 q_global_end as i64,
-                (Kind::Int64, q_chunk.device()),
+                (Kind::Int64, Device::Cpu),
             )
             .unsqueeze(1)
             .unsqueeze(0)
-            .unsqueeze(0);
+            .unsqueeze(0)
+            .to_device(q_chunk.device());
             let k_pos = Tensor::arange_start(
                 kv_global_start as i64,
                 kv_global_end as i64,
-                (Kind::Int64, q_chunk.device()),
+                (Kind::Int64, Device::Cpu),
             )
             .unsqueeze(0)
             .unsqueeze(0)
-            .unsqueeze(0);
+            .unsqueeze(0)
+            .to_device(q_chunk.device());
             let causal = q_pos.ge_tensor(&k_pos);
-            scores = scores.masked_fill(&causal.logical_not(), f64::NEG_INFINITY);
+            // Replace masked_fill with add+mul to avoid MPS masked_fill bug
+            let neg_inf_mask = causal.logical_not().to_kind(Kind::Float) * f64::NEG_INFINITY;
+            scores = scores + neg_inf_mask;
         }
 
         // ====== 第三步：Online Softmax 更新 ======
@@ -246,9 +252,10 @@ impl HcpRingAttentionBackend {
         //           = (exp_prev.unsqueeze(3) * rs.unsqueeze(3) * obh + exp_local.unsqueeze(3) * local_pv) / new_sum.unsqueeze(3)
 
         // local_max: 当前 KV block 中每个 query 的最大 score。
-        // max_dim(3, false): 在第 3 维（kv_chunk_len 维）上取最大值，不保留维度。
+        // amax([3], false): 在第 3 维（kv_chunk_len 维）上取最大值，不保留维度。
+        // 使用 amax 代替 max_dim 避免 MPS 后端对 argmax 的 bug。
         // shape: [batch, num_heads, q_chunk_len]
-        let (local_max, _) = scores.max_dim(3, false);
+        let local_max = scores.amax(&[3i64][..], false);
 
         // weights: 当前 block 的 score 减去最大值后取指数。
         // 减最大值是为了数值稳定性（防止 exp 爆炸）。

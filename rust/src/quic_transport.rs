@@ -1,6 +1,6 @@
 //! QUIC-based KV transport for distributed ring attention.
 use crate::model::kv_transport::{KvBlock, KvTransport};
-use quinn::{ClientConfig, Endpoint, RecvStream, SendStream, ServerConfig};
+use quinn::{ClientConfig, Endpoint, RecvStream, SendStream, ServerConfig, VarInt};
 use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use std::net::SocketAddr;
@@ -73,6 +73,7 @@ pub fn create_endpoint(listen_addr: SocketAddr) -> Result<Endpoint, String> {
     transport_config.max_concurrent_bidi_streams(256u32.into());
     transport_config.max_concurrent_uni_streams(256u32.into());
     transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(1)));
+    transport_config.max_idle_timeout(Some(std::time::Duration::from_secs(300).try_into().unwrap()));
     // Increase stream window to accommodate large KV blocks (e.g. 1.3MB for 1365 tokens).
     // Default ~1.2MB is insufficient for ring-KV exchange deadlocking.
     // GQA repeat 后 KV block 大小 = 2 * num_heads * seq * head_dim * 4 bytes.
