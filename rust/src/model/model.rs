@@ -124,6 +124,17 @@ impl LlamaModel {
         // Embedding lookup
         let mut hidden_states = Tensor::embedding(&self.embedding, input_ids, -1, false, false);
 
+        // Guard: prevent position_ids from exceeding RoPE cache / model capacity.
+        if let Some(max_pos) = self.config.max_position_embeddings {
+            let max_pos = max_pos as i64;
+            if self.seq_offset as i64 + seq_len > max_pos {
+                return Err(ModelError::Generation(format!(
+                    "sequence length {} + offset {} exceeds max_position_embeddings {}; prompt too long",
+                    seq_len, self.seq_offset, max_pos
+                )));
+            }
+        }
+
         // Position IDs: [batch, seq_len]
         let is_prefill = !self.is_prefill_done;
         let position_ids = if is_prefill {

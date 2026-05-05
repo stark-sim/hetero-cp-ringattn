@@ -2,12 +2,13 @@
 
 ## 当前焦点
 
-[2026-05-05] **HCP kernel 长序列验证里程碑**：32K 单节点 ✅、32K 分布式 2-domain ✅、64K 单节点 ⏳（运行中）。decode 端到端 ✅（同机 2-domain CUDA+CUDA）。
+[2026-05-05] **HCP kernel 长序列验证里程碑**：32K 单节点 ✅、32K 分布式 2-domain ✅、64K 单节点 ✅、128K 单节点 ⏳（运行中，~10GB 显存）。decode 端到端 ✅（同机 2-domain CUDA+CUDA + 跨节点 MPS+CUDA）。
 
 **关键修复与优化**：
 1. `backend.rs` MPS NaN 回归修复（commit `7900a8e`）：`add+mul` workaround 产生 NaN（`0.0 * NEG_INFINITY = NaN`），改用 `where_self` 替代。42/42 测试通过。
 2. `model.rs` LM head 长序列优化（commit `85d24cc`）：`seq_len > 8192` 时只计算最后一个 token 的 logits，消除 ~20GB 峰值，使 32K+ 在 24GB GPU 可行。
 3. `model.rs` dense causal mask 跳过（commit `f8734a7`）：单节点长序列 prefill 传 `[1,1,1,1]` dummy mask 替代 `[seq_len, seq_len]` 密集 mask（64K 时达 16GB）。
+4. `layers.rs` MLP chunking（commit `632393f`）：128K 单节点 prefill 在 MLP 层触发 `CUBLAS_STATUS_EXECUTION_FAILED`。MLP 是逐 token 独立的，安全 chunk（`seq_len > 8192`），峰值中间内存从 ~3.6GB 降到 ~225MB。
 
 **验证结果**：
 | 配置 | Seq | 结果 | 耗时 | 输出 |
@@ -16,7 +17,7 @@
 | 单节点 CUDA | 24K | ✅ | ~6min | `the lazy dog. The` |
 | 单节点 CUDA | 32K | ✅ | ~8-10min | `dog. The quick brown` |
 | 2-domain CUDA | 32K | ✅ | 3m53s | `dog. The quick brown` |
-| 单节点 CUDA | 64K | ⏳ | — | 运行中 |
+| 单节点 CUDA | 64K | ✅ | ~15-20min | `the lazy dog. The` |
 | 同机 2-domain decode | 9 | ✅ | ~5s | `. The lazy dog is` |
 
 **跨节点异构 decode 状态**：
@@ -30,6 +31,8 @@
 | 单节点 CUDA | 24K | ✅ | ~6min | `the lazy dog. The` |
 | 单节点 CUDA | 32K | ✅ | ~8-10min | `dog. The quick brown` |
 | 单节点 CUDA | 64K | ✅ | ~15-20min | `the lazy dog. The` |
+| 单节点 CUDA | 128K | ❌ | — | `position_ids=131072` 超出 `max_position_embeddings=131072`（RoPE cache 索引越界） |
+| 单节点 CUDA | 131071 | ⏳ | ~30-40min | 运行中（验证 max_position_embeddings 边界） |
 | 2-domain CUDA | 32K | ✅ | 3m53s | `dog. The quick brown` |
 | 同机 2-domain decode | 9 | ✅ | ~5s | `. The lazy dog is` |
 | 跨节点 MPS+CUDA decode | 9 | ✅ | ~30-40s | `. The lazy` |

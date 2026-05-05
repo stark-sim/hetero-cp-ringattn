@@ -153,6 +153,9 @@
 - [x] [2026-05-05] **dense causal mask 跳过**：单节点长序列 prefill 不再创建 `[seq_len, seq_len]` 密集 causal mask（64K 时达 16GB）。`HcpRingAttentionBackend` 已通过全局位置比较实现 causal，mask 张量仅作为标志使用。`seq_len > 8192` 时传 `[1,1,1,1]` dummy zero tensor。
 - [x] [2026-05-05] **32K 单节点验证通过**：RTX 4090 上 Qwen2-0.5B 32K prefill + 5 decode tokens，`generated: dog. The quick brown`，显存峰值 ~12.4GB，耗时 ~8-10min。
 - [x] [2026-05-05] **2-domain 分布式 32K 验证通过**：同机 RTX 4090 `--local-domain-ids 0,1`，domain0 prefill 16K + domain1 prefill 16K，KV ring 交换正常，`generated: dog. The quick brown`，耗时 3m53s。
+- [x] [2026-05-05] **64K 单节点验证通过**：RTX 4090 上 Qwen2-0.5B 64K prefill + 5 decode tokens，`generated: the lazy dog. The`，显存峰值 ~13GB，耗时 ~15-20min。
+- [x] [2026-05-05] **MLP chunking 修复 cuBLAS 执行失败**：128K 单节点 prefill 在 MLP 层触发 `CUBLAS_STATUS_EXECUTION_FAILED`。`layers.rs` 中 `Mlp::forward` 对 `seq_len > 8192` 做 chunking，峰值中间内存从 ~3.6GB 降到 ~225MB。Commit `632393f`。
+- [x] [2026-05-05] **128K 边界问题诊断**：prompt=131072 tokens 时 prefill 成功，但 decode 阶段 `position_ids=131072` 超出 Qwen2-0.5B `max_position_embeddings=131072`（有效索引 `[0, 131071]`），导致 RoPE `index_select` CUDA assert。改用 131071 token prompt 验证 max_position_embeddings 边界。
 - [x] [2026-05-04] **QUIC idle timeout 修复**：`quic_transport.rs` 添加 `max_idle_timeout(300s)`，防止 prefill 阶段（2-3min）连接因空闲而断开。
 - [x] [2026-05-04] **跨节点异构 worker CP prefill 验证**：Mac MPS (domain 0) + 远程 RTX 4090 CUDA (domain 1) 通过 VPN 协同完成 64-token prefill，`worker 0 prefill done global_seq_len=32` + `worker 1 prefill done global_seq_len=64`。脚本 `scripts/run_cross_node_2domain_smoke.sh` 已创建。
 - [2026-05-04] **跨节点 decode 状态**：Decode 命令已成功分发到两个 worker，KV ring 交换正常运行（未因 connection lost 失败），功能架构已确认正确。但 MPS+VPN 组合下 decode 每层 KV 交换叠加 24 layers × 2 tokens 预计 >5 min，超出后台 300s 超时。完整端到端待 GPU+GPU 环境恢复后前台运行验证。
