@@ -148,6 +148,11 @@
 - [x] [2026-05-02] **单进程多 domain worker 实现**：`distributed_worker.rs` 支持 `--local-domain-ids 0,1`（同进程多 domain），权重只加载一次（`Arc<ModelWeights>` + `shallow_clone`），每个 domain 独立 LlamaModel + KV cache + coordinator stream + QUIC endpoint。`KvTransport` trait 添加 `Send` bound。移除了 `forward_lock`（会导致 ring attention 死锁），依赖 `no_grad` + 自然 CUDA stream 串行化。本地 2-domain/4-domain CPU smoke 均通过。
 - [x] [2026-05-03] **统一 QUIC 控制面**：`distributed_protocol.rs` 新增 QUIC 版 frame I/O；`distributed_coordinator.rs` 从 TCP listener 改为 QUIC endpoint；`distributed_worker.rs` 从 TCP connect 改为 QUIC connect。本地 2-domain CPU smoke ✅（`generated: . The lazy dog is`），远程 4090 CUDA 8K smoke ✅（`generated:  lazy dog. The quick`）。全链路统一 QUIC，消除 TCP 高延迟下的 EAGAIN 问题。
 - [x] [2026-05-04] **MPS 兼容性修复**：`backend.rs` `process_kv_block` 中 `arange_start` 改在 CPU 创建后 `to_device`；`masked_fill` 替换为 `add+mul`；`max_dim` 替换为 `amax`（避免 MPS 后端 argmax bug）。本地 MPS 单节点 smoke 通过。
+- [x] [2026-05-05] **MPS NaN 回归修复**：`add+mul` workaround 在 CPU 上产生 NaN（`0.0 * NEG_INFINITY = NaN`），改用 `where_self` 替代。42/42 测试通过。
+- [x] [2026-05-05] **LM head 长序列优化**：`LlamaModel::forward` 中当 `seq_len > 8192` 时只计算最后一个 token 的 logits。所有调用方（Generator、distributed_worker）prefill 阶段均只使用最后一个 logits 进行采样。消除了 ~20GB 的 LM head 峰值，使 32K+ 单节点推理在 24GB GPU 上可行。
+- [x] [2026-05-05] **dense causal mask 跳过**：单节点长序列 prefill 不再创建 `[seq_len, seq_len]` 密集 causal mask（64K 时达 16GB）。`HcpRingAttentionBackend` 已通过全局位置比较实现 causal，mask 张量仅作为标志使用。`seq_len > 8192` 时传 `[1,1,1,1]` dummy zero tensor。
+- [x] [2026-05-05] **32K 单节点验证通过**：RTX 4090 上 Qwen2-0.5B 32K prefill + 5 decode tokens，`generated: dog. The quick brown`，显存峰值 ~12.4GB，耗时 ~8-10min。
+- [x] [2026-05-05] **2-domain 分布式 32K 验证通过**：同机 RTX 4090 `--local-domain-ids 0,1`，domain0 prefill 16K + domain1 prefill 16K，KV ring 交换正常，`generated: dog. The quick brown`，耗时 3m53s。
 - [x] [2026-05-04] **QUIC idle timeout 修复**：`quic_transport.rs` 添加 `max_idle_timeout(300s)`，防止 prefill 阶段（2-3min）连接因空闲而断开。
 - [x] [2026-05-04] **跨节点异构 worker CP prefill 验证**：Mac MPS (domain 0) + 远程 RTX 4090 CUDA (domain 1) 通过 VPN 协同完成 64-token prefill，`worker 0 prefill done global_seq_len=32` + `worker 1 prefill done global_seq_len=64`。脚本 `scripts/run_cross_node_2domain_smoke.sh` 已创建。
 - [2026-05-04] **跨节点 decode 状态**：Decode 命令已成功分发到两个 worker，KV ring 交换正常运行（未因 connection lost 失败），功能架构已确认正确。但 MPS+VPN 组合下 decode 每层 KV 交换叠加 24 layers × 2 tokens 预计 >5 min，超出后台 300s 超时。完整端到端待 GPU+GPU 环境恢复后前台运行验证。
@@ -165,4 +170,4 @@
 | M5+: 单进程多 domain worker | 已完成 | [2026-05-02] 本地 CPU 验证通过 |
 | M5++: 统一 QUIC 控制面 | 已完成 | [2026-05-03] 本地 CPU + 远程 4090 CUDA 验证通过 |
 | M5+++: 跨节点异构 worker CP | **进行中** | [2026-05-04] Mac MPS + RTX 4090 CUDA prefill ✅，decode 功能正确但性能受限（MPS+VPN 瓶颈），GPU+GPU 重跑待验证 |
-| M6: 扩展性论证 | **进行中** | [2026-05-03] 16K 分布式通过，8K 远程 4090 通过，32K/64K/128K 待验证 |
+| M6: 扩展性论证 | **进行中** | [2026-05-05] 32K 单节点 ✅、32K 分布式 ✅、64K 单节点 ⏳、128K 待验证 |
