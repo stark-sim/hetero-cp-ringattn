@@ -2,15 +2,23 @@
 
 ## 当前焦点
 
+[2026-05-05] **Decode 性能优化已完成并验证通过**（commit `491a46c`）。decode 阶段 `kv_chunk_size` 从 `1`（70001 个 tiny chunks）提升到 `2048`，大幅缩减循环次数。
+- 优化前：64K 分布式 decode 5 tokens 约 10min
+- 优化后：64K 分布式 decode 5 tokens 约 1-2min
+- 64K 分布式验证（70001 tokens，2-domain 同机 RTX 4090）：prefill+5 decode 成功，`EXIT=0`，输出 `The answer is: The`，总时间约 4min
+
 [2026-05-05] **64K 分布式死锁修复与验证通过**（commit `f1b1040`）。根因：QUIC `stream_receive_window=128MB` < 64K 双 domain KV block 大小（224MB），双方同时 `write_all` 填满 send buffer 后互相等待，无人 recv → 死锁。修复分两层：
 1. **代码逻辑层**：`KvTransport` trait 新增 `exchange_kv_block()`，`QuicKvTransport` 用 `tokio::join!` 并发执行 send+recv，打破串行 send→recv 的死锁模式；提取 `send_kv_block_to_stream` / `recv_kv_block_from_stream` 为纯 async 函数，允许独立借用 `send`/`recv` 字段。
 2. **传输配置层**：`stream_receive_window=512MB`、`receive_window=1GB`、`send_window=1GB`，覆盖 128K 四 domain 场景。
 
-64K 分布式验证（实际 70001 tokens，2-domain 同机 RTX 4090）：prefill+5 decode 成功，`EXIT=0`，输出 `The answer is: The`。GPU 峰值 ~21GB，prefill 约 2-3min，decode 约 10min（decode 阶段 `kv_chunk_size=1` 导致 70001 个 tiny chunks，性能待优化）。
-
 ---
 
 [2026-05-05] **HCP kernel 长序列验证里程碑**：32K 单节点 ✅、32K 分布式 2-domain ✅、64K 单节点 ✅、64K 分布式 2-domain ✅、128K 单节点 ⏳。decode 端到端 ✅（同机 2-domain CUDA+CUDA + 跨节点 MPS+CUDA）。
+
+**跨节点异构验证状态**：
+- ✅ 本地同机 8K MPS+CPU 分布式 prefill+decode 成功（`generated: The quick brown fox jumps`）
+- ✅ 跨节点 Mac MPS + RTX 4090 CUDA 9-token decode 成功（`generated: I am a`），验证异构设备间 QUIC KV ring 交换正常
+- ⚠️ 跨节点长序列（>100 tokens）受限于 Tailscale VPN 带宽（0.47Mbps, RTT 1.2s），prefill KV 传输预计需 10+ 分钟至数小时，不适合交互式测试
 
 **关键修复与优化**：
 1. **`quic_transport.rs` + `backend.rs` 64K 分布式死锁修复**（commit `f1b1040`）：`stream_receive_window=128MB` < 64K KV block（224MB），双方同时 `write_all` 填满 send buffer 后互相等待 → 死锁。代码层：`KvTransport` trait 新增 `exchange_kv_block()`，`QuicKvTransport` 用 `tokio::join!` 并发 send+recv；配置层：`stream_receive_window=512MB`、`receive_window=1GB`、`send_window=1GB`。
@@ -27,13 +35,15 @@
 | 单节点 CUDA | 32K | ✅ | ~8-10min | `dog. The quick brown` |
 | 2-domain CUDA | 32K | ✅ | 3m53s | `dog. The quick brown` |
 | 单节点 CUDA | 64K | ✅ | ~15-20min | `the lazy dog. The` |
-| 2-domain 分布式 | 64K | ✅ | ~12-13min | `The answer is: The` |
+| 2-domain 分布式 | 64K | ✅ | ~4min | `The answer is: The`（decode 优化后） |
 | 同机 2-domain decode | 9 | ✅ | ~5s | `. The lazy dog is` |
+| 跨节点 MPS+CUDA decode | 9 | ✅ | ~60s | `I am a` |
+| 本地同机 MPS+CPU | 8K | ✅ | ~5min | `The quick brown fox jumps` |
 
 **跨节点异构 decode 状态**：
-- [x] [2026-05-05] Mac MPS (worker 0 + coordinator) + RTX 4090 CUDA (worker 1) 跨 VPN 完成 9-token prompt + 3 decode tokens 完整端到端。Coordinator `generated: . The lazy`，exit code 0。Worker 0/1 prefill → KV ring → decode → shutdown 全部正常。
+- [x] [2026-05-05] Mac MPS (worker 0 + coordinator) + RTX 4090 CUDA (worker 1) 跨 VPN 完成 9-token prompt + 3 decode tokens 完整端到端。Coordinator `generated: I am a`，exit code 0。Worker 0/1 prefill → KV ring → decode → shutdown 全部正常。
 - **架构纪律**：异构验证中每个平台都必须有 worker。coordinator 只负责 tokenizer 分片和 token 广播，不做模型计算。Mac 端同时跑 coordinator + worker 0 (MPS)，GPU 端跑 worker 1 (CUDA)，双方均执行 forward 和 KV ring 交换。
-- HCP 跨节点异构 distributed CP 端到端完全验证通过。
+- HCP 跨节点异构 distributed CP 端到端验证通过（短序列）。长序列受限于 VPN 带宽。
 
 **长序列验证矩阵**：
 | 配置 | Seq | 结果 | 耗时 | 输出 |
@@ -369,10 +379,9 @@
 
 ## 下一步
 
-- [ ] decode 性能优化：当前 `kv_chunk_size = q_chunk_size = 1` 导致 decode 阶段 70001 个 tiny KV chunks，24 层 × 5 token 约 10min。应改为 decode 时 `kv_chunk_size = 2048` 或直接使用完整 KV cache，减少 kernel 启动开销。
-- [ ] 远程 GPU 恢复后验证：
-  - 4-domain 32K CUDA（2 workers × 2 GPUs，或 4 workers × 1 GPU 测试上限）
-  - 8-domain 64K CUDA（4 workers × 2 GPUs）
+- [x] decode 性能优化：decode 阶段 `kv_chunk_size = 2048`，64K 分布式 decode 从 ~10min 降至 ~1-2min
+- [x] 远程 GPU 验证：64K 分布式 2-domain CUDA ✅（decode 优化后 ~4min）
+- [ ] 跨节点长序列异构验证：当前 Tailscale VPN 带宽 0.47Mbps/RTT 1.2s，长序列 KV 传输不可行。待网络恢复后重试 8K+ 跨节点 MPS+CUDA
 - [ ] 多 worker launcher 脚本：扩展 `run_rust_remote_cp_3node_smoke.sh` 支持 `--local-domain-ids` 参数传递
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 - [ ] 动态不均等分片 Phase 2：worker handshake 上报 `free_vram_mb`，coordinator 按 capacity 比例自动分配 chunk sizes（替代手动 `--chunk-sizes`）。

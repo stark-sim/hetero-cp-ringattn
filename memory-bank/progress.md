@@ -155,6 +155,7 @@
 - [x] [2026-05-05] **2-domain 分布式 32K 验证通过**：同机 RTX 4090 `--local-domain-ids 0,1`，domain0 prefill 16K + domain1 prefill 16K，KV ring 交换正常，`generated: dog. The quick brown`，耗时 3m53s。
 - [x] [2026-05-05] **64K 单节点验证通过**：RTX 4090 上 Qwen2-0.5B 64K prefill + 5 decode tokens，`generated: the lazy dog. The`，显存峰值 ~13GB，耗时 ~15-20min。
 - [x] [2026-05-05] **64K 分布式 2-domain 验证通过**：同机 RTX 4090 `--local-domain-ids 0,1`，实际 70001 tokens prefill + 5 decode，`generated: The answer is: The`，`EXIT=0`。prefill 成功验证了 `exchange_kv_block` 并发修复 + QUIC 大窗口配置。
+- [x] [2026-05-05] **Decode 性能优化**（commit `491a46c`）：decode 阶段 `kv_chunk_size` 从 `1` 提升到 `2048`，避免 70001 个 tiny chunks 的开销。64K 分布式 decode 从 ~10min 降至 ~1-2min，总时间从 ~12-13min 降至 ~4min。
 - [x] [2026-05-05] **64K 分布式死锁修复**（commit `f1b1040`）：代码层 `exchange_kv_block()` 并发 send+recv + 配置层 QUIC 窗口增大（512MB stream / 1GB conn）。根因和修复方案已记录于 `activeContext.md`。
 - [x] [2026-05-05] **MLP chunking 修复 cuBLAS 执行失败**：128K 单节点 prefill 在 MLP 层触发 `CUBLAS_STATUS_EXECUTION_FAILED`。`layers.rs` 中 `Mlp::forward` 对 `seq_len > 8192` 做 chunking，峰值中间内存从 ~3.6GB 降到 ~225MB。Commit `632393f`。
 - [x] [2026-05-05] **Attention projection chunking 修复 cuBLAS 执行失败**：131071 prefill 在 q/k/v/o_proj matmul 触发 `CUBLAS_STATUS_EXECUTION_FAILED`（M=131071 超出 cuBLAS 限制）。`GqaAttention::forward` 对 projection 做 chunking（`seq_len > 8192`），与 MLP chunking 配合后 131071 prefill-only 成功通过。Commit `0fd39d9`。
@@ -162,7 +163,9 @@
 - [x] [2026-05-05] **131067 单节点端到端验证通过**：RTX 4090 上 Qwen2-0.5B 131067 prefill + 5 decode tokens 成功完成，`EXIT=0`，输出 `gregated dog חדר.worm`。验证了 projection+MLP chunking + `max_position_embeddings` guard 后，单节点可处理 ~131K context（模型理论上限）。显存峰值 ~10.6GB，耗时 ~30-40min。
 - [x] [2026-05-04] **QUIC idle timeout 修复**：`quic_transport.rs` 添加 `max_idle_timeout(300s)`，防止 prefill 阶段（2-3min）连接因空闲而断开。
 - [x] [2026-05-04] **跨节点异构 worker CP prefill 验证**：Mac MPS (domain 0) + 远程 RTX 4090 CUDA (domain 1) 通过 VPN 协同完成 64-token prefill，`worker 0 prefill done global_seq_len=32` + `worker 1 prefill done global_seq_len=64`。脚本 `scripts/run_cross_node_2domain_smoke.sh` 已创建。
-- [2026-05-04] **跨节点 decode 状态**：Decode 命令已成功分发到两个 worker，KV ring 交换正常运行（未因 connection lost 失败），功能架构已确认正确。但 MPS+VPN 组合下 decode 每层 KV 交换叠加 24 layers × 2 tokens 预计 >5 min，超出后台 300s 超时。完整端到端待 GPU+GPU 环境恢复后前台运行验证。
+- [x] [2026-05-05] **跨节点异构 decode 端到端验证**：Mac MPS + RTX 4090 CUDA 跨 VPN 完成 9-token prompt + 3 decode tokens，`generated: I am a`，exit code 0。验证了异构设备间 QUIC KV ring 交换正常。
+- [x] [2026-05-05] **本地同机异构 8K 验证**：Mac MPS + CPU 同机 2-domain 完成 8801-token prefill + 5 decode，`generated: The quick brown fox jumps`。验证了代码逻辑正确性和 MPS GPU 使用。
+- [2026-05-05] **跨节点长序列限制**：Tailscale VPN 当前带宽 0.47Mbps/RTT 1.2s，111-token 跨节点 prefill 预计需 10+ 分钟，8K 预计需数小时。长序列跨节点异构验证待网络恢复后重试。
 
 ## 里程碑
 
