@@ -20,9 +20,19 @@
 | 同机 2-domain decode | 9 | ✅ | ~5s | `. The lazy dog is` |
 
 **跨节点异构 decode 状态**：
-- [2026-05-04] Mac MPS + RTX 4090 CUDA 跨 VPN 完成 64-token prefill ✅
-- Decode 功能架构已确认正确，但 MPS+VPN 每层 KV 交换慢，完整端到端待短 prompt 前台验证
-- 下一步：用 9-token prompt + 3 decode tokens 重跑跨节点异构 decode（预计 2-4min）
+- [x] [2026-05-05] Mac MPS + RTX 4090 CUDA 跨 VPN 完成 9-token prompt + 3 decode tokens 完整端到端。Coordinator `generated: . The lazy`，exit code 0。Worker 0/1 prefill → KV ring → decode → shutdown 全部正常。
+- HCP 跨节点异构 distributed CP 端到端完全验证通过。
+
+**长序列验证矩阵**：
+| 配置 | Seq | 结果 | 耗时 | 输出 |
+|------|-----|------|------|------|
+| 单节点 CUDA | 16K | ✅ | 2m8s | `jumps over the lazy dog` |
+| 单节点 CUDA | 24K | ✅ | ~6min | `the lazy dog. The` |
+| 单节点 CUDA | 32K | ✅ | ~8-10min | `dog. The quick brown` |
+| 单节点 CUDA | 64K | ✅ | ~15-20min | `the lazy dog. The` |
+| 2-domain CUDA | 32K | ✅ | 3m53s | `dog. The quick brown` |
+| 同机 2-domain decode | 9 | ✅ | ~5s | `. The lazy dog is` |
+| 跨节点 MPS+CUDA decode | 9 | ✅ | ~30-40s | `. The lazy` |
 
 ---
 

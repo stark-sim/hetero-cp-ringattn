@@ -169,5 +169,5 @@
 | M5: 远端闭环 | 已完成 | [2026-04-30] |
 | M5+: 单进程多 domain worker | 已完成 | [2026-05-02] 本地 CPU 验证通过 |
 | M5++: 统一 QUIC 控制面 | 已完成 | [2026-05-03] 本地 CPU + 远程 4090 CUDA 验证通过 |
-| M5+++: 跨节点异构 worker CP | **进行中** | [2026-05-04] Mac MPS + RTX 4090 CUDA prefill ✅，decode 功能正确但性能受限（MPS+VPN 瓶颈），GPU+GPU 重跑待验证 |
+| M5+++: 跨节点异构 worker CP | **已完成** | [2026-05-05] Mac MPS + RTX 4090 CUDA prefill ✅、decode 端到端 ✅（9-token prompt + 3 decode tokens） |
 | M6: 扩展性论证 | **进行中** | [2026-05-05] 32K 单节点 ✅、32K 分布式 ✅、64K 单节点 ⏳、128K 待验证 |
