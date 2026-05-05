@@ -241,14 +241,30 @@ impl Mlp {
     }
 
     pub fn forward(&self, x: &Tensor) -> Tensor {
-        // gate: 生成门控信号，shape [batch, seq_len, intermediate_size]
-        let gate = x.matmul(&self.gate_proj.transpose(0, 1));
-        // up: 升维特征，shape [batch, seq_len, intermediate_size]
-        let up = x.matmul(&self.up_proj.transpose(0, 1));
-        // silu(gate) * up: 门控后的激活，shape [batch, seq_len, intermediate_size]
-        let activated = gate.silu() * up;
-        // down: 降维回 hidden_size，shape [batch, seq_len, hidden_size]
-        activated.matmul(&self.down_proj.transpose(0, 1))
+        const MLP_CHUNK_SIZE: i64 = 8192;
+        let seq_len = x.size()[1];
+
+        if seq_len > MLP_CHUNK_SIZE {
+            let mut all_outputs = Vec::new();
+            for start in (0..seq_len).step_by(MLP_CHUNK_SIZE as usize) {
+                let chunk_len = (start + MLP_CHUNK_SIZE).min(seq_len) - start;
+                let chunk = x.narrow(1, start, chunk_len);
+                let gate = chunk.matmul(&self.gate_proj.transpose(0, 1));
+                let up = chunk.matmul(&self.up_proj.transpose(0, 1));
+                let activated = gate.silu() * up;
+                all_outputs.push(activated.matmul(&self.down_proj.transpose(0, 1)));
+            }
+            Tensor::cat(&all_outputs, 1)
+        } else {
+            // gate: 生成门控信号，shape [batch, seq_len, intermediate_size]
+            let gate = x.matmul(&self.gate_proj.transpose(0, 1));
+            // up: 升维特征，shape [batch, seq_len, intermediate_size]
+            let up = x.matmul(&self.up_proj.transpose(0, 1));
+            // silu(gate) * up: 门控后的激活，shape [batch, seq_len, intermediate_size]
+            let activated = gate.silu() * up;
+            // down: 降维回 hidden_size，shape [batch, seq_len, hidden_size]
+            activated.matmul(&self.down_proj.transpose(0, 1))
+        }
     }
 }
 
