@@ -31,7 +31,8 @@
 | 同机 2-domain decode | 9 | ✅ | ~5s | `. The lazy dog is` |
 
 **跨节点异构 decode 状态**：
-- [x] [2026-05-05] Mac MPS + RTX 4090 CUDA 跨 VPN 完成 9-token prompt + 3 decode tokens 完整端到端。Coordinator `generated: . The lazy`，exit code 0。Worker 0/1 prefill → KV ring → decode → shutdown 全部正常。
+- [x] [2026-05-05] Mac MPS (worker 0 + coordinator) + RTX 4090 CUDA (worker 1) 跨 VPN 完成 9-token prompt + 3 decode tokens 完整端到端。Coordinator `generated: . The lazy`，exit code 0。Worker 0/1 prefill → KV ring → decode → shutdown 全部正常。
+- **架构纪律**：异构验证中每个平台都必须有 worker。coordinator 只负责 tokenizer 分片和 token 广播，不做模型计算。Mac 端同时跑 coordinator + worker 0 (MPS)，GPU 端跑 worker 1 (CUDA)，双方均执行 forward 和 KV ring 交换。
 - HCP 跨节点异构 distributed CP 端到端完全验证通过。
 
 **长序列验证矩阵**：

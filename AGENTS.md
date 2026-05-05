@@ -45,6 +45,12 @@ This project uses a Memory Bank system in `memory-bank/` for cross-session conte
 - For dual-machine P2P smoke, do not use `127.0.0.1` as the validation endpoint. Bind the server to `0.0.0.0` or the target subnet address and connect the client to the `192.168.8.x` GPU host address.
 - Non-interactive SSH on the GPU host may not load Cargo. Prefer an explicit PATH prefix such as `PATH=/home/stark/.cargo/bin:$PATH` when launching Rust smoke commands remotely; do not edit remote shell startup files just to work around this.
 
+### Cross-Node Heterogeneous Validation Discipline:
+- **Every platform in a heterogeneous setup MUST run at least one worker**. The coordinator only handles tokenizer sharding and token broadcasting; it performs NO model computation. A setup where Platform A runs only the coordinator and Platform B runs only the worker does NOT validate heterogeneous compute capability.
+- **Correct architecture**: Mac runs `coordinator + worker 0 (MPS)`, GPU host runs `worker 1 (CUDA)`. Both platforms execute model forward passes and participate in the KV ring exchange.
+- `distributed_worker.rs` supports `--local-domain-ids 0,1` for multi-domain workers in a single process, but this is for local development convenience. For true cross-node heterogeneous validation, each platform must run its own worker process(es).
+- Record cross-node results with explicit worker distribution: which domain runs on which platform and device.
+
 ### Special Commands:
 - `memory bank update` / `memory bank güncelle` -> Review and update ALL memory bank files
 - `memory bank status` / `memory bank durumu` -> Show current status summary
