@@ -82,7 +82,10 @@ pub fn create_endpoint(listen_addr: SocketAddr) -> Result<Endpoint, String> {
     // 大 block 时会因为发送端窗口耗尽而互相死锁。
     transport_config.stream_receive_window((128u64 * 1024 * 1024).try_into().unwrap());
     transport_config.receive_window((256u64 * 1024 * 1024).try_into().unwrap());
-    transport_config.send_window(256u64 * 1024 * 1024);
+    // 1GB send_window to cover 64K+ seq distributed prefill:
+    // 32K seq KV block = ~134MB (K+V), two domains send simultaneously = ~268MB.
+    // 256MB was insufficient and caused deadlock. 1GB provides headroom for 128K.
+    transport_config.send_window(1024u64 * 1024 * 1024);
 
     let mut endpoint = Endpoint::server(server_config, listen_addr)
         .map_err(|e| format!("bind failed: {e}"))?;
