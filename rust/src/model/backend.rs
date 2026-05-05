@@ -212,8 +212,14 @@ impl HcpRingAttentionBackend {
             .unsqueeze(0)
             .to_device(q_chunk.device());
             let causal = q_pos.ge_tensor(&k_pos);
-            // Replace masked_fill with add+mul to avoid MPS masked_fill bug
-            let neg_inf_mask = causal.logical_not().to_kind(Kind::Float) * f64::NEG_INFINITY;
+            // MPS masked_fill bug workaround: use where_self instead of add+mul.
+            // add+mul (logical_not().to_kind(Float) * NEG_INFINITY) produces NaN
+            // because 0.0 * NEG_INFINITY = NaN in IEEE 754.
+            let neg_inf = Tensor::from(f64::NEG_INFINITY)
+                .to_kind(Kind::Float)
+                .to_device(q_chunk.device());
+            let zero = Tensor::zeros(1, (Kind::Float, q_chunk.device()));
+            let neg_inf_mask = neg_inf.where_self(&causal.logical_not(), &zero);
             scores = scores + neg_inf_mask;
         }
 
