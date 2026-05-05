@@ -350,13 +350,31 @@ impl GqaAttention {
         let seq_len = hidden_states.size()[1];
         let hidden_size = hidden_states.size()[2];
 
+        // Chunked projection for long sequences to avoid cuBLAS execution failure
+        // on very large M dimensions (e.g. M=131072 for 128K seq).
+        const PROJ_CHUNK_SIZE: i64 = 8192;
+        let project = |x: &Tensor, w: &Tensor| -> Tensor {
+            let sl = x.size()[1];
+            if sl > PROJ_CHUNK_SIZE {
+                let mut parts = Vec::new();
+                for start in (0..sl).step_by(PROJ_CHUNK_SIZE as usize) {
+                    let chunk_len = (start + PROJ_CHUNK_SIZE).min(sl) - start;
+                    let chunk = x.narrow(1, start, chunk_len);
+                    parts.push(chunk.matmul(&w.transpose(0, 1)));
+                }
+                Tensor::cat(&parts, 1)
+            } else {
+                x.matmul(&w.transpose(0, 1))
+            }
+        };
+
         // ====== 第一步：线性投影 ======
         // 用三个权重矩阵把 hidden_states 映射成 Q、K、V。
-        let mut q = hidden_states.matmul(&self.q_proj.transpose(0, 1));
+        let mut q = project(hidden_states, &self.q_proj);
         if let Some(ref bias) = self.q_bias { q += bias; }
-        let mut k = hidden_states.matmul(&self.k_proj.transpose(0, 1));
+        let mut k = project(hidden_states, &self.k_proj);
         if let Some(ref bias) = self.k_bias { k += bias; }
-        let mut v = hidden_states.matmul(&self.v_proj.transpose(0, 1));
+        let mut v = project(hidden_states, &self.v_proj);
         if let Some(ref bias) = self.v_bias { v += bias; }
 
         // ====== 第二步：reshape 成多头格式 ======
@@ -410,7 +428,7 @@ impl GqaAttention {
         // ====== 第十步：reshape 并 O-projection ======
         // 把多头的输出拼接起来，再乘 o_proj 映射回 hidden_size。
         let attn_output = attn_output.transpose(1, 2).contiguous().view([batch, seq_len, hidden_size]);
-        Ok(attn_output.matmul(&self.o_proj.transpose(0, 1)))
+        Ok(project(&attn_output, &self.o_proj))
     }
 
     /// 【重复 KV head】
