@@ -385,7 +385,10 @@ impl HcpRingAttentionBackend {
             .div_ceil(self.num_domains)
             .max(1)
             .min(2048);
-        let kv_chunk_size = q_chunk_size;
+        // decode phase (seq_len == 1): avoid tiny-chunk overhead by using larger
+        // KV chunks. 70001 chunks of size 1 causes ~10min decode; 2048 reduces
+        // it to ~35 chunks per domain, cutting kernel launch overhead by 2000x.
+        let kv_chunk_size = if seq_len == 1 { 2048 } else { q_chunk_size };
 
         // 存储每个 Q chunk 的输出，最后 cat 拼接。
         let mut outputs = Vec::new();
