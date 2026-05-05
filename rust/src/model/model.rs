@@ -174,12 +174,11 @@ impl LlamaModel {
         hidden_states = self.norm.forward(&hidden_states);
 
         // LM Head — chunked for long sequences to avoid OOM.
-        // Peak memory: LM_HEAD_CHUNK_SIZE * vocab_size * 4B (~5GB for 8K chunk)
-        // instead of seq_len * vocab_size * 4B (~20GB for 24K seq).
+        // Avoid pre-allocating a full [batch, seq_len, vocab_size] buffer;
+        // instead compute chunks and cat at the end. This keeps peak memory
+        // at ~5GB (8K * vocab_size * 4B) instead of ~20GB (32K * vocab_size * 4B).
         const LM_HEAD_CHUNK_SIZE: i64 = 8192;
         let seq_len = hidden_states.size()[1];
-        let batch = hidden_states.size()[0];
-        let vocab_size = self.config.vocab_size as i64;
 
         let logits = if seq_len > LM_HEAD_CHUNK_SIZE {
             let weight = if let Some(ref lm_head) = self.lm_head {
@@ -187,14 +186,13 @@ impl LlamaModel {
             } else {
                 self.embedding.shallow_clone().transpose(0, 1)
             };
-            let mut output = Tensor::zeros([batch, seq_len, vocab_size], (Kind::Float, hidden_states.device()));
+            let mut all_logits = Vec::new();
             for start in (0..seq_len).step_by(LM_HEAD_CHUNK_SIZE as usize) {
                 let chunk_len = ((start as i64) + LM_HEAD_CHUNK_SIZE).min(seq_len) - (start as i64);
                 let chunk = hidden_states.narrow(1, start as i64, chunk_len);
-                let logits_chunk = chunk.matmul(&weight);
-                output.narrow(1, start as i64, chunk_len).copy_(&logits_chunk);
+                all_logits.push(chunk.matmul(&weight));
             }
-            output
+            Tensor::cat(&all_logits, 1)
         } else {
             if let Some(ref lm_head) = self.lm_head {
                 hidden_states.matmul(&lm_head.transpose(0, 1))
