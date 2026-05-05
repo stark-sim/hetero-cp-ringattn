@@ -16,6 +16,24 @@
 - `tokio` 1.x（async runtime for QUIC）
 - `safetensors`、`tokenizers`、`half`（真实模型权重加载与推理）
 
+### QUIC Transport 配置
+
+`rust/src/quic_transport.rs` 中 `create_endpoint` 显式配置以下参数，覆盖 quinn 默认值（~1.2MB stream window / ~10MB send window）：
+
+| 参数 | 值 | 理由 |
+|------|-----|------|
+| `max_concurrent_bidi_streams` | 256 | 24 层 × 2 domain 预留 |
+| `max_concurrent_uni_streams` | 256 | 预留 |
+| `keep_alive_interval` | 1s | 防止长计算阶段连接 idle 断开 |
+| `max_idle_timeout` | 300s | 覆盖 prefill/decode 的静默期 |
+| `stream_receive_window` | **512MB** | 覆盖 64K seq 的 KV block（~224MB），留 128K 余量 |
+| `receive_window` | **1GB** | connection-level 总接收窗口 |
+| `send_window` | **1GB** | 覆盖双 domain 同时发送的 KV block 总量 |
+
+**死锁历史**：
+- 2026-05-02：16K 分布式死锁，`send_window=10MB` < 58MB KV block → 修复为 `send_window=256MB`
+- 2026-05-05：64K 分布式死锁，`stream_receive_window=128MB` < 224MB KV block → 修复为 `stream_receive_window=512MB`，并引入 `exchange_kv_block()` 并发 send+recv 作为代码层保险
+
 ### Styling
 
 - 不适用。本项目不是前端 UI 仓库。

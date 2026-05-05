@@ -154,6 +154,8 @@
 - [x] [2026-05-05] **32K 单节点验证通过**：RTX 4090 上 Qwen2-0.5B 32K prefill + 5 decode tokens，`generated: dog. The quick brown`，显存峰值 ~12.4GB，耗时 ~8-10min。
 - [x] [2026-05-05] **2-domain 分布式 32K 验证通过**：同机 RTX 4090 `--local-domain-ids 0,1`，domain0 prefill 16K + domain1 prefill 16K，KV ring 交换正常，`generated: dog. The quick brown`，耗时 3m53s。
 - [x] [2026-05-05] **64K 单节点验证通过**：RTX 4090 上 Qwen2-0.5B 64K prefill + 5 decode tokens，`generated: the lazy dog. The`，显存峰值 ~13GB，耗时 ~15-20min。
+- [x] [2026-05-05] **64K 分布式 2-domain 验证通过**：同机 RTX 4090 `--local-domain-ids 0,1`，实际 70001 tokens prefill + 5 decode，`generated: The answer is: The`，`EXIT=0`。prefill 成功验证了 `exchange_kv_block` 并发修复 + QUIC 大窗口配置。
+- [x] [2026-05-05] **64K 分布式死锁修复**（commit `f1b1040`）：代码层 `exchange_kv_block()` 并发 send+recv + 配置层 QUIC 窗口增大（512MB stream / 1GB conn）。根因和修复方案已记录于 `activeContext.md`。
 - [x] [2026-05-05] **MLP chunking 修复 cuBLAS 执行失败**：128K 单节点 prefill 在 MLP 层触发 `CUBLAS_STATUS_EXECUTION_FAILED`。`layers.rs` 中 `Mlp::forward` 对 `seq_len > 8192` 做 chunking，峰值中间内存从 ~3.6GB 降到 ~225MB。Commit `632393f`。
 - [x] [2026-05-05] **Attention projection chunking 修复 cuBLAS 执行失败**：131071 prefill 在 q/k/v/o_proj matmul 触发 `CUBLAS_STATUS_EXECUTION_FAILED`（M=131071 超出 cuBLAS 限制）。`GqaAttention::forward` 对 projection 做 chunking（`seq_len > 8192`），与 MLP chunking 配合后 131071 prefill-only 成功通过。Commit `0fd39d9`。
 - [x] [2026-05-05] **128K 边界问题诊断**：prompt=131072 tokens 时 prefill 成功，但 decode 阶段 `position_ids=131072` 超出 Qwen2-0.5B `max_position_embeddings=131072`（有效索引 `[0, 131071]`），导致 RoPE `index_select` CUDA assert。添加 `max_position_embeddings` guard 返回友好错误信息（commit `1ef6288`）。改用 131067 token prompt（max_tokens=5）验证端到端。
@@ -175,4 +177,4 @@
 | M5+: 单进程多 domain worker | 已完成 | [2026-05-02] 本地 CPU 验证通过 |
 | M5++: 统一 QUIC 控制面 | 已完成 | [2026-05-03] 本地 CPU + 远程 4090 CUDA 验证通过 |
 | M5+++: 跨节点异构 worker CP | **已完成** | [2026-05-05] Mac MPS + RTX 4090 CUDA prefill ✅、decode 端到端 ✅（9-token prompt + 3 decode tokens） |
-| M6: 扩展性论证 | **进行中** | [2026-05-05] 32K 单节点 ✅、32K 分布式 ✅、64K 单节点 ⏳、128K 待验证 |
+| M6: 扩展性论证 | **进行中** | [2026-05-05] 32K 单节点 ✅、32K 分布式 ✅、64K 单节点 ✅、64K 分布式 ✅、128K 待验证 |

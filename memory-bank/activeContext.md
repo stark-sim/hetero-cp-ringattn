@@ -2,13 +2,22 @@
 
 ## 当前焦点
 
-[2026-05-05] **HCP kernel 长序列验证里程碑**：32K 单节点 ✅、32K 分布式 2-domain ✅、64K 单节点 ✅、128K 单节点 ⏳（运行中，~10GB 显存）。decode 端到端 ✅（同机 2-domain CUDA+CUDA + 跨节点 MPS+CUDA）。
+[2026-05-05] **64K 分布式死锁修复与验证通过**（commit `f1b1040`）。根因：QUIC `stream_receive_window=128MB` < 64K 双 domain KV block 大小（224MB），双方同时 `write_all` 填满 send buffer 后互相等待，无人 recv → 死锁。修复分两层：
+1. **代码逻辑层**：`KvTransport` trait 新增 `exchange_kv_block()`，`QuicKvTransport` 用 `tokio::join!` 并发执行 send+recv，打破串行 send→recv 的死锁模式；提取 `send_kv_block_to_stream` / `recv_kv_block_from_stream` 为纯 async 函数，允许独立借用 `send`/`recv` 字段。
+2. **传输配置层**：`stream_receive_window=512MB`、`receive_window=1GB`、`send_window=1GB`，覆盖 128K 四 domain 场景。
+
+64K 分布式验证（实际 70001 tokens，2-domain 同机 RTX 4090）：prefill+5 decode 成功，`EXIT=0`，输出 `The answer is: The`。GPU 峰值 ~21GB，prefill 约 2-3min，decode 约 10min（decode 阶段 `kv_chunk_size=1` 导致 70001 个 tiny chunks，性能待优化）。
+
+---
+
+[2026-05-05] **HCP kernel 长序列验证里程碑**：32K 单节点 ✅、32K 分布式 2-domain ✅、64K 单节点 ✅、64K 分布式 2-domain ✅、128K 单节点 ⏳。decode 端到端 ✅（同机 2-domain CUDA+CUDA + 跨节点 MPS+CUDA）。
 
 **关键修复与优化**：
-1. `backend.rs` MPS NaN 回归修复（commit `7900a8e`）：`add+mul` workaround 产生 NaN（`0.0 * NEG_INFINITY = NaN`），改用 `where_self` 替代。42/42 测试通过。
-2. `model.rs` LM head 长序列优化（commit `85d24cc`）：`seq_len > 8192` 时只计算最后一个 token 的 logits，消除 ~20GB 峰值，使 32K+ 在 24GB GPU 可行。
-3. `model.rs` dense causal mask 跳过（commit `f8734a7`）：单节点长序列 prefill 传 `[1,1,1,1]` dummy mask 替代 `[seq_len, seq_len]` 密集 mask（64K 时达 16GB）。
-4. `layers.rs` MLP chunking（commit `632393f`）：128K 单节点 prefill 在 MLP 层触发 `CUBLAS_STATUS_EXECUTION_FAILED`。MLP 是逐 token 独立的，安全 chunk（`seq_len > 8192`），峰值中间内存从 ~3.6GB 降到 ~225MB。
+1. **`quic_transport.rs` + `backend.rs` 64K 分布式死锁修复**（commit `f1b1040`）：`stream_receive_window=128MB` < 64K KV block（224MB），双方同时 `write_all` 填满 send buffer 后互相等待 → 死锁。代码层：`KvTransport` trait 新增 `exchange_kv_block()`，`QuicKvTransport` 用 `tokio::join!` 并发 send+recv；配置层：`stream_receive_window=512MB`、`receive_window=1GB`、`send_window=1GB`。
+2. `backend.rs` MPS NaN 回归修复（commit `7900a8e`）：`add+mul` workaround 产生 NaN（`0.0 * NEG_INFINITY = NaN`），改用 `where_self` 替代。42/42 测试通过。
+3. `model.rs` LM head 长序列优化（commit `85d24cc`）：`seq_len > 8192` 时只计算最后一个 token 的 logits，消除 ~20GB 峰值，使 32K+ 在 24GB GPU 可行。
+4. `model.rs` dense causal mask 跳过（commit `f8734a7`）：单节点长序列 prefill 传 `[1,1,1,1]` dummy mask 替代 `[seq_len, seq_len]` 密集 mask（64K 时达 16GB）。
+5. `layers.rs` MLP chunking（commit `632393f`）：128K 单节点 prefill 在 MLP 层触发 `CUBLAS_STATUS_EXECUTION_FAILED`。MLP 是逐 token 独立的，安全 chunk（`seq_len > 8192`），峰值中间内存从 ~3.6GB 降到 ~225MB。
 
 **验证结果**：
 | 配置 | Seq | 结果 | 耗时 | 输出 |
@@ -18,6 +27,7 @@
 | 单节点 CUDA | 32K | ✅ | ~8-10min | `dog. The quick brown` |
 | 2-domain CUDA | 32K | ✅ | 3m53s | `dog. The quick brown` |
 | 单节点 CUDA | 64K | ✅ | ~15-20min | `the lazy dog. The` |
+| 2-domain 分布式 | 64K | ✅ | ~12-13min | `The answer is: The` |
 | 同机 2-domain decode | 9 | ✅ | ~5s | `. The lazy dog is` |
 
 **跨节点异构 decode 状态**：
@@ -35,6 +45,7 @@
 | 单节点 CUDA | 131071 prefill | ✅ | ~30-40min | prefill-only 成功（projection+MLP chunking 解决 cuBLAS） |
 | 单节点 CUDA | 131067 | ✅ | ~30-40min | `gregated dog חדר.worm`（prefill+5 decode 端到端通过） |
 | 2-domain CUDA | 32K | ✅ | 3m53s | `dog. The quick brown` |
+| 2-domain 分布式 | 64K | ✅ | ~12-13min | `The answer is: The` |
 | 同机 2-domain decode | 9 | ✅ | ~5s | `. The lazy dog is` |
 | 跨节点 MPS+CUDA decode | 9 | ✅ | ~30-40s | `. The lazy` |
 
@@ -357,6 +368,7 @@
 
 ## 下一步
 
+- [ ] decode 性能优化：当前 `kv_chunk_size = q_chunk_size = 1` 导致 decode 阶段 70001 个 tiny KV chunks，24 层 × 5 token 约 10min。应改为 decode 时 `kv_chunk_size = 2048` 或直接使用完整 KV cache，减少 kernel 启动开销。
 - [ ] 远程 GPU 恢复后验证：
   - 4-domain 32K CUDA（2 workers × 2 GPUs，或 4 workers × 1 GPU 测试上限）
   - 8-domain 64K CUDA（4 workers × 2 GPUs）
