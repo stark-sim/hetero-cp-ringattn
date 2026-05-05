@@ -181,18 +181,15 @@ impl LlamaModel {
         let seq_len = hidden_states.size()[1];
 
         let logits = if seq_len > LM_HEAD_CHUNK_SIZE {
-            let weight = if let Some(ref lm_head) = self.lm_head {
-                lm_head.shallow_clone().transpose(0, 1)
+            // Long prefill: only compute logits for the last position.
+            // All callers (Generator, distributed_worker) only use the last
+            // token's logits for sampling. Avoids ~20GB peak.
+            let last_hidden = hidden_states.narrow(1, seq_len - 1, 1);
+            if let Some(ref lm_head) = self.lm_head {
+                last_hidden.matmul(&lm_head.transpose(0, 1))
             } else {
-                self.embedding.shallow_clone().transpose(0, 1)
-            };
-            let mut all_logits = Vec::new();
-            for start in (0..seq_len).step_by(LM_HEAD_CHUNK_SIZE as usize) {
-                let chunk_len = ((start as i64) + LM_HEAD_CHUNK_SIZE).min(seq_len) - (start as i64);
-                let chunk = hidden_states.narrow(1, start as i64, chunk_len);
-                all_logits.push(chunk.matmul(&weight));
+                last_hidden.matmul(&self.embedding.transpose(0, 1))
             }
-            Tensor::cat(&all_logits, 1)
         } else {
             if let Some(ref lm_head) = self.lm_head {
                 hidden_states.matmul(&lm_head.transpose(0, 1))
