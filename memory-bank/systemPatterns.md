@@ -82,6 +82,12 @@ project-root/
 - **报告纪律**：实验产物应落在 `reports/<RUN_ID>/` 下，便于回溯。
 - **分级 tolerance policy**：数值验证不采用单一阈值，而是按测试层级分为三级：`Strict`（同设备算法等价，`rtol=1e-5`）、`Relaxed`（异构设备交叉验证，`rtol=1e-4`）、`EndToEnd`（多层模型累积误差，`rtol=1e-3`）。阈值基于 float32 机器精度（~1.2e-7）和业界框架默认值推导，给 100~1000 倍安全余量。`--tolerance-tier` CLI 参数可在运行时切换，correctness JSON report 包含 `tolerance_tier` 字段以明确当前验证标准。
 - **异构 runtime 配置**：`ComputeRuntime` trait 解耦计算实现与协议逻辑；`TchComputeRuntime` 通过 `HCP_TCH_DEVICE` / `HCP_TORCH_DEVICE` 环境变量选择目标设备（`cpu` / `mps` / `cuda` / `cuda:N`），默认 fallback 到 `cpu`；`NoOpComputeRuntime` 作为无 `tch-backend` feature 时的编译兼容 stub。device 选择不依赖交互 shell 的偶然环境，而是通过统一的环境变量或构造函数参数传入。
+- **长序列 Chunking 策略**：单节点 prefill 时，当 `seq_len > 8192` 时对 token-independent 运算做 chunking，避免 cuBLAS 大 M 维度执行失败和显存峰值爆炸：
+  - **MLP (`layers.rs`)**：`gate_proj` / `up_proj` / `down_proj` 逐 chunk 计算后 `cat`，峰值从 ~3.6GB 降到 ~225MB。
+  - **Attention projection (`layers.rs`)**：`q_proj` / `k_proj` / `v_proj` / `o_proj` 逐 chunk 计算后 `cat`，避免 `[1,131071,896]×[896,896]` 触发 `CUBLAS_STATUS_EXECUTION_FAILED`。
+  - **LM head (`model.rs`)**：长 prefill 只计算最后一个 token 的 logits，避免预分配 `[batch, seq_len, vocab_size]` 大 buffer（32K 时 ~20GB）。
+  - **Causal mask (`model.rs`)**：`seq_len > 8192` 时跳过 dense `[seq_len, seq_len]` mask 分配（64K 时 ~16GB），改用 `[1,1,1,1]` dummy zero tensor 作 causal 标志。
+  - **Attention scores (`backend.rs`)**：`HcpRingAttentionBackend` 的 `ring_attention` 本身按 `q_chunk_size=2048` 和 `kv_chunk_size=2048` 循环，不 materialize 完整的 `[seq_len, seq_len]` scores。
 
 ## 组件关系
 

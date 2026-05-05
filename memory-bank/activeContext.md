@@ -32,7 +32,8 @@
 | 单节点 CUDA | 32K | ✅ | ~8-10min | `dog. The quick brown` |
 | 单节点 CUDA | 64K | ✅ | ~15-20min | `the lazy dog. The` |
 | 单节点 CUDA | 128K | ❌ | — | `position_ids=131072` 超出 `max_position_embeddings=131072`（RoPE cache 索引越界） |
-| 单节点 CUDA | 131071 | ⏳ | ~30-40min | 运行中（验证 max_position_embeddings 边界） |
+| 单节点 CUDA | 131071 prefill | ✅ | ~30-40min | prefill-only 成功（projection+MLP chunking 解决 cuBLAS） |
+| 单节点 CUDA | 131067 | ⏳ | ~30-40min | prefill+5 decode 运行中（确保 decode 不越界） |
 | 2-domain CUDA | 32K | ✅ | 3m53s | `dog. The quick brown` |
 | 同机 2-domain decode | 9 | ✅ | ~5s | `. The lazy dog is` |
 | 跨节点 MPS+CUDA decode | 9 | ✅ | ~30-40s | `. The lazy` |
