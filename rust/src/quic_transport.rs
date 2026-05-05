@@ -77,13 +77,13 @@ pub fn create_endpoint(listen_addr: SocketAddr) -> Result<Endpoint, String> {
     // Increase stream window to accommodate large KV blocks (e.g. 1.3MB for 1365 tokens).
     // Default ~1.2MB is insufficient for ring-KV exchange deadlocking.
     // GQA repeat 后 KV block 大小 = 2 * num_heads * seq * head_dim * 4 bytes.
-    // 8192 tokens → ~58.7MB, 16384 tokens → ~117MB.
+    // 8192 tokens → ~58.7MB, 16384 tokens → ~117MB, 32768 tokens → ~224MB.
     // 必须同时增大 send_window 和 receive_window，否则 ring 中双方同时 write_all
     // 大 block 时会因为发送端窗口耗尽而互相死锁。
-    transport_config.stream_receive_window((128u64 * 1024 * 1024).try_into().unwrap());
-    transport_config.receive_window((256u64 * 1024 * 1024).try_into().unwrap());
+    transport_config.stream_receive_window((512u64 * 1024 * 1024).try_into().unwrap());
+    transport_config.receive_window((1024u64 * 1024 * 1024).try_into().unwrap());
     // 1GB send_window to cover 64K+ seq distributed prefill:
-    // 32K seq KV block = ~134MB (K+V), two domains send simultaneously = ~268MB.
+    // 32K seq KV block = ~224MB (K+V), two domains send simultaneously = ~448MB.
     // 256MB was insufficient and caused deadlock. 1GB provides headroom for 128K.
     transport_config.send_window(1024u64 * 1024 * 1024);
 
@@ -118,91 +118,126 @@ impl QuicKvTransport {
     }
 }
 
+/// Send a KV block over a QUIC send stream (async, no self reference).
+async fn send_kv_block_to_stream(
+    send: &mut SendStream,
+    block: &KvBlock,
+) -> Result<(), String> {
+    let k_bytes = tensor_to_bytes(&block.k)?;
+    let v_bytes = tensor_to_bytes(&block.v)?;
+    let k_shape: Vec<i64> = block.k.size();
+    let v_shape: Vec<i64> = block.v.size();
+
+    let meta = serde_json::json!({
+        "layer_idx": block.layer_idx,
+        "global_seq_start": block.global_seq_start,
+        "global_seq_end": block.global_seq_end,
+        "k_shape": k_shape,
+        "v_shape": v_shape,
+        "k_bytes": k_bytes.len(),
+        "v_bytes": v_bytes.len(),
+    });
+    let meta_bytes = meta.to_string().into_bytes();
+    let meta_len = meta_bytes.len() as u32;
+
+    let mut frame = Vec::with_capacity(4 + meta_bytes.len() + k_bytes.len() + v_bytes.len());
+    frame.extend_from_slice(&meta_len.to_be_bytes());
+    frame.extend_from_slice(&meta_bytes);
+    frame.extend_from_slice(&k_bytes);
+    frame.extend_from_slice(&v_bytes);
+
+    send.write_all(&frame).await
+        .map_err(|e| format!("quic send failed: {e}"))?;
+    Ok(())
+}
+
+/// Receive a KV block from a QUIC recv stream (async, no self reference).
+async fn recv_kv_block_from_stream(
+    recv: &mut RecvStream,
+    handshake_done: &mut bool,
+    device: Device,
+) -> Result<Option<KvBlock>, String> {
+    // Skip the 1-byte dummy written during stream setup (once per stream)
+    if !*handshake_done {
+        let mut dummy = [0u8; 1];
+        match read_exact(recv, &mut dummy).await {
+            Ok(()) => *handshake_done = true,
+            Err(ReadExactError::Closed) => return Ok(None),
+            Err(ReadExactError::ReadError(e)) => {
+                return Err(format!("quic recv dummy failed: {e}"));
+            }
+        }
+    }
+
+    let mut len_bytes = [0u8; 4];
+    match read_exact(recv, &mut len_bytes).await {
+        Ok(()) => {}
+        Err(ReadExactError::Closed) => return Ok(None),
+        Err(ReadExactError::ReadError(e)) => {
+            return Err(format!("quic recv meta_len failed: {e}"));
+        }
+    }
+    let meta_len = u32::from_be_bytes(len_bytes) as usize;
+
+    let mut meta_bytes = vec![0u8; meta_len];
+    read_exact(recv, &mut meta_bytes).await
+        .map_err(|e| format!("quic recv meta failed: {e}"))?;
+    let meta: serde_json::Value = serde_json::from_slice(&meta_bytes)
+        .map_err(|e| format!("quic parse meta failed: {e}"))?;
+
+    let layer_idx = meta["layer_idx"].as_u64().ok_or("missing layer_idx")? as usize;
+    let global_seq_start = meta["global_seq_start"].as_u64().ok_or("missing global_seq_start")? as usize;
+    let global_seq_end = meta["global_seq_end"].as_u64().ok_or("missing global_seq_end")? as usize;
+    let k_bytes_len = meta["k_bytes"].as_u64().ok_or("missing k_bytes")? as usize;
+    let v_bytes_len = meta["v_bytes"].as_u64().ok_or("missing v_bytes")? as usize;
+    let k_shape: Vec<i64> = meta["k_shape"].as_array().ok_or("missing k_shape")?
+        .iter().map(|v| v.as_i64().ok_or("invalid k_shape"))
+        .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+    let v_shape: Vec<i64> = meta["v_shape"].as_array().ok_or("missing v_shape")?
+        .iter().map(|v| v.as_i64().ok_or("invalid v_shape"))
+        .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+
+    let mut k_bytes = vec![0u8; k_bytes_len];
+    read_exact(recv, &mut k_bytes).await
+        .map_err(|e| format!("quic recv k_bytes failed: {e}"))?;
+    let mut v_bytes = vec![0u8; v_bytes_len];
+    read_exact(recv, &mut v_bytes).await
+        .map_err(|e| format!("quic recv v_bytes failed: {e}"))?;
+
+    let k = bytes_to_tensor(&k_bytes, &k_shape, device)?;
+    let v = bytes_to_tensor(&v_bytes, &v_shape, device)?;
+
+    Ok(Some(KvBlock { layer_idx, global_seq_start, global_seq_end, k, v }))
+}
+
 impl KvTransport for QuicKvTransport {
     fn send_kv_block(&mut self, block: &KvBlock) -> Result<(), String> {
-        self.rt.block_on(async {
-            let k_bytes = tensor_to_bytes(&block.k)?;
-            let v_bytes = tensor_to_bytes(&block.v)?;
-            let k_shape: Vec<i64> = block.k.size();
-            let v_shape: Vec<i64> = block.v.size();
-
-            let meta = serde_json::json!({
-                "layer_idx": block.layer_idx,
-                "global_seq_start": block.global_seq_start,
-                "global_seq_end": block.global_seq_end,
-                "k_shape": k_shape,
-                "v_shape": v_shape,
-                "k_bytes": k_bytes.len(),
-                "v_bytes": v_bytes.len(),
-            });
-            let meta_bytes = meta.to_string().into_bytes();
-            let meta_len = meta_bytes.len() as u32;
-
-            let mut frame = Vec::with_capacity(4 + meta_bytes.len() + k_bytes.len() + v_bytes.len());
-            frame.extend_from_slice(&meta_len.to_be_bytes());
-            frame.extend_from_slice(&meta_bytes);
-            frame.extend_from_slice(&k_bytes);
-            frame.extend_from_slice(&v_bytes);
-
-            self.send.write_all(&frame).await
-                .map_err(|e| format!("quic send failed: {e}"))?;
-            Ok(())
-        })
+        self.rt.block_on(send_kv_block_to_stream(&mut self.send, block))
     }
 
     fn recv_kv_block(&mut self) -> Result<Option<KvBlock>, String> {
+        self.rt.block_on(recv_kv_block_from_stream(
+            &mut self.recv,
+            &mut self.handshake_done,
+            self.device,
+        ))
+    }
+
+    /// Concurrent send+recv exchange: runs both directions in parallel via
+    /// `tokio::join!` so that a blocked send does not starve the receive side.
+    /// This prevents the classic ring-deadlock where both peers simultaneously
+    /// fill the stream send buffer and then wait for each other to read.
+    fn exchange_kv_block(&mut self, block: &KvBlock) -> Result<Option<KvBlock>, String> {
+        let send = &mut self.send;
+        let recv = &mut self.recv;
+        let handshake_done = &mut self.handshake_done;
+        let device = self.device;
         self.rt.block_on(async {
-            // Skip the 1-byte dummy written during stream setup (once per stream)
-            if !self.handshake_done {
-                let mut dummy = [0u8; 1];
-                match read_exact(&mut self.recv, &mut dummy).await {
-                    Ok(()) => self.handshake_done = true,
-                    Err(ReadExactError::Closed) => return Ok(None),
-                    Err(ReadExactError::ReadError(e)) => {
-                        return Err(format!("quic recv dummy failed: {e}"));
-                    }
-                }
-            }
-
-            let mut len_bytes = [0u8; 4];
-            match read_exact(&mut self.recv, &mut len_bytes).await {
-                Ok(()) => {}
-                Err(ReadExactError::Closed) => return Ok(None),
-                Err(ReadExactError::ReadError(e)) => {
-                    return Err(format!("quic recv meta_len failed: {e}"));
-                }
-            }
-            let meta_len = u32::from_be_bytes(len_bytes) as usize;
-
-            let mut meta_bytes = vec![0u8; meta_len];
-            read_exact(&mut self.recv, &mut meta_bytes).await
-                .map_err(|e| format!("quic recv meta failed: {e}"))?;
-            let meta: serde_json::Value = serde_json::from_slice(&meta_bytes)
-                .map_err(|e| format!("quic parse meta failed: {e}"))?;
-
-            let layer_idx = meta["layer_idx"].as_u64().ok_or("missing layer_idx")? as usize;
-            let global_seq_start = meta["global_seq_start"].as_u64().ok_or("missing global_seq_start")? as usize;
-            let global_seq_end = meta["global_seq_end"].as_u64().ok_or("missing global_seq_end")? as usize;
-            let k_bytes_len = meta["k_bytes"].as_u64().ok_or("missing k_bytes")? as usize;
-            let v_bytes_len = meta["v_bytes"].as_u64().ok_or("missing v_bytes")? as usize;
-            let k_shape: Vec<i64> = meta["k_shape"].as_array().ok_or("missing k_shape")?
-                .iter().map(|v| v.as_i64().ok_or("invalid k_shape"))
-                .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
-            let v_shape: Vec<i64> = meta["v_shape"].as_array().ok_or("missing v_shape")?
-                .iter().map(|v| v.as_i64().ok_or("invalid v_shape"))
-                .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
-
-            let mut k_bytes = vec![0u8; k_bytes_len];
-            read_exact(&mut self.recv, &mut k_bytes).await
-                .map_err(|e| format!("quic recv k_bytes failed: {e}"))?;
-            let mut v_bytes = vec![0u8; v_bytes_len];
-            read_exact(&mut self.recv, &mut v_bytes).await
-                .map_err(|e| format!("quic recv v_bytes failed: {e}"))?;
-
-            let k = bytes_to_tensor(&k_bytes, &k_shape, self.device)?;
-            let v = bytes_to_tensor(&v_bytes, &v_shape, self.device)?;
-
-            Ok(Some(KvBlock { layer_idx, global_seq_start, global_seq_end, k, v }))
+            let send_fut = send_kv_block_to_stream(send, block);
+            let recv_fut = recv_kv_block_from_stream(recv, handshake_done, device);
+            let (send_res, recv_res) = tokio::join!(send_fut, recv_fut);
+            send_res?;
+            recv_res
         })
     }
 }

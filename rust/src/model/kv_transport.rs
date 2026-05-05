@@ -39,6 +39,17 @@ pub trait KvTransport: Send {
     /// Receive a KV block from the previous peer in the ring.
     /// Returns `None` when the peer has closed the connection (no more blocks).
     fn recv_kv_block(&mut self) -> Result<Option<KvBlock>, String>;
+
+    /// Atomically send a block and receive a block in the same round.
+    ///
+    /// Default implementation is sequential (send then recv). QUIC transport
+    /// overrides this to run both directions concurrently, preventing deadlock
+    /// when both peers simultaneously send large KV blocks that exceed the
+    /// stream receive window.
+    fn exchange_kv_block(&mut self, block: &KvBlock) -> Result<Option<KvBlock>, String> {
+        self.send_kv_block(block)?;
+        self.recv_kv_block()
+    }
 }
 
 /// TCP-based KV block transport using length-prefixed JSON metadata + raw f32 bytes.

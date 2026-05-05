@@ -360,22 +360,17 @@ impl HcpRingAttentionBackend {
             };
 
             for round in 0..self.num_domains.saturating_sub(1) {
-                if let Err(e) = transport.send_kv_block(&current_block) {
-                    eprintln!("[ring_attention] round {round} send_kv_block failed: {e}");
-                    break;
-                }
-
-                match transport.recv_kv_block() {
+                match transport.exchange_kv_block(&current_block) {
                     Ok(Some(peer_block)) => {
                         peer_blocks.push(peer_block.clone());
                         current_block = peer_block;
                     }
                     Ok(None) => {
-                        eprintln!("[ring_attention] round {round} recv_kv_block returned None");
+                        eprintln!("[ring_attention] round {round} exchange_kv_block returned None");
                         break;
                     }
                     Err(e) => {
-                        eprintln!("[ring_attention] round {round} recv_kv_block failed: {e}");
+                        eprintln!("[ring_attention] round {round} exchange_kv_block failed: {e}");
                         break;
                     }
                 }

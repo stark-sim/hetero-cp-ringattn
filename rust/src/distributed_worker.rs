@@ -291,9 +291,7 @@ fn domain_worker_loop(
                     layer.attention.set_distributed(domain_id, seq_offset as usize, None);
                 }
                 let input = Tensor::from_slice(&chunk).unsqueeze(0).to_device(device);
-
                 let logits = model.forward(&input, &mut kv_caches).expect("prefill forward failed");
-
                 let last_logits = logits.narrow(1, logits.size()[1] - 1, 1).squeeze();
                 let logits_vec: Vec<f32> = Vec::try_from(&last_logits).expect("logits to vec failed");
                 let logits_bytes: Vec<u8> = logits_vec.iter().flat_map(|&v| v.to_le_bytes()).collect();
