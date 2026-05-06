@@ -462,11 +462,13 @@
   - **单卡 2-domain vLLM 不可行**：vLLM `gpu_memory_utilization` 基于总显存比例，首个实例加载后导致第二个实例 `kv_cache_size` 为负。方案 B（多机/多卡，每设备单实例）是正确路径
   - 真实 KV ring 需 Phase 3 接入 vLLM `LLMEngine` 底层 API
 
-- [x] **Python QUIC Transport 实现**（commit `16c14e7`）
-  - 基于 `aioquic` 实现 `QuicKvTransport`，帧格式与 Rust `quinn` 完全兼容（4-byte BE length prefix + JSON metadata + raw f32 bytes）
+- [x] **Python QUIC Transport 实现 + Python↔Rust 互通验证**（commit `16c14e7` + `99b9ceb`）
+  - 基于 `aioquic` 实现 `QuicKvTransport`，帧格式与 Rust `quinn` 完全兼容
+  - 关键兼容点：1-byte dummy handshake（Rust `open_bi()` 后立即写 `\x00`，接收方首次 `read` 跳过）
   - 自签名证书生成 + 开发环境跳过验证
-  - `test_quic_kv.py` 闭环验证通过：KV block 发送 → server +1 变换 → 接收回显 → checksum 一致 ✅
-  - 下一步：与 Rust `quinn` 互通验证
+  - `test_quic_kv.py` Python 内部闭环验证通过 ✅
+  - `test_quic_python_rust.py` + `quic-echo-server` Rust server 互通验证通过 ✅
+    - Python client 发送 KV block → Rust server 接收 → k/v + 1.0 → 回显 → Python 验证 checksum 一致
 
 - [ ] **Phase 3: Python Worker SDK 接入真实分布式 Transport**
   - 选项 A：Python `aioquic` / `quinn` binding 实现 `KvTransport`
