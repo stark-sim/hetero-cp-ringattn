@@ -296,10 +296,10 @@ def main():
     args = parser.parse_args()
 
     print(f"[main] computing single-node reference (backend={args.backend})...")
-    if args.backend == "vllm":
-        ref_tokens = compute_reference_vllm(args)
-    else:
-        ref_tokens = compute_reference_transformers(args)
+    # For vLLM 2-domain test, use transformers reference to avoid GPU memory
+    # contention with worker processes. Phase 1.5 already verified vLLM single-node
+    # output matches transformers baseline.
+    ref_tokens = compute_reference_transformers(args)
     print(f"[main] reference tokens: {ref_tokens}")
 
     if args.backend == "vllm":
