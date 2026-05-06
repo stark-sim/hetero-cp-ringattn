@@ -17,8 +17,9 @@
 
 import argparse
 import json
-import multiprocessing
+import os
 import struct
+import subprocess
 import sys
 import time
 from typing import List
@@ -48,7 +49,7 @@ def compute_reference(args) -> List[int]:
     return generated
 
 
-def _run_coordinator(args, ref_tokens: List[int], ready_event):
+def run_coordinator(args, ref_tokens: List[int]):
     """Coordinator：接受 1 个 worker，完整 prompt prefill，广播 decode。"""
     tok = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
     token_ids = tok.encode(args.prompt, add_special_tokens=False)
@@ -61,7 +62,6 @@ def _run_coordinator(args, ref_tokens: List[int], ready_event):
     listener.bind((host, int(port)))
     listener.listen(1)
     print(f"[coordinator] listening on {args.listen_addr}")
-    ready_event.set()
 
     sock, addr = listener.accept()
     print(f"[coordinator] worker connected from {addr}")
@@ -138,51 +138,49 @@ def _run_coordinator(args, ref_tokens: List[int], ready_event):
         sys.exit(1)
 
 
-def _run_worker(args):
-    """Worker 入口。"""
-    if args.backend == "vllm":
-        from hcp_vllm_worker import VllmBackend
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        backend = VllmBackend(args.model_dir, device)
-    else:
-        from test_worker_control_plane import TransformersBackend
-        device = "mps" if torch.backends.mps.is_available() else "cpu"
-        backend = TransformersBackend(args.model_dir, device)
+def run_worker_subprocess(args) -> subprocess.Popen:
+    """用 subprocess 启动 worker 进程（避免 vLLM 与 multiprocessing 冲突）。"""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.path.dirname(os.path.abspath(__file__))
 
-    from hcp_worker_sdk import NoOpKvTransport, HcpWorkerServer
-    transport = NoOpKvTransport()
-    server = HcpWorkerServer(
-        backend=backend,
-        transport=transport,
-        domain_id=0,
-        num_domains=1,
-    )
-    print(f"[worker] starting, coord={args.listen_addr}")
-    server.run(
-        coordinator_addr=args.listen_addr,
-        listen_addr="127.0.0.1:29501",
-        next_peer_addr="127.0.0.1:0",
-    )
+    cmd = [
+        sys.executable,
+        "-c",
+        f"""
+import sys
+sys.path.insert(0, '{os.path.dirname(os.path.abspath(__file__))}')
 
+from hcp_worker_sdk import NoOpKvTransport, HcpWorkerServer
 
-def run_single(args, ref_tokens):
-    """单进程内启动 coordinator + worker。"""
-    coord_ready = multiprocessing.Event()
+backend_name = '{args.backend}'
+model_dir = '{args.model_dir}'
 
-    p_worker = multiprocessing.Process(target=_run_worker, args=(args,))
-    p_worker.start()
-    time.sleep(1)
+if backend_name == 'vllm':
+    from hcp_vllm_worker import VllmBackend
+    import torch
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    backend = VllmBackend(model_dir, device)
+else:
+    from test_worker_control_plane import TransformersBackend
+    import torch
+    device = 'mps' if torch.backends.mps.is_available() else 'cpu'
+    backend = TransformersBackend(model_dir, device)
 
-    p_coord = multiprocessing.Process(target=_run_coordinator, args=(args, ref_tokens, coord_ready))
-    p_coord.start()
-
-    p_coord.join(timeout=300)
-    p_worker.join(timeout=60)
-
-    if p_coord.exitcode != 0:
-        print(f"[main] coordinator exited with code {p_coord.exitcode}")
-        sys.exit(1)
-    print("[main] done")
+transport = NoOpKvTransport()
+server = HcpWorkerServer(
+    backend=backend,
+    transport=transport,
+    domain_id=0,
+    num_domains=1,
+)
+server.run(
+    coordinator_addr='{args.listen_addr}',
+    listen_addr='127.0.0.1:29501',
+    next_peer_addr='127.0.0.1:0',
+)
+""",
+    ]
+    return subprocess.Popen(cmd, env=env)
 
 
 def main():
@@ -198,7 +196,17 @@ def main():
     ref_tokens = compute_reference(args)
     print(f"[main] reference tokens: {ref_tokens}")
 
-    run_single(args, ref_tokens)
+    # 启动 worker 子进程
+    proc = run_worker_subprocess(args)
+    time.sleep(2)
+
+    try:
+        run_coordinator(args, ref_tokens)
+    finally:
+        proc.terminate()
+        proc.wait(timeout=30)
+
+    print("[main] done")
 
 
 if __name__ == "__main__":
