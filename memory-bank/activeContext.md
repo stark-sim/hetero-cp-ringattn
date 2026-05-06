@@ -470,10 +470,32 @@
   - `test_quic_python_rust.py` + `quic-echo-server` Rust server 互通验证通过 ✅
     - Python client 发送 KV block → Rust server 接收 → k/v + 1.0 → 回显 → Python 验证 checksum 一致
 
-- [ ] **Phase 3: Python Worker SDK 接入真实分布式 Transport**
-  - 选项 A：Python `aioquic` / `quinn` binding 实现 `KvTransport`
-  - 选项 B：Python worker 通过 TCP 与 Rust worker 互通（跨语言 KV ring）
-  - 双节点：Mac 跑 Python Worker 0，GPU 跑 Python vLLM Worker 1
+- [x] **Phase 3.1: Python bincode 编解码器 + QUIC 控制面接入 Rust coordinator**（commit `fc6a6de`）
+  - `python/hcp_worker_sdk/bincode.py`: 手写 bincode 1.3 兼容编解码器，覆盖 `WorkerCommand`/`WorkerResponse`/`WorkerHandshake`
+    - enum tag: u32 LE (4 bytes); usize/i64/u64: 8 bytes LE; Vec: 8-byte len prefix + raw bytes
+    - 6 个单元测试全部通过，与 Rust `bincode::serialize` 输出逐 byte 匹配 ✅
+  - `python/hcp_worker_sdk/quic_control.py`: `QuicControlClient` 基于 `aioquic`
+    - Handshake: 16 bytes LE (domain_id u64 + capacity_mb u64)，无 length prefix
+    - Command/Response: [4-byte BE length][bincode payload]
+    - 与 Rust `distributed_protocol.rs` 的 `read_handshake_quic` / `send_command_quic` / `recv_response_quic` 完全互通
+  - `python/test_python_worker_rust_coord.py`: mock worker 端到端测试
+    - 启动 Rust coordinator（`--distributed-role coordinator`）+ Python mock worker
+    - 完整控制面流程验证：Handshake → Prefill → SyncGlobalSeqLen → 3×Decode → Shutdown ✅
+  - `python/hcp_vllm_quic_worker.py`: vLLM backend QUIC worker（ready for remote GPU deployment）
+    - 命令行参数：`--model-dir`, `--coordinator-host`, `--coordinator-port`, `--domain-id`
+    - 复用 `VllmBackend` prefill/decode，通过 `QuicControlClient` 收发 bincode 命令
+
+- [ ] **Phase 3.2: 两个 Python worker 通过 QUIC 交换 KV block（transport 验证）**
+  - 需要 `QuicKvTransport` 接入 Python worker 事件循环（与 bincode 控制面共用同一 QUIC connection）
+  - 或测试 Python worker ↔ Rust worker 跨语言 KV ring
+
+- [ ] **Phase 3.3: 跨机器异构端到端（Mac + 远端 GPU）**
+  - Mac 跑 Python Worker 0（transformers backend），GPU 跑 Python vLLM Worker 1
+  - 控制面走 QUIC + bincode，数据面走 QUIC KV ring
+
+- [ ] **Phase 3.4: vLLM 真实 KV 提取**
+  - vLLM 0.6.4 `LLM` API 不暴露 KV cache，需接入 `LLMEngine` 底层 API
+  - PagedAttention KV 格式转换需避免性能损失
 
 ## 重要模式与偏好
 
@@ -499,7 +521,7 @@
 
 ## 当前阻塞
 
-- [2026-05-03] **无阻塞**。远程 4090 已恢复，统一 QUIC 控制面 + 单进程多 domain worker 均已验证通过（8K seq）。下一步：32K/64K 扩展验证。
+- [2026-05-07] **无阻塞**。Phase 3.1 Python bincode + QUIC 控制面已验证通过。下一步：Phase 3.2（Python worker 间 QUIC KV ring 交换）或 Phase 3.3（跨机器异构端到端）。
 - [2026-05-02] **单卡多 worker 显存上限不变**：权重共享只能省一份权重 (~4.6GB)，但 LM head output 和 KV cache 仍按 domain 数倍增。2 domain × 8K 同卡 ≈ 2×(4.64GB LM head + KV) + 4.6GB 权重 ≈ 14GB+，仍可能 OOM。大 seq 必须多卡分布。
 - [2026-04-24] 当前沙箱环境不允许 Python worker 绑定本地端口，完整 Python smoke 会触发 `PermissionError: [Errno 1] Operation not permitted`。
 - [2026-04-24] `ringattn_controller.py` 当前会将 `bytes` 放入 `json.dumps` payload，导致 `TypeError: Object of type bytes is not JSON serializable`。
