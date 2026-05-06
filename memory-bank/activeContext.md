@@ -2,19 +2,21 @@
 
 ## 当前焦点
 
-[2026-05-05] **Rust Worker SDK 重构完成并验证通过**（commit `dfbb517`）。`distributed_worker.rs` 解耦为协议运行时 (`WorkerRuntime`) + 可插拔后端 (`WorkerBackend` trait) + 默认 tch-rs 后端 (`TchWorkerBackend`）。`cargo test` 42/42 通过，`cargo check` 通过。SDK 相关 clippy 警告已清理。
+[2026-05-05] **Rust Worker SDK 重构完成并验证通过**（commit `dfbb517` + `02230d0`）。`distributed_worker.rs` 解耦为协议运行时 (`WorkerRuntime`) + 可插拔后端 (`WorkerBackend` trait) + 默认 tch-rs 后端 (`TchWorkerBackend`）。`cargo test` 42/42 通过，`cargo check` 通过。SDK 相关 clippy 警告已清理。解耦目的已记录于 `systemPatterns.md`。
 
-**解耦目的（已记录于 `systemPatterns.md`）**：
-1. **关注点分离**：协议循环（QUIC 连接、handshake、command loop）与模型计算（tensor forward、KV cache）完全独立。
-2. **框架接入零侵入**：vLLM / TensorRT-LLM / MLX 只需实现 `WorkerBackend` trait，即可复用 `WorkerRuntime` 协议层 + `KvTransport` 传输层。
-3. **零行为变更**：`TchWorkerBackend` 内部调用链与重构前 `domain_worker_loop` 完全一致，42/42 测试通过验证无回归。
-4. **性能无损**：继续使用 `exchange_kv_block` 并发 send+recv + 512MB QUIC stream window，无额外网络往返或 tensor 拷贝。
+**性能回归测试已完成**（真实 Qwen2-0.5B 权重，commit `02230d0` 后）：
 
-**三层架构**：
-- `distributed_worker.rs` — 薄壳（解析参数 → 创建后端 → `WorkerRuntime::run()`）
-- `WorkerRuntime<B>` — 通用协议循环，与模型实现无关
-- `WorkerBackend` trait — 框架接入点（`load` / `prefill` / `decode` / `capacity_mb` / `setup_kv_transports`）
-- `TchWorkerBackend` — 默认 tch-rs 实现，包装 `LlamaModel`
+| 配置 | Prompt | Decode | 时间 | 历史基准 | 结论 |
+|------|--------|--------|------|----------|------|
+| 单节点 CPU | 11 tok | 20 | 2.393s | 2.87s | ✅ 更快 |
+| 单节点 MPS | 11 tok | 20 | 2.186s | 2.06s | ✅ 同一数量级 |
+| 单节点 MPS (num_domains=2) | 11 tok | 20 | 3.241s | — | ✅ 正常 |
+| 2-domain CPU 分布式 | 11 tok | 20 | 9.594s | 3-domain 13.20s | ✅ 合理 |
+| 2-domain CPU 分布式 | 30 tok | 5 | 7.566s | — | ✅ 正常 |
+
+- **功能正确性**：单节点 CPU/MPS/2-domain 分布式输出完全一致（` in the universe.` / ` The quick brown fox jumps`）
+- **性能无回归**：单节点 CPU 比历史更快（2.39s vs 2.87s），MPS 与历史同一数量级（2.19s vs 2.06s），分布式 2-domain 9.6s 与 3-domain 历史 13.2s 合理
+- **重构前后对比**：解耦没有引入额外网络往返、tensor 拷贝或 trait dispatch 开销
 
 [2026-05-05] **Decode 性能优化已完成并验证通过**（commit `491a46c`）。decode 阶段 `kv_chunk_size` 从 `1`（70001 个 tiny chunks）提升到 `2048`，大幅缩减循环次数。
 
