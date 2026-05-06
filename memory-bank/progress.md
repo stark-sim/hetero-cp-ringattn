@@ -176,6 +176,7 @@
 ## 新增：部署指南与可插拔架构
 
 - [x] [2026-05-05] **Python Worker SDK Phase 1 控制面验证通过**（commit `dabd6fc`）：`test_worker_control_plane.py` 端到端跑通 prefill → decode → shutdown。修复 `WorkerResponse` dataclass 类方法/字段同名冲突（`error` → `from_error`），bytes JSON 序列化改用 hex 编码。新增 `NoOpKvTransport` stub，单节点跳过 peer 连接和 KV exchange。
+- [x] [2026-05-05] **Python Worker SDK Phase 1.5 vLLM Adapter MVP 验证通过**（commit `29bab9b`）：`VllmBackend` 接入 vLLM 0.6.4 `LLM` API，在远程 RTX 4090 上加载 Qwen2-0.5B，控制面 Prefill/Decode/Shutdown 全链路通过。输出与 transformers baseline 一致（` in the universe`）。vLLM 采用 --no-deps 安装 + 手动补核心依赖，避免 serving 重依赖树。
 - [x] [2026-05-05] **Rust Worker SDK 实现完成**：`worker_sdk/backend.rs` (`WorkerBackend` trait)、`worker_sdk/runtime.rs` (`WorkerRuntime<B>` 协议循环)、`worker_sdk/tch_backend.rs` (`TchWorkerBackend` 默认 tch-rs 后端)、`distributed_worker.rs` 重构为薄壳（解析参数 → 创建后端 → 运行 runtime）。`cargo test` 42/42 通过，SDK 相关 clippy 警告已清理。
   - 解耦目的：协议层与模型计算层完全分离，外部框架（vLLM/TensorRT-LLM/MLX）只需实现 `WorkerBackend` trait 即可接入 HCP 分布式网络。
   - 单元测试验证：分布式 prefill（`test_distributed_llama_model_prefill` diff=2.79e-6 ✅）、4-step decode（`test_distributed_llama_model_decode` diff~2e-6 ✅）、generator token 一致性（`test_distributed_generator_tokens_match_reference` logits diff~1e-5 ✅）。

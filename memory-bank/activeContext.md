@@ -438,10 +438,10 @@
   - ✅ `TransformersBackend` 实现 `HcpWorkerBackend` trait
   - ✅ `HcpWorkerServer` 事件循环接收 Prefill/Decode/Shutdown，返回 logits
   - ✅ 简化 Coordinator 端到端生成验证通过
-- [ ] **Phase 1.5: Python Worker SDK + vLLM Adapter MVP**（单节点 vLLM）
-  - 将 `TransformersBackend` 替换为 `VllmBackend`，接入 vLLM `LLMEngine`
-  - 验证 vLLM prefill/decode 输出格式与 HCP 协议兼容
-  - 保持 `NoOpKvTransport`，单节点端到端生成
+- [x] **Phase 1.5: Python Worker SDK + vLLM Adapter MVP**（单节点 vLLM，commit `29bab9b`）
+  - ✅ `VllmBackend` 接入 vLLM 0.6.4 `LLM` API，在远程 RTX 4090 上加载 Qwen2-0.5B
+  - ✅ 控制面 Prefill/Decode/Shutdown 全链路通过，输出与 transformers baseline 一致：` in the universe`
+  - ✅ `NoOpKvTransport` 单节点跳过 KV exchange
 - [ ] **Phase 2: vLLM Adapter 接入 Mock KV Transport**
   - 用 `LinkedMockKvTransport` 在单进程内模拟 2-domain
   - 验证 vLLM 输出 + HCP online softmax 合并后数值正确
