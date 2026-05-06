@@ -28,7 +28,9 @@ class VllmBackend(HcpWorkerBackend):
             dtype="float32",
             trust_remote_code=True,
             tensor_parallel_size=1,
-            gpu_memory_utilization=0.4,
+            gpu_memory_utilization=0.35,
+            enforce_eager=True,
+            max_num_seqs=1,
         )
         self.vocab_size = self.llm.llm_engine.model_config.get_vocab_size()
         self._history: List[int] = []
