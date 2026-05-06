@@ -4,12 +4,12 @@
 
 [2026-05-05] **Rust Worker SDK 重构完成并验证通过**（commit `dfbb517` + `02230d0`）。`distributed_worker.rs` 解耦为协议运行时 (`WorkerRuntime`) + 可插拔后端 (`WorkerBackend` trait) + 默认 tch-rs 后端 (`TchWorkerBackend`）。`cargo test` 42/42 通过，`cargo check` 通过。SDK 相关 clippy 警告已清理。解耦目的已记录于 `systemPatterns.md`。
 
-**跨节点异构验证已通过**（commit `8ab45b7` 后，RUN_ID=`cross-node-2domain-20260506-150240`）：
-- Mac MPS (domain 0, worker 0) + RTX 4090 CUDA (domain 1, worker 1) 跨 VPN 完成 11-token prompt + 5 decode tokens
-- Coordinator `generated: The quick brown fox jumps`，exit code 0
-- 总耗时 ~40s（含模型加载和网络握手）
+**跨节点异构验证已通过**（commit `719a168` 后，white/RTX 4090）：
+- Mac MPS (domain 0) + white RTX 4090 CUDA (domain 1) 跨新 tailnet 完成端到端验证
+- 11-token: `generated: The quick brown fox jumps`，exit=0，~40s
+- **111-token: `generated: 10000`（5× decode token 16/15），exit=0，prefill 分片 [0,56)/[56,111)**
 - Worker 0/1 prefill → KV ring 交换 → decode → shutdown 全部正常
-- 验证了解耦后 `WorkerRuntime` + `TchWorkerBackend` 在真实异构环境中的端到端正确性
+- 551-token 测试正在后台运行（预计 ~30min）
 
 **性能回归测试已完成**（真实 Qwen2-0.5B 权重，commit `02230d0` 后）：
 
