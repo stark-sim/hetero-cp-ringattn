@@ -395,16 +395,26 @@
 
 - [x] decode 性能优化：decode 阶段 `kv_chunk_size = 2048`，64K 分布式 decode 从 ~10min 降至 ~1-2min
 - [x] 远程 GPU 验证：64K 分布式 2-domain CUDA ✅（decode 优化后 ~4min）
-- [ ] 跨节点长序列异构验证：当前 Tailscale VPN 带宽 0.47Mbps/RTT 1.2s，长序列 KV 传输不可行。待网络恢复后重试 8K+ 跨节点 MPS+CUDA
+- [x] 跨节点长序列异构验证：551 tokens ✅（~30min）。更长序列受限于 Tailscale VPN 带宽
 - [ ] 多 worker launcher 脚本：扩展 `run_rust_remote_cp_3node_smoke.sh` 支持 `--local-domain-ids` 参数传递
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
-- [ ] 动态不均等分片 Phase 2：worker handshake 上报 `free_vram_mb`，coordinator 按 capacity 比例自动分配 chunk sizes（替代手动 `--chunk-sizes`）。
+- [x] 动态不均等分片 Phase 2：worker handshake 上报 `free_vram_mb`，coordinator 按 capacity 比例自动分配 chunk sizes ✅ 已完成
 - [ ] KV 传输压缩：当前 KV 以原始 float32 传输，大 seq 场景（32K+/64K+/128K）带宽压力巨大。探索量化（INT8/FP8）或差分编码。
-- [ ] 大 seq 工程验证：当前最大测试 seq = 31，需验证 32K+/64K+/128K 的 correctness 和显存行为。
+- [x] 大 seq 工程验证：32K ✅ / 64K ✅ / 128K 边界 131067 ✅（单节点）
 - [ ] 将 Rust correctness model 继续拆分为 library + binary，便于后续 protocol / transport 复用。
-- [ ] 远端多进程分布式验证：在 `sd-1` GPU 节点上启动 worker，Mac 本机启动 coordinator，验证跨机器 TCP ring + 异构设备（MPS coordinator 仅采样，CUDA worker 计算）。
+- [x] 远端多进程分布式验证：在 `sd-1` GPU 节点上启动 worker，Mac 本机启动 coordinator，验证跨机器 QUIC ring + 异构设备 ✅
 - [ ] 多 worker launcher 脚本：扩展 `run_distributed_2node_smoke.sh` 支持远程 SSH 启动 worker、统一日志收集。
-- [ ] 分级 tolerance policy 已落地：`ToleranceTier` 三级（Strict/Relaxed/EndToEnd），`--tolerance-tier` CLI 参数支持切换，correctness report 包含 tier 信息。
+- [x] 分级 tolerance policy 已落地：`ToleranceTier` 三级（Strict/Relaxed/EndToEnd），`--tolerance-tier` CLI 参数支持切换，correctness report 包含 tier 信息。
+- [ ] **Phase 1: Python Worker SDK + vLLM Adapter MVP**（单节点）
+  - 实现 `HcpVllmWorker`，支持 `Prefill` / `Decode` / `Shutdown`
+  - 暂时不接入 KV ring，先验证控制面通信
+  - Coordinator 连接 Python Worker，跑通 end-to-end 生成
+- [ ] **Phase 2: vLLM Adapter 接入 Mock KV Transport**
+  - 用 `LinkedMockKvTransport` 在单进程内模拟 2-domain
+  - 验证 vLLM 输出 + HCP online softmax 合并后数值正确
+- [ ] **Phase 3: vLLM Adapter 接入 QUIC Transport**
+  - 用 Python `aioquic` 或 `quinn` Python binding 实现 KvTransport
+  - 双节点：Mac 跑 Rust Worker 0，GPU 跑 Python vLLM Worker 1
 
 ## 重要模式与偏好
 

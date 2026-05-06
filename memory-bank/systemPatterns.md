@@ -22,10 +22,16 @@ project-root/
 │   ├── ringattn_runtime.cc
 │   ├── ringattn_coordinator_smoke_main.cc
 │   └── rust_bridge.cc
-├── python/                            # controller、worker、online softmax 原型
+├── python/                            # controller、worker、online softmax 原型、HCP Worker SDK
 │   ├── ringattn_controller.py
 │   ├── ringattn_worker.py
-│   └── ringattn_kernel_stub.py
+│   ├── ringattn_kernel_stub.py
+│   └── hcp_worker_sdk/                # Python 版 Worker SDK（vLLM/TensorRT-LLM/MLX 适配基础）
+│       ├── __init__.py
+│       ├── types.py
+│       ├── backend.py
+│       ├── transport.py
+│       └── server.py
 ├── rust/                              # Rust correctness model、report、C++ bridge、模型实现
 │   ├── src/
 │   │   ├── main.rs                    # CLI + smoke 入口
@@ -59,7 +65,20 @@ project-root/
 │   ├── run_rust_remote_p2p_client.sh
 │   ├── run_rust_remote_cp_node.sh
 │   └── run_rust_remote_cp_3node_smoke.sh
-├── docs/                              # 设计、验证、路线图、产品论证
+├── docs/                              # 设计、验证、路线图、产品论证、部署指南
+│   ├── DESIGN.md
+│   ├── DEPLOYMENT_GUIDE.md            # 手动部署指南（单节点/双节点异构）
+│   ├── PLUGIN_ARCHITECTURE.md         # 可插拔域内后端架构（vLLM 适配设计）
+│   ├── VLLM_INTEGRATION.md            # vLLM Worker 适配器详细设计
+│   ├── HISTORY_AND_LESSONS.md
+│   ├── HLPP_VS_HCP.md
+│   ├── PRODUCT_THESIS.md
+│   ├── PROTOCOL_SMOKE.md
+│   ├── RINGATTN_MODEL.md
+│   ├── ROADMAP.md
+│   ├── RUST_CPP_TORCH_PLAN.md
+│   ├── TCH_RS_USAGE_PLAN.md
+│   └── VALIDATION_PLAN.md
 ├── reports/                           # 实验报告输出目录
 └── memory-bank/                       # 跨会话上下文
 ```
@@ -87,7 +106,51 @@ project-root/
   - **Attention projection (`layers.rs`)**：`q_proj` / `k_proj` / `v_proj` / `o_proj` 逐 chunk 计算后 `cat`，避免 `[1,131071,896]×[896,896]` 触发 `CUBLAS_STATUS_EXECUTION_FAILED`。
   - **LM head (`model.rs`)**：长 prefill 只计算最后一个 token 的 logits，避免预分配 `[batch, seq_len, vocab_size]` 大 buffer（32K 时 ~20GB）。
   - **Causal mask (`model.rs`)**：`seq_len > 8192` 时跳过 dense `[seq_len, seq_len]` mask 分配（64K 时 ~16GB），改用 `[1,1,1,1]` dummy zero tensor 作 causal 标志。
-  - **Attention scores (`backend.rs`)**：`HcpRingAttentionBackend` 的 `ring_attention` 本身按 `q_chunk_size=2048` 和 `kv_chunk_size=2048` 循环，不 materialize 完整的 `[seq_len, seq_len]` scores。
+  - **Attention scores (`backend.rs`)**：`HcpRingAttentionBackend` 的 `ring_attention` 本身按 `q_chunk_size=2048` 和 `kv_chunk_size=2048` 循环，不 materialize 完整的 `[seq_len, seq_seq]` scores。
+
+## 可插拔域内后端架构（新增）
+
+HCP 的边界是**跨域低层协议**（P2P KV ring + online softmax），**域内实现是黑盒**。在同构计算域内，可以通过接口实现的形式，将默认 Rust/tch-rs Worker 替换为 vLLM、TensorRT-LLM、MLX 等社区成熟框架。
+
+### 核心接口契约
+
+```
+Coordinator (Rust) ──QUIC──► Worker Interface ──► 框架实现（vLLM / TensorRT-LLM / MLX）
+                              ├─ 控制面: WorkerCommand / WorkerResponse (bincode)
+                              ├─ 数据面: KvTransport::exchange_kv_block()
+                              └─ 模型面: HcpWorkerBackend (load/prefill/decode/get_kv/apply_peer)
+```
+
+### 适配器分层
+
+```
+Layer 3: 框架原生层
+  ├─ vLLM: LLMEngine, Worker, CacheEngine, GPUModelRunner
+  ├─ TensorRT-LLM: GptSession, KVCacheManager
+  └─ MLX: nn.Module, KV cache array
+
+Layer 2: HCP 适配层（必须自己实现）
+  ├─ CommandHandler: WorkerCommand → 框架 API
+  ├─ KvTransportBridge: 框架 KV cache ↔ KvBlock 序列化
+  ├─ OnlineSoftmaxAggregator: peer KV 增量合并
+  └─ HandshakeReporter: capacity_mb / device 上报
+
+Layer 1: HCP 协议层（可复用 SDK）
+  ├─ QUIC endpoint 管理
+  ├─ Frame I/O（length-prefixed bincode）
+  ├─ WorkerCommand / WorkerResponse 序列化
+  └─ KvTransport trait 实现（QUIC/TCP）
+```
+
+### Python Worker SDK
+
+已创建 `python/hcp_worker_sdk/` 目录，提供 Python 版 Worker SDK：
+- `types.py`: `KvBlock`, `WorkerCommand`, `WorkerResponse`, `WorkerHandshake`
+- `backend.py`: `HcpWorkerBackend` 抽象接口（框架适配器必须实现）
+- `transport.py`: `KvTransport` + `TcpKvTransport` 实现
+- `server.py`: `HcpWorkerServer` 通用事件循环
+
+详见 `docs/PLUGIN_ARCHITECTURE.md` 和 `docs/VLLM_INTEGRATION.md`。
 
 ## 组件关系
 
@@ -151,13 +214,14 @@ project-root/
 |------|--------------------------|--------------------------------------|-----------|
 | **来源** | Liu et al., 2023 | PyTorch 2.7+ `torch.distributed._tensor.experimental.context_parallel` | 独立实现 |
 | **通信语义** | `send` / `recv` P2P | `all-gather` / `all-to-all` collective | `send_kv_block` / `recv_kv_block` P2P |
-| **通信库** | 任意 socket / MPI | NCCL | 自定义 TCP / 本地 queue |
+| **通信库** | 任意 socket / MPI | NCCL | 自定义 TCP / QUIC / 本地 queue |
 | **设备假设** | 任意（论文用 TPU/GPU） | 同构 NVIDIA GPU | **异构**（MPS + CUDA） |
 | **分块策略** | 支持非均分 | 均分（Sequential / Round Robin） | **支持非均分**（uneven blocks） |
 | **实现层** | JAX / Python | Python dispatch hook | **Rust + tch-rs**（C++ libtorch） |
 | **Correctness** | online softmax 增量更新 | online softmax 增量更新 | online softmax 增量更新，18 个单元测试验证 |
 | **性能优化** | 计算-通信重叠 | NCCL 拓扑优化 + 计算-通信重叠 | 当前阶段先保证 correctness，性能优化后置 |
 | **与官方关系** | 原始定义 | PyTorch 官方实现 | **不依赖 PyTorch CP**，从头基于底层 tch-rs 算子实现 |
+| **域内后端** | 论文未涉及 | PyTorch / Transformers | **可插拔**（vLLM / TensorRT-LLM / MLX） |
 
 ### 4. 为什么 HCP 选择 P2P
 
@@ -165,6 +229,7 @@ project-root/
 2. **非均分对异构必要**：MPS 和 CUDA 的算力/显存/带宽不同，均分 sequence 会导致负载失衡；P2P 允许每个 domain 根据自己的 capacity 持有不同大小的 block。
 3. **P2P 是论文的原始定义**：PyTorch 的 collective 实现是一种"同构集群特化版"，不是 Ring Attention 的数学必须。
 4. **Rust 层实现**：脱离 Python GIL 和 PyTorch distributed 的 runtime 假设，更适合长期运行的分布式推理服务。
+5. **域内可插拔**：HCP 不绑定域内实现，允许同构域内使用 vLLM/TensorRT-LLM/MLX 等最强社区框架，最大化复用社区轮子。
 
 ### 5. 代价与风险
 
@@ -208,7 +273,9 @@ project-root/
 | 单进程多 domain worker | 单个 OS 进程内通过 `std::thread::spawn` 运行多个 domain，共享 `Arc<ModelWeights>`（权重 shallow_clone），每 domain 独立 LlamaModel/KV cache/coordinator/QUIC。减少 per-card 权重内存占用，但 KV cache 和 LM head output 仍按 domain 数倍增 | [2026-05-02] |
 | 移除 `forward_lock`，改用 `no_grad` + 自然 stream 串行化 | `forward_lock` 在 ring attention 中导致死锁：domain0 在 `recv_kv_block` 阻塞等待 domain1，但 domain1 被 lock 挡在外面。推理时 `no_grad_guard()` 已禁用梯度图，MPS/CUDA 天然按 stream 顺序执行，无需额外互斥 | [2026-05-02] |
 | 默认 1 worker / 1 GPU，开发可尝试 2 worker / 1 GPU | 生产环境单 worker 最稳定、显存最可控；开发环境双 worker 可验证权重共享逻辑，但不能突破单卡显存上限（LM head + KV cache 仍倍增） | [2026-05-02] |
-| MPS 后端 tensor op workaround：`arange_start` CPU fallback、`add+mul` 替代 `masked_fill`、`amax` 替代 `max_dim` | MPS 后端多个 tch-rs/libtorch op 存在 bug：`arange_start` 在 MPS 设备上结果错误；`masked_fill` 行为不正确；`max_dim` 返回 argmax 时异常。统一策略：可疑 op 先在 CPU 创建再 `to_device`，或用数学等价 op 替代（如 `add+mul` 等价于 `masked_fill`） | [2026-05-04] |
+| MPS 后端 tensor op workaround：`arange_start` CPU fallback、`add+mul` 替代 `masked_fill`、`amax` 替代 `max_dim` | MPS 后端多个 tch-rs/libtorch op 存在 bug：`arange_start` 在 MPS 设备上产生错误结果；`masked_fill` 行为不正确；`max_dim` 返回 argmax 时异常。统一策略：可疑 op 先在 CPU 创建再 `to_device`，或用数学等价 op 替代（如 `add+mul` 等价于 `masked_fill`） | [2026-05-04] |
 | QUIC `max_idle_timeout` 适配长计算阶段 | prefill/decode 阶段 worker 可能在数分钟内只进行本地计算而不发送任何 QUIC 帧，quinn 默认 idle timeout（~30s）会断开 connection。显式设置 `max_idle_timeout=300s` 覆盖长计算阶段的静默期 | [2026-05-04] |
 | 并发 `exchange_kv_block` 替代串行 send→recv 防止 ring 死锁 | `ring_attention` 中原先 `send_kv_block(&block)` 后 `recv_kv_block()` 是串行阻塞的；当双方同时发送的 KV block 超过 stream receive window 时，send 阻塞且无人 recv → 死锁。`KvTransport::exchange_kv_block()` 在 `QuicKvTransport` 中用 `tokio::join!` 并发执行 send 和 recv，确保 recv 侧始终运行，不受 send 阻塞影响；同时提取独立 async 函数以拆分 `&mut self.send` 和 `&mut self.recv` 借用 | [2026-05-05] |
 | 跨节点异构验证：每个平台必须有 worker | coordinator 只加载 tokenizer+config，不做模型计算。若 Platform A 只跑 coordinator、Platform B 只跑 worker，则 Platform A 的异构计算能力未被验证。正确架构：Mac 跑 `coordinator + worker 0 (MPS)`，GPU 跑 `worker 1 (CUDA)`，双方均执行 forward 和 KV ring 交换 | [2026-05-05] |
+| **可插拔域内后端架构** | 在同构计算域内，通过接口实现的形式将默认 Rust/tch-rs Worker 替换为 vLLM、TensorRT-LLM、MLX 等社区框架。HCP 只定义跨域 P2P KV 交换和 online softmax 协议，域内实现是黑盒。Python Worker SDK (`python/hcp_worker_sdk/`) 提供标准接口降低适配门槛。详见 `docs/PLUGIN_ARCHITECTURE.md` | [2026-04-30] |
+| **vLLM 适配器设计** | 优先用非侵入式 Wrapper 方案（后处理模式）：不修改 vLLM 源码，在 vLLM 完成一层 forward 后提取 KV、走 HCP transport 交换 peer KV、用 online softmax 合并增量贡献。PagedAttention KV cache 格式通过 gather/scatter 转换。详见 `docs/VLLM_INTEGRATION.md` | [2026-04-30] |

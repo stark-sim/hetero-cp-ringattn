@@ -173,6 +173,36 @@
   - **551 tokens: ~30min ✅** (`What is the sentiment of`)
 - Mac MPS + RTX 4090 CUDA 跨节点 QUIC KV ring 交换在 551-token（~3.5MB KV block）下稳定工作。
 
+## 新增：部署指南与可插拔架构
+
+- [x] [2026-04-30] **手动部署指南** (`docs/DEPLOYMENT_GUIDE.md`)：从零开始的手动部署文档，覆盖：
+  - 单节点本地部署（Mac MPS / GPU CUDA 独立验证）
+  - 双节点异构部署（Mac MPS + remote RTX 4090 CUDA）完整步骤
+  - 统一启动脚本使用说明
+  - 高级配置（手动不均等分片、capacity-aware、单进程多 domain、高延迟 VPN 调参）
+  - 故障排查手册（coordinator 卡 waiting、worker connect 失败、CUDA 不可用、MPS NaN、长序列 OOM）
+  - 验证清单
+- [x] [2026-04-30] **可插拔域内后端架构** (`docs/PLUGIN_ARCHITECTURE.md`)：
+  - 核心思想：HCP 定义跨域 P2P 协议，域内实现是黑盒
+  - 接口契约：控制面（WorkerCommand/WorkerResponse）、数据面（KvTransport）、模型面（HcpWorkerBackend）
+  - 适配器分层设计：框架原生层 → HCP 适配层 → HCP 协议层
+  - vLLM 适配器设计决策（PagedAttention KV 格式转换、后处理模式、online softmax 实现位置）
+  - 最小 MVP 实现路径（Phase 0-4）
+  - Python Worker SDK 接口定义参考
+  - TensorRT-LLM / MLX 适配要点
+- [x] [2026-04-30] **vLLM Worker 适配器详细设计** (`docs/VLLM_INTEGRATION.md`)：
+  - vLLM 选型理由（PagedAttention、Continuous Batching、CUDA kernel）
+  - 系统架构图（Coordinator → vLLM + HCP Adapter）
+  - 三大挑战与解决方案：PagedAttention KV cache 格式转换、attention 替换策略（非侵入式 Wrapper）、模型并行 all-gather
+  - 最小可运行代码骨架（`hcp_vllm_worker.py`）
+  - 部署命令示例（同构 vLLM 集群、异构混合 Mac+GPU）
+  - 性能预期与风险缓解
+- [x] [2026-04-30] **Python Worker SDK** (`python/hcp_worker_sdk/`)：
+  - `types.py`: `KvBlock`, `WorkerCommand`, `WorkerResponse`, `WorkerHandshake`（bincode/JSON 序列化）
+  - `backend.py`: `HcpWorkerBackend` 抽象接口（load_model/prefill/decode/get_kv_block/apply_peer_kv/capacity_mb）
+  - `transport.py`: `KvTransport` + `TcpKvTransport`（length-prefixed JSON + raw f32 bytes）
+  - `server.py`: `HcpWorkerServer` 通用事件循环（handshake → command loop → response）
+
 ## 里程碑
 
 | 里程碑 | 状态 | 目标日期 |
