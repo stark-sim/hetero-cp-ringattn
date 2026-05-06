@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-2-domain Mock KV Ring 验证 — 单进程内模拟分布式 KV 交换。
+2-domain Mock KV Ring 验证 — 单进程/多进程模拟分布式 KV 交换。
 
 验证目标：
 1. LinkedMockKvTransport 能在内存中无损交换 KV block
@@ -15,7 +15,6 @@
 
 import argparse
 import json
-import queue
 import struct
 import sys
 import threading
@@ -23,20 +22,6 @@ import time
 import torch
 import numpy as np
 from typing import List
-
-from hcp_worker_sdk import HcpWorkerBackend, KvBlock, HcpWorkerServer, LinkedMockKvTransport
-from hcp_worker_sdk.types import WorkerCommand, WorkerResponse, WorkerHandshake
-from test_worker_control_plane import TransformersBackend
-
-# Lazy import vLLM backend
-_VllmBackend = None
-
-def _get_vllm_backend():
-    global _VllmBackend
-    if _VllmBackend is None:
-        from hcp_vllm_worker import VllmBackend
-        _VllmBackend = VllmBackend
-    return _VllmBackend
 
 
 def run_coordinator(args, ref_tokens: List[int], ready_event):
@@ -75,6 +60,7 @@ def run_coordinator(args, ref_tokens: List[int], ready_event):
         data = b""
         while len(data) < 16:
             data += sock.recv(16 - len(data))
+        from hcp_worker_sdk.types import WorkerHandshake
         hs = WorkerHandshake.from_bytes(data)
         print(f"[coordinator] handshake domain={hs.domain_id} cap={hs.capacity_mb} MB")
 
@@ -84,6 +70,7 @@ def run_coordinator(args, ref_tokens: List[int], ready_event):
         sock.sendall(frame)
 
     def recv_resp(sock):
+        from hcp_worker_sdk.types import WorkerResponse
         len_bytes = b""
         while len(len_bytes) < 4:
             len_bytes += sock.recv(4 - len(len_bytes))
@@ -94,6 +81,7 @@ def run_coordinator(args, ref_tokens: List[int], ready_event):
         return WorkerResponse.from_dict(json.loads(data.decode()))
 
     # Prefill
+    from hcp_worker_sdk.types import WorkerCommand
     send_cmd(socks[0], WorkerCommand.prefill(chunk0, seq_offset=0))
     send_cmd(socks[1], WorkerCommand.prefill(chunk1, seq_offset=mid))
     resp0 = recv_resp(socks[0])
@@ -107,8 +95,6 @@ def run_coordinator(args, ref_tokens: List[int], ready_event):
         send_cmd(sock, WorkerCommand.sync_global_seq_len(global_seq_len))
 
     # Decode loop (sample from worker 0 only)
-    # Step 0: use reference first token (prefill logits from chunk are not correct
-    # without true ring-attention online softmax; we verify decode phase correctness)
     generated = []
     if args.max_tokens > 0:
         first_token = ref_tokens[0]
@@ -144,7 +130,6 @@ def run_coordinator(args, ref_tokens: List[int], ready_event):
     text = tok.decode(generated, skip_special_tokens=True)
     print(f"[coordinator] generated: '{text}'")
 
-    # Compare with reference
     if generated == ref_tokens:
         print(f"[coordinator] ✅ MATCH: 2-domain output identical to single-node reference")
     else:
@@ -154,14 +139,17 @@ def run_coordinator(args, ref_tokens: List[int], ready_event):
 
 def run_worker(domain_id: int, model_dir: str, device: str,
                coordinator_addr: str, listen_addr: str,
-               inbox, outbox, next_peer_addr: str = "127.0.0.1:0",
-               backend_name: str = "transformers"):
-    import socket
+               next_peer_addr: str, backend_name: str,
+               inbox, outbox):
+    """Worker 入口（可运行于 thread 或 process 中）。"""
     if backend_name == "vllm":
-        backend_cls = _get_vllm_backend()
+        from hcp_vllm_worker import VllmBackend
+        backend = VllmBackend(model_dir, device)
     else:
-        backend_cls = TransformersBackend
-    backend = backend_cls(model_dir, device)
+        from test_worker_control_plane import TransformersBackend
+        backend = TransformersBackend(model_dir, device)
+
+    from hcp_worker_sdk import LinkedMockKvTransport, HcpWorkerServer
     transport = LinkedMockKvTransport(inbox, outbox)
     server = HcpWorkerServer(
         backend=backend,
@@ -218,6 +206,70 @@ def compute_reference_vllm(args) -> List[int]:
     return list(generated)
 
 
+def run_threading(args, ref_tokens):
+    """transformers backend：单进程多线程。"""
+    import queue
+    q01 = queue.Queue()
+    q10 = queue.Queue()
+    coord_ready = threading.Event()
+
+    t_coord = threading.Thread(target=run_coordinator, args=(args, ref_tokens, coord_ready))
+    t_coord.start()
+    coord_ready.wait()
+    time.sleep(0.1)
+
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    t1 = threading.Thread(
+        target=run_worker,
+        args=(1, args.model_dir, device, args.listen_addr, "127.0.0.1:29502",
+              "127.0.0.1:29501", args.backend, q01, q10),
+    )
+    t0 = threading.Thread(
+        target=run_worker,
+        args=(0, args.model_dir, device, args.listen_addr, "127.0.0.1:29501",
+              "127.0.0.1:29502", args.backend, q10, q01),
+    )
+    t1.start()
+    time.sleep(0.5)
+    t0.start()
+
+    t_coord.join()
+    t0.join(timeout=30)
+    t1.join(timeout=30)
+    print("[main] done")
+
+
+def run_multiprocessing(args, ref_tokens):
+    """vllm backend：多进程（vLLM 不支持同进程多实例）。"""
+    import multiprocessing as mp
+    mp.set_start_method("spawn", force=True)
+
+    q01 = mp.Queue()
+    q10 = mp.Queue()
+    coord_ready = mp.Event()
+
+    p1 = mp.Process(
+        target=run_worker,
+        args=(1, args.model_dir, "cuda", args.listen_addr, "127.0.0.1:29502",
+              "127.0.0.1:29501", args.backend, q01, q10),
+    )
+    p0 = mp.Process(
+        target=run_worker,
+        args=(0, args.model_dir, "cuda", args.listen_addr, "127.0.0.1:29501",
+              "127.0.0.1:29502", args.backend, q10, q01),
+    )
+    p1.start()
+    time.sleep(2)
+    p0.start()
+
+    # coordinator 在主进程中运行
+    run_coordinator(args, ref_tokens, coord_ready)
+
+    p0.join(timeout=120)
+    p1.join(timeout=120)
+    print("[main] done")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-dir", required=True)
@@ -234,38 +286,10 @@ def main():
         ref_tokens = compute_reference_transformers(args)
     print(f"[main] reference tokens: {ref_tokens}")
 
-    # Two linked queues for mock KV transport
-    q01 = queue.Queue()  # domain 0 -> domain 1
-    q10 = queue.Queue()  # domain 1 -> domain 0
-
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
-
-    # 先启动 coordinator listener
-    coord_ready = threading.Event()
-    t_coord = threading.Thread(target=run_coordinator, args=(args, ref_tokens, coord_ready))
-    t_coord.start()
-    coord_ready.wait()
-    time.sleep(0.1)
-
-    # 再启动 worker threads
-    t1 = threading.Thread(
-        target=run_worker,
-        args=(1, args.model_dir, device, args.listen_addr, "127.0.0.1:29502", q01, q10,
-              "127.0.0.1:29501", args.backend),
-    )
-    t0 = threading.Thread(
-        target=run_worker,
-        args=(0, args.model_dir, device, args.listen_addr, "127.0.0.1:29501", q10, q01,
-              "127.0.0.1:29502", args.backend),
-    )
-    t1.start()
-    time.sleep(0.5)
-    t0.start()
-
-    t_coord.join()
-    t0.join(timeout=30)
-    t1.join(timeout=30)
-    print("[main] done")
+    if args.backend == "vllm":
+        run_multiprocessing(args, ref_tokens)
+    else:
+        run_threading(args, ref_tokens)
 
 
 if __name__ == "__main__":
