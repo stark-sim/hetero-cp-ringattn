@@ -185,32 +185,41 @@ def compute_reference_transformers(args) -> List[int]:
     return generated
 
 
-def compute_reference_vllm(args) -> List[int]:
-    """用单节点 vLLM 计算贪婪解码参考结果。"""
-    import gc
+def _compute_reference_vllm_worker(args_dict, result_queue):
+    """子进程 worker：计算 vLLM 参考结果。"""
     from vllm import LLM, SamplingParams
     from transformers import AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
+    tok = AutoTokenizer.from_pretrained(args_dict["model_dir"], trust_remote_code=True)
     llm = LLM(
-        model=args.model_dir,
+        model=args_dict["model_dir"],
         dtype="float32",
         trust_remote_code=True,
         tensor_parallel_size=1,
         gpu_memory_utilization=0.4,
     )
-    token_ids = tok.encode(args.prompt, add_special_tokens=False)
+    token_ids = tok.encode(args_dict["prompt"], add_special_tokens=False)
     outputs = llm.generate(
         prompt_token_ids=[token_ids],
-        sampling_params=SamplingParams(max_tokens=args.max_tokens, temperature=0),
+        sampling_params=SamplingParams(max_tokens=args_dict["max_tokens"], temperature=0),
     )
     generated = outputs[0].outputs[0].token_ids
-    # Explicitly release vLLM GPU memory before spawning workers
-    del llm
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    return list(generated)
+    result_queue.put(list(generated))
+
+
+def compute_reference_vllm(args) -> List[int]:
+    """用单节点 vLLM 计算贪婪解码参考结果（在独立子进程中运行以释放 GPU）。"""
+    import multiprocessing as mp
+    mp.set_start_method("spawn", force=True)
+    q = mp.Queue()
+    p = mp.Process(
+        target=_compute_reference_vllm_worker,
+        args=(vars(args), q),
+    )
+    p.start()
+    result = q.get()
+    p.join(timeout=120)
+    return result
 
 
 def run_threading(args, ref_tokens):
