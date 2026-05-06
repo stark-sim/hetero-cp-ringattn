@@ -187,6 +187,7 @@ def compute_reference_transformers(args) -> List[int]:
 
 def compute_reference_vllm(args) -> List[int]:
     """用单节点 vLLM 计算贪婪解码参考结果。"""
+    import gc
     from vllm import LLM, SamplingParams
     from transformers import AutoTokenizer
 
@@ -196,6 +197,7 @@ def compute_reference_vllm(args) -> List[int]:
         dtype="float32",
         trust_remote_code=True,
         tensor_parallel_size=1,
+        gpu_memory_utilization=0.4,
     )
     token_ids = tok.encode(args.prompt, add_special_tokens=False)
     outputs = llm.generate(
@@ -203,6 +205,11 @@ def compute_reference_vllm(args) -> List[int]:
         sampling_params=SamplingParams(max_tokens=args.max_tokens, temperature=0),
     )
     generated = outputs[0].outputs[0].token_ids
+    # Explicitly release vLLM GPU memory before spawning workers
+    del llm
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     return list(generated)
 
 
