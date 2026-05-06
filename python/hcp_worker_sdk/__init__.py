@@ -17,7 +17,7 @@ HCP Worker SDK — Python 版
 
 from .types import KvBlock, WorkerCommand, WorkerResponse, WorkerHandshake
 from .backend import HcpWorkerBackend
-from .transport import KvTransport, TcpKvTransport, NoOpKvTransport
+from .transport import KvTransport, TcpKvTransport, NoOpKvTransport, LinkedMockKvTransport
 from .server import HcpWorkerServer
 
 __all__ = [
@@ -28,5 +28,7 @@ __all__ = [
     "HcpWorkerBackend",
     "KvTransport",
     "TcpKvTransport",
+    "NoOpKvTransport",
+    "LinkedMockKvTransport",
     "HcpWorkerServer",
 ]

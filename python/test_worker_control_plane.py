@@ -73,34 +73,99 @@ class TransformersBackend(HcpWorkerBackend):
         self._num_heads = getattr(config, "num_attention_heads", 14)
         self._head_dim = getattr(config, "hidden_size", 896) // self._num_heads
         self._history: List[int] = []
+        self._past_key_values = None
+        self._layer_kv_start: List[int] = [0] * self._num_layers
         print(f"[transformers backend] loaded: {self._num_layers} layers")
 
     def load_model(self, model_dir: str, device: str) -> None:
         pass
 
     def prefill(self, chunk: List[int], seq_offset: int) -> Tuple[torch.Tensor, int]:
+        from transformers.cache_utils import DynamicCache
         self._history = list(chunk)
-        logits = self._forward(self._history)
-        return logits, len(self._history) + seq_offset
+        self._layer_kv_start = [seq_offset] * self._num_layers
+        input_ids = torch.tensor([self._history], dtype=torch.long, device=self.device)
+        with torch.no_grad():
+            outputs = self.model(input_ids, use_cache=True)
+            logits = outputs.logits[0, -1]
+            if outputs.past_key_values is not None:
+                if isinstance(outputs.past_key_values, tuple):
+                    self._past_key_values = DynamicCache.from_legacy_cache(outputs.past_key_values)
+                else:
+                    self._past_key_values = outputs.past_key_values
+        return logits.to(torch.float32).cpu(), len(self._history) + seq_offset
 
     def decode(self, token: int) -> torch.Tensor:
+        from transformers.cache_utils import DynamicCache
         self._history.append(token)
-        return self._forward(self._history)
-
-    def _forward(self, token_ids: List[int]) -> torch.Tensor:
-        input_ids = torch.tensor([token_ids], dtype=torch.long, device=self.device)
+        input_ids = torch.tensor([[token]], dtype=torch.long, device=self.device)
         with torch.no_grad():
-            outputs = self.model(input_ids)
+            outputs = self.model(
+                input_ids,
+                past_key_values=self._past_key_values,
+                use_cache=True,
+            )
             logits = outputs.logits[0, -1]
+            if outputs.past_key_values is not None:
+                if isinstance(outputs.past_key_values, tuple):
+                    self._past_key_values = DynamicCache.from_legacy_cache(outputs.past_key_values)
+                else:
+                    self._past_key_values = outputs.past_key_values
         return logits.to(torch.float32).cpu()
 
     def get_kv_block(self, layer_idx: int, seq_start: int, seq_end: int) -> KvBlock:
-        k = torch.empty(0)
-        v = torch.empty(0)
-        return KvBlock(layer_idx, seq_start, seq_end, k, v)
+        if self._past_key_values is None:
+            k = torch.empty(0)
+            v = torch.empty(0)
+            return KvBlock(layer_idx, seq_start, seq_end, k, v)
+        k, v = self._past_key_values[layer_idx]
+        # Convert global seq positions to local indices within this layer's KV cache
+        layer_start = self._layer_kv_start[layer_idx]
+        local_start = max(0, seq_start - layer_start)
+        local_end = max(0, seq_end - layer_start)
+        # k/v shape: [batch, num_heads, seq_len, head_dim]
+        k_slice = k[:, :, local_start:local_end, :].clone()
+        v_slice = v[:, :, local_start:local_end, :].clone()
+        return KvBlock(layer_idx, seq_start, seq_end, k_slice, v_slice)
 
     def apply_peer_kv(self, layer_idx: int, peer_block: KvBlock) -> None:
-        pass
+        if self._past_key_values is None or peer_block.k.numel() == 0:
+            return
+        k_local, v_local = self._past_key_values[layer_idx]
+        layer_start = self._layer_kv_start[layer_idx]
+        # Determine whether peer is before or after local KV
+        if peer_block.global_seq_start < layer_start:
+            # Prepend peer KV
+            k_new = torch.cat([peer_block.k.to(k_local.device), k_local], dim=2)
+            v_new = torch.cat([peer_block.v.to(v_local.device), v_local], dim=2)
+            self._layer_kv_start[layer_idx] = peer_block.global_seq_start
+        else:
+            # Append peer KV
+            k_new = torch.cat([k_local, peer_block.k.to(k_local.device)], dim=2)
+            v_new = torch.cat([v_local, peer_block.v.to(v_local.device)], dim=2)
+        # Update via layers list
+        self._past_key_values.layers[layer_idx].keys = k_new
+        self._past_key_values.layers[layer_idx].values = v_new
+
+    def recalculate_logits(self) -> torch.Tensor:
+        """KV 交换后，用完整的 past_key_values 重新计算最后位置的 logits。"""
+        from transformers.cache_utils import DynamicCache
+        if not self._history:
+            return torch.zeros(self.model.config.vocab_size, dtype=torch.float32)
+        input_ids = torch.tensor([[self._history[-1]]], dtype=torch.long, device=self.device)
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids,
+                past_key_values=self._past_key_values,
+                use_cache=True,
+            )
+            logits = outputs.logits[0, -1]
+            if outputs.past_key_values is not None:
+                if isinstance(outputs.past_key_values, tuple):
+                    self._past_key_values = DynamicCache.from_legacy_cache(outputs.past_key_values)
+                else:
+                    self._past_key_values = outputs.past_key_values
+        return logits.to(torch.float32).cpu()
 
     @property
     def capacity_mb(self) -> int:

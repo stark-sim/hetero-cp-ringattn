@@ -33,6 +33,29 @@ class NoOpKvTransport(KvTransport):
         return None
 
 
+class LinkedMockKvTransport(KvTransport):
+    """内存队列连接的 Mock KV Transport（单进程 2-domain Phase 2 验证用）。"""
+
+    def __init__(self, inbox, outbox, timeout: float = 5.0):
+        """
+        Args:
+            inbox: 接收 peer KV block 的 queue.Queue
+            outbox: 发送本地 KV block 的 queue.Queue
+            timeout: queue get 超时秒数
+        """
+        self.inbox = inbox
+        self.outbox = outbox
+        self.timeout = timeout
+
+    def exchange_kv_block(self, block: KvBlock) -> Optional[KvBlock]:
+        """先发后收：将 block 放入 outbox，然后从 inbox 取 peer block。"""
+        self.outbox.put(block)
+        try:
+            return self.inbox.get(timeout=self.timeout)
+        except Exception:
+            return None
+
+
 class TcpKvTransport(KvTransport):
     """基于 TCP socket 的 KV block 传输。"""
 

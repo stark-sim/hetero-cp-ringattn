@@ -110,10 +110,10 @@ class HcpWorkerServer:
         """处理 Decode 命令。"""
         token = cmd.token or 0
 
-        # 执行框架 decode
+        # 执行框架 decode（更新本地 KV cache）
         logits = self.backend.decode(token)
 
-        # KV Ring 交换（decode 阶段只交换 prefill 历史 KV）
+        # KV Ring 交换（decode 阶段通常不需要，因所有 worker 已同步）
         self._exchange_kv_ring(prefill=False)
 
         return WorkerResponse.decode_done(logits)
@@ -126,14 +126,19 @@ class HcpWorkerServer:
         1. 提取本 domain 的 KV block
         2. 通过 transport 与 peer 交换
         3. 将收到的 peer KV 合并到当前层
+
+        当前简化实现：仅 prefill 阶段需要交换 KV；decode 阶段所有 worker
+        已同步（独立处理相同 token），跳过交换。
         """
         if self.num_domains <= 1:
             return  # 单节点模式跳过 KV exchange
 
+        if not prefill:
+            return  # decode 阶段跳过（所有 worker 已有相同完整 KV）
+
         for layer_idx in range(self.backend.num_layers):
             seq_start = self.seq_offset
-            seq_end = self.global_seq_len if prefill else self.seq_offset + self.backend.num_layers
-            # 注意：decode 阶段 seq_end 需要特殊处理，这里简化
+            seq_end = self.global_seq_len
 
             local_block = self.backend.get_kv_block(layer_idx, seq_start, seq_end)
 
