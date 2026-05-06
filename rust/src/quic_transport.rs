@@ -72,8 +72,16 @@ pub fn create_endpoint(listen_addr: SocketAddr) -> Result<Endpoint, String> {
     let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
     transport_config.max_concurrent_bidi_streams(256u32.into());
     transport_config.max_concurrent_uni_streams(256u32.into());
+    // Aggressive keep-alive to prevent NAT/firewall from dropping idle UDP mappings.
+    // With 1.2s RTT cross-VPN, NAT idle timeouts (often 30-60s) can expire during
+    // long prefill computation gaps. Keep-alive every 1s ensures NAT table refresh.
     transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(1)));
-    transport_config.max_idle_timeout(Some(std::time::Duration::from_secs(300).try_into().unwrap()));
+    transport_config.max_idle_timeout(Some(std::time::Duration::from_secs(3600).try_into().unwrap()));
+    // Disable MTU discovery: Tailscale WireGuard MTU is 1280, and PMTUD may probe
+    // larger sizes that get dropped by intermediate devices. Stick to conservative
+    // 1200 bytes to avoid fragmentation-related packet loss on high-RTT paths.
+    transport_config.mtu_discovery_config(None);
+    transport_config.initial_mtu(1200);
     // Increase stream window to accommodate large KV blocks (e.g. 1.3MB for 1365 tokens).
     // Default ~1.2MB is insufficient for ring-KV exchange deadlocking.
     // GQA repeat 后 KV block 大小 = 2 * num_heads * seq * head_dim * 4 bytes.
@@ -235,9 +243,15 @@ impl KvTransport for QuicKvTransport {
         self.rt.block_on(async {
             let send_fut = send_kv_block_to_stream(send, block);
             let recv_fut = recv_kv_block_from_stream(recv, handshake_done, device);
-            let (send_res, recv_res) = tokio::join!(send_fut, recv_fut);
-            send_res?;
-            recv_res
+            let exchange_fut = async {
+                let (send_res, recv_res) = tokio::join!(send_fut, recv_fut);
+                send_res?;
+                recv_res
+            };
+            match tokio::time::timeout(std::time::Duration::from_secs(120), exchange_fut).await {
+                Ok(result) => result,
+                Err(_) => Err("exchange_kv_block timeout after 120s".to_string()),
+            }
         })
     }
 }

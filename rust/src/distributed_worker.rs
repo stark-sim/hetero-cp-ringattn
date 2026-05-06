@@ -197,7 +197,7 @@ fn domain_worker_loop(
         let accept_fut = async move {
             loop {
                 match tokio::time::timeout(
-                    std::time::Duration::from_secs(3),
+                    std::time::Duration::from_secs(30),
                     endpoint_for_accept.accept()
                 ).await {
                     Ok(Some(incoming)) => break incoming.await.expect("prev peer connection failed"),
