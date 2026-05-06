@@ -2,6 +2,12 @@
 
 ## 当前焦点
 
+[2026-05-05] **Python Worker SDK Phase 1 控制面验证通过**（commit `dabd6fc`）。
+- 修复 `WorkerResponse` dataclass 字段 `error` 与类方法 `error` 同名冲突（Python dataclass 将类方法作为字段默认值），重命名为 `from_error`。
+- 修复 bytes JSON 序列化：改用 hex 编码替代 `list()`，避免类型歧义。
+- 新增 `NoOpKvTransport` stub，单节点模式跳过 peer 连接和 KV exchange。
+- `test_worker_control_plane.py` --coordinator + --worker 端到端通过：prefill → 3× decode → shutdown，生成 `' in the universe'`。
+
 [2026-05-05] **Rust Worker SDK 重构完成并验证通过**（commit `dfbb517` + `02230d0`）。`distributed_worker.rs` 解耦为协议运行时 (`WorkerRuntime`) + 可插拔后端 (`WorkerBackend` trait) + 默认 tch-rs 后端 (`TchWorkerBackend`）。`cargo test` 42/42 通过，`cargo check` 通过。SDK 相关 clippy 警告已清理。解耦目的已记录于 `systemPatterns.md`。
 
 **跨节点异构验证已通过**（commit `719a168` 后，white/RTX 4090）：
@@ -428,10 +434,14 @@
 - [x] 远端多进程分布式验证：在 `sd-1` GPU 节点上启动 worker，Mac 本机启动 coordinator，验证跨机器 QUIC ring + 异构设备 ✅
 - [ ] 多 worker launcher 脚本：扩展 `run_distributed_2node_smoke.sh` 支持远程 SSH 启动 worker、统一日志收集。
 - [x] 分级 tolerance policy 已落地：`ToleranceTier` 三级（Strict/Relaxed/EndToEnd），`--tolerance-tier` CLI 参数支持切换，correctness report 包含 tier 信息。
-- [ ] **Phase 1: Python Worker SDK + vLLM Adapter MVP**（单节点）
-  - 实现 `HcpVllmWorker`，支持 `Prefill` / `Decode` / `Shutdown`
-  - 暂时不接入 KV ring，先验证控制面通信
-  - Coordinator 连接 Python Worker，跑通 end-to-end 生成
+- [x] **Phase 1: Python Worker SDK 控制面验证**（单节点，commit `dabd6fc`）
+  - ✅ `TransformersBackend` 实现 `HcpWorkerBackend` trait
+  - ✅ `HcpWorkerServer` 事件循环接收 Prefill/Decode/Shutdown，返回 logits
+  - ✅ 简化 Coordinator 端到端生成验证通过
+- [ ] **Phase 1.5: Python Worker SDK + vLLM Adapter MVP**（单节点 vLLM）
+  - 将 `TransformersBackend` 替换为 `VllmBackend`，接入 vLLM `LLMEngine`
+  - 验证 vLLM prefill/decode 输出格式与 HCP 协议兼容
+  - 保持 `NoOpKvTransport`，单节点端到端生成
 - [ ] **Phase 2: vLLM Adapter 接入 Mock KV Transport**
   - 用 `LinkedMockKvTransport` 在单进程内模拟 2-domain
   - 验证 vLLM 输出 + HCP online softmax 合并后数值正确

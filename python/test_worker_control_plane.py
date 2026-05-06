@@ -39,6 +39,16 @@ from hcp_worker_sdk import (
 )
 from hcp_worker_sdk.types import WorkerCommand, WorkerResponse, WorkerHandshake
 
+# Lazy import vllm backend to avoid import error when vllm is not installed
+_VllmBackend = None
+
+def _get_vllm_backend():
+    global _VllmBackend
+    if _VllmBackend is None:
+        from hcp_vllm_worker import VllmBackend
+        _VllmBackend = VllmBackend
+    return _VllmBackend
+
 
 class TransformersBackend(HcpWorkerBackend):
     """用 transformers 实现的简化 backend，用于本地控制面验证。"""
@@ -113,8 +123,14 @@ class TransformersBackend(HcpWorkerBackend):
 
 
 def run_worker(args):
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
-    backend = TransformersBackend(args.model_dir, device)
+    if args.backend == "vllm":
+        backend_cls = _get_vllm_backend()
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        backend = backend_cls(args.model_dir, device)
+    else:
+        device = "mps" if torch.backends.mps.is_available() else "cpu"
+        backend = TransformersBackend(args.model_dir, device)
+
     transport = NoOpKvTransport()
     server = HcpWorkerServer(
         backend=backend,
@@ -227,6 +243,8 @@ def main():
     parser.add_argument("--listen-addr", default="127.0.0.1:29501")
     parser.add_argument("--prompt", default="The answer to life, the universe, and everything is")
     parser.add_argument("--max-tokens", type=int, default=5)
+    parser.add_argument("--backend", default="transformers", choices=["transformers", "vllm"],
+                        help="worker backend to use")
     args = parser.parse_args()
 
     if args.worker:
