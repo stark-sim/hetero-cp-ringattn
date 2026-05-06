@@ -2,6 +2,15 @@
 
 ## 当前焦点
 
+[2026-05-05] **Python Worker SDK Phase 2: 2-domain Mock KV Ring 验证通过**（commit `1cacb35`）。
+- `TransformersBackend` 接入 `past_key_values`（`DynamicCache` for transformers 4.57.6），prefill/decode 均使用 KV cache 增量计算。
+- `get_kv_block` / `apply_peer_kv` 实现按层 seq_start 跟踪，支持 prepend/append 正确拼接 peer KV。
+- 新增 `LinkedMockKvTransport`：内存 queue 单进程模拟 2-domain KV ring 交换。
+- `test_worker_2domain.py` 单进程起 coordinator + 2 worker threads，prefill 分片 → KV ring 交换 → decode 循环 → shutdown 全链路通过。
+- **2-domain 输出与单节点参考完全一致**：` generated: ' in the universe. The'`（tokens: [304, 279, 15494, 13, 576]）。
+- 修复 `seq_start` 全局/本地索引混淆 bug（`get_kv_block` 需按层 `_layer_kv_start` 转换）。
+- 移除 decode 阶段 KV exchange（所有 worker 已同步），避免重复拼接污染 KV cache。
+
 [2026-05-05] **Python Worker SDK Phase 1 控制面验证通过**（commit `dabd6fc`）。
 - 修复 `WorkerResponse` dataclass 字段 `error` 与类方法 `error` 同名冲突（Python dataclass 将类方法作为字段默认值），重命名为 `from_error`。
 - 修复 bytes JSON 序列化：改用 hex 编码替代 `list()`，避免类型歧义。
@@ -442,12 +451,17 @@
   - ✅ `VllmBackend` 接入 vLLM 0.6.4 `LLM` API，在远程 RTX 4090 上加载 Qwen2-0.5B
   - ✅ 控制面 Prefill/Decode/Shutdown 全链路通过，输出与 transformers baseline 一致：` in the universe`
   - ✅ `NoOpKvTransport` 单节点跳过 KV exchange
-- [ ] **Phase 2: vLLM Adapter 接入 Mock KV Transport**
-  - 用 `LinkedMockKvTransport` 在单进程内模拟 2-domain
-  - 验证 vLLM 输出 + HCP online softmax 合并后数值正确
-- [ ] **Phase 3: vLLM Adapter 接入 QUIC Transport**
-  - 用 Python `aioquic` 或 `quinn` Python binding 实现 KvTransport
-  - 双节点：Mac 跑 Rust Worker 0，GPU 跑 Python vLLM Worker 1
+- [x] **Phase 2: Python Worker SDK 2-domain Mock KV Ring 验证**（commit `1cacb35`）
+  - ✅ `LinkedMockKvTransport` 单进程模拟 2-domain KV 交换
+  - ✅ `TransformersBackend` `get_kv_block` / `apply_peer_kv` 正确性验证
+  - ✅ 2-domain 输出与单节点参考完全一致
+- [ ] **Phase 2.5: vLLM Adapter 接入 Mock KV Transport**
+  - `VllmBackend` 当前未实现 `get_kv_block` / `apply_peer_kv`（vLLM PagedAttention KV 格式需要额外转换）
+  - 单进程 2-domain 模拟：验证 vLLM 输出 + HCP KV 合并后数值正确
+- [ ] **Phase 3: Python Worker SDK 接入真实分布式 Transport**
+  - 选项 A：Python `aioquic` / `quinn` binding 实现 `KvTransport`
+  - 选项 B：Python worker 通过 TCP 与 Rust worker 互通（跨语言 KV ring）
+  - 双节点：Mac 跑 Python Worker 0，GPU 跑 Python vLLM Worker 1
 
 ## 重要模式与偏好
 

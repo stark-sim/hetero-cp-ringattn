@@ -4,7 +4,7 @@
 
 验证目标：
 1. LinkedMockKvTransport 能在内存中无损交换 KV block
-2. TransformersBackend 的 get_kv_block / apply_peer_kv / recalculate_logits 正确
+2. Backend 的 get_kv_block / apply_peer_kv 正确
 3. 2-domain 输出与单节点参考一致
 
 用法：
@@ -27,6 +27,16 @@ from typing import List
 from hcp_worker_sdk import HcpWorkerBackend, KvBlock, HcpWorkerServer, LinkedMockKvTransport
 from hcp_worker_sdk.types import WorkerCommand, WorkerResponse, WorkerHandshake
 from test_worker_control_plane import TransformersBackend
+
+# Lazy import vLLM backend
+_VllmBackend = None
+
+def _get_vllm_backend():
+    global _VllmBackend
+    if _VllmBackend is None:
+        from hcp_vllm_worker import VllmBackend
+        _VllmBackend = VllmBackend
+    return _VllmBackend
 
 
 def run_coordinator(args, ref_tokens: List[int], ready_event):
@@ -144,9 +154,14 @@ def run_coordinator(args, ref_tokens: List[int], ready_event):
 
 def run_worker(domain_id: int, model_dir: str, device: str,
                coordinator_addr: str, listen_addr: str,
-               inbox, outbox, next_peer_addr: str = "127.0.0.1:0"):
+               inbox, outbox, next_peer_addr: str = "127.0.0.1:0",
+               backend_name: str = "transformers"):
     import socket
-    backend = TransformersBackend(model_dir, device)
+    if backend_name == "vllm":
+        backend_cls = _get_vllm_backend()
+    else:
+        backend_cls = TransformersBackend
+    backend = backend_cls(model_dir, device)
     transport = LinkedMockKvTransport(inbox, outbox)
     server = HcpWorkerServer(
         backend=backend,
@@ -162,7 +177,7 @@ def run_worker(domain_id: int, model_dir: str, device: str,
     )
 
 
-def compute_reference(args) -> List[int]:
+def compute_reference_transformers(args) -> List[int]:
     """用单节点 transformers 计算贪婪解码参考结果。"""
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -182,16 +197,41 @@ def compute_reference(args) -> List[int]:
     return generated
 
 
+def compute_reference_vllm(args) -> List[int]:
+    """用单节点 vLLM 计算贪婪解码参考结果。"""
+    from vllm import LLM, SamplingParams
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
+    llm = LLM(
+        model=args.model_dir,
+        dtype="float32",
+        trust_remote_code=True,
+        tensor_parallel_size=1,
+    )
+    token_ids = tok.encode(args.prompt, add_special_tokens=False)
+    outputs = llm.generate(
+        prompt_token_ids=[token_ids],
+        sampling_params=SamplingParams(max_tokens=args.max_tokens, temperature=0),
+    )
+    generated = outputs[0].outputs[0].token_ids
+    return list(generated)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--prompt", default="The answer to life, the universe, and everything is")
     parser.add_argument("--max-tokens", type=int, default=5)
     parser.add_argument("--listen-addr", default="127.0.0.1:29500")
+    parser.add_argument("--backend", choices=["transformers", "vllm"], default="transformers")
     args = parser.parse_args()
 
-    print("[main] computing single-node reference...")
-    ref_tokens = compute_reference(args)
+    print(f"[main] computing single-node reference (backend={args.backend})...")
+    if args.backend == "vllm":
+        ref_tokens = compute_reference_vllm(args)
+    else:
+        ref_tokens = compute_reference_transformers(args)
     print(f"[main] reference tokens: {ref_tokens}")
 
     # Two linked queues for mock KV transport
@@ -211,12 +251,12 @@ def main():
     t1 = threading.Thread(
         target=run_worker,
         args=(1, args.model_dir, device, args.listen_addr, "127.0.0.1:29502", q01, q10,
-              "127.0.0.1:29501"),
+              "127.0.0.1:29501", args.backend),
     )
     t0 = threading.Thread(
         target=run_worker,
         args=(0, args.model_dir, device, args.listen_addr, "127.0.0.1:29501", q10, q01,
-              "127.0.0.1:29502"),
+              "127.0.0.1:29502", args.backend),
     )
     t1.start()
     time.sleep(0.5)
