@@ -57,7 +57,10 @@ async def server_task(host: str, port: int):
             )
             await transport._send_kv_block(block_out)
             print("[server] sent back")
+            await writer.drain()
+            await asyncio.sleep(0.2)
             writer.close()
+            await writer.wait_closed()
             result["done"].set()
         asyncio.create_task(handle())
 

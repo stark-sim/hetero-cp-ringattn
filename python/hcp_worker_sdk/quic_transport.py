@@ -80,12 +80,18 @@ class QuicKvTransport(KvTransport):
 
     使用 asyncio StreamReader/Writer 进行读写。
     exchange_kv_block() 是同步接口，内部桥接 async。
+
+    兼容 Rust quinn 的 1-byte dummy handshake：
+    - 发送方首次发送前先写 1 byte \x00
+    - 接收方首次接收前先读 1 byte dummy 并丢弃
     """
 
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, device: torch.device):
         self.reader = reader
         self.writer = writer
         self.device = device
+        self._send_dummy_done = False
+        self._recv_dummy_done = False
 
     @staticmethod
     def _tensor_to_bytes(t: torch.Tensor) -> bytes:
@@ -104,6 +110,12 @@ class QuicKvTransport(KvTransport):
         return t
 
     async def _send_kv_block(self, block: KvBlock) -> None:
+        # Rust quinn workaround: write 1-byte dummy on first send
+        if not self._send_dummy_done:
+            self.writer.write(b"\x00")
+            await self.writer.drain()
+            self._send_dummy_done = True
+
         k_bytes = self._tensor_to_bytes(block.k)
         v_bytes = self._tensor_to_bytes(block.v)
         k_shape = list(block.k.shape)
@@ -124,6 +136,16 @@ class QuicKvTransport(KvTransport):
         await self.writer.drain()
 
     async def _recv_kv_block(self) -> Optional[KvBlock]:
+        # Rust quinn workaround: skip 1-byte dummy on first recv
+        if not self._recv_dummy_done:
+            try:
+                dummy = await self.reader.readexactly(1)
+                if dummy != b"\x00":
+                    pass
+                self._recv_dummy_done = True
+            except (asyncio.IncompleteReadError, ConnectionResetError):
+                return None
+
         try:
             len_bytes = await self.reader.readexactly(4)
         except (asyncio.IncompleteReadError, ConnectionResetError):
