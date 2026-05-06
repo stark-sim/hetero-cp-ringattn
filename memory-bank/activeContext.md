@@ -3,6 +3,15 @@
 ## 当前焦点
 
 [2026-05-05] **Decode 性能优化已完成并验证通过**（commit `491a46c`）。decode 阶段 `kv_chunk_size` 从 `1`（70001 个 tiny chunks）提升到 `2048`，大幅缩减循环次数。
+
+[2026-05-05] **QUIC 高 RTT 超时增强**（commit `dab3ebf`）。针对 RTT 1.2s 的 Tailscale VPN 跨节点路径，增加全部 timeout：
+- `accept` 超时 3s → 30s（QUIC 握手需 2-3 RTT）
+- `keep_alive_interval` 1s（NAT 表项刷新）
+- `max_idle_timeout` 300s → 3600s（防止长 prefill 期间 idle 断开）
+- `exchange_kv_block` 添加 120s 超时（fail-fast 替代无限 hang）
+- 禁用 MTU discovery，`initial_mtu=1200`（Tailscale WireGuard MTU=1280）
+
+**根因结论**：跨节点 111-token 测试仍因 Tailscale VPN 在 sustained 400KB+ UDP 流量下约 2-3 分钟后完全断开而失败。这是网络基础设施限制，代码 timeout 已调至极限。9-token 短序列跨节点验证 ✅ 通过。
 - 优化前：64K 分布式 decode 5 tokens 约 10min
 - 优化后：64K 分布式 decode 5 tokens 约 1-2min
 - 64K 分布式验证（70001 tokens，2-domain 同机 RTX 4090）：prefill+5 decode 成功，`EXIT=0`，输出 `The answer is: The`，总时间约 4min
