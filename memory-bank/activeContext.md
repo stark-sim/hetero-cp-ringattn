@@ -27,7 +27,12 @@
 **跨节点异构验证状态**：
 - ✅ 本地同机 8K MPS+CPU 分布式 prefill+decode 成功（`generated: The quick brown fox jumps`）
 - ✅ 跨节点 Mac MPS + RTX 4090 CUDA 9-token decode 成功（`generated: I am a`），验证异构设备间 QUIC KV ring 交换正常
-- ⚠️ 跨节点长序列（>100 tokens）受限于 Tailscale VPN 带宽（0.47Mbps, RTT 1.2s），prefill KV 传输预计需 10+ 分钟至数小时，不适合交互式测试
+- ✅ 跨节点异构验证矩阵（网络恢复后 RTT ~380ms）：
+  - 9 tokens: ~60s ✅
+  - 111 tokens: ~8min ✅ (`The quick brown fox jumps`)
+  - 221 tokens: ~15min ✅ (`How many times does the`)
+  - **551 tokens: ~30min ✅** (`What is the sentiment of`)
+- Mac MPS + RTX 4090 CUDA 跨节点 QUIC KV ring 交换在 551-token（~3.5MB KV block）下稳定工作
 
 **关键修复与优化**：
 1. **`quic_transport.rs` + `backend.rs` 64K 分布式死锁修复**（commit `f1b1040`）：`stream_receive_window=128MB` < 64K KV block（224MB），双方同时 `write_all` 填满 send buffer 后互相等待 → 死锁。代码层：`KvTransport` trait 新增 `exchange_kv_block()`，`QuicKvTransport` 用 `tokio::join!` 并发 send+recv；配置层：`stream_receive_window=512MB`、`receive_window=1GB`、`send_window=1GB`。

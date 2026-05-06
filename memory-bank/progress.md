@@ -166,7 +166,12 @@
 - [x] [2026-05-05] **跨节点异构 decode 端到端验证**：Mac MPS + RTX 4090 CUDA 跨 VPN 完成 9-token prompt + 3 decode tokens，`generated: I am a`，exit code 0。验证了异构设备间 QUIC KV ring 交换正常。
 - [x] [2026-05-05] **本地同机异构 8K 验证**：Mac MPS + CPU 同机 2-domain 完成 8801-token prefill + 5 decode，`generated: The quick brown fox jumps`。验证了代码逻辑正确性和 MPS GPU 使用。
 - [x] [2026-05-05] **QUIC 高 RTT 超时增强**（commit `dab3ebf`）：accept 30s、keep_alive 1s、idle 3600s、exchange 120s 超时、MTU 1200。全部 timeout 已调至极限。
-- [2026-05-05] **跨节点长序列根因确认**：111-token 跨节点测试反复失败，根因为 Tailscale VPN 在 sustained 400KB+ UDP 流量下约 2-3 分钟后完全断开（SSH 也超时）。这是网络基础设施限制，非代码问题。9-token 短序列 ✅ 通过。
+- [x] [2026-05-05] **跨节点异构验证矩阵**（网络恢复后 RTT ~380ms）：
+  - 9 tokens: ~60s ✅ (`I am a`)
+  - 111 tokens: ~8min ✅ (`The quick brown fox jumps`)
+  - 221 tokens: ~15min ✅ (`How many times does the`)
+  - **551 tokens: ~30min ✅** (`What is the sentiment of`)
+- Mac MPS + RTX 4090 CUDA 跨节点 QUIC KV ring 交换在 551-token（~3.5MB KV block）下稳定工作。
 
 ## 里程碑
 
