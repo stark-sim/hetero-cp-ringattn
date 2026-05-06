@@ -43,10 +43,15 @@ project-root/
 │   │   ├── compute_runtime.rs         # ComputeRuntime trait（Tch/NoOp）
 │   │   ├── kv_transport.rs            # KvTransport trait + Mock/Tcp/Quic 实现
 │   │   ├── quic_transport.rs          # QuicKvTransport（quinn-based）
-│   │   ├── distributed_worker.rs      # 多进程分布式 worker
+│   │   ├── distributed_worker.rs      # 多进程分布式 worker（薄壳：解析参数 → 创建后端 → 运行 runtime）
 │   │   ├── distributed_coordinator.rs # 多进程分布式 coordinator
 │   │   ├── distributed_protocol.rs    # WorkerCommand/WorkerResponse 协议
 │   │   ├── infer.rs                   # inference CLI
+│   │   ├── worker_sdk/                # Rust Worker SDK：协议层 + 传输层 与 模型计算层 解耦
+│   │   │   ├── backend.rs             # WorkerBackend trait：框架接入点
+│   │   │   ├── runtime.rs             # WorkerRuntime<B>：QUIC 协议循环、handshake、command loop
+│   │   │   ├── tch_backend.rs         # TchWorkerBackend：默认 tch-rs 实现
+│   │   │   └── mod.rs                 # 模块导出
 │   │   └── model/                     # 真实模型实现
 │   │       ├── mod.rs
 │   │       ├── model.rs               # LlamaModel、Generator、DecoderLayer
@@ -151,6 +156,53 @@ Layer 1: HCP 协议层（可复用 SDK）
 - `server.py`: `HcpWorkerServer` 通用事件循环
 
 详见 `docs/PLUGIN_ARCHITECTURE.md` 和 `docs/VLLM_INTEGRATION.md`。
+
+### Rust Worker SDK（新增）
+
+`rust/src/worker_sdk/` 将 `distributed_worker.rs` 中原有的**协议循环 + 模型计算**紧耦合代码彻底解耦为三层：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  distributed_worker.rs（薄壳）                               │
+│  解析 CLI 参数 → 选择 device → 加载 TchWorkerBackend          │
+│  → 创建 WorkerRuntime → run()                                │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  WorkerRuntime<B: WorkerBackend>（协议层，完全可复用）         │
+│  - QUIC endpoint 管理、handshake、command loop                │
+│  - WorkerCommand 分发：Prefill / Decode / SyncGlobalSeqLen    │
+│  - KvTransport 生命周期管理（每层一个 QuicKvTransport）        │
+│  - 与 B 完全无关，换 backend 不需要改 runtime 代码            │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  WorkerBackend trait（模型面接口）                            │
+│  load() / prefill() / decode() / sync_global_seq_len()       │
+│  / capacity_mb() / setup_kv_transports()                    │
+└─────────────────────────────────────────────────────────────┘
+                              │
+              ┌───────────────┼───────────────┐
+              ▼               ▼               ▼
+┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
+│ TchWorkerBackend│ │ VllmWorkerBackend│ │ TensorRTBackend │
+│ （默认 tch-rs）  │ │ （未来）          │ │ （未来）          │
+└─────────────────┘ └─────────────────┘ └─────────────────┘
+```
+
+**解耦目的**：
+1. **关注点分离**：协议循环（QUIC 连接管理、handshake、command 解析、超时处理）与模型计算（tensor forward、KV cache 管理、RoPE 应用）完全独立。协议工程师不需要理解 LlamaModel 内部，模型工程师不需要理解 QUIC 帧格式。
+2. **框架接入零侵入**：外部框架（vLLM、TensorRT-LLM、MLX）只需实现 `WorkerBackend` trait，即可接入完整的 HCP 分布式网络，复用 `WorkerRuntime` 的协议层和 `KvTransport` 的传输层。无需 fork 或修改 HCP 核心代码。
+3. **零行为变更**：`TchWorkerBackend` 内部仍调用 `LlamaModel::forward`、`setup_distributed_domain`、`capacity::query_device_capacity_mb`，与重构前 `domain_worker_loop` 的行为完全一致。`cargo test` 42/42 通过验证无回归。
+4. **单进程多 domain 不变**：`distributed_worker.rs` 仍通过 `Arc<ModelWeights>` + `shallow_clone` 在多个 domain thread 间共享权重，每个 domain 独立 `LlamaModel` + `KvCaches` + `WorkerRuntime`。
+5. **性能无损**：`WorkerRuntime` 内部继续使用 `QuicKvTransport::exchange_kv_block`（`tokio::join!` 并发 send+recv + 512MB stream window），没有增加额外的网络往返、tensor 拷贝或 trait object dispatch 开销。prefill/decode 的耗时与重构前在同一数量级。
+
+**验证矩阵**：
+- `test_distributed_llama_model_prefill` — 2-layer GQA prefill，diff=2.79e-6 ✅
+- `test_distributed_llama_model_decode` — 4-step 连续 decode，每步 diff ~2e-6 ✅
+- `test_distributed_generator_tokens_match_reference` — 4-step greedy decode，domain0/domain1 token 一致，logits diff ~1e-5 ✅
 
 ## 组件关系
 

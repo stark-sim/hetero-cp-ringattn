@@ -176,6 +176,8 @@
 ## 新增：部署指南与可插拔架构
 
 - [x] [2026-05-05] **Rust Worker SDK 实现完成**：`worker_sdk/backend.rs` (`WorkerBackend` trait)、`worker_sdk/runtime.rs` (`WorkerRuntime<B>` 协议循环)、`worker_sdk/tch_backend.rs` (`TchWorkerBackend` 默认 tch-rs 后端)、`distributed_worker.rs` 重构为薄壳（解析参数 → 创建后端 → 运行 runtime）。`cargo test` 42/42 通过，SDK 相关 clippy 警告已清理。
+  - 解耦目的：协议层与模型计算层完全分离，外部框架（vLLM/TensorRT-LLM/MLX）只需实现 `WorkerBackend` trait 即可接入 HCP 分布式网络。
+  - 验证：分布式 prefill（`test_distributed_llama_model_prefill` diff=2.79e-6 ✅）、4-step decode（`test_distributed_llama_model_decode` diff~2e-6 ✅）、generator token 一致性（`test_distributed_generator_tokens_match_reference` logits diff~1e-5 ✅）。
 - [x] [2026-04-30] **手动部署指南** (`docs/DEPLOYMENT_GUIDE.md`)：从零开始的手动部署文档，覆盖：
   - 单节点本地部署（Mac MPS / GPU CUDA 独立验证）
   - 双节点异构部署（Mac MPS + remote RTX 4090 CUDA）完整步骤
