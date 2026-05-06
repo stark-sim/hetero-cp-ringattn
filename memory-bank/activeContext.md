@@ -4,6 +4,13 @@
 
 [2026-05-05] **Rust Worker SDK 重构完成并验证通过**（commit `dfbb517` + `02230d0`）。`distributed_worker.rs` 解耦为协议运行时 (`WorkerRuntime`) + 可插拔后端 (`WorkerBackend` trait) + 默认 tch-rs 后端 (`TchWorkerBackend`）。`cargo test` 42/42 通过，`cargo check` 通过。SDK 相关 clippy 警告已清理。解耦目的已记录于 `systemPatterns.md`。
 
+**跨节点异构验证已通过**（commit `8ab45b7` 后，RUN_ID=`cross-node-2domain-20260506-150240`）：
+- Mac MPS (domain 0, worker 0) + RTX 4090 CUDA (domain 1, worker 1) 跨 VPN 完成 11-token prompt + 5 decode tokens
+- Coordinator `generated: The quick brown fox jumps`，exit code 0
+- 总耗时 ~40s（含模型加载和网络握手）
+- Worker 0/1 prefill → KV ring 交换 → decode → shutdown 全部正常
+- 验证了解耦后 `WorkerRuntime` + `TchWorkerBackend` 在真实异构环境中的端到端正确性
+
 **性能回归测试已完成**（真实 Qwen2-0.5B 权重，commit `02230d0` 后）：
 
 | 配置 | Prompt | Decode | 时间 | 历史基准 | 结论 |
