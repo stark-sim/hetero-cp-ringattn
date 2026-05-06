@@ -1104,7 +1104,7 @@ mod tests {
         tch::manual_seed(555);
 
         // Create GqaAttention
-        let mut gqa = super::super::layers::GqaAttention {
+        let gqa = super::super::layers::GqaAttention {
             q_proj: Tensor::randn([(num_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),
             k_proj: Tensor::randn([(num_kv_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),
             v_proj: Tensor::randn([(num_kv_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),

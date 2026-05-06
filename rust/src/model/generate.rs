@@ -254,7 +254,6 @@ impl DistributedGenerator {
 #[cfg(test)]
 #[cfg(feature = "tch-backend")]
 mod tests {
-    use super::*;
     use crate::model::{
         config::ModelConfig,
         model::LlamaModel,
@@ -295,7 +294,7 @@ mod tests {
         let num_domains = 2usize;
         let num_layers = config.num_layers;
 
-        let mut ref_model = LlamaModel::from_weights(config.clone(), weights, device, 1).unwrap();
+        let ref_model = LlamaModel::from_weights(config.clone(), weights, device, 1).unwrap();
         let mut domain0 = LlamaModel::from_weights(config.clone(), weights, device, num_domains).unwrap();
         let mut domain1 = LlamaModel::from_weights(config.clone(), weights, device, num_domains).unwrap();
 

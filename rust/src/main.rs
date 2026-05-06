@@ -13,6 +13,8 @@ mod infer;
 mod model;
 mod protocol;
 mod tch_backend;
+#[cfg(feature = "tch-backend")]
+mod worker_sdk;
 
 use serde::Serialize;
 use std::collections::BTreeMap;

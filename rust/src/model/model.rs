@@ -68,7 +68,7 @@ impl LlamaModel {
                 config.rms_norm_eps,
             )?;
 
-            let attention = GqaAttention::from_weights(weights, layer_idx, &config, &rope)?;
+            let _attention = GqaAttention::from_weights(weights, layer_idx, &config, &rope)?;
             let mlp = Mlp::from_weights(weights, layer_idx)?;
 
             // Always use HcpRingAttentionBackend (even for single-node).

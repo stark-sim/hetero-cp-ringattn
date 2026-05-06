@@ -59,6 +59,7 @@ pub fn deserialize<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, St
 /// Uses a manual retry loop instead of `write_all` to handle
 /// `ErrorKind::WouldBlock` / `ErrorKind::Interrupted` on high-latency
 /// links where TCP send buffers may temporarily stall.
+#[allow(dead_code)]
 pub fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> Result<(), String> {
     let len = payload.len() as u32;
     let mut buf = Vec::with_capacity(4 + payload.len());
@@ -99,6 +100,7 @@ pub fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> Result<(), String>
 }
 
 /// Read a length-prefixed frame from a stream.
+#[allow(dead_code)]
 pub fn read_frame(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
     let mut len_bytes = [0u8; 4];
     stream
@@ -116,24 +118,28 @@ pub fn read_frame(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
 }
 
 /// Send a command to a stream.
+#[allow(dead_code)]
 pub fn send_command(stream: &mut TcpStream, cmd: &WorkerCommand) -> Result<(), String> {
     let bytes = serialize(cmd)?;
     write_frame(stream, &bytes)
 }
 
 /// Receive a command from a stream.
+#[allow(dead_code)]
 pub fn recv_command(stream: &mut TcpStream) -> Result<WorkerCommand, String> {
     let bytes = read_frame(stream)?;
     deserialize(&bytes)
 }
 
 /// Send a response to a stream.
+#[allow(dead_code)]
 pub fn send_response(stream: &mut TcpStream, resp: &WorkerResponse) -> Result<(), String> {
     let bytes = serialize(resp)?;
     write_frame(stream, &bytes)
 }
 
 /// Receive a response from a stream.
+#[allow(dead_code)]
 pub fn recv_response(stream: &mut TcpStream) -> Result<WorkerResponse, String> {
     let bytes = read_frame(stream)?;
     deserialize(&bytes)
@@ -169,6 +175,7 @@ impl WorkerHandshake {
 }
 
 /// Write a handshake to a stream.
+#[allow(dead_code)]
 pub fn write_handshake(stream: &mut TcpStream, handshake: &WorkerHandshake) -> Result<(), String> {
     stream
         .write_all(&handshake.to_bytes())
@@ -176,6 +183,7 @@ pub fn write_handshake(stream: &mut TcpStream, handshake: &WorkerHandshake) -> R
 }
 
 /// Read a handshake from a stream.
+#[allow(dead_code)]
 pub fn read_handshake(stream: &mut TcpStream) -> Result<WorkerHandshake, String> {
     let mut buf = [0u8; WorkerHandshake::SIZE];
     stream

@@ -78,7 +78,7 @@ fn main() {
     let n_repeat = if target_tokens <= unit_len {
         1
     } else {
-        1 + (target_tokens - unit_len + delta - 1) / delta
+        1 + (target_tokens - unit_len).div_ceil(delta)
     };
 
     // Build large text and encode once

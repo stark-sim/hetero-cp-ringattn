@@ -1,6 +1,6 @@
 //! QUIC-based KV transport for distributed ring attention.
 use crate::model::kv_transport::{KvBlock, KvTransport};
-use quinn::{ClientConfig, Endpoint, RecvStream, SendStream, ServerConfig, VarInt};
+use quinn::{ClientConfig, Endpoint, RecvStream, SendStream, ServerConfig};
 use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use std::net::SocketAddr;

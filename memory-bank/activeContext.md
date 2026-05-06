@@ -2,6 +2,8 @@
 
 ## 当前焦点
 
+[2026-05-05] **Rust Worker SDK 重构完成并验证通过**（commit `2195592` + clippy 清理）。`distributed_worker.rs` 解耦为协议运行时 (`WorkerRuntime`) + 可插拔后端 (`WorkerBackend` trait) + 默认 tch-rs 后端 (`TchWorkerBackend`)。`cargo test` 42/42 通过，`cargo check` 通过。SDK 相关 clippy 警告已清理：`VarInt` 未使用导入、`write_frame`/`read_frame` 死代码、`_attention` 未使用变量、`gen_prompt.rs` `manual_div_ceil`、`.into_iter()` 冗余调用。
+
 [2026-05-05] **Decode 性能优化已完成并验证通过**（commit `491a46c`）。decode 阶段 `kv_chunk_size` 从 `1`（70001 个 tiny chunks）提升到 `2048`，大幅缩减循环次数。
 
 [2026-05-05] **QUIC 高 RTT 超时增强**（commit `dab3ebf`）。针对 RTT 1.2s 的 Tailscale VPN 跨节点路径，增加全部 timeout：
