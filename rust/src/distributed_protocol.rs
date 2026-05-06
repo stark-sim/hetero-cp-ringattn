@@ -330,3 +330,41 @@ pub fn accept_with_retry(listener: &std::net::TcpListener, attempts: usize, dela
     }
     unreachable!()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_bincode_format() {
+        let cmd = WorkerCommand::Prefill {
+            chunk: vec![1, 2, 3],
+            seq_offset: 0,
+        };
+        let bytes = bincode::serialize(&cmd).unwrap();
+        println!("Prefill cmd: {:?}", bytes);
+
+        let cmd2 = WorkerCommand::Decode(42);
+        let bytes2 = bincode::serialize(&cmd2).unwrap();
+        println!("Decode cmd: {:?}", bytes2);
+
+        let cmd3 = WorkerCommand::SyncGlobalSeqLen(11);
+        let bytes3 = bincode::serialize(&cmd3).unwrap();
+        println!("SyncGlobalSeqLen cmd: {:?}", bytes3);
+
+        let cmd4 = WorkerCommand::Shutdown;
+        let bytes4 = bincode::serialize(&cmd4).unwrap();
+        println!("Shutdown cmd: {:?}", bytes4);
+
+        let resp = WorkerResponse::PrefillDone {
+            last_logits_bytes: vec![0xAB, 0xCD],
+            global_seq_len: 11,
+        };
+        let rbytes = bincode::serialize(&resp).unwrap();
+        println!("PrefillDone resp: {:?}", rbytes);
+
+        // WorkerHandshake: domain_id(u64 LE) + capacity_mb(u64 LE) = 16 bytes
+        let hs_bytes: Vec<u8> = vec![0,0,0,0,0,0,0,0, 0,16,0,0,0,0,0,0];
+        println!("Handshake (expected): {:?}", hs_bytes);
+    }
+}
