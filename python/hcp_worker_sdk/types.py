@@ -108,9 +108,9 @@ class WorkerResponse:
     def to_dict(self) -> dict:
         d = {"kind": self.kind}
         if self.last_logits_bytes is not None:
-            d["last_logits_bytes"] = list(self.last_logits_bytes)
+            d["last_logits_bytes"] = self.last_logits_bytes.hex()
         if self.logits_bytes is not None:
-            d["logits_bytes"] = list(self.logits_bytes)
+            d["logits_bytes"] = self.logits_bytes.hex()
         if self.global_seq_len is not None:
             d["global_seq_len"] = self.global_seq_len
         if self.error is not None:
@@ -121,8 +121,8 @@ class WorkerResponse:
     def from_dict(cls, d: dict) -> "WorkerResponse":
         return cls(
             kind=d["kind"],
-            last_logits_bytes=bytes(d["last_logits_bytes"]) if "last_logits_bytes" in d else None,
-            logits_bytes=bytes(d["logits_bytes"]) if "logits_bytes" in d else None,
+            last_logits_bytes=bytes.fromhex(d["last_logits_bytes"]) if "last_logits_bytes" in d else None,
+            logits_bytes=bytes.fromhex(d["logits_bytes"]) if "logits_bytes" in d else None,
             global_seq_len=d.get("global_seq_len"),
             error=d.get("error"),
         )
@@ -146,5 +146,5 @@ class WorkerResponse:
         )
 
     @classmethod
-    def error(cls, message: str) -> "WorkerResponse":
+    def from_error(cls, message: str) -> "WorkerResponse":
         return cls(kind="Error", error=message)

@@ -26,6 +26,13 @@ class KvTransport(ABC):
         pass
 
 
+class NoOpKvTransport(KvTransport):
+    """不实际交换 KV 的 stub transport（Phase 1 控制面验证用）。"""
+
+    def exchange_kv_block(self, block: KvBlock) -> Optional[KvBlock]:
+        return None
+
+
 class TcpKvTransport(KvTransport):
     """基于 TCP socket 的 KV block 传输。"""
 

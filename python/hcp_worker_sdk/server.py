@@ -55,8 +55,9 @@ class HcpWorkerServer:
             listen_addr: "host:port"，本 worker 监听 peer 连接的地址
             next_peer_addr: "host:port"，下一个 peer 的地址
         """
-        # 1. 建立 peer 连接（先 listen 或先 connect，取决于 domain_id）
-        self._setup_peer_connections(listen_addr, next_peer_addr)
+        # 1. 建立 peer 连接（单节点模式跳过）
+        if self.num_domains > 1:
+            self._setup_peer_connections(listen_addr, next_peer_addr)
 
         # 2. 连接 coordinator
         self._connect_coordinator(coordinator_addr)
@@ -86,7 +87,7 @@ class HcpWorkerServer:
                 print(f"[worker {self.domain_id}] shutting down")
                 break
             else:
-                resp = WorkerResponse.error(f"unknown command: {cmd.kind}")
+                resp = WorkerResponse.from_error(f"unknown command: {cmd.kind}")
 
             if resp is not None:
                 self._send_response(resp)
@@ -126,6 +127,9 @@ class HcpWorkerServer:
         2. 通过 transport 与 peer 交换
         3. 将收到的 peer KV 合并到当前层
         """
+        if self.num_domains <= 1:
+            return  # 单节点模式跳过 KV exchange
+
         for layer_idx in range(self.backend.num_layers):
             seq_start = self.seq_offset
             seq_end = self.global_seq_len if prefill else self.seq_offset + self.backend.num_layers
