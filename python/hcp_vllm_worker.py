@@ -29,7 +29,7 @@ class VllmBackend(HcpWorkerBackend):
             trust_remote_code=True,
             tensor_parallel_size=1,
         )
-        self.vocab_size = self.llm.llm_engine.model_config.vocab_size
+        self.vocab_size = self.llm.llm_engine.model_config.get_vocab_size()
         self._history: List[int] = []
         print(f"[vllm backend] loaded, vocab_size={self.vocab_size}")
 
