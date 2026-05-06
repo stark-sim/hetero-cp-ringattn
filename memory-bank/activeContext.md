@@ -455,9 +455,11 @@
   - ✅ `LinkedMockKvTransport` 单进程模拟 2-domain KV 交换
   - ✅ `TransformersBackend` `get_kv_block` / `apply_peer_kv` 正确性验证
   - ✅ 2-domain 输出与单节点参考完全一致
-- [ ] **Phase 2.5: vLLM Adapter 接入 Mock KV Transport**
-  - `VllmBackend` 当前未实现 `get_kv_block` / `apply_peer_kv`（vLLM PagedAttention KV 格式需要额外转换）
-  - 单进程 2-domain 模拟：验证 vLLM 输出 + HCP KV 合并后数值正确
+- [x] **Phase 2.5: vLLM Adapter 控制面流程验证**（commit `fd8649c` + `417d66d`）
+  - `VllmBackend` 接入 vLLM 0.6.4 `LLM` API，控制面 Prefill/Decode/Shutdown 全链路通过
+  - 参考 tokens 统一使用 transformers 计算（vLLM `LLM` API 不支持细粒度 KV cache 提取）
+  - **单卡 2-domain vLLM 不可行**：vLLM `gpu_memory_utilization` 基于总显存比例，第一个实例加载后 (~8-10GB) 导致第二个实例 `kv_cache_size` 为负。即使降至 0.15 仍 OOM。Phase 2.5 目标调整为验证控制面流程正确性，非真实 KV ring 交换
+  - 真实 KV ring 需 Phase 3 接入 vLLM `LLMEngine` 底层 API 或多卡环境
 - [ ] **Phase 3: Python Worker SDK 接入真实分布式 Transport**
   - 选项 A：Python `aioquic` / `quinn` binding 实现 `KvTransport`
   - 选项 B：Python worker 通过 TCP 与 Rust worker 互通（跨语言 KV ring）
