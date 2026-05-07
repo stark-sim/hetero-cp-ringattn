@@ -191,11 +191,14 @@
   - `test_quic_kv_ring_concurrent.py`: 并发 send+recv 无死锁 ✅
   - `test_two_python_workers_quic.py`: 2 个 mock worker + Rust coordinator 全链路通过 ✅
   - 关键修复：aioquic client 创建 stream 后需写 1-byte dummy 触发 server `stream_handler`；`exchange_kv_block` 改用并发 send+recv
-- [x] [2026-05-07] **Phase 3.3: 跨机器异构端到端代码框架完成**（commit `8a4a907`）：
+- [x] [2026-05-07] **Phase 3.3: 跨机器异构端到端验证通过**（commit `6b6265f`）：
   - `python/hcp_transformers_quic_worker.py`: Mac 端 TransformersBackend worker
   - `python/test_transformers_2domain_quic.py`: 本地同机 2-domain 分布式验证通过 ✅
   - `scripts/run_python_distributed_2node.sh`: 自动化跨机器启动脚本（Mac+GPU）
-  - 远程 GPU 网络阻塞：无法访问 HuggingFace，模型下载失败。待网络恢复后重跑即可验证。
+  - 远程 GPU 通过 `HTTP_PROXY=http://127.0.0.1:7890` 下载模型，vLLM 加载成功
+  - **验证结果**：Mac CPU (worker 0, capacity=4096 MB) + RTX 4090 CUDA (worker 1, capacity=14467 MB)
+  - Coordinator `generated: . I am`，vLLM decode ~155 it/s
+  - 控制面 QUIC+bincode，数据面 QUIC KV ring，全部正常
 - [x] [2026-05-05] **Rust Worker SDK 实现完成**：`worker_sdk/backend.rs` (`WorkerBackend` trait)、`worker_sdk/runtime.rs` (`WorkerRuntime<B>` 协议循环)、`worker_sdk/tch_backend.rs` (`TchWorkerBackend` 默认 tch-rs 后端)、`distributed_worker.rs` 重构为薄壳（解析参数 → 创建后端 → 运行 runtime）。`cargo test` 42/42 通过，SDK 相关 clippy 警告已清理。
   - 解耦目的：协议层与模型计算层完全分离，外部框架（vLLM/TensorRT-LLM/MLX）只需实现 `WorkerBackend` trait 即可接入 HCP 分布式网络。
   - 单元测试验证：分布式 prefill（`test_distributed_llama_model_prefill` diff=2.79e-6 ✅）、4-step decode（`test_distributed_llama_model_decode` diff~2e-6 ✅）、generator token 一致性（`test_distributed_generator_tokens_match_reference` logits diff~1e-5 ✅）。

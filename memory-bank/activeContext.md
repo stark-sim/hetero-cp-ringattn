@@ -493,14 +493,16 @@
   - 关键修复：aioquic server 只在收到 STREAM 数据帧时才调用 `stream_handler`，client 创建 stream 后需立即写 1-byte dummy 触发 server 回调
   - `QuicKvTransport.exchange_kv_block` 改用并发 send+recv（`asyncio.gather`），避免经典 ring 死锁
 
-- [x] **Phase 3.3: 跨机器异构端到端代码框架完成**（commit `8a4a907`）
+- [x] **Phase 3.3: 跨机器异构端到端验证通过**（commit `6b6265f`）
   - `python/hcp_transformers_quic_worker.py`: Mac 端 TransformersBackend worker，完整 QuicWorkerServer 接入
   - `python/test_transformers_2domain_quic.py`: 本地同机 2-domain TransformersBackend 分布式验证通过 ✅（`generated: . I am`）
   - `scripts/run_python_distributed_2node.sh`: 自动化跨机器启动脚本
     - Mac: coordinator (0.0.0.0:26001) + worker 0 (TransformersBackend, domain 0)
     - Remote GPU: worker 1 (VllmBackend, domain 1) via SSH
-    - 网络预检查：远程无法访问 HuggingFace 时打印警告
-  - **阻塞点**：远程 GPU (`100.64.0.2`) 当前无法访问互联网（curl 到 huggingface.co 和 google.com 均超时），vLLM 模型下载失败。待网络恢复后重跑脚本即可验证端到端。
+    - 远程通过 `HTTP_PROXY=http://127.0.0.1:7890` 下载 HuggingFace 模型
+  - **验证结果**：Mac CPU (worker 0, capacity=4096 MB) + RTX 4090 CUDA (worker 1, capacity=14467 MB)
+  - Coordinator `generated: . I am`，vLLM decode ~155 it/s
+  - 控制面 QUIC+bincode，数据面 QUIC KV ring，全部正常
 
 - [ ] **Phase 3.4: vLLM 真实 KV 提取**
   - vLLM 0.6.4 `LLM` API 不暴露 KV cache，需接入 `LLMEngine` 底层 API
@@ -530,8 +532,8 @@
 
 ## 当前阻塞
 
-- [2026-05-07] **Phase 3.1 + 3.2 已完成**。Python bincode + QUIC 控制面 + Python↔Python QUIC KV ring 交换全部验证通过。
-- [2026-05-07] **Phase 3.3 阻塞**：远程 GPU (`100.64.0.2`) 当前无法访问互联网（curl 到 huggingface.co / google.com 均超时），vLLM 模型下载失败。代码框架和启动脚本已全部就绪，待网络恢复后执行 `bash scripts/run_python_distributed_2node.sh` 即可验证跨机器异构端到端。
+- [2026-05-07] **Phase 3.1 + 3.2 + 3.3 全部完成**。Python bincode + QUIC 控制面 + Python↔Python QUIC KV ring 交换 + 跨机器异构端到端全部验证通过。
+- [2026-05-07] **跨机器异构端到端通过**（commit `6b6265f`）：Mac (TransformersBackend/CPU) + Remote RTX 4090 (VllmBackend/CUDA)，Tailscale VPN，控制面 QUIC+bincode，数据面 QUIC KV ring。Coordinator `generated: . I am`。vLLM decode ~155 it/s。
 - [2026-05-02] **单卡多 worker 显存上限不变**：权重共享只能省一份权重 (~4.6GB)，但 LM head output 和 KV cache 仍按 domain 数倍增。2 domain × 8K 同卡 ≈ 2×(4.64GB LM head + KV) + 4.6GB 权重 ≈ 14GB+，仍可能 OOM。大 seq 必须多卡分布。
 - [2026-04-24] 当前沙箱环境不允许 Python worker 绑定本地端口，完整 Python smoke 会触发 `PermissionError: [Errno 1] Operation not permitted`。
 - [2026-04-24] `ringattn_controller.py` 当前会将 `bytes` 放入 `json.dumps` payload，导致 `TypeError: Object of type bytes is not JSON serializable`。
