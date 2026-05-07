@@ -86,11 +86,11 @@ class QuicKvTransport(KvTransport):
     - 接收方首次接收前先读 1 byte dummy 并丢弃
     """
 
-    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, device: torch.device):
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, device: torch.device, dummy_sent: bool = False):
         self.reader = reader
         self.writer = writer
         self.device = device
-        self._send_dummy_done = False
+        self._send_dummy_done = dummy_sent
         self._recv_dummy_done = False
 
     @staticmethod
@@ -171,22 +171,34 @@ class QuicKvTransport(KvTransport):
             v=v,
         )
 
-    def exchange_kv_block(self, block: KvBlock) -> Optional[KvBlock]:
-        """同步接口：先发后收。"""
-        async def _exchange():
-            await self._send_kv_block(block)
-            return await self._recv_kv_block()
+    async def _exchange_kv_block(self, block: KvBlock) -> Optional[KvBlock]:
+        """并发 send+recv，避免双方同时 send 导致的死锁。"""
+        send_task = asyncio.create_task(self._send_kv_block(block))
+        recv_task = asyncio.create_task(self._recv_kv_block())
+        done, pending = await asyncio.wait(
+            [send_task, recv_task],
+            return_when=asyncio.ALL_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
+        send_task.result()  # raise if send failed
+        return recv_task.result()
 
+    def exchange_kv_block(self, block: KvBlock) -> Optional[KvBlock]:
+        """同步接口：并发 send+recv。
+
+        若当前无运行中的事件循环则新建一个运行；
+        若已有事件循环则直接在该 loop 内执行（调用方需确保不会阻塞）。
+        """
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            return asyncio.run(_exchange())
+            return asyncio.run(self._exchange_kv_block(block))
 
-        # 如果已有运行中的事件循环，用线程池桥接
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            future = pool.submit(asyncio.run, _exchange())
-            return future.result()
+        # 当前已有事件循环：直接调度到该 loop（适用于 Jupyter / asyncio 环境）
+        return asyncio.run_coroutine_threadsafe(
+            self._exchange_kv_block(block), loop
+        ).result()
 
 
 async def create_quic_server(host: str, port: int) -> tuple:
@@ -224,15 +236,22 @@ async def create_quic_server(host: str, port: int) -> tuple:
     return connected_event, accepted_streams, server_task
 
 
-async def create_quic_client(host: str, port: int) -> tuple:
+async def create_quic_client(host: str, port: int, send_dummy: bool = True) -> tuple:
     """创建 QUIC client，返回 (reader, writer, connection_manager)。
 
     使用 async with 管理 connection 生命周期：
         async with create_quic_client(...) as (reader, writer, conn):
             ...
+
+    注意：默认创建 stream 后立即写 1-byte dummy，触发 server 端 stream_handler。
+    aioquic server 只在收到 STREAM 数据帧时才调用 stream_handler。
+    若 send_dummy=False，由调用方自行处理握手（例如 QuicKvTransport 内部）。
     """
     configuration = QuicConfiguration(is_client=True, verify_mode=ssl.CERT_NONE)
     connection_manager = connect(host, port, configuration=configuration)
     connection = await connection_manager.__aenter__()
     reader, writer = await connection.create_stream()
+    if send_dummy:
+        writer.write(b"\x00")
+        await writer.drain()
     return reader, writer, connection_manager
