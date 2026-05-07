@@ -43,15 +43,16 @@ echo ""
 # --- Kill existing processes on exit ---
 cleanup() {
     echo "[cleanup] stopping local processes..."
-    kill $COORD_PID $WORKER0_PID 2>/dev/null || true
-    ssh "${GPU_USER}@${GPU_ADDR}" "pkill -f 'hcp_vllm_quic_worker'" 2>/dev/null || true
+    kill ${COORD_PID:-} ${WORKER0_PID:-} 2>/dev/null || true
+    ssh "${GPU_USER}@${GPU_ADDR}" "bash -lc 'pkill -f hcp_vllm_quic_worker'" 2>/dev/null || true
 }
 trap cleanup EXIT
 
 # --- Start Coordinator (local Mac) ---
 echo "[local] starting coordinator on 0.0.0.0:$COORD_PORT..."
 DYLD_LIBRARY_PATH="/Users/stark_sim/libtorch/lib" \
-cargo run --features tch-backend --bin hcp-ringattn-rust -- \
+cargo run --manifest-path "$PROJECT_ROOT/rust/Cargo.toml" \
+    --features tch-backend --bin hcp-ringattn-rust -- \
     --distributed-role coordinator \
     --model-dir "$MODEL_DIR_ABS" \
     --prompt "$PROMPT" \
@@ -62,11 +63,21 @@ cargo run --features tch-backend --bin hcp-ringattn-rust -- \
 COORD_PID=$!
 sleep 4
 
+# --- Pre-flight: remote network check ---
+echo "[remote] checking network access on $GPU_ADDR..."
+NET_OK=$(ssh "${GPU_USER}@${GPU_ADDR}" "bash -lc 'curl -s -o /dev/null -w %{http_code} --max-time 5 https://huggingface.co || echo 000'" 2>/dev/null || echo "000")
+if [ "$NET_OK" != "200" ]; then
+    echo "WARNING: Remote GPU cannot reach HuggingFace (http_code=$NET_OK)."
+    echo "         Model download will fail. Ensure remote has internet access"
+    echo "         or pre-download the model to ~/hetero-cp-ringattn/models/Qwen2-0.5B"
+fi
+
 # --- Start Worker 1 on remote GPU via SSH ---
 echo "[remote] starting worker 1 on $GPU_ADDR..."
 ssh "${GPU_USER}@${GPU_ADDR}" "bash -lc '
-    cd ~/hetero-cp-ringattn
+    source /home/stark/miniconda3/etc/profile.d/conda.sh
     conda activate vllm
+    cd ~/hetero-cp-ringattn
     python python/hcp_vllm_quic_worker.py \
         --model-dir Qwen/Qwen2-0.5B \
         --coordinator-host $MAC_ADDR \
@@ -80,7 +91,7 @@ ssh "${GPU_USER}@${GPU_ADDR}" "bash -lc '
     echo worker1_pid=\$!
 '" &
 REMOTE_SSH_PID=$!
-sleep 3
+sleep 5
 
 # --- Start Worker 0 on local Mac ---
 echo "[local] starting worker 0 (TransformersBackend)..."
