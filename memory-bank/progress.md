@@ -184,7 +184,18 @@
   - `python/hcp_worker_sdk/bincode.py`: 手写 bincode 1.3 兼容编解码器（enum tag u32 LE, usize/i64/u64 8-byte LE, Vec 8-byte len prefix）。6 个单元测试与 Rust `bincode::serialize` 输出逐 byte 匹配 ✅。
   - `python/hcp_worker_sdk/quic_control.py`: `QuicControlClient` 基于 `aioquic`，Handshake 16-byte LE + Command/Response [4-byte BE length][bincode payload]，与 Rust `distributed_protocol.rs` 完全互通。
   - `python/test_python_worker_rust_coord.py`: mock worker 端到端测试，完整控制面流程 Handshake → Prefill → SyncGlobalSeqLen → 3×Decode → Shutdown 通过 ✅。
-  - `python/hcp_vllm_quic_worker.py`: vLLM backend QUIC worker，命令行参数支持 `--model-dir`/`--coordinator-host`/`--coordinator-port`/`--domain-id`，ready for 远程 GPU 部署。
+  - `python/hcp_vllm_quic_worker.py`: vLLM backend QUIC worker，ready for 远程 GPU 部署。
+- [x] [2026-05-07] **Phase 3.2: Python↔Python QUIC KV ring 交换验证**（commit `24d1fb8`）：
+  - `python/hcp_worker_sdk/quic_server.py`: `QuicWorkerServer` 同时支持 QUIC 控制面（coordinator）和 QUIC 数据面（peer KV ring）
+  - `test_quic_kv_ring.py`: 基础 Python↔Python KV block roundtrip ✅
+  - `test_quic_kv_ring_concurrent.py`: 并发 send+recv 无死锁 ✅
+  - `test_two_python_workers_quic.py`: 2 个 mock worker + Rust coordinator 全链路通过 ✅
+  - 关键修复：aioquic client 创建 stream 后需写 1-byte dummy 触发 server `stream_handler`；`exchange_kv_block` 改用并发 send+recv
+- [x] [2026-05-07] **Phase 3.3: 跨机器异构端到端代码框架完成**（commit `8a4a907`）：
+  - `python/hcp_transformers_quic_worker.py`: Mac 端 TransformersBackend worker
+  - `python/test_transformers_2domain_quic.py`: 本地同机 2-domain 分布式验证通过 ✅
+  - `scripts/run_python_distributed_2node.sh`: 自动化跨机器启动脚本（Mac+GPU）
+  - 远程 GPU 网络阻塞：无法访问 HuggingFace，模型下载失败。待网络恢复后重跑即可验证。
 - [x] [2026-05-05] **Rust Worker SDK 实现完成**：`worker_sdk/backend.rs` (`WorkerBackend` trait)、`worker_sdk/runtime.rs` (`WorkerRuntime<B>` 协议循环)、`worker_sdk/tch_backend.rs` (`TchWorkerBackend` 默认 tch-rs 后端)、`distributed_worker.rs` 重构为薄壳（解析参数 → 创建后端 → 运行 runtime）。`cargo test` 42/42 通过，SDK 相关 clippy 警告已清理。
   - 解耦目的：协议层与模型计算层完全分离，外部框架（vLLM/TensorRT-LLM/MLX）只需实现 `WorkerBackend` trait 即可接入 HCP 分布式网络。
   - 单元测试验证：分布式 prefill（`test_distributed_llama_model_prefill` diff=2.79e-6 ✅）、4-step decode（`test_distributed_llama_model_decode` diff~2e-6 ✅）、generator token 一致性（`test_distributed_generator_tokens_match_reference` logits diff~1e-5 ✅）。
