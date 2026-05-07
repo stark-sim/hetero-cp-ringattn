@@ -105,13 +105,23 @@ class QuicWorkerServer:
             return
 
         if self.domain_id == 0:
-            # Domain 0 connects to next_peer first
+            # Domain 0 connects to next_peer first (with retry for slow remote startup)
             print(f"[worker {self.domain_id}] connecting to peer {next_host}:{next_port}...")
-            reader, writer, conn_mgr = await create_quic_client(next_host, next_port, send_dummy=True)
-            self.kv_transport = QuicKvTransport(reader, writer, self.device, dummy_sent=True)
-            # Store conn_mgr to keep connection alive
-            self._peer_conn_mgr = conn_mgr
-            print(f"[worker {self.domain_id}] peer connected")
+            for attempt in range(1, 31):
+                try:
+                    reader, writer, conn_mgr = await asyncio.wait_for(
+                        create_quic_client(next_host, next_port, send_dummy=True),
+                        timeout=10.0,
+                    )
+                    self.kv_transport = QuicKvTransport(reader, writer, self.device, dummy_sent=True)
+                    self._peer_conn_mgr = conn_mgr
+                    print(f"[worker {self.domain_id}] peer connected")
+                    break
+                except (ConnectionError, asyncio.TimeoutError) as e:
+                    print(f"[worker {self.domain_id}] peer connect attempt {attempt}/30 failed: {e}")
+                    await asyncio.sleep(2.0)
+            else:
+                raise ConnectionError(f"failed to connect to peer {next_host}:{next_port} after 30 attempts")
         else:
             # Domain N listens first
             print(f"[worker {self.domain_id}] listening for peer on {listen_host}:{listen_port}...")
