@@ -96,8 +96,9 @@ REMOTE_SSH_PID=$!
 sleep 5
 
 # --- Start Worker 0 on local Mac ---
-echo "[local] starting worker 0 (TransformersBackend)..."
-python python/hcp_transformers_quic_worker.py \
+echo "[local] starting worker 0 (vLLM Metal backend)..."
+VLLM_PLUGINS=metal \
+~/.venv-vllm-metal/bin/python python/hcp_vllm_quic_worker.py \
     --model-dir "$MODEL_DIR_ABS" \
     --coordinator-host 127.0.0.1 \
     --coordinator-port $COORD_PORT \

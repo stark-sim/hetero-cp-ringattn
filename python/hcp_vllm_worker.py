@@ -9,10 +9,28 @@ vLLM Backend for HCP Worker SDK — Phase 1.5 MVP
 - 性能非目标（每次 decode 都重新 prefill），先验证控制面通信可行。
 """
 
+import inspect
 import torch
 from typing import List, Tuple
 
 from hcp_worker_sdk import HcpWorkerBackend, KvBlock
+
+
+def _vllm_generate(llm, token_ids, sampling_params):
+    """兼容 vLLM 0.6.x 和 0.20.x 的 generate() API。"""
+    sig = inspect.signature(llm.generate)
+    if "prompt_token_ids" in sig.parameters:
+        # vLLM 0.6.x
+        return llm.generate(
+            prompt_token_ids=token_ids,
+            sampling_params=sampling_params,
+        )
+    else:
+        # vLLM 0.20.x: prompts 参数接受 list[int] (token IDs)
+        return llm.generate(
+            prompts=[token_ids],
+            sampling_params=sampling_params,
+        )
 
 
 class VllmBackend(HcpWorkerBackend):
@@ -44,9 +62,10 @@ class VllmBackend(HcpWorkerBackend):
         from vllm import SamplingParams
 
         self._history = list(chunk)
-        outputs = self.llm.generate(
-            prompt_token_ids=self._history,
-            sampling_params=SamplingParams(max_tokens=1, temperature=0),
+        outputs = _vllm_generate(
+            self.llm,
+            self._history,
+            SamplingParams(max_tokens=1, temperature=0),
         )
         completion = outputs[0].outputs[0]
         token_id = completion.token_ids[0]
@@ -65,9 +84,10 @@ class VllmBackend(HcpWorkerBackend):
         from vllm import SamplingParams
 
         self._history.append(token)
-        outputs = self.llm.generate(
-            prompt_token_ids=self._history,
-            sampling_params=SamplingParams(max_tokens=1, temperature=0),
+        outputs = _vllm_generate(
+            self.llm,
+            self._history,
+            SamplingParams(max_tokens=1, temperature=0),
         )
         completion = outputs[0].outputs[0]
         token_id = completion.token_ids[0]
