@@ -75,13 +75,11 @@ fi
 # --- Start Worker 1 on remote GPU via SSH ---
 echo "[remote] starting worker 1 on $GPU_ADDR..."
 ssh "${GPU_USER}@${GPU_ADDR}" "bash -lc '
-    source /home/stark/miniconda3/etc/profile.d/conda.sh
-    conda activate vllm
-    export HTTP_PROXY=http://127.0.0.1:7890
-    export HTTPS_PROXY=http://127.0.0.1:7890
+    export PATH=\"\$HOME/.local/bin:\$PATH\"
+    source ~/venv-vllm/bin/activate
     cd ~/hetero-cp-ringattn
     python python/hcp_vllm_quic_worker.py \
-        --model-dir Qwen/Qwen2-0.5B \
+        --model-dir models/Qwen2-0.5B \
         --coordinator-host $MAC_ADDR \
         --coordinator-port $COORD_PORT \
         --domain-id 1 \
