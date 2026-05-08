@@ -199,6 +199,12 @@
   - **验证结果**：Mac CPU (worker 0, capacity=4096 MB) + RTX 4090 CUDA (worker 1, capacity=14467 MB)
   - Coordinator `generated: . I am`，vLLM decode ~155 it/s
   - 控制面 QUIC+bincode，数据面 QUIC KV ring，全部正常
+- [x] [2026-05-08] **Mac 端 vLLM Metal backend 安装并单节点验证通过**（commit `b3e7c95`）：
+  - vllm-metal 0.2.0 + vLLM 0.20.1+cpu 通过 install.sh 安装在 `~/.venv-vllm-metal`
+  - `VllmBackend` 新增 `_vllm_generate()` 适配层，兼容 vLLM 0.6.x (`prompt_token_ids`) 和 0.20.x (`prompts`)
+  - Mac worker 使用 vllm-metal 运行，模型加载在 **MPS (Metal GPU)** 上
+  - 单节点测试：coordinator + vllm-metal worker，Prefill + 3×Decode + Shutdown 全部正常，输出 `generated: ! I'm`
+  - **跨机器 E2E 待 VPN 恢复后验证**：Mac vllm-metal (MPS) + Remote RTX 4090 vLLM 0.6.4 (CUDA)
 - [x] [2026-05-05] **Rust Worker SDK 实现完成**：`worker_sdk/backend.rs` (`WorkerBackend` trait)、`worker_sdk/runtime.rs` (`WorkerRuntime<B>` 协议循环)、`worker_sdk/tch_backend.rs` (`TchWorkerBackend` 默认 tch-rs 后端)、`distributed_worker.rs` 重构为薄壳（解析参数 → 创建后端 → 运行 runtime）。`cargo test` 42/42 通过，SDK 相关 clippy 警告已清理。
   - 解耦目的：协议层与模型计算层完全分离，外部框架（vLLM/TensorRT-LLM/MLX）只需实现 `WorkerBackend` trait 即可接入 HCP 分布式网络。
   - 单元测试验证：分布式 prefill（`test_distributed_llama_model_prefill` diff=2.79e-6 ✅）、4-step decode（`test_distributed_llama_model_decode` diff~2e-6 ✅）、generator token 一致性（`test_distributed_generator_tokens_match_reference` logits diff~1e-5 ✅）。

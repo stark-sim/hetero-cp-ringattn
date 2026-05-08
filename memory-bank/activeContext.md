@@ -504,6 +504,13 @@
   - Coordinator `generated: . I am`，vLLM decode ~155 it/s
   - 控制面 QUIC+bincode，数据面 QUIC KV ring，全部正常
 
+- [x] **Mac 端 vLLM Metal backend 已安装并单节点验证通过**（commit `b3e7c95`）
+  - vllm-metal 0.2.0 + vLLM 0.20.1+cpu 安装在 `~/.venv-vllm-metal`
+  - `VllmBackend` 新增 `_vllm_generate()` 适配层，同时兼容 vLLM 0.6.x (`prompt_token_ids`) 和 0.20.x (`prompts`)
+  - Mac worker 脚本 `hcp_vllm_quic_worker.py` 通过 vllm-metal 运行，模型加载在 **MPS (Metal GPU)** 上
+  - 单节点测试：coordinator + vllm-metal worker，Prefill + 3×Decode + Shutdown 全部正常，输出 `generated: ! I'm`
+  - **跨机器 E2E 待 VPN 恢复后验证**：Mac vllm-metal (MPS) + Remote RTX 4090 vLLM 0.6.4 (CUDA)
+
 - [ ] **Phase 3.4: vLLM 真实 KV 提取**
   - vLLM 0.6.4 `LLM` API 不暴露 KV cache，需接入 `LLMEngine` 底层 API
   - PagedAttention KV 格式转换需避免性能损失
