@@ -137,6 +137,9 @@
 - [2026-04-30] projection weights 已从 deterministic 初始化升级为支持外部 JSON 权重加载（`HCP_WEIGHTS_JSON`）；RoPE、LayerNorm、o_proj、residual 均已接入 protocol；M5 目标已完成。
 - [2026-04-26] 3-node remote CP query chunk smoke 的一次失败根因是 Mac 子网地址从 `192.168.8.204` 变化到 `192.168.8.239`；后续重跑已通过。后续 remote smoke 前应先用 `ifconfig | rg 'inet 192\.168\.8\.'` 确认当前 Mac 地址。
 - [2026-04-30] GPU host 当前 VPN 地址为 `100.118.253.68`，Mac 本机 VPN 地址为 `100.121.35.138`；LAN 地址 `192.168.8.172` / `192.168.8.239` 目前不可达。remote smoke 需使用当前可达地址。
+- [2026-05-09] **远程 GPU 已切换到 white**（100.64.0.2, user stark）。sd-1（100.64.0.93）因网络/代理不稳定弃用。
+- [2026-05-09] **vllm-metal EngineCore 子进程残留**：父进程异常退出时 EngineCore 子进程可能未清理（macOS spawn 模式）。已添加 `pkill -9 -f EngineCore` 清理逻辑，待添加优雅退出 handler。
+- [2026-05-09] **vllm-metal 初始化时间长**：首次 gloo init ~60s + Metal kernel warmup ~10-20s（M1 Pro）。预热后约 8-10s。QUIC peer accept 超时已从 30s 延长到 180s 覆盖。
 - [2026-05-01] 网络环境切换：CUDA 节点通过 `user@sd-1`（IP `100.64.0.93`）访问，Mac 本机当前可达地址为 `100.64.0.95`；remote smoke 需使用 IP 地址（`GPU_HOST=100.64.0.93`），因为 Rust socket 解析不支持主机名。
 - [2026-05-01] 3-node remote CP smoke 通过：`RUN_ID=rust-remote-cp-sd1-ip2-20260501 PORT_BASE=29430 GPU_HOST=100.64.0.93 GPU_USER=user MAC_NODE_ADDR=100.64.0.95`；node0/node2 MPS 全部 bridge `code=2 12/12`，node1 CUDA 全部 bridge `code=3 12/12`；tch compute checksum 分别为 71.35 / 238.88 / 406.41。
 - [x] [2026-05-01] Transport trait 重构后 3-node regression 验证通过：`PORT_BASE=29250 GPU_HOST=100.64.0.93 GPU_USER=user MAC_NODE_ADDR=100.64.0.95`；全部节点 `sent=8 received=8 compute_updates=12`，C++ bridge 与 tch bridge 全部 `12/12` pass；checksum 与重构前完全一致（71.35 / 238.88 / 406.41），未引入 regression。
@@ -204,7 +207,18 @@
   - `VllmBackend` 新增 `_vllm_generate()` 适配层，兼容 vLLM 0.6.x (`prompt_token_ids`) 和 0.20.x (`prompts`)
   - Mac worker 使用 vllm-metal 运行，模型加载在 **MPS (Metal GPU)** 上
   - 单节点测试：coordinator + vllm-metal worker，Prefill + 3×Decode + Shutdown 全部正常，输出 `generated: ! I'm`
-  - **跨机器 E2E 待 VPN 恢复后验证**：Mac vllm-metal (MPS) + Remote RTX 4090 vLLM 0.6.4 (CUDA)
+- [x] [2026-05-09] **远程 GPU 从 sd-1 切换到 white**（100.64.0.2, user stark, RTX 4090）：sd-1 有网络/代理不稳定问题。white 环境已搭建完成。
+- [x] [2026-05-09] **Python 包管理全面迁移到 uv**：本地 Mac `~/.venv-vllm-metal`，远程 white `~/venv-vllm`。不再使用 conda。
+- [x] [2026-05-09] **white 远程环境搭建完成**：uv 0.11.7, Python 3.11.15, torch 2.5.1+cu124, vLLM 0.6.4, transformers 4.45.2, aioquic 1.3.0。model.safetensors 已复制到 white。
+- [x] [2026-05-09] **vllm-metal 跨机器 E2E 超时根因定位**：worker 0 (Mac vllm-metal) 初始化 81s > worker 1 (white) peer accept 30s 超时，导致 worker 1 先退出。已修改 `quic_server.py` 超时（peer connect 10→30s, peer accept 30→180s）。
+- [x] [2026-05-09] **vllm-metal EngineCore spawn 保护**：macOS 默认 spawn 模式，入口脚本必须有 `if __name__ == '__main__':` 保护，否则 EngineCore 子进程重新导入主模块导致递归崩溃。
+- [x] [2026-05-09] **跨机器异构 E2E 验证通过（vllm-metal + white RTX 4090）**：`scripts/run_python_distributed_2node.sh` 成功运行，Mac vllm-metal (MPS, 预热后 8.39s 初始化) + white RTX 4090 (vLLM 0.6.4 CUDA) 完整端到端通过。Coordinator 输出 `generated: . I am`。QUIC 控制面 + 数据面双链路稳定，异构后端协同正常。
+- [x] [2026-05-09] **大规模跨机器验证矩阵完成**（一个节点一个 worker，Mac vllm-metal + white RTX 4090）：
+  - T0 回归（2 tokens + 3 decode）：`. I am` ✅ ~40s
+  - T1 规模（111 tokens + 5 decode）：`quick brown fox jumps over` ✅ ~2min
+  - T2 极限（551 tokens + 5 decode）：`100 dog.` ✅ ~40s
+  - 性能亮点：white RTX 4090 551-token prefill 达 968 tok/s，decode 105-109 it/s；vllm-metal warm-up 后 276-token prefill 仅 1.10s
+  - 与 Rust 基线对比：Python Worker SDK + vLLM 侧 551 tokens 仅需 ~40s，远低于 Rust 基线 ~30min（vLLM optimized kernels 优势明显）
 - [x] [2026-05-05] **Rust Worker SDK 实现完成**：`worker_sdk/backend.rs` (`WorkerBackend` trait)、`worker_sdk/runtime.rs` (`WorkerRuntime<B>` 协议循环)、`worker_sdk/tch_backend.rs` (`TchWorkerBackend` 默认 tch-rs 后端)、`distributed_worker.rs` 重构为薄壳（解析参数 → 创建后端 → 运行 runtime）。`cargo test` 42/42 通过，SDK 相关 clippy 警告已清理。
   - 解耦目的：协议层与模型计算层完全分离，外部框架（vLLM/TensorRT-LLM/MLX）只需实现 `WorkerBackend` trait 即可接入 HCP 分布式网络。
   - 单元测试验证：分布式 prefill（`test_distributed_llama_model_prefill` diff=2.79e-6 ✅）、4-step decode（`test_distributed_llama_model_decode` diff~2e-6 ✅）、generator token 一致性（`test_distributed_generator_tokens_match_reference` logits diff~1e-5 ✅）。
@@ -251,4 +265,5 @@
 | M5+: 单进程多 domain worker | 已完成 | [2026-05-02] 本地 CPU 验证通过 |
 | M5++: 统一 QUIC 控制面 | 已完成 | [2026-05-03] 本地 CPU + 远程 4090 CUDA 验证通过 |
 | M5+++: 跨节点异构 worker CP | **已完成** | [2026-05-05] Mac MPS + RTX 4090 CUDA prefill ✅、decode 端到端 ✅（9-token prompt + 3 decode tokens） |
-| M6: 扩展性论证 | **进行中** | [2026-05-05] 32K 单节点 ✅、32K 分布式 ✅、64K 单节点 ✅、64K 分布式 ✅、128K 待验证 |
+| M6: 扩展性论证 | **已完成** | [2026-05-05] 32K/64K/131067 单节点 ✅、32K/64K 分布式 ✅ |
+| M7: Python Worker SDK + vLLM 异构 E2E | **进行中** | [2026-05-09] Mac vllm-metal + white RTX 4090 vLLM 跨机器测试，超时问题已定位修复中 |
