@@ -28,6 +28,7 @@ MAX_TOKENS="${MAX_TOKENS:-3}"
 COORD_PORT=26001
 PEER_PORT0=26091
 PEER_PORT1=26092
+CHUNK_SIZES="${CHUNK_SIZES:-}"
 
 # Abs path for remote reference
 MODEL_DIR_ABS="$(cd "$PROJECT_ROOT" && realpath "$MODEL_DIR")"
@@ -43,13 +44,26 @@ echo ""
 # --- Kill existing processes on exit ---
 cleanup() {
     echo "[cleanup] stopping local processes..."
+    # Graceful shutdown: SIGTERM first, give workers time to clean up EngineCore
     kill ${COORD_PID:-} ${WORKER0_PID:-} 2>/dev/null || true
     ssh "${GPU_USER}@${GPU_ADDR}" "bash -lc 'pkill -f hcp_vllm_quic_worker'" 2>/dev/null || true
+    sleep 2
+    # Fallback: only if graceful shutdown failed and EngineCore still alive
+    local residual=$(ps aux | grep -c '[E]ngineCore' || true)
+    if [ "$residual" -gt 0 ] 2>/dev/null; then
+        echo "[cleanup] fallback: force-killing residual EngineCore processes"
+        pkill -9 -f EngineCore 2>/dev/null || true
+    fi
 }
 trap cleanup EXIT
 
 # --- Start Coordinator (local Mac) ---
 echo "[local] starting coordinator on 0.0.0.0:$COORD_PORT..."
+COORD_EXTRA_ARGS=()
+if [ -n "$CHUNK_SIZES" ]; then
+    COORD_EXTRA_ARGS+=("--chunk-sizes" "$CHUNK_SIZES")
+    echo "[local] using uneven chunks: $CHUNK_SIZES"
+fi
 DYLD_LIBRARY_PATH="/Users/stark_sim/libtorch/lib" \
 cargo run --manifest-path "$PROJECT_ROOT/rust/Cargo.toml" \
     --features tch-backend --bin hcp-ringattn-rust -- \
@@ -59,6 +73,7 @@ cargo run --manifest-path "$PROJECT_ROOT/rust/Cargo.toml" \
     --max-tokens "$MAX_TOKENS" \
     --num-domains 2 \
     --listen-addr "0.0.0.0:$COORD_PORT" \
+    "${COORD_EXTRA_ARGS[@]}" \
     >"$PROJECT_ROOT/reports/coordinator.log" 2>&1 &
 COORD_PID=$!
 sleep 4

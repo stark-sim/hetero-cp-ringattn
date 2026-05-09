@@ -52,6 +52,7 @@ class QuicWorkerServer:
         peer_listen_port: int,
         next_peer_host: str,
         next_peer_port: int,
+        shutdown_event: Optional[asyncio.Event] = None,
     ) -> None:
         """Main worker event loop."""
         # 1. Setup peer connection (before coordinator, to avoid deadlock)
@@ -71,6 +72,10 @@ class QuicWorkerServer:
 
         # 3. Command loop
         while True:
+            if shutdown_event is not None and shutdown_event.is_set():
+                print(f"[worker {self.domain_id}] shutdown event received, exiting command loop")
+                break
+
             cmd = await self.control_client.recv_command()
             kind = cmd["kind"]
             print(f"[worker {self.domain_id}] received: {kind}")
@@ -93,6 +98,26 @@ class QuicWorkerServer:
 
         await self.control_client.close()
 
+    async def cleanup(self) -> None:
+        """Cleanup QUIC connections and peer resources."""
+        print(f"[worker {self.domain_id}] cleaning up connections...")
+        if self.control_client is not None:
+            try:
+                await self.control_client.close()
+            except Exception as e:
+                print(f"[worker {self.domain_id}] control client close warning: {e}")
+        if hasattr(self, "_peer_conn_mgr"):
+            try:
+                self._peer_conn_mgr.close()
+            except Exception as e:
+                print(f"[worker {self.domain_id}] peer conn mgr close warning: {e}")
+        if hasattr(self, "_peer_server_task"):
+            try:
+                self._peer_server_task.cancel()
+            except Exception as e:
+                print(f"[worker {self.domain_id}] peer server task cancel warning: {e}")
+        print(f"[worker {self.domain_id}] cleanup done")
+
     async def _setup_peer_connection(
         self,
         listen_host: str,
@@ -111,7 +136,7 @@ class QuicWorkerServer:
                 try:
                     reader, writer, conn_mgr = await asyncio.wait_for(
                         create_quic_client(next_host, next_port, send_dummy=True),
-                        timeout=10.0,
+                        timeout=30.0,
                     )
                     self.kv_transport = QuicKvTransport(reader, writer, self.device, dummy_sent=True)
                     self._peer_conn_mgr = conn_mgr
@@ -126,7 +151,7 @@ class QuicWorkerServer:
             # Domain N listens first
             print(f"[worker {self.domain_id}] listening for peer on {listen_host}:{listen_port}...")
             connected_event, accepted_streams, server_task = await create_quic_server(listen_host, listen_port)
-            await asyncio.wait_for(connected_event.wait(), timeout=30.0)
+            await asyncio.wait_for(connected_event.wait(), timeout=180.0)
             reader, writer = accepted_streams[0]
             self.kv_transport = QuicKvTransport(reader, writer, self.device)
             self._peer_server_task = server_task

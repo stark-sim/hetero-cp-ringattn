@@ -219,6 +219,17 @@
   - T2 极限（551 tokens + 5 decode）：`100 dog.` ✅ ~40s
   - 性能亮点：white RTX 4090 551-token prefill 达 968 tok/s，decode 105-109 it/s；vllm-metal warm-up 后 276-token prefill 仅 1.10s
   - 与 Rust 基线对比：Python Worker SDK + vLLM 侧 551 tokens 仅需 ~40s，远低于 Rust 基线 ~30min（vLLM optimized kernels 优势明显）
+- [x] [2026-05-09] **EngineCore 优雅退出实现并验证**：
+  - `VllmBackend.shutdown()` 跨版本 cleanup（vLLM 0.6.x / 0.20.x）
+  - `QuicWorkerServer` 支持 `shutdown_event` 信号中断
+  - `hcp_vllm_quic_worker.py` SIGTERM/SIGINT handler + finally cleanup
+  - cleanup 脚本改为先 graceful、后 fallback
+  - E2E 验证无 EngineCore 残留 ✅
+- [x] [2026-05-09] **更长序列不均等分片验证（25% Mac / 75% CUDA）**：
+  - T3: 1024 tokens + 5 decode, chunk-sizes 256,768 → `jumps over the lazy dog` ✅
+  - T4: 2048 tokens + 5 decode, chunk-sizes 512,1536 → `dog jumps over the lazy` ✅
+  - Mac MPS 512-token prefill 1.69s (303 tok/s)，white RTX 4090 1536-token prefill ~0.32s (4788 tok/s)
+  - 验证了 coordinator `--chunk-sizes` 不均等分片在跨机器异构场景下稳定工作
 - [x] [2026-05-05] **Rust Worker SDK 实现完成**：`worker_sdk/backend.rs` (`WorkerBackend` trait)、`worker_sdk/runtime.rs` (`WorkerRuntime<B>` 协议循环)、`worker_sdk/tch_backend.rs` (`TchWorkerBackend` 默认 tch-rs 后端)、`distributed_worker.rs` 重构为薄壳（解析参数 → 创建后端 → 运行 runtime）。`cargo test` 42/42 通过，SDK 相关 clippy 警告已清理。
   - 解耦目的：协议层与模型计算层完全分离，外部框架（vLLM/TensorRT-LLM/MLX）只需实现 `WorkerBackend` trait 即可接入 HCP 分布式网络。
   - 单元测试验证：分布式 prefill（`test_distributed_llama_model_prefill` diff=2.79e-6 ✅）、4-step decode（`test_distributed_llama_model_decode` diff~2e-6 ✅）、generator token 一致性（`test_distributed_generator_tokens_match_reference` logits diff~1e-5 ✅）。

@@ -18,6 +18,7 @@ Usage:
 import argparse
 import asyncio
 import os
+import signal
 import sys
 
 import torch
@@ -45,11 +46,37 @@ async def run_worker(
     print(f"[vllm worker] loaded, vocab_size={backend.vocab_size}, capacity={backend.capacity_mb} MB")
 
     server = QuicWorkerServer(backend, domain_id, num_domains, torch.device(device))
-    await server.run(
-        coordinator_host, coordinator_port,
-        peer_listen_host, peer_listen_port,
-        next_peer_host, next_peer_port,
-    )
+
+    # Graceful shutdown: signal handler sets event, command loop checks it
+    shutdown_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def _signal_handler():
+        sig_name = "SIGTERM" if signal.SIGTERM in (signal.SIGTERM,) else "signal"
+        print(f"[worker] received {sig_name}, initiating graceful shutdown...")
+        shutdown_event.set()
+
+    loop.add_signal_handler(signal.SIGTERM, _signal_handler)
+    loop.add_signal_handler(signal.SIGINT, _signal_handler)
+
+    try:
+        await server.run(
+            coordinator_host, coordinator_port,
+            peer_listen_host, peer_listen_port,
+            next_peer_host, next_peer_port,
+            shutdown_event=shutdown_event,
+        )
+    finally:
+        print("[worker] running cleanup...")
+        await server.cleanup()
+        backend.shutdown()
+        # Remove signal handlers to avoid re-entry issues
+        try:
+            loop.remove_signal_handler(signal.SIGTERM)
+            loop.remove_signal_handler(signal.SIGINT)
+        except Exception:
+            pass
+        print("[worker] graceful shutdown complete")
 
 
 def main():

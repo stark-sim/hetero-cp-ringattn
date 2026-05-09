@@ -48,5 +48,14 @@
   - T1 规模（111 tokens + 5 decode）：`quick brown fox jumps over` ✅ ~2min
   - T2 极限（551 tokens + 5 decode）：`100 dog.` ✅ ~40s
   - 关键发现：vllm-metal warm-up 后 551-token prefill 仅 1.10s（276 tok），white RTX 4090 达 968 tok/s prefill + 105-109 it/s decode。Python Worker SDK 侧跨机器性能远超 Rust 基线（Rust 551 tokens ~30min）。
-- [ ] **EngineCore 子进程优雅退出**：在 `hcp_vllm_quic_worker.py` 中添加 signal/atexit handler，确保父进程退出时正确关闭 LLM EngineCore（当前 cleanup 用 `pkill -9` 粗暴终止）
+- [x] [2026-05-09] **EngineCore 子进程优雅退出完成**：
+  - `VllmBackend.shutdown()` 添加跨版本兼容 cleanup（stop_remote_worker_execution_loop、del llm、gc.collect、CUDA empty_cache、psutil 终止 EngineCore 子进程）
+  - `QuicWorkerServer.run()` 支持 `shutdown_event` 参数，command loop 可响应外部信号
+  - `hcp_vllm_quic_worker.py` 注册 SIGTERM/SIGINT handler，finally 块调用 `server.cleanup()` + `backend.shutdown()`
+  - `run_python_distributed_2node.sh` cleanup 改为先 SIGTERM、sleep 2s、仅残留时 fallback 到 `pkill -9`
+  - E2E 验证无 EngineCore 残留 ✅
+- [x] [2026-05-09] **更长序列验证完成（25% Mac / 75% CUDA 分片）**：
+  - T3: 1024 tokens + 5 decode, chunk-sizes 256,768 → `jumps over the lazy dog` ✅
+  - T4: 2048 tokens + 5 decode, chunk-sizes 512,1536 → `dog jumps over the lazy` ✅
+  - Mac MPS 512-token prefill 1.69s (303 tok/s)，white RTX 4090 1536-token prefill ~0.32s (4788 tok/s)
 - [ ] **Phase 3.4: vLLM 真实 KV 提取**（长期）：vLLM 0.6.4/0.20.x `LLM` API 不暴露 KV cache，需探索 `LLMEngine` 底层 API 或 vllm-metal 的 MLX KV cache 访问

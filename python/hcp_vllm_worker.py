@@ -125,3 +125,59 @@ class VllmBackend(HcpWorkerBackend):
         hidden = getattr(self.llm.llm_engine.model_config.hf_config, "hidden_size", 896)
         heads = getattr(self.llm.llm_engine.model_config.hf_config, "num_attention_heads", 14)
         return hidden // heads
+
+    def shutdown(self) -> None:
+        """Gracefully shutdown the vLLM backend and release resources."""
+        print("[vllm backend] shutting down...")
+
+        # Try to stop remote worker execution loop (vLLM 0.6.x)
+        try:
+            engine = getattr(self.llm, "llm_engine", None)
+            if engine:
+                if hasattr(engine, "stop_remote_worker_execution_loop"):
+                    engine.stop_remote_worker_execution_loop()
+                    print("[vllm backend] stopped remote worker execution loop")
+                executor = getattr(engine, "model_executor", None)
+                if executor and hasattr(executor, "shutdown"):
+                    executor.shutdown()
+                    print("[vllm backend] shutdown model executor")
+        except Exception as e:
+            print(f"[vllm backend] engine shutdown warning: {e}")
+
+        # Release LLM reference
+        try:
+            del self.llm
+            import gc
+            gc.collect()
+            print("[vllm backend] LLM reference released")
+        except Exception as e:
+            print(f"[vllm backend] LLM release warning: {e}")
+
+        # Clear CUDA cache
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+                print("[vllm backend] CUDA cache cleared")
+            except Exception as e:
+                print(f"[vllm backend] CUDA cache clear warning: {e}")
+
+        # For vllm-metal (multiprocessing.spawn), terminate EngineCore child processes
+        try:
+            import psutil
+            current = psutil.Process()
+            for child in current.children(recursive=True):
+                name = child.name()
+                if "EngineCore" in name or "engine" in name.lower():
+                    print(f"[vllm backend] terminating child PID={child.pid} ({name})")
+                    child.terminate()
+                    try:
+                        child.wait(timeout=5)
+                    except psutil.TimeoutExpired:
+                        print(f"[vllm backend] child PID={child.pid} did not terminate, killing")
+                        child.kill()
+        except ImportError:
+            pass  # psutil not available
+        except Exception as e:
+            print(f"[vllm backend] child process cleanup warning: {e}")
+
+        print("[vllm backend] shutdown complete")
