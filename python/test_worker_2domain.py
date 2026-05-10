@@ -94,12 +94,19 @@ def run_coordinator(args, ref_tokens: List[int], ready_event):
     for sock in socks:
         send_cmd(sock, WorkerCommand.sync_global_seq_len(global_seq_len))
 
-    # Decode loop (sample from worker 0 only)
+    # Decode loop: sample first token from LAST worker's prefill logits
+    # (last worker holds the final chunk, its logits see all KV via ring)
     generated = []
     if args.max_tokens > 0:
-        first_token = ref_tokens[0]
+        # Use worker 1 (last domain) prefill logits for first token
+        last_logits = np.frombuffer(resp1.last_logits_bytes, dtype=np.float32)
+        first_token = int(np.argmax(last_logits))
         generated.append(first_token)
-        print(f"[coordinator] step 0: token={first_token} (from reference)")
+        print(f"[coordinator] step 0: token={first_token} (from worker 1 prefill logits)")
+
+        # Verify against reference (for correctness checking)
+        if first_token != ref_tokens[0]:
+            print(f"[coordinator] ⚠️ first_token mismatch: ref={ref_tokens[0]}, got={first_token}")
 
         for sock in socks:
             send_cmd(sock, WorkerCommand.decode(first_token))

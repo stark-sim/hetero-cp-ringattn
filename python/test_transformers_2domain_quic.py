@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from hcp_transformers_quic_worker import run_worker
 
 
-MODEL_DIR = "models/Qwen2-0.5B"
+MODEL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models", "Qwen2-0.5B")
 COORDINATOR_ADDR = ("127.0.0.1", 26021)
 PEER_PORTS = [26031, 26032]
 
@@ -35,8 +35,9 @@ def start_coordinator(num_domains: int = 2):
         "--listen-addr", f"{COORDINATOR_ADDR[0]}:{COORDINATOR_ADDR[1]}",
     ]
     print(f"[test] starting coordinator: {' '.join(cmd)}")
+    rust_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "rust")
     proc = subprocess.Popen(
-        cmd, cwd="rust", env=env,
+        cmd, cwd=rust_dir, env=env,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
     return proc

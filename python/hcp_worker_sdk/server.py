@@ -104,6 +104,11 @@ class HcpWorkerServer:
         # KV Ring 交换（prefill 阶段需要交换所有层的 KV）
         self._exchange_kv_ring(prefill=True)
 
+        # KV exchange 后，最后一个 domain 用完整 KV 重新计算 logits
+        # （只有最后一个 domain 的 self._history[-1] 是 prompt 最后一个 token）
+        if hasattr(self.backend, 'recalculate_logits') and self.domain_id == self.num_domains - 1:
+            logits = self.backend.recalculate_logits()
+
         return WorkerResponse.prefill_done(logits, self.global_seq_len)
 
     def _handle_decode(self, cmd: WorkerCommand) -> WorkerResponse:

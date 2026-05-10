@@ -113,12 +113,31 @@ class TransformersBackend(HcpWorkerBackend):
                     self._past_key_values = outputs.past_key_values
         return logits.to(torch.float32).cpu()
 
+    def _get_kv_layer(self, layer_idx: int):
+        """兼容 transformers 4.x/5.x 的 DynamicCache KV 访问。"""
+        cache = self._past_key_values
+        if hasattr(cache, 'layers'):
+            layer = cache.layers[layer_idx]
+            return layer.keys, layer.values
+        else:
+            return cache[layer_idx]
+
+    def _set_kv_layer(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor):
+        """兼容 transformers 4.x/5.x 的 DynamicCache KV 设置。"""
+        cache = self._past_key_values
+        if hasattr(cache, 'layers'):
+            cache.layers[layer_idx].keys = k
+            cache.layers[layer_idx].values = v
+        else:
+            cache._key_cache[layer_idx] = k
+            cache._value_cache[layer_idx] = v
+
     def get_kv_block(self, layer_idx: int, seq_start: int, seq_end: int) -> KvBlock:
         if self._past_key_values is None:
             k = torch.empty(0)
             v = torch.empty(0)
             return KvBlock(layer_idx, seq_start, seq_end, k, v)
-        k, v = self._past_key_values[layer_idx]
+        k, v = self._get_kv_layer(layer_idx)
         # Convert global seq positions to local indices within this layer's KV cache
         layer_start = self._layer_kv_start[layer_idx]
         local_start = max(0, seq_start - layer_start)
@@ -131,7 +150,7 @@ class TransformersBackend(HcpWorkerBackend):
     def apply_peer_kv(self, layer_idx: int, peer_block: KvBlock) -> None:
         if self._past_key_values is None or peer_block.k.numel() == 0:
             return
-        k_local, v_local = self._past_key_values[layer_idx]
+        k_local, v_local = self._get_kv_layer(layer_idx)
         layer_start = self._layer_kv_start[layer_idx]
         # Determine whether peer is before or after local KV
         if peer_block.global_seq_start < layer_start:
@@ -143,23 +162,46 @@ class TransformersBackend(HcpWorkerBackend):
             # Append peer KV
             k_new = torch.cat([k_local, peer_block.k.to(k_local.device)], dim=2)
             v_new = torch.cat([v_local, peer_block.v.to(v_local.device)], dim=2)
-        # Update via layers list
-        self._past_key_values.layers[layer_idx].keys = k_new
-        self._past_key_values.layers[layer_idx].values = v_new
+        # Update via compatible setter
+        self._set_kv_layer(layer_idx, k_new, v_new)
+
+    def _trim_last_token_from_cache(self):
+        """从 KV cache 中移除最后一个 token 的 KV，用于 recalculate_logits。"""
+        if self._past_key_values is None:
+            return None
+        from transformers.cache_utils import DynamicCache
+        trimmed = DynamicCache()
+        for layer_idx in range(self._num_layers):
+            k, v = self._get_kv_layer(layer_idx)
+            if k.size(2) > 0:
+                trimmed.update(k[:, :, :-1, :], v[:, :, :-1, :], layer_idx)
+        return trimmed
 
     def recalculate_logits(self) -> torch.Tensor:
-        """KV 交换后，用完整的 past_key_values 重新计算最后位置的 logits。"""
+        """KV 交换后，用完整的 past_key_values 重新计算最后位置的 logits。
+
+        实现逻辑：
+        1. 从 KV cache 中移除最后一个 token 的 KV（避免 forward 时重复 append）
+        2. 用最后一个 token + trimmed KV cache 重新 forward
+        3. transformers 会自动用完整的 KV（含 peer）计算 attention
+        4. 返回正确的 logits
+        """
         from transformers.cache_utils import DynamicCache
         if not self._history:
             return torch.zeros(self.model.config.vocab_size, dtype=torch.float32)
+
+        # 从 KV cache 中移除最后一个 token，防止重复
+        trimmed_past = self._trim_last_token_from_cache()
+
         input_ids = torch.tensor([[self._history[-1]]], dtype=torch.long, device=self.device)
         with torch.no_grad():
             outputs = self.model(
                 input_ids,
-                past_key_values=self._past_key_values,
+                past_key_values=trimmed_past,
                 use_cache=True,
             )
             logits = outputs.logits[0, -1]
+            # 更新 KV cache（现在包含正确的、无重复的最后 token KV）
             if outputs.past_key_values is not None:
                 if isinstance(outputs.past_key_values, tuple):
                     self._past_key_values = DynamicCache.from_legacy_cache(outputs.past_key_values)
