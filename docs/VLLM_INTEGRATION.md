@@ -1,5 +1,9 @@
 # vLLM Worker 适配器详细设计
 
+> ⚠️ **方向修正（2026-05-09）**：本文档 §3.1 的 "提取连续 KV tensor" 方向和 §3.2 的 "后处理模式" 是次优路径。核心洞察是：**vLLM 的 PagedAttention block 是 Ring Attention 的天然粒度单位，抛弃 block = 抛弃 vLLM 全部价值**。正确方向是让 ring 在 vLLM block 层面运作，而非提取连续 tensor。详见 `docs/BLOCK_RING_FUSION.md`。
+>
+> 本文档保留作为历史参考和实现骨架，但架构决策以 `BLOCK_RING_FUSION.md` 为准。
+
 > 本文档描述如何将 vLLM 的 `LLMEngine` 包装为 HCP 分布式 Worker，让 vLLM 负责同构 GPU 域内的所有优化（PagedAttention、Continuous Batching、CUDA kernel），HCP 负责跨域 KV Ring 交换。
 
 ---

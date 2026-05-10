@@ -58,4 +58,10 @@
   - T3: 1024 tokens + 5 decode, chunk-sizes 256,768 → `jumps over the lazy dog` ✅
   - T4: 2048 tokens + 5 decode, chunk-sizes 512,1536 → `dog jumps over the lazy` ✅
   - Mac MPS 512-token prefill 1.69s (303 tok/s)，white RTX 4090 1536-token prefill ~0.32s (4788 tok/s)
-- [ ] **Phase 3.4: vLLM 真实 KV 提取**（长期）：vLLM 0.6.4/0.20.x `LLM` API 不暴露 KV cache，需探索 `LLMEngine` 底层 API 或 vllm-metal 的 MLX KV cache 访问
+- [ ] **Phase 3.4: Transformers 路径真实 KV + online softmax correctness 验证**（短期优先）：
+  - 用 `hcp_transformers_quic_worker.py` 验证真实 KV 提取 + peer KV 合并后的 logits 与单节点参考一致
+  - 这是验证 HCP 数学正确性的最快路径，vLLM 路径待 correctness 验证后再评估
+- [ ] **Phase 4: vLLM Block-Aware Ring**（长期）：
+  - 修正之前方向：不是从 vLLM 提取连续 KV tensor，而是让 ring 在 vLLM block 层面运作
+  - 核心洞察：vLLM 的 PagedAttention block 是 Ring Attention 的天然粒度单位，二者必须协同
+  - 详见 `docs/BLOCK_RING_FUSION.md`
