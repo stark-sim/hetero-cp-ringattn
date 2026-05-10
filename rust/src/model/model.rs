@@ -658,4 +658,154 @@ mod tests {
             next_token = ref_decode_logits.squeeze().argmax(-1, false).int64_value(&[]) as i64;
         }
     }
+
+    /// 【Batch forward correctness 验证】
+    ///
+    /// 测试目标：验证 LlamaModel::forward 在 batch > 1 时，
+    /// 每个 sample 的输出与单独 batch=1 forward 的结果在数值上一致。
+    ///
+    /// 这是 batching 的 correctness 基线：如果 batch > 1 的结果与
+    /// 逐个处理 batch=1 的结果不一致，说明模型层存在 batch 相关的 bug
+    ///（如 position_ids、attention_mask、KV cache 等未正确处理 batch 维度）。
+    ///
+    /// 验证内容：
+    /// 1. Prefill batch=2 vs 两个独立的 batch=1 prefill
+    /// 2. Decode batch=2 vs 两个独立的 batch=1 decode（各一步）
+    /// 3. 多步 decode batch=2 vs 独立的 batch=1 decode（4 步）
+    #[test]
+    fn test_batch_forward_correctness() {
+        let device = Device::Cpu;
+
+        let config = ModelConfig {
+            architectures: Some(vec!["LlamaForCausalLM".to_string()]),
+            hidden_size: 32,
+            num_layers: 2,
+            num_heads: 4,
+            num_kv_heads: Some(1),
+            intermediate_size: 64,
+            vocab_size: 100,
+            rope_theta: 10000.0,
+            rms_norm_eps: 1e-6,
+            tie_word_embeddings: false,
+            torch_dtype: Some("float32".to_string()),
+            hidden_act: "silu".to_string(),
+            max_position_embeddings: Some(128),
+            attention_dropout: 0.0,
+            bos_token_id: None,
+            eos_token_id: None,
+            use_cache: true,
+            sliding_window: None,
+            use_sliding_window: None,
+            partial_rotary_factor: 1.0,
+        };
+
+        let weights = create_synthetic_weights(&config, device);
+
+        // 创建三个独立的模型实例，各自有独立的 KV cache
+        let mut model_batch = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+        let mut model_a = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+        let mut model_b = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+
+        // 准备两个不同的 prompt（相同长度，避免 padding 复杂度）
+        let seq_len = 12i64;
+        let prompt_a: Vec<i64> = (0..seq_len).collect();
+        let prompt_b: Vec<i64> = (10..10 + seq_len).collect();
+
+        // ====== Prefill correctness ======
+        let input_a = Tensor::from_slice(&prompt_a).unsqueeze(0).to_device(device); // [1, 12]
+        let input_b = Tensor::from_slice(&prompt_b).unsqueeze(0).to_device(device); // [1, 12]
+        let input_batch = Tensor::cat(&[input_a.shallow_clone(), input_b.shallow_clone()], 0); // [2, 12]
+
+        let mut caches_a = model_a.create_kv_caches();
+        let mut caches_b = model_b.create_kv_caches();
+        let mut caches_batch = model_batch.create_kv_caches();
+
+        let logits_a = model_a.forward(&input_a, &mut caches_a).unwrap();
+        let logits_b = model_b.forward(&input_b, &mut caches_b).unwrap();
+        let logits_batch = model_batch.forward(&input_batch, &mut caches_batch).unwrap();
+
+        // logits_batch shape: [2, 12, vocab_size]
+        let batch_a = logits_batch.narrow(0, 0, 1); // [1, 12, vocab]
+        let batch_b = logits_batch.narrow(0, 1, 1); // [1, 12, vocab]
+
+        let diff_a = (&logits_a - &batch_a).abs().mean(Kind::Float).double_value(&[]);
+        let diff_b = (&logits_b - &batch_b).abs().mean(Kind::Float).double_value(&[]);
+
+        println!("Prefill batch correctness: diff_a={:.2e}, diff_b={:.2e}", diff_a, diff_b);
+
+        const BATCH_TOL: f64 = 1e-5;
+        assert!(diff_a < BATCH_TOL, "Prefill batch sample 0 differs: {}", diff_a);
+        assert!(diff_b < BATCH_TOL, "Prefill batch sample 1 differs: {}", diff_b);
+
+        // ====== Single-step decode correctness ======
+        // 从 batch 模型的 prefill 输出采样两个 token
+        let last_logits_a = logits_a.narrow(1, seq_len - 1, 1).squeeze();
+        let last_logits_b = logits_b.narrow(1, seq_len - 1, 1).squeeze();
+        let token_a = last_logits_a.argmax(-1, false).int64_value(&[]) as i64;
+        let token_b = last_logits_b.argmax(-1, false).int64_value(&[]) as i64;
+
+        let decode_a = Tensor::from_slice(&[token_a]).unsqueeze(0).to_device(device);
+        let decode_b = Tensor::from_slice(&[token_b]).unsqueeze(0).to_device(device);
+        let decode_batch = Tensor::cat(&[decode_a.shallow_clone(), decode_b.shallow_clone()], 0);
+
+        let d_logits_a = model_a.forward(&decode_a, &mut caches_a).unwrap();
+        let d_logits_b = model_b.forward(&decode_b, &mut caches_b).unwrap();
+        let d_logits_batch = model_batch.forward(&decode_batch, &mut caches_batch).unwrap();
+
+        let d_batch_a = d_logits_batch.narrow(0, 0, 1);
+        let d_batch_b = d_logits_batch.narrow(0, 1, 1);
+
+        let d_diff_a = (&d_logits_a - &d_batch_a).abs().mean(Kind::Float).double_value(&[]);
+        let d_diff_b = (&d_logits_b - &d_batch_b).abs().mean(Kind::Float).double_value(&[]);
+
+        println!("Decode batch correctness: diff_a={:.2e}, diff_b={:.2e}", d_diff_a, d_diff_b);
+
+        assert!(d_diff_a < BATCH_TOL, "Decode batch sample 0 differs: {}", d_diff_a);
+        assert!(d_diff_b < BATCH_TOL, "Decode batch sample 1 differs: {}", d_diff_b);
+
+        // ====== Multi-step decode correctness ======
+        // Logits may diverge slightly due to floating-point non-determinism
+        // in batched vs single-path BLAS kernels (~1e-5). What matters for
+        // correctness is that the *sampled tokens* are identical. We check
+        // both: logits diff must stay below a generous tolerance, and argmax
+        // must agree exactly.
+        const NUM_DECODE_STEPS: usize = 4;
+        const LOGITS_TOL: f64 = 1e-3;
+        let mut next_token_a = token_a;
+        let mut next_token_b = token_b;
+
+        for step in 0..NUM_DECODE_STEPS {
+            let da = Tensor::from_slice(&[next_token_a]).unsqueeze(0).to_device(device);
+            let db = Tensor::from_slice(&[next_token_b]).unsqueeze(0).to_device(device);
+            let dbatch = Tensor::cat(&[da.shallow_clone(), db.shallow_clone()], 0);
+
+            let la = model_a.forward(&da, &mut caches_a).unwrap();
+            let lb = model_b.forward(&db, &mut caches_b).unwrap();
+            let lbatch = model_batch.forward(&dbatch, &mut caches_batch).unwrap();
+
+            let lbatch_a = lbatch.narrow(0, 0, 1);
+            let lbatch_b = lbatch.narrow(0, 1, 1);
+
+            let step_diff_a = (&la - &lbatch_a).abs().mean(Kind::Float).double_value(&[]);
+            let step_diff_b = (&lb - &lbatch_b).abs().mean(Kind::Float).double_value(&[]);
+
+            let token_batch_a = lbatch_a.squeeze().argmax(-1, false).int64_value(&[]);
+            let token_batch_b = lbatch_b.squeeze().argmax(-1, false).int64_value(&[]);
+            let token_ref_a = la.squeeze().argmax(-1, false).int64_value(&[]);
+            let token_ref_b = lb.squeeze().argmax(-1, false).int64_value(&[]);
+
+            println!(
+                "Multi-step decode step {}: diff_a={:.2e}, diff_b={:.2e}, tokens=[{},{}] vs ref=[{},{}]",
+                step, step_diff_a, step_diff_b, token_batch_a, token_batch_b, token_ref_a, token_ref_b
+            );
+
+            assert!(step_diff_a < LOGITS_TOL, "step {} batch sample 0 logits diff too large: {}", step, step_diff_a);
+            assert!(step_diff_b < LOGITS_TOL, "step {} batch sample 1 logits diff too large: {}", step, step_diff_b);
+            assert_eq!(token_batch_a, token_ref_a, "step {} batch sample 0 token mismatch", step);
+            assert_eq!(token_batch_b, token_ref_b, "step {} batch sample 1 token mismatch", step);
+
+            next_token_a = token_ref_a as i64;
+            next_token_b = token_ref_b as i64;
+        }
+    }
 }

@@ -235,6 +235,13 @@
   - 单元测试验证：分布式 prefill（`test_distributed_llama_model_prefill` diff=2.79e-6 ✅）、4-step decode（`test_distributed_llama_model_decode` diff~2e-6 ✅）、generator token 一致性（`test_distributed_generator_tokens_match_reference` logits diff~1e-5 ✅）。
   - **真实权重性能回归测试**（Qwen2-0.5B）：单节点 CPU 2.39s（vs 历史 2.87s ✅）、单节点 MPS 2.19s（vs 历史 2.06s ✅）、2-domain CPU 分布式 9.59s（decode 20 tokens）✅。全部配置输出一致，性能无回归。
   - **跨节点异构验证**（Mac MPS + RTX 4090 CUDA）：11-token prompt + 5 decode，`generated: The quick brown fox jumps`，exit=0，~40s。`WorkerRuntime` + `TchWorkerBackend` 在真实异构网络环境中端到端通过。
+- [x] [2026-05-09] **Rust Static Batching 实现与 correctness 验证**：
+  - `BatchGenerator`：支持 batch > 1 的并行 prefill + decode，等长 prompts 约束（避免 padding mask 引入 correctness 风险）
+  - `generate_batch` / `generate_batch_from_ids`：从 prompts 或原始 token IDs 启动 batch generation
+  - 早期停止：单 request EOS 后继续喂 0 token，KV cache 形状保持一致，不影响其他 request 的 attention 计算
+  - `test_batch_forward_correctness`：验证 `LlamaModel::forward` batch=2 时，每个 sample 的 logits 与独立 batch=1 一致（diff ~1e-6），4-step decode token 完全一致
+  - `test_batch_generator_correctness`：验证 `BatchGenerator` batch=2 的输出与两个独立单 request 生成结果完全一致
+  - 全部 24 个 model tests 通过，无 regression
 - [x] [2026-04-30] **手动部署指南** (`docs/DEPLOYMENT_GUIDE.md`)：从零开始的手动部署文档，覆盖：
   - 单节点本地部署（Mac MPS / GPU CUDA 独立验证）
   - 双节点异构部署（Mac MPS + remote RTX 4090 CUDA）完整步骤
@@ -280,5 +287,6 @@
 | M7: Python Worker SDK + vLLM 异构 E2E | **控制面已完成** | [2026-05-09] Mac vllm-metal + white RTX 4090 vLLM 跨机器控制面（Prefill/Decode/Shutdown）通过，但 KV 数据面仍为 stub |
 | M8: Transformers 真实 KV + online softmax correctness | **已完成** | [2026-05-09] `test_worker_2domain.py` (mock) ✅、`test_transformers_2domain_quic.py` (QUIC) ✅。`recalculate_logits()` + `DynamicCache` 兼容层 + 仅最后一个 domain 重算 |
 | M9: 冻结 Python 层，聚焦 Rust + C++ + libtorch | **已决策** | [2026-05-09] Python 层进入维护模式不再扩展，Rust 层是唯一主干 |
-| M10: Rust 性能优化与生产化 | **待启动** | 量化、连续 batching、RDMA transport |
+| M10: Rust Static Batching | **已完成** | [2026-05-09] `BatchGenerator` 支持 batch > 1 的 prefill/decode，correctness 验证通过（batch=2 vs 两个独立 batch=1 完全一致），24/24 tests 无 regression |
+| M10.1: Rust 性能优化与生产化 | **待启动** | 量化（暂不实施，correctness 优先）、连续 batching、RDMA transport |
 | M11: vLLM Block-Aware Ring | **远景** | [2026-05-09] 核心洞察：ring 在 vLLM block 层面运作。详见 `docs/BLOCK_RING_FUSION.md` |

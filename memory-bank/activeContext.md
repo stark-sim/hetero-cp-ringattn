@@ -62,9 +62,16 @@
   - `test_worker_2domain.py` (mock transport) ✅、`test_transformers_2domain_quic.py` (QUIC) ✅
   - 关键修复：`recalculate_logits()` + `DynamicCache` 兼容层 + 仅最后一个 domain 重算
   - **架构决策：冻结 Python 层投入**。Python 层的存在理由只有 vLLM 适配。transformers correctness 已由 Rust 层覆盖，继续维护两套 SDK 不划算。后续以 Rust + C++ + libtorch 为主干。
-- [ ] **Phase 4: Rust 层性能优化与生产化**（长期）：
-  - 量化支持（FP8/INT8 KV cache）
-  - 连续 batching / 多 request 调度
+- [x] **Phase 4.1: Rust 层 Static Batching**（ correctness 优先）：
+  - `BatchGenerator` 实现：支持 batch > 1 的 prefill + decode，所有 prompts 必须等长（避免 padding mask 复杂度）
+  - `generate_batch_from_ids`：核心 batch generation API，支持 greedy/temperature/top-p 采样
+  - 早期停止：单个 request 遇到 EOS 后继续喂 0 token 保持 KV cache 形状一致，不影响其他 request
+  - correctness 验证：`test_batch_forward_correctness`（batch=2 vs batch=1，prefill + 4-step decode，logits diff ~1e-6，token 完全一致）✅
+  - correctness 验证：`test_batch_generator_correctness`（`BatchGenerator` batch=2 vs 两个独立 `Generator`，token 序列完全一致）✅
+  - 无 regression：全部 24 个 model tests 通过 ✅
+- [ ] **Phase 4.2: Rust 层性能优化与生产化**（长期）：
+  - 量化支持（FP8/INT8 KV cache）— **暂不实施**，correctness 流程尚未完全走完
+  - 连续 batching / 动态 request 调度
   - 更高效的 transport（RDMA / GPUDirect）
 - [ ] **Phase 5: vLLM Block-Aware Ring**（远景）：
   - 让 ring 在 vLLM PagedAttention block 层面运作

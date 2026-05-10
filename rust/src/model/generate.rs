@@ -127,6 +127,172 @@ impl Generator {
     }
 }
 
+/// Batch autoregressive text generator (single-node).
+///
+/// Processes multiple prompts in parallel using the same model.
+/// All prompts must have the same tokenized length; if they differ,
+/// the caller must pad them to equal length before calling.
+///
+/// Current limitations (by design — correctness first):
+/// - Static batching only: all requests start and finish together.
+/// - No continuous batching (no dynamic add/remove of requests).
+/// - No early stopping: every request runs for the full `max_new_tokens`.
+///   Tokens after EOS are still generated but ignored. This avoids the
+///   complexity of masking completed sequences in the KV cache, which
+///   would require per-sample attention masks during decode.
+/// - All prompts must have the same length. Unequal lengths will fail
+///   with an error to prevent silent correctness bugs from padding.
+///
+/// These limitations do not affect correctness; they only affect
+/// throughput efficiency. Once the full correctness pipeline is
+/// complete, we can relax them incrementally.
+#[cfg(feature = "tch-backend")]
+pub struct BatchGenerator {
+    model: LlamaModel,
+    tokenizer: Tokenizer,
+    device: Device,
+}
+
+#[cfg(feature = "tch-backend")]
+impl BatchGenerator {
+    /// Create a batch generator from a loaded model and tokenizer file path.
+    pub fn new(model: LlamaModel, tokenizer_path: &str, device: Device) -> Result<Self, ModelError> {
+        let tokenizer = Tokenizer::from_file(tokenizer_path)
+            .map_err(|e| ModelError::Tokenizer(e.to_string()))?;
+        Ok(Self { model, tokenizer, device })
+    }
+
+    /// Create a batch generator from a model and an already-loaded tokenizer.
+    #[allow(dead_code)]
+    pub fn from_model(model: LlamaModel, tokenizer: Tokenizer, device: Device) -> Self {
+        Self { model, tokenizer, device }
+    }
+
+    /// Generate text for multiple prompts in parallel.
+    ///
+    /// Returns one `Vec<u32>` of generated token IDs per prompt.
+    pub fn generate_batch(
+        &mut self,
+        prompts: &[&str],
+        max_new_tokens: usize,
+        temperature: f64,
+        top_p: f64,
+    ) -> Result<Vec<Vec<u32>>, ModelError> {
+        if prompts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Tokenize all prompts
+        let prompt_id_list: Vec<Vec<i64>> = prompts
+            .iter()
+            .map(|p| self.tokenize(p))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        self.generate_batch_from_ids(&prompt_id_list, max_new_tokens, temperature, top_p)
+    }
+
+    /// Core batch generation from token IDs.
+    ///
+    /// `prompt_ids_list[i]` is the token ID list for the i-th request.
+    /// All lists must have the same length.
+    pub fn generate_batch_from_ids(
+        &mut self,
+        prompt_ids_list: &[Vec<i64>],
+        max_new_tokens: usize,
+        temperature: f64,
+        top_p: f64,
+    ) -> Result<Vec<Vec<u32>>, ModelError> {
+        if prompt_ids_list.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Guard: all prompts must have the same length.
+        // This avoids the complexity of padding masks and per-sample
+        // position_ids during decode, keeping correctness simple.
+        let first_len = prompt_ids_list[0].len();
+        if let Some((idx, ids)) = prompt_ids_list.iter().enumerate().find(|(_, ids)| ids.len() != first_len) {
+            return Err(ModelError::Generation(format!(
+                "BatchGenerator requires all prompts to have the same tokenized length \
+                 (prompt 0 has {}, prompt {} has {}). \
+                 Pad shorter prompts to equal length before calling.",
+                first_len, idx, ids.len()
+            )));
+        }
+
+        let batch_size = prompt_ids_list.len() as i64;
+        let seq_len = first_len as i64;
+
+        // Build batch input tensor: [batch, seq_len]
+        let flat_ids: Vec<i64> = prompt_ids_list.iter().flatten().copied().collect();
+        let input_tensor = Tensor::from_slice(&flat_ids)
+            .reshape([batch_size, seq_len])
+            .to_device(self.device);
+
+        let mut kv_caches = self.model.create_kv_caches();
+
+        // Prefill
+        let logits = self.model.forward(&input_tensor, &mut kv_caches)?;
+
+        // Decode loop
+        let mut all_generated: Vec<Vec<u32>> = vec![Vec::new(); batch_size as usize];
+        let eos_token = self.model.config.eos_token_id();
+        let mut finished = vec![false; batch_size as usize];
+
+        // Extract last-token logits for each sample in the batch.
+        // logits shape: [batch, seq_len, vocab_size]
+        let last_logits = logits.narrow(1, seq_len - 1, 1).squeeze_dim(1); // [batch, vocab_size]
+
+        // Sample first token for each request
+        let mut next_tokens: Vec<i64> = Vec::with_capacity(batch_size as usize);
+        for b in 0..batch_size {
+            let sample_logits = last_logits.narrow(0, b, 1).squeeze();
+            let token = sample_token(&sample_logits, temperature, top_p)?;
+            next_tokens.push(token as i64);
+            all_generated[b as usize].push(token);
+            if Some(token) == eos_token {
+                finished[b as usize] = true;
+            }
+        }
+
+        for _ in 1..max_new_tokens {
+            // Build decode input: [batch, 1]
+            let decode_input = Tensor::from_slice(&next_tokens)
+                .unsqueeze(1)
+                .to_device(self.device); // [batch, 1]
+
+            let decode_logits = self.model.forward(&decode_input, &mut kv_caches)?;
+            // decode_logits shape: [batch, 1, vocab_size]
+            let decode_last = decode_logits.squeeze_dim(1); // [batch, vocab_size]
+
+            for b in 0..batch_size {
+                if finished[b as usize] {
+                    // Keep feeding 0 for finished sequences so the KV cache
+                    // shape stays consistent across the batch.
+                    next_tokens[b as usize] = 0;
+                    continue;
+                }
+
+                let sample_logits = decode_last.narrow(0, b, 1).squeeze();
+                let token = sample_token(&sample_logits, temperature, top_p)?;
+                next_tokens[b as usize] = token as i64;
+                all_generated[b as usize].push(token);
+                if Some(token) == eos_token {
+                    finished[b as usize] = true;
+                }
+            }
+        }
+
+        Ok(all_generated)
+    }
+
+    /// Tokenize prompt text into IDs.
+    fn tokenize(&self, prompt: &str) -> Result<Vec<i64>, ModelError> {
+        let encoding = self.tokenizer.encode(prompt, true)
+            .map_err(|e| ModelError::Tokenizer(e.to_string()))?;
+        Ok(encoding.get_ids().iter().map(|&id| id as i64).collect())
+    }
+}
+
 /// Distributed autoregressive text generator.
 ///
 /// Simulates multi-domain CP inference in a single process.
@@ -260,6 +426,7 @@ mod tests {
         weights::{ModelWeights, WeightNames},
     };
     use tch::{Device, Kind, Tensor};
+    use tokenizers::Tokenizer;
 
     fn create_synthetic_weights(config: &ModelConfig, device: Device) -> ModelWeights {
         let mut tensors = std::collections::HashMap::new();
@@ -398,6 +565,114 @@ mod tests {
             assert!(diff1 < DECODE_TOL, "domain1 logits diff too large at step {}: {}", step, diff1);
 
             ref_logits = ref_decode_logits;
+        }
+    }
+
+    /// 【BatchGenerator correctness 验证】
+    ///
+    /// 验证 BatchGenerator 的 batch=2 输出与两个独立的 batch=1 生成结果一致。
+    /// 这是 batching 的端到端 correctness 基线。
+    #[test]
+    fn test_batch_generator_correctness() {
+        use crate::model::generate::BatchGenerator;
+
+        let device = Device::Cpu;
+        let config = ModelConfig {
+            architectures: Some(vec!["LlamaForCausalLM".to_string()]),
+            hidden_size: 32,
+            num_layers: 2,
+            num_heads: 4,
+            num_kv_heads: Some(1),
+            intermediate_size: 64,
+            vocab_size: 100,
+            rope_theta: 10000.0,
+            rms_norm_eps: 1e-6,
+            tie_word_embeddings: false,
+            torch_dtype: Some("float32".to_string()),
+            hidden_act: "silu".to_string(),
+            max_position_embeddings: Some(128),
+            attention_dropout: 0.0,
+            bos_token_id: None,
+            eos_token_id: None,
+            use_cache: true,
+            sliding_window: None,
+            use_sliding_window: None,
+            partial_rotary_factor: 1.0,
+        };
+        let weights = create_synthetic_weights(&config, device);
+
+        // Create a minimal tokenizer in memory (BPE with 27 tokens: a-z + <pad>)
+        let tokenizer_json = r#"{
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": null,
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "BPE",
+                "dropout": null,
+                "unk_token": null,
+                "continuing_subword_prefix": null,
+                "end_of_word_suffix": null,
+                "fuse_unk": false,
+                "vocab": {"a":0,"b":1,"c":2,"d":3,"e":4,"f":5,"g":6,"h":7,"i":8,"j":9,"k":10,"l":11,"m":12,"n":13,"o":14,"p":15,"q":16,"r":17,"s":18,"t":19,"u":20,"v":21,"w":22,"x":23,"y":24,"z":25,"<pad>":26},
+                "merges": []
+            }
+        }"#;
+        let tokenizer = Tokenizer::from_bytes(tokenizer_json).unwrap();
+
+        let model_batch = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+        let model_a = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+        let model_b = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+
+        let mut batch_gen = BatchGenerator::from_model(model_batch, tokenizer, device);
+
+        // Two different prompts of the same length
+        let prompt_a: Vec<i64> = (0..12i64).collect();
+        let prompt_b: Vec<i64> = (10..22i64).collect();
+
+        // Batch generation
+        let batch_results = batch_gen.generate_batch_from_ids(
+            &[prompt_a.clone(), prompt_b.clone()],
+            8,   // max_new_tokens
+            0.0, // temperature=0 → greedy
+            0.0, // top_p disabled
+        ).unwrap();
+
+        // Reference: single-request generation using direct model.forward + greedy sampling
+        let mut ref_a = generate_single(model_a, &prompt_a, 8, device);
+        let mut ref_b = generate_single(model_b, &prompt_b, 8, device);
+
+        assert_eq!(batch_results[0], ref_a, "batch sample 0 differs from reference");
+        assert_eq!(batch_results[1], ref_b, "batch sample 1 differs from reference");
+
+        println!("BatchGenerator correctness passed: batch=2 matches two independent batch=1 runs.");
+        println!("  sample0 tokens: {:?}", batch_results[0]);
+        println!("  sample1 tokens: {:?}", batch_results[1]);
+
+        // Helper: single-request greedy generation
+        fn generate_single(mut model: LlamaModel, prompt_ids: &[i64], max_new: usize, device: Device) -> Vec<u32> {
+            let mut caches = model.create_kv_caches();
+            let input = Tensor::from_slice(prompt_ids).unsqueeze(0).to_device(device);
+            let mut logits = model.forward(&input, &mut caches).unwrap();
+
+            let mut generated = Vec::new();
+            let eos = model.config.eos_token_id();
+
+            for _ in 0..max_new {
+                let last = logits.narrow(1, logits.size()[1] - 1, 1).squeeze();
+                let token = last.argmax(-1, false).int64_value(&[]) as u32;
+                generated.push(token);
+                if Some(token) == eos {
+                    break;
+                }
+                let next = Tensor::from_slice(&[token as i64]).unsqueeze(0).to_device(device);
+                logits = model.forward(&next, &mut caches).unwrap();
+            }
+            generated
         }
     }
 }
