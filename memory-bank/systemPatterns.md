@@ -283,6 +283,53 @@ Layer 1: HCP 协议层（可复用 SDK）
 4. **Rust 层实现**：脱离 Python GIL 和 PyTorch distributed 的 runtime 假设，更适合长期运行的分布式推理服务。
 5. **域内可插拔**：HCP 不绑定域内实现，允许同构域内使用 vLLM/TensorRT-LLM/MLX 等最强社区框架，最大化复用社区轮子。
 
+## Correctness-First 开发纪律
+
+本项目当前处于** correctness 验证阶段**，尚未进入性能调优阶段。在此阶段，所有代码变更和架构决策必须服从以下纪律：
+
+### 1. 禁止实施的优化（在当前阶段）
+
+在 correctness 流程完全走完、多级 tolerance 策略在全部 target 设备上稳定通过之前，**不得实施**任何可能引入数值误差或行为偏差的优化：
+
+- **量化**：FP8/INT8 KV cache、BF16 权重、INT8/INT4 weight-only 量化、GPTQ/AWQ 等。这些方案在推理社区有成熟实现，但都会引入 ~1e-3 ~1e-2 级别的数值误差，足以在决策边界翻转 argmax。
+- **近似 Attention**：FlashAttention 以外的稀疏 attention、local attention window 缩小、KV cache 压缩（H2O、Scissorhands 等）。这些改变 attention 的数学定义。
+- **非 deterministic kernel**：使用 `CUBLAS_WORKSPACE_CONFIG` 以外的环境、TF32 模式、混合精度 training 的残余设置。
+- **投机/跳过层优化**：speculative decoding、layer skipping、early exit。这些改变 layer stack 的语义，使 hidden states 不再等价于完整模型。
+- **有损 padding/short-cut**：为了支持不同长度 prompts 的 batching 而简化 attention mask（如忽略 padding 位置的影响），或为了节省内存而截断 KV cache。
+
+### 2. 提出任何优化前的强制 trade-off 分析
+
+如果任何人（包括 AI coding agent）提出优化建议，必须先回答四个问题：
+
+1. **为什么默认存在**：当前（非优化）方法解决的是什么问题？
+2. **牺牲了什么**：该优化 discard 了哪些 correctness 保证、灵活性或通用性？
+3. **被牺牲的东西在一般情况下的作用**：这些 guarantee 在训练、评估、高级解码（beam search、contrastive search、perplexity）中起什么作用？
+4. **对本项目的具体影响**：为什么这些 sacrifice 在当前阶段可以接受（或不可接受）？
+
+**示例 — "last token only" LM head 优化**：
+- 默认计算完整 logits 是因为 `LlamaModel::forward` 的 contract 是返回 `[batch, seq, vocab]`，支持 per-position loss、perplexity、contrastive search、speculative decoding verification。
+- 牺牲：模型从"全序列 logits"变为"仅最后一个位置"，破坏了通用 transformer 输出 contract。
+- 被牺牲的东西的作用：训练（cross-entropy over all positions）、评估（perplexity）、高级解码（contrastive search 比较多个位置分数）、speculative decoding（draft model 需要评分所有 draft tokens）。
+- 对本项目的影响：HCP 是 inference-only，greedy/temperature sampling 只关心最后一个 token。但 correctness tests 目前比较所有位置的 logits，"last token only" 会 break 这些 tests。增加 `return_full_logits: bool` flag 会增加 API 复杂度。Prefill 是一次性成本，decode 是循环，收益仅限于 prefill 阶段。**结论：skip。**
+
+### 3. 什么情况下可以放宽
+
+以下条件下，上述纪律自动解除：
+
+- `test_distributed_llama_model_prefill` / `test_distributed_llama_model_decode` / `test_distributed_generator_tokens_match_reference` 在 **全部 target 设备**（CPU / MPS / CUDA）上稳定通过至少 5 个不同 seed 的随机验证。
+- 新增至少 1 个真实权重端到端验证（如 Qwen2-0.5B greedy decode 与 HuggingFace transformers 输出逐 token 一致）。
+- 用户明确书面批准某一特定优化，并附带接受其 correctness 风险的声明。
+
+### 4. 当前已验证的 correctness 基线
+
+| 测试 | 场景 | 误差 | 状态 |
+|------|------|------|------|
+| `test_batch_forward_correctness` | batch=2 vs 独立 batch=1，prefill + 4-step decode | logits diff ~1e-6，token 完全一致 | ✅ [2026-05-09] |
+| `test_batch_generator_correctness` | `BatchGenerator` batch=2 vs 两个独立 `Generator` | token 序列完全一致 | ✅ [2026-05-09] |
+| `test_distributed_llama_model_prefill` | 2-domain 分布式 prefill vs 单节点参考 | diff=2.79e-6 | ✅ |
+| `test_distributed_llama_model_decode` | 4-step 连续分布式 decode | diff~2e-6 | ✅ |
+| `test_distributed_generator_tokens_match_reference` | 4-step greedy decode domain0/domain1 | logits diff~1e-5 | ✅ |
+
 ### 5. 代价与风险
 
 - **延迟**：在 NVLink 全互联集群上，P2P 的逐 hop 延迟可能略高于 NCCL collective 的拓扑优化路由。
@@ -333,3 +380,5 @@ Layer 1: HCP 协议层（可复用 SDK）
 | **vLLM 适配器设计** | ~~优先用非侵入式 Wrapper 方案（后处理模式）~~ → **修正为 Block-Aware Ring**：vLLM 的 PagedAttention block 是 Ring Attention 的天然粒度单位，抛弃 block = 抛弃 vLLM 全部价值。正确路径是让 ring 交换粒度对齐 vLLM block，改 CacheEngine 支持远程 block，而非提取连续 tensor。详见 `docs/BLOCK_RING_FUSION.md` | [2026-05-09] |
 | **Transformers backend 限制** | Python transformers `model.forward` 无法在层间注入 peer KV 并重算 attention。`recalculate_logits()` 只能修复 prefill 阶段最后一个 token 的 logits，decode 阶段 layer 1+ 的 hidden states 仍基于不完整 KV。数学 correctness 由 Rust 层保证，Python 层负责 control-plane + transport 验证 | [2026-05-09] |
 | **冻结 Python 层，聚焦 Rust + C++ + libtorch** | Python 层的存在理由只有 vLLM 适配。一旦 vLLM 走 Block-Aware Ring（长期）、transformers  correctness 已由 Rust 层覆盖，Python 就成了无根之木。继续投入 Python = 维护两套协议 + 两套 SDK + 版本兼容性包袱。后续以 Rust 为主干，Python 代码进入维护模式不再扩展 | [2026-05-09] |
+| **Static Batching：等长 prompts + 0-token 填充** | `BatchGenerator` 支持 batch > 1，但要求所有 prompts 等长（避免 padding mask 的 correctness 风险）。已完成的 request 喂 0 token 保持 KV cache 形状一致。不实现连续 batching 或动态 padding，直到 correctness 基线更稳固 | [2026-05-09] |
+| **Correctness-First 纪律：优化必须证明无害** | 在 correctness 流程完全走完之前，不实施任何可能损害服务质量的优化。包括但不限于：量化（FP8/INT8/BF16 KV cache）、近似 attention、非 deterministic kernel、跳过层/投机解码。每次提出优化前必须写 trade-off 分析：为什么默认存在、牺牲了什么、牺牲的东西在一般情况下的作用、对本项目的具体影响。见下方「Correctness-First 开发纪律」 | [2026-05-09] |
