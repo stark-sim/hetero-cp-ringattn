@@ -279,4 +279,6 @@
 | M6: 扩展性论证 | **已完成** | [2026-05-05] 32K/64K/131067 单节点 ✅、32K/64K 分布式 ✅ |
 | M7: Python Worker SDK + vLLM 异构 E2E | **控制面已完成** | [2026-05-09] Mac vllm-metal + white RTX 4090 vLLM 跨机器控制面（Prefill/Decode/Shutdown）通过，但 KV 数据面仍为 stub |
 | M8: Transformers 真实 KV + online softmax correctness | **已完成** | [2026-05-09] `test_worker_2domain.py` (mock) ✅、`test_transformers_2domain_quic.py` (QUIC) ✅。`recalculate_logits()` + `DynamicCache` 兼容层 + 仅最后一个 domain 重算 |
-| M9: vLLM Block-Aware Ring | **架构已确定，待实现** | [2026-05-09] 核心洞察：ring 在 vLLM block 层面运作，而非提取连续 tensor。详见 `docs/BLOCK_RING_FUSION.md` |
+| M9: 冻结 Python 层，聚焦 Rust + C++ + libtorch | **已决策** | [2026-05-09] Python 层进入维护模式不再扩展，Rust 层是唯一主干 |
+| M10: Rust 性能优化与生产化 | **待启动** | 量化、连续 batching、RDMA transport |
+| M11: vLLM Block-Aware Ring | **远景** | [2026-05-09] 核心洞察：ring 在 vLLM block 层面运作。详见 `docs/BLOCK_RING_FUSION.md` |

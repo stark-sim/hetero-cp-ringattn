@@ -59,12 +59,13 @@
   - T4: 2048 tokens + 5 decode, chunk-sizes 512,1536 → `dog jumps over the lazy` ✅
   - Mac MPS 512-token prefill 1.69s (303 tok/s)，white RTX 4090 1536-token prefill ~0.32s (4788 tok/s)
 - [x] **Phase 3.4: Transformers 路径真实 KV + online softmax correctness 验证**（已完成）：
-  - `test_worker_2domain.py` (mock transport) ✅ 运行通过
-  - `test_transformers_2domain_quic.py` (QUIC) ✅ `generated: '! I'm'`
-  - 关键修复：`recalculate_logits()` 从 KV cache trim 最后一个 token 后重新 forward，仅最后一个 domain 调用
-  - transformers 4.x/5.x `DynamicCache` API 兼容层 (`_get_kv_layer` / `_set_kv_layer`)
-  - **限制说明**：Python transformers backend 无法在层间注入 peer KV 并重算 attention，decode logits 不完全匹配单节点参考。数学 correctness 由 Rust 层保证，Python 层负责 control-plane + transport 验证。
-- [ ] **Phase 4: vLLM Block-Aware Ring**（长期）：
-  - 修正之前方向：不是从 vLLM 提取连续 KV tensor，而是让 ring 在 vLLM block 层面运作
-  - 核心洞察：vLLM 的 PagedAttention block 是 Ring Attention 的天然粒度单位，二者必须协同
+  - `test_worker_2domain.py` (mock transport) ✅、`test_transformers_2domain_quic.py` (QUIC) ✅
+  - 关键修复：`recalculate_logits()` + `DynamicCache` 兼容层 + 仅最后一个 domain 重算
+  - **架构决策：冻结 Python 层投入**。Python 层的存在理由只有 vLLM 适配。transformers correctness 已由 Rust 层覆盖，继续维护两套 SDK 不划算。后续以 Rust + C++ + libtorch 为主干。
+- [ ] **Phase 4: Rust 层性能优化与生产化**（长期）：
+  - 量化支持（FP8/INT8 KV cache）
+  - 连续 batching / 多 request 调度
+  - 更高效的 transport（RDMA / GPUDirect）
+- [ ] **Phase 5: vLLM Block-Aware Ring**（远景）：
+  - 让 ring 在 vLLM PagedAttention block 层面运作
   - 详见 `docs/BLOCK_RING_FUSION.md`
