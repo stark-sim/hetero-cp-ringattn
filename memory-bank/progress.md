@@ -278,5 +278,5 @@
 | M5+++: 跨节点异构 worker CP | **已完成** | [2026-05-05] Mac MPS + RTX 4090 CUDA prefill ✅、decode 端到端 ✅（9-token prompt + 3 decode tokens） |
 | M6: 扩展性论证 | **已完成** | [2026-05-05] 32K/64K/131067 单节点 ✅、32K/64K 分布式 ✅ |
 | M7: Python Worker SDK + vLLM 异构 E2E | **控制面已完成** | [2026-05-09] Mac vllm-metal + white RTX 4090 vLLM 跨机器控制面（Prefill/Decode/Shutdown）通过，但 KV 数据面仍为 stub |
-| M8: Transformers 真实 KV + online softmax correctness | **待启动** | [2026-05-09] 优先用 `hcp_transformers_quic_worker.py` 验证真实 KV 提取和 peer 合并后的数学正确性 |
+| M8: Transformers 真实 KV + online softmax correctness | **已完成** | [2026-05-09] `test_worker_2domain.py` (mock) ✅、`test_transformers_2domain_quic.py` (QUIC) ✅。`recalculate_logits()` + `DynamicCache` 兼容层 + 仅最后一个 domain 重算 |
 | M9: vLLM Block-Aware Ring | **架构已确定，待实现** | [2026-05-09] 核心洞察：ring 在 vLLM block 层面运作，而非提取连续 tensor。详见 `docs/BLOCK_RING_FUSION.md` |
