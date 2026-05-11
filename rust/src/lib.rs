@@ -1,3 +1,4 @@
+mod cli;
 mod compute_runtime;
 #[cfg(feature = "tch-backend")]
 mod capacity;
@@ -7,39 +8,27 @@ mod distributed_coordinator;
 mod distributed_protocol;
 #[cfg(feature = "tch-backend")]
 mod distributed_worker;
-#[cfg(feature = "tch-backend")]
-mod quic_transport;
+mod error;
 mod infer;
 mod model;
 mod protocol;
 mod tch_backend;
 #[cfg(feature = "tch-backend")]
 mod worker_sdk;
+#[cfg(feature = "tch-backend")]
+mod quic_transport;
 
+pub use cli::{CliArgs, parse_cli_args, next_cli_value};
+pub use error::{RingError, Tolerance, ToleranceTier};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::Path;
-use thiserror::Error;
 
 const PAYLOAD_CHUNK_QUERY_LEN: i32 = 4;
 
-#[derive(Debug, Error)]
-pub enum RingError {
-    #[error("sum(seq_chunk_len)={actual} does not match global_seq_len={expected}")]
-    InvalidChunkSum { actual: usize, expected: usize },
-    #[error("domain {domain_id} has invalid seq_chunk_len or block_size")]
-    InvalidDomain { domain_id: String },
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("json error: {0}")]
-    Json(#[from] serde_json::Error),
-    #[error("protocol error: {0}")]
-    Protocol(#[from] protocol::ProtocolError),
-    #[error("invalid cli args: {0}")]
-    InvalidCli(String),
-}
+
 
 #[derive(Clone, Debug)]
 struct Tensor3 {
@@ -235,52 +224,7 @@ struct CaseReport {
     seed_results: Vec<SeedResult>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize)]
-enum ToleranceTier {
-    #[default]
-    Strict,
-    Relaxed,
-    EndToEnd,
-}
 
-impl ToleranceTier {
-    fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "strict" | "s" => Some(Self::Strict),
-            "relaxed" | "r" => Some(Self::Relaxed),
-            "end-to-end" | "e2e" | "e" => Some(Self::EndToEnd),
-            _ => None,
-        }
-    }
-
-    fn default_tolerance(self) -> Tolerance {
-        match self {
-            Self::Strict => Tolerance {
-                max_abs_err: 1e-5,
-                mean_abs_err: 1e-6,
-                max_rel_err: 1e-5,
-            },
-            Self::Relaxed => Tolerance {
-                max_abs_err: 1e-4,
-                mean_abs_err: 1e-5,
-                max_rel_err: 1e-4,
-            },
-            Self::EndToEnd => Tolerance {
-                max_abs_err: 1e-3,
-                mean_abs_err: 1e-4,
-                max_rel_err: 1e-3,
-            },
-        }
-    }
-}
-
-
-#[derive(Clone, Copy, Serialize)]
-struct Tolerance {
-    max_abs_err: f64,
-    mean_abs_err: f64,
-    max_rel_err: f64,
-}
 
 #[derive(Clone, Copy, Serialize)]
 struct Metrics {
@@ -326,24 +270,7 @@ struct Lcg {
     spare: Option<f64>,
 }
 
-#[derive(Debug)]
-struct CliArgs {
-    report_path: String,
-    remote_p2p_role: Option<String>,
-    node_index: Option<usize>,
-    bind_addr: Option<String>,
-    connect_addr: Option<String>,
-    stress_test: bool,
-    tolerance_tier: ToleranceTier,
-    infer_model_dir: Option<String>,
-    infer_prompt: Option<String>,
-    infer_prompt_file: Option<String>,
-    infer_max_tokens: usize,
-    infer_temperature: f64,
-    infer_top_p: f64,
-    infer_num_domains: usize,
-    distributed_role: Option<String>,
-}
+
 
 impl Lcg {
     fn new(seed: u64) -> Self {
@@ -811,126 +738,6 @@ fn default_cases() -> Vec<(&'static str, CaseConfig)> {
             case_config(&[128], &[32], 4, 16),
         ),
     ]
-}
-
-fn parse_cli_args() -> Result<CliArgs, RingError> {
-    let mut args = env::args().skip(1);
-    let mut report_path = String::from("reports/rust_ringattn_correctness.json");
-    let mut remote_p2p_role = None;
-    let mut node_index = None;
-    let mut bind_addr = None;
-    let mut connect_addr = None;
-    let mut stress_test = false;
-    let mut tolerance_tier = ToleranceTier::default();
-    let mut infer_model_dir = None;
-    let mut infer_prompt = None;
-    let mut infer_prompt_file = None;
-    let mut infer_max_tokens = 50;
-    let mut infer_temperature = 0.7;
-    let mut infer_top_p = 0.9;
-    let mut infer_num_domains = 1usize;
-    let mut distributed_role = None;
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--report-path" => {
-                report_path = next_cli_value(&mut args, "--report-path")?;
-            }
-            "--remote-p2p-role" => {
-                remote_p2p_role = Some(next_cli_value(&mut args, "--remote-p2p-role")?);
-            }
-            "--node-index" => {
-                let value = next_cli_value(&mut args, "--node-index")?;
-                node_index = Some(value.parse::<usize>().map_err(|error| {
-                    RingError::InvalidCli(format!("invalid --node-index: {error}"))
-                })?);
-            }
-            "--bind" => {
-                bind_addr = Some(next_cli_value(&mut args, "--bind")?);
-            }
-            "--connect" => {
-                connect_addr = Some(next_cli_value(&mut args, "--connect")?);
-            }
-            "--stress-test" => {
-                stress_test = true;
-            }
-            "--tolerance-tier" => {
-                let value = next_cli_value(&mut args, "--tolerance-tier")?;
-                tolerance_tier = ToleranceTier::from_str(&value).ok_or_else(|| {
-                    RingError::InvalidCli(format!(
-                        "invalid --tolerance-tier: {value}; expected strict|relaxed|end-to-end"
-                    ))
-                })?;
-            }
-            "--infer-model-dir" => {
-                infer_model_dir = Some(next_cli_value(&mut args, "--infer-model-dir")?);
-            }
-            "--infer-prompt" => {
-                infer_prompt = Some(next_cli_value(&mut args, "--infer-prompt")?);
-            }
-            "--infer-prompt-file" => {
-                infer_prompt_file = Some(next_cli_value(&mut args, "--infer-prompt-file")?);
-            }
-            "--infer-max-tokens" => {
-                let value = next_cli_value(&mut args, "--infer-max-tokens")?;
-                infer_max_tokens = value.parse().map_err(|e| {
-                    RingError::InvalidCli(format!("invalid --infer-max-tokens: {e}"))
-                })?;
-            }
-            "--infer-temperature" => {
-                let value = next_cli_value(&mut args, "--infer-temperature")?;
-                infer_temperature = value.parse().map_err(|e| {
-                    RingError::InvalidCli(format!("invalid --infer-temperature: {e}"))
-                })?;
-            }
-            "--infer-top-p" => {
-                let value = next_cli_value(&mut args, "--infer-top-p")?;
-                infer_top_p = value.parse().map_err(|e| {
-                    RingError::InvalidCli(format!("invalid --infer-top-p: {e}"))
-                })?;
-            }
-            "--infer-num-domains" => {
-                let value = next_cli_value(&mut args, "--infer-num-domains")?;
-                infer_num_domains = value.parse().map_err(|e| {
-                    RingError::InvalidCli(format!("invalid --infer-num-domains: {e}"))
-                })?;
-            }
-            "--distributed-role" => {
-                distributed_role = Some(next_cli_value(&mut args, "--distributed-role")?);
-                // Worker / coordinator parse remaining args themselves;
-                // stop parsing here so we don't reject their private flags.
-                break;
-            }
-            _ => {
-                return Err(RingError::InvalidCli(format!("unknown argument {arg}")));
-            }
-        }
-    }
-    Ok(CliArgs {
-        report_path,
-        remote_p2p_role,
-        node_index,
-        bind_addr,
-        connect_addr,
-        stress_test,
-        tolerance_tier,
-        infer_model_dir,
-        infer_prompt,
-        infer_prompt_file,
-        infer_max_tokens,
-        infer_temperature,
-        infer_top_p,
-        infer_num_domains,
-        distributed_role,
-    })
-}
-
-fn next_cli_value(
-    args: &mut impl Iterator<Item = String>,
-    flag: &'static str,
-) -> Result<String, RingError> {
-    args.next()
-        .filter(|value| !value.starts_with("--"))
-        .ok_or_else(|| RingError::InvalidCli(format!("missing value for {flag}")))
 }
 
 fn torch_device_success_code(requested_device: &str) -> Option<i32> {
