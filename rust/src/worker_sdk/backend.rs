@@ -4,7 +4,7 @@
 //! HCP 的 `WorkerRuntime` 负责协议循环和 coordinator 通信，
 //! 后端负责模型加载、forward 计算和 KV ring 交换。
 
-use crate::model::kv_transport::KvTransport;
+use crate::model::transport::KvTransport;
 use tch::Device;
 
 /// 分布式 Worker 后端抽象。

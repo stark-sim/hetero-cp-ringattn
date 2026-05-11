@@ -6,7 +6,7 @@
 //! 对于外部框架（vLLM、TensorRT-LLM、MLX 等），需要实现自定义的 `WorkerBackend`。
 
 use crate::model::cache::KvCaches;
-use crate::model::kv_transport::KvTransport;
+use crate::model::transport::KvTransport;
 use crate::model::model::LlamaModel;
 use crate::model::{ModelConfig, ModelWeights};
 use crate::worker_sdk::backend::WorkerBackend;

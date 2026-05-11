@@ -3,7 +3,7 @@ use crate::model::ModelError;
 #[cfg(feature = "tch-backend")]
 use tch::Tensor;
 #[cfg(feature = "tch-backend")]
-use crate::model::kv_transport::KvTransport;
+use crate::model::transport::KvTransport;
 
 /// Trait for attention computation backends.
 #[cfg(feature = "tch-backend")]

@@ -4,14 +4,14 @@ pub mod config;
 pub mod sampling;
 pub mod generator;
 pub mod distributed_generator;
-pub mod kv_transport;
+pub mod transport;
 pub mod layers;
 #[allow(clippy::module_inception)]
 pub mod model;
 pub mod weights;
 
 #[cfg(feature = "tch-backend")]
-pub use kv_transport::KvTransport;
+pub use transport::KvTransport;
 
 pub use model::LlamaModel;
 pub use weights::{ModelWeights, WeightNames};

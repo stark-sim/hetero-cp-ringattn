@@ -347,7 +347,7 @@ mod tests {
         let mut transports0 = Vec::with_capacity(num_layers);
         let mut transports1 = Vec::with_capacity(num_layers);
         for _ in 0..num_layers {
-            let (t0, t1) = crate::model::kv_transport::LinkedMockKvTransport::create_pair();
+            let (t0, t1) = crate::model::transport::LinkedMockKvTransport::create_pair();
             transports0.push(t0);
             transports1.push(t1);
         }
@@ -461,7 +461,7 @@ mod tests {
         let mut transports0 = Vec::with_capacity(num_layers);
         let mut transports1 = Vec::with_capacity(num_layers);
         for _ in 0..num_layers {
-            let (t0, t1) = crate::model::kv_transport::LinkedMockKvTransport::create_pair();
+            let (t0, t1) = crate::model::transport::LinkedMockKvTransport::create_pair();
             transports0.push(t0);
             transports1.push(t1);
         }
@@ -590,7 +590,7 @@ mod tests {
         let mut transports0 = Vec::with_capacity(num_layers);
         let mut transports1 = Vec::with_capacity(num_layers);
         for _ in 0..num_layers {
-            let (t0, t1) = crate::model::kv_transport::LinkedMockKvTransport::create_pair();
+            let (t0, t1) = crate::model::transport::LinkedMockKvTransport::create_pair();
             transports0.push(t0);
             transports1.push(t1);
         }

@@ -4,7 +4,7 @@ use super::backend::AttentionBackend;
 #[cfg(feature = "tch-backend")]
 use tch::{Device, Kind, Tensor};
 #[cfg(feature = "tch-backend")]
-use crate::model::kv_transport::{KvBlock, KvTransport};
+use crate::model::transport::{KvBlock, KvTransport};
 
 /// Ring-attention backend that splits sequence into chunks and computes
 /// attention via online softmax over K/V blocks.
@@ -291,7 +291,7 @@ impl HcpRingAttentionBackend {
         //
         // 【decode 阶段特殊处理】seq_len == 1 时，只发送 prefill 阶段产生的 KV 分区
         //（记录在 self.prefill_kv_len 中），decode 新 token 的 KV 完全由每个节点本地持有。
-        let mut peer_blocks: Vec<crate::model::kv_transport::KvBlock> = Vec::new();
+        let mut peer_blocks: Vec<crate::model::transport::KvBlock> = Vec::new();
 
         if let Some(ref mut transport) = self.kv_transport {
             let (k_to_send, v_to_send, send_seq_end) = if seq_len == 1 {
@@ -933,7 +933,7 @@ mod tests {
     #[test]
     #[cfg(feature = "tch-backend")]
     fn test_ring_attention_decode_with_peer_kv() {
-        use crate::model::kv_transport::MockKvTransport;
+        use crate::model::transport::MockKvTransport;
 
         let device = tch::Device::Cpu;
         let num_heads = 4i64;
@@ -974,7 +974,7 @@ mod tests {
 
         // Worker 0: receives peer KV [8..15] from worker 1
         let mut transport0 = MockKvTransport::new();
-        transport0.push(crate::model::kv_transport::KvBlock {
+        transport0.push(crate::model::transport::KvBlock {
             layer_idx: 0,
             global_seq_start: half as usize,
             global_seq_end: kv_len as usize - 1,
@@ -1005,7 +1005,7 @@ mod tests {
 
         // Worker 1: receives peer KV [0..7] from worker 0
         let mut transport1 = MockKvTransport::new();
-        transport1.push(crate::model::kv_transport::KvBlock {
+        transport1.push(crate::model::transport::KvBlock {
             layer_idx: 0,
             global_seq_start: 0,
             global_seq_end: half as usize,
@@ -1126,7 +1126,7 @@ mod tests {
     #[test]
     #[cfg(feature = "tch-backend")]
     fn test_ring_attention_with_mock_transport() {
-        use crate::model::kv_transport::MockKvTransport;
+        use crate::model::transport::MockKvTransport;
 
         let device = tch::Device::Cpu;
         let num_heads = 4i64;
@@ -1159,7 +1159,7 @@ mod tests {
 
         // Worker 0: receives peer KV from worker 1
         let mut transport0 = MockKvTransport::new();
-        transport0.push(crate::model::kv_transport::KvBlock {
+        transport0.push(crate::model::transport::KvBlock {
             layer_idx: 0,
             global_seq_start: half as usize,
             global_seq_end: seq_len as usize,
@@ -1190,7 +1190,7 @@ mod tests {
 
         // Worker 1: receives peer KV from worker 0
         let mut transport1 = MockKvTransport::new();
-        transport1.push(crate::model::kv_transport::KvBlock {
+        transport1.push(crate::model::transport::KvBlock {
             layer_idx: 0,
             global_seq_start: 0,
             global_seq_end: half as usize,

@@ -13,7 +13,7 @@ use crate::distributed_protocol::{
     recv_command_quic, send_response_quic, write_handshake_quic, WorkerCommand, WorkerResponse,
     WorkerHandshake,
 };
-use crate::model::kv_transport::KvTransport;
+use crate::model::transport::KvTransport;
 use crate::worker_sdk::backend::WorkerBackend;
 use quinn::{RecvStream, SendStream};
 use std::net::SocketAddr;
