@@ -253,6 +253,17 @@
   - 根因：启动脚本 `DYLD_LIBRARY_PATH` export 在 coordinator 启动之后，dyld 找不到 `libtorch_cpu.dylib` → SIGABRT（Abort trap 6）
   - 修复：环境变量 export 提到所有 libtorch-linked binary 启动之前；远程 worker 补 `LD_LIBRARY_PATH`
   - 验证：2 个 prompt 串行处理，exit=0，Worker 0/1 均优雅退出，零 panic ✅
+- [x] [2026-05-11] **工程化代码重构**（14 commits）：
+  - 将纯 binary crate 重构为 **lib + bin** 结构，`main.rs` 从 2,694 行精简到 3 行
+  - 按"操作对象"分组拆分大文件，创建 20+ 个新模块：
+    - `protocol.rs` (2,671) → `protocol/message.rs` + `transport.rs` + `framing.rs` + `node.rs`
+    - `model/backend.rs` (1,282) → `model/attention/backend.rs` + `attention/ring.rs`
+    - `model/generate.rs` (678) → `model/sampling.rs` + `generator.rs` + `distributed_generator.rs`
+    - `model/layers.rs` (584) → `layers/norm.rs` + `rotary.rs` + `mlp.rs` + `attention.rs`
+    - `model/kv_transport.rs` (367) → `model/transport/block.rs` + `trait.rs` + `tcp.rs` + `mock.rs`
+    - 新建 `cli.rs`, `error.rs`, `report.rs`, `remote.rs`, `smoke/`, `distributed/`
+  - 全部 45 cargo tests 通过，零 regression
+  - 已推送至 main 分支
 - [x] [2026-04-30] **手动部署指南** (`docs/DEPLOYMENT_GUIDE.md`)：从零开始的手动部署文档，覆盖：
   - 单节点本地部署（Mac MPS / GPU CUDA 独立验证）
   - 双节点异构部署（Mac MPS + remote RTX 4090 CUDA）完整步骤

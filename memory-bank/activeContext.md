@@ -2,7 +2,17 @@
 
 ## 当前焦点
 
-[2026-05-11] **跨节点异构多请求 E2E 验证通过**。Mac MPS (domain 0) + white RTX 4090 CUDA (domain 1) 跨 Tailscale VPN 完成 2 个 prompt 串行处理（`The answer to life` → ` is not a`，`Once upon a time` → `, there was`），exit code 0，worker 优雅退出，零 panic。根因是启动脚本中 `DYLD_LIBRARY_PATH` 环境变量设置顺序错误（coordinator 启动后才 export，导致 dyld 找不到 libtorch → SIGABRT）。修复后验证通过。
+[2026-05-11] **工程化代码重构完成**。14 个 commit 将纯 binary crate 重构为 lib + bin 结构，按域深度拆分所有大文件：
+- `main.rs` 2,694 → 3 行（thin wrapper）
+- `lib.rs` 新建 → 548 行（模块声明 + re-exports）
+- `protocol.rs` 2,671 → 拆为 message.rs + transport.rs + framing.rs + node.rs
+- `model/backend.rs` 1,282 → 拆为 attention/backend.rs + attention/ring.rs
+- `model/generate.rs` 678 → 拆为 sampling.rs + generator.rs + distributed_generator.rs
+- `model/layers.rs` 584 → 拆为 layers/norm.rs + rotary.rs + mlp.rs + attention.rs
+- `model/kv_transport.rs` 367 → 拆为 transport/block.rs + trait.rs + tcp.rs + mock.rs
+- 新建 `cli.rs`, `error.rs`, `report.rs`, `remote.rs`, `smoke/` 目录, `distributed/` 目录
+- 全部 45 cargo tests 通过，零 regression
+- 已推送至 main 分支
 
 上一阶段 **跨机器异构 E2E（Mac vllm-metal + white RTX 4090）** 已在 Python 层完成验证并冻结。Python 层不再扩展。
 
