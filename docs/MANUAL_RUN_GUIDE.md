@@ -12,7 +12,6 @@
 # Mac 本地
 export LIBTORCH=/Users/stark_sim/libtorch
 export DYLD_LIBRARY_PATH=$LIBTORCH/lib:$DYLD_LIBRARY_PATH
-export HCP_TCH_DEVICE=mps   # 或 cpu，如果用 cpu 就把 mps 改成 cpu
 
 # 验证 libtorch 可用
 cd ~/VSCodeProjects/hetero-cp-ringattn/rust
@@ -40,14 +39,56 @@ EOF
 
 ---
 
+## Stage 0：代码结构速查（理解再动手）
+
+重构后的代码按"操作对象"分组。启动进程之前，先花 5 分钟了解每个模块管什么：
+
+| 你想理解什么 | 文件 | 核心职责 |
+|-------------|------|----------|
+| **Coordinator 怎么调度 prompt 分片** | `src/distributed/coordinator.rs` | 接受 worker 连接 → tokenize → 三 tier 分片 → 广播 Prefill/Decode → 采样 token |
+| **Worker 怎么启动、怎么连 peer** | `src/distributed/worker.rs` | 解析参数 → 加载权重（一次）→ 每 domain 一个线程 → 运行 WorkerRuntime |
+| **Worker 事件循环长什么样** | `src/worker_sdk/runtime.rs` | QUIC 网络初始化 → per-layer stream → command loop → graceful exit |
+| **Ring Attention 算法本身** | `src/model/attention/ring.rs` | online softmax、KV block 交换、causal mask、prefill/decode 路径 |
+| **KV 怎么跨省界发出去** | `src/distributed/transport/quic.rs` | QUIC endpoint、1GB window、并发 send+recv（防死锁）、dummy handshake |
+| **单节点参考输出怎么算** | `src/infer.rs` | LlamaModel 加载 → greedy/temperature 采样 → 自回归生成 |
+| **Smoke 测试框架** | `src/smoke/` | 参考 attention 算法、correctness case、C++/tch bridge 验证 |
+
+---
+
 ## Stage 1：单节点推理（理解 baseline）
 
-> **设计内涵**：先确认单节点能跑通，掌握参考输出。这是后续分布式对比的基准。
+> **设计内涵**：先确认单节点能跑通，掌握参考输出。这是后续分布式对比的基准。单节点必须覆盖 **CPU / MPS / CUDA** 三种设备，确保模型本身无 device-specific bug。
 
-### 命令
+### 1a. CPU 单节点（最基础的正确性验证）
 
 ```bash
 cd ~/VSCodeProjects/hetero-cp-ringattn/rust
+DYLD_LIBRARY_PATH=$LIBTORCH/lib:$DYLD_LIBRARY_PATH \
+  HCP_TCH_DEVICE=cpu \
+  ./target/release/hcp-ringattn-rust \
+    --infer-model-dir /Users/stark_sim/models/qwen2-0.5b \
+    --infer-prompt "The answer to life" \
+    --infer-max-tokens 3 \
+    --infer-temperature 0.0 \
+    --infer-num-domains 1
+```
+
+**预期输出**：
+```
+[infer] device: Cpu
+[infer] loading weights from /Users/stark_sim/models/qwen2-0.5b
+[infer] building model (24 layers, 14 heads)
+[infer] generating (max_tokens=3, temperature=0)...
+ is not a
+```
+
+**观察重点**：
+- `device: Cpu` — 确认 fallback 路径正常
+- 记录输出：`The answer to life` → ` is not a`（这是后续所有 distributed 验证的**黄金参考**）
+
+### 1b. MPS 单节点（Mac GPU 验证）
+
+```bash
 DYLD_LIBRARY_PATH=$LIBTORCH/lib:$DYLD_LIBRARY_PATH \
   HCP_TCH_DEVICE=mps \
   ./target/release/hcp-ringattn-rust \
@@ -58,37 +99,46 @@ DYLD_LIBRARY_PATH=$LIBTORCH/lib:$DYLD_LIBRARY_PATH \
     --infer-num-domains 1
 ```
 
-### 预期输出
+**预期输出**：与 CPU 完全一致 ` is not a`
 
-```
-[infer] device: Mps
-[infer] loading weights from /Users/stark_sim/models/qwen2-0.5b
-[infer] building model (24 layers, 14 heads)
-[infer] generating (max_tokens=3, temperature=0)...
- is not a
-```
+**观察重点**：
+- `device: Mps` — 确认 Metal GPU 被选中
+- 输出必须与 CPU 参考一致，否则说明 MPS backend 有数值问题
 
-### 观察重点
-
-1. `device: Mps` — 确认确实跑在 GPU 上，不是 fallback 到 CPU
-2. `24 layers, 14 heads` — Qwen2-0.5B 的模型结构
-3. `--infer-num-domains 1` — 单节点不分片，全部计算在一台机器上完成
-4. 记录输出：`The answer to life` → ` is not a`
-
-### 再跑第二个 prompt
+### 1c. CUDA 单节点（远程 GPU 验证）
 
 ```bash
-DYLD_LIBRARY_PATH=$LIBTORCH/lib:$DYLD_LIBRARY_PATH \
-  HCP_TCH_DEVICE=mps \
-  ./target/release/hcp-ringattn-rust \
-    --infer-model-dir /Users/stark_sim/models/qwen2-0.5b \
-    --infer-prompt "Once upon a time" \
-    --infer-max-tokens 3 \
-    --infer-temperature 0.0 \
-    --infer-num-domains 1
+ssh stark@100.64.0.2
+
+cd ~/hetero-cp-ringattn/rust
+export PATH=/home/stark/.cargo/bin:$PATH
+export LIBTORCH=/home/stark/libtorch
+export LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH
+export HCP_TCH_DEVICE=cuda
+
+./target/release/hcp-ringattn-rust \
+  --infer-model-dir ~/hetero-cp-ringattn/models/Qwen2-0.5B \
+  --infer-prompt "The answer to life" \
+  --infer-max-tokens 3 \
+  --infer-temperature 0.0 \
+  --infer-num-domains 1
 ```
 
-预期输出：`, there was`
+**预期输出**：与 CPU/MPS 完全一致 ` is not a`
+
+**观察重点**：
+- `device: Cuda(0)` — 确认 RTX 4090 被选中
+- 输出必须与 CPU 参考一致，否则说明 CUDA backend 有数值问题
+
+### 1d. 单节点 device 一致性验证
+
+| Device | 预期输出 | 验证标准 |
+|--------|----------|----------|
+| CPU | ` is not a` | 基准参考 |
+| MPS | ` is not a` | 与 CPU 逐 token 一致 |
+| CUDA | ` is not a` | 与 CPU 逐 token 一致 |
+
+如果三个 device 输出不一致，说明模型实现存在 device-specific bug（例如 MPS `masked_fill` 行为差异、CUDA dtype 问题），必须先修复再进入分布式验证。
 
 ---
 
@@ -279,6 +329,94 @@ export HCP_TCH_DEVICE=cuda
 
 ---
 
+## Stage 4：代码阅读路线（按业务逻辑）
+
+手动跑通之后，按以下顺序读代码，理解每个模块的业务逻辑：
+
+### 4a. Coordinator 调度流程
+
+```
+src/distributed/coordinator.rs
+  → run() [入口]
+    → 创建 QUIC endpoint，监听 worker 连接
+    → accept_workers() [按 domain_id 排序]
+    → tokenize prompt
+    → allocate_chunks() [三 tier：chunk-sizes > capacity-aware > 均分]
+    → 循环每个 request：
+      → 发送 Prefill 到每个 worker
+      → 收集 PrefillDone，max(global_seq_len)
+      → 广播 SyncGlobalSeqLen
+      → 采样第一个 token
+      → decode 循环：广播 Decode → 收集 logits → 采样 → 广播下一个 token
+    → 全部完成后 Shutdown
+```
+
+### 4b. Worker 生命周期
+
+```
+src/distributed/worker.rs
+  → run() [入口]
+    → select_device() [env > MPS > CUDA > CPU]
+    → 加载 ModelConfig + ModelWeights（一次，shallow_clone 共享）
+    → 每 domain 一个线程：
+      → TchWorkerBackend::load() / from_model()
+      → WorkerRuntime::new() [网络初始化]
+      → runtime.run() [事件循环]
+    → ResetBarrier::wait() [多 domain 同步]
+
+src/worker_sdk/runtime.rs
+  → new() [网络初始化]
+    → create_endpoint()
+    → dial next peer + accept prev peer
+    → open per-layer bidirectional streams
+    → write 1-byte dummy handshake
+    → connect to coordinator
+    → backend.setup_kv_transports()
+    → send WorkerHandshake
+  → run() [事件循环]
+    → loop:
+      → recv_command_quic()
+      → dispatch: Prefill → backend.prefill() → PrefillDone
+      → dispatch: Decode → backend.decode() → DecodeDone
+      → dispatch: Shutdown → break
+    → graceful exit on connection lost
+```
+
+### 4c. Ring Attention 核心算法
+
+```
+src/model/attention/ring.rs
+  → HcpRingAttentionBackend::forward()
+    → Q/K/V projection + RoPE
+    → 如果是分布式（num_domains > 1）：
+      → ring_attention()
+        → 构建本地 KvBlock
+        → for round in 0..num_domains-1:
+          → transport.exchange_kv_block() [并发 send+recv]
+          → 收到 peer block 后 online_update_block()
+            → online softmax: max, sum_exp, output
+        → 最终输出 = output / sum_exp
+    → 如果是单节点：local_attention_scores()
+    → O-projection + residual
+```
+
+### 4d. QUIC 传输层
+
+```
+src/distributed/transport/quic.rs
+  → create_endpoint()
+    → 自签名证书 + SkipServerVerification
+    → 1GB send/receive window（防 KV block 死锁）
+    → 1s keep-alive（NAT/防火墙存活）
+    → 1200 MTU（Tailscale/WireGuard 兼容）
+  → QuicKvTransport::exchange_kv_block()
+    → tokio::join!(send_kv_block, recv_kv_block) [并发，防死锁]
+    → 120s timeout
+    → 帧格式：4-byte BE length + JSON metadata + raw f32 bytes
+```
+
+---
+
 ## 设计内涵速查表
 
 | 你看到什么 | 它意味着什么 |
@@ -302,6 +440,8 @@ export HCP_TCH_DEVICE=cuda
 | `QUIC connection to next peer: timed out` | 对端 worker 还没启动 | 按顺序启动：Coordinator → Worker 1 → Worker 0 |
 | 输出与单节点不一致 | KV 没交换成功 | 检查 `[ring_attention]` 日志是否存在 |
 | Worker 1 启动报 `cargo: command not found` | white 上 PATH 没加载 cargo | 加 `export PATH=/home/stark/.cargo/bin:$PATH` |
+| MPS 输出与 CPU 不一致 | MPS backend 数值差异 | 检查 `ring_attention` 中 `masked_fill`/`where_self` 的 MPS workaround |
+| CUDA 输出与 CPU 不一致 | CUDA dtype/accumulation 差异 | 检查 f32 vs f16、cuBLAS 执行失败、position_ids 越界 |
 
 ---
 
