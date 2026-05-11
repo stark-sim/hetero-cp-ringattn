@@ -2,7 +2,7 @@
 
 ## 当前焦点
 
-[2026-05-09] **Rust Static Batching 已完成**，commit `327dc31`。`BatchGenerator` 支持 batch > 1 的并行 prefill + decode，correctness 验证通过（batch=2 vs 两个独立 batch=1 完全一致），24/24 model tests 无 regression。
+[2026-05-09] **Rust 分布式推理服务化已完成**。Coordinator 从单请求 smoke 工具升级为支持多请求串行处理的完整推理服务。commit 待填。
 
 上一阶段 **跨机器异构 E2E（Mac vllm-metal + white RTX 4090）** 已在 Python 层完成验证并冻结。Python 层不再扩展。
 
@@ -10,6 +10,14 @@
 
 ## 近期变化
 
+- [2026-05-09] **Rust 分布式推理服务化**：
+  - Protocol 添加 `request_id`：`WorkerCommand` / `WorkerResponse` 所有 variant 携带 request ID，支持多请求生命周期隔离
+  - Worker 新请求自动隔离：`TchWorkerBackend::prefill` 在每次 Prefill 时自动重建 KV cache（`create_kv_caches()`），避免旧请求污染新请求的 attention 计算
+  - Worker 优雅退出：`WorkerRuntime::run()` 检测到 "connection lost" / "stream closed" 等连接关闭信号时打印日志并正常返回 Ok，不再 panic
+  - Coordinator 多请求串行处理：新增 `--prompts-file` 参数（每行一个 prompt），循环处理每个请求，全部完成后统一 Shutdown workers
+  - Coordinator 错误处理改进：单个请求的失败（logits size mismatch、sample_token error）只影响当前请求，继续处理下一个请求
+  - 本地 2-domain CPU smoke 验证：2 个短 prompt 串行处理，Request 1 → ` is not a`，Request 2 → `, there was`，Worker 优雅退出，无 panic ✅
+  - 全部 45 个 tests 通过，无 regression
 - [2026-05-09] **Rust Static Batching 实现与验证**：
   - `BatchGenerator`：等长 prompts 约束 + 0-token EOS 填充 + greedy/temperature/top-p 采样
   - `test_batch_forward_correctness`：batch=2 vs batch=1，logits diff ~1e-6，token 完全一致 ✅
@@ -75,7 +83,11 @@
   - correctness 验证：`test_batch_forward_correctness`（batch=2 vs batch=1，prefill + 4-step decode，logits diff ~1e-6，token 完全一致）✅
   - correctness 验证：`test_batch_generator_correctness`（`BatchGenerator` batch=2 vs 两个独立 `Generator`，token 序列完全一致）✅
   - 无 regression：全部 24 个 model tests 通过 ✅
-- [ ] **Phase 4.2: Rust 层性能优化与生产化**（长期）：
+- [ ] **Phase 4.2: Rust 层 HTTP API 服务化**：
+  - Coordinator 添加 HTTP server（axum），提供 OpenAI-compatible `/v1/completions` API
+  - Request queue + 异步处理，支持并发请求接入
+  - Health check `/health` 和 metrics `/metrics` endpoint
+- [ ] **Phase 4.3: Rust 层性能优化与生产化**（长期）：
   - 量化支持（FP8/INT8 KV cache）— **暂不实施**，correctness 流程尚未完全走完
   - 连续 batching / 动态 request 调度
   - 更高效的 transport（RDMA / GPUDirect）

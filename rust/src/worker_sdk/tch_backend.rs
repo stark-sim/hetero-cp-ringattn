@@ -95,6 +95,13 @@ impl WorkerBackend for TchWorkerBackend {
         chunk: &[i64],
         seq_offset: usize,
     ) -> Result<(Vec<f32>, usize), String> {
+        // Reset KV cache for a new request. Each Prefill command starts a
+        // fresh autoregressive sequence; reusing old KV cache would pollute
+        // the attention computation with stale history.
+        self.kv_caches = self.model.create_kv_caches();
+        self.model.is_prefill_done = false;
+        self.model.global_seq_len = 0;
+
         self.model.seq_offset = seq_offset as i64;
         // 更新每层的 seq_offset（用于 causal mask 的全局位置计算）
         for layer in self.model.layers.iter_mut() {

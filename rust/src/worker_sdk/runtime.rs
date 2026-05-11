@@ -108,12 +108,29 @@ impl<B: WorkerBackend> WorkerRuntime<B> {
 
         loop {
             println!("[worker {domain_id}] waiting for command...");
-            let cmd = recv_command_quic(&mut self.coord_recv, &rt_handle)
-                .map_err(|e| format!("recv_command failed: {e}"))?;
+            let cmd = match recv_command_quic(&mut self.coord_recv, &rt_handle) {
+                Ok(c) => c,
+                Err(e) => {
+                    // Graceful exit when coordinator closes the connection.
+                    // This happens after coordinator sends Shutdown and tears
+                    // down the QUIC endpoint; it's not an error condition.
+                    let msg = e.to_lowercase();
+                    if msg.contains("connection lost")
+                        || msg.contains("stream closed")
+                        || msg.contains("peer closed")
+                        || msg.contains("reset by peer")
+                        || msg.contains("closed")
+                    {
+                        println!("[worker {domain_id}] coordinator connection closed, exiting gracefully");
+                        return Ok(());
+                    }
+                    return Err(format!("recv_command failed: {e}"));
+                }
+            };
             println!("[worker {domain_id}] received command: {cmd:?}");
 
             match cmd {
-                WorkerCommand::Prefill { chunk, seq_offset } => {
+                WorkerCommand::Prefill { request_id, chunk, seq_offset } => {
                     let seq_offset = seq_offset as usize;
                     let (logits_vec, global_seq_len) = self
                         .backend
@@ -124,13 +141,14 @@ impl<B: WorkerBackend> WorkerRuntime<B> {
                         logits_vec.iter().flat_map(|&v| v.to_le_bytes()).collect();
 
                     let resp = WorkerResponse::PrefillDone {
+                        request_id,
                         last_logits_bytes: logits_bytes,
                         global_seq_len,
                     };
                     send_response_quic(&mut self.coord_send, &resp, &rt_handle)
                         .map_err(|e| format!("send PrefillDone failed: {e}"))?;
                 }
-                WorkerCommand::Decode(token) => {
+                WorkerCommand::Decode { request_id, token } => {
                     let logits_vec = self
                         .backend
                         .decode(token)
@@ -139,13 +157,16 @@ impl<B: WorkerBackend> WorkerRuntime<B> {
                     let logits_bytes: Vec<u8> =
                         logits_vec.iter().flat_map(|&v| v.to_le_bytes()).collect();
 
-                    let resp = WorkerResponse::DecodeDone { logits_bytes };
+                    let resp = WorkerResponse::DecodeDone {
+                        request_id,
+                        logits_bytes,
+                    };
                     send_response_quic(&mut self.coord_send, &resp, &rt_handle)
                         .map_err(|e| format!("send DecodeDone failed: {e}"))?;
                 }
-                WorkerCommand::SyncGlobalSeqLen(len) => {
+                WorkerCommand::SyncGlobalSeqLen { request_id, len } => {
                     self.backend.sync_global_seq_len(len);
-                    println!("[worker {domain_id}] synced global_seq_len = {len}");
+                    println!("[worker {domain_id}] request {request_id} synced global_seq_len = {len}");
                 }
                 WorkerCommand::Shutdown => {
                     println!("[worker {domain_id}] shutting down");

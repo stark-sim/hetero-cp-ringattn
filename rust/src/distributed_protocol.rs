@@ -12,16 +12,23 @@ use tokio::runtime::Handle;
 /// Control messages sent from coordinator to worker.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub enum WorkerCommand {
-    /// Run prefill on the given token IDs.
+    /// Run prefill on the given token IDs for a specific request.
     /// `seq_offset` is the global start position of this chunk (domain0=0, domain1=chunk0_len, etc.)
     Prefill {
+        request_id: u64,
         chunk: Vec<i64>,
         seq_offset: i64,
     },
-    /// Run single-token decode.
-    Decode(i64),
+    /// Run single-token decode for a specific request.
+    Decode {
+        request_id: u64,
+        token: i64,
+    },
     /// Synchronize global sequence length before decode.
-    SyncGlobalSeqLen(usize),
+    SyncGlobalSeqLen {
+        request_id: u64,
+        len: usize,
+    },
     /// Shutdown the worker.
     Shutdown,
 }
@@ -32,15 +39,20 @@ pub enum WorkerResponse {
     /// Prefill completed; includes last-token logits as f32 bytes and the
     /// worker's global_seq_len so the coordinator can sync across domains.
     PrefillDone {
+        request_id: u64,
         last_logits_bytes: Vec<u8>,
         global_seq_len: usize,
     },
     /// Decode completed; includes logits as f32 bytes.
     DecodeDone {
+        request_id: u64,
         logits_bytes: Vec<u8>,
     },
     /// Worker encountered an error.
-    Error(String),
+    Error {
+        request_id: u64,
+        message: String,
+    },
 }
 
 /// Serialize a message to bytes using bincode.
@@ -338,17 +350,18 @@ mod tests {
     #[test]
     fn test_bincode_format() {
         let cmd = WorkerCommand::Prefill {
+            request_id: 1,
             chunk: vec![1, 2, 3],
             seq_offset: 0,
         };
         let bytes = bincode::serialize(&cmd).unwrap();
         println!("Prefill cmd: {:?}", bytes);
 
-        let cmd2 = WorkerCommand::Decode(42);
+        let cmd2 = WorkerCommand::Decode { request_id: 1, token: 42 };
         let bytes2 = bincode::serialize(&cmd2).unwrap();
         println!("Decode cmd: {:?}", bytes2);
 
-        let cmd3 = WorkerCommand::SyncGlobalSeqLen(11);
+        let cmd3 = WorkerCommand::SyncGlobalSeqLen { request_id: 1, len: 11 };
         let bytes3 = bincode::serialize(&cmd3).unwrap();
         println!("SyncGlobalSeqLen cmd: {:?}", bytes3);
 
@@ -357,6 +370,7 @@ mod tests {
         println!("Shutdown cmd: {:?}", bytes4);
 
         let resp = WorkerResponse::PrefillDone {
+            request_id: 1,
             last_logits_bytes: vec![0xAB, 0xCD],
             global_seq_len: 11,
         };

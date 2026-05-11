@@ -242,6 +242,12 @@
   - `test_batch_forward_correctness`：验证 `LlamaModel::forward` batch=2 时，每个 sample 的 logits 与独立 batch=1 一致（diff ~1e-6），4-step decode token 完全一致
   - `test_batch_generator_correctness`：验证 `BatchGenerator` batch=2 的输出与两个独立单 request 生成结果完全一致
   - 全部 24 个 model tests 通过，无 regression
+- [x] [2026-05-09] **Rust 分布式推理服务化**：
+  - Protocol 添加 `request_id`：`WorkerCommand`/`WorkerResponse` 所有 variant 携带 request ID，支持多请求生命周期隔离
+  - Worker 新请求自动隔离：`TchWorkerBackend::prefill` 在每次 Prefill 时自动重建 KV cache，避免旧请求污染新请求
+  - Worker 优雅退出：`WorkerRuntime::run()` 检测到 connection lost / stream closed 时正常返回 Ok，不再 panic
+  - Coordinator 多请求串行处理：新增 `--prompts-file` 参数（每行一个 prompt），循环处理每个请求，错误只影响当前请求
+  - 本地 2-domain CPU smoke 验证：2 个短 prompt 串行处理（`The answer to life` → ` is not a`，`Once upon a time` → `, there was`），Worker 优雅退出，无 panic，全部 45 tests 通过 ✅
 - [x] [2026-04-30] **手动部署指南** (`docs/DEPLOYMENT_GUIDE.md`)：从零开始的手动部署文档，覆盖：
   - 单节点本地部署（Mac MPS / GPU CUDA 独立验证）
   - 双节点异构部署（Mac MPS + remote RTX 4090 CUDA）完整步骤
@@ -288,5 +294,7 @@
 | M8: Transformers 真实 KV + online softmax correctness | **已完成** | [2026-05-09] `test_worker_2domain.py` (mock) ✅、`test_transformers_2domain_quic.py` (QUIC) ✅。`recalculate_logits()` + `DynamicCache` 兼容层 + 仅最后一个 domain 重算 |
 | M9: 冻结 Python 层，聚焦 Rust + C++ + libtorch | **已决策** | [2026-05-09] Python 层进入维护模式不再扩展，Rust 层是唯一主干 |
 | M10: Rust Static Batching | **已完成** | [2026-05-09] `BatchGenerator` 支持 batch > 1 的 prefill/decode，correctness 验证通过（batch=2 vs 两个独立 batch=1 完全一致），24/24 tests 无 regression |
-| M10.1: Rust 性能优化与生产化 | **待启动** | 量化（暂不实施，correctness 优先）、连续 batching、RDMA transport |
+| M10.1: Rust 分布式推理服务化 | **已完成** | [2026-05-09] Protocol 添加 request_id、Worker 新请求自动隔离 KV cache、Coordinator 支持 `--prompts-file` 多请求串行处理、Worker 优雅退出。本地 2-domain CPU smoke 验证 2 个 prompt 串行通过，无 panic |
+| M10.2: Rust HTTP API 服务化 | **待启动** | axum OpenAI-compatible API、request queue、health/metrics endpoint |
+| M10.3: Rust 性能优化与生产化 | **待启动** | 量化（暂不实施，correctness 优先）、连续 batching、RDMA transport |
 | M11: vLLM Block-Aware Ring | **远景** | [2026-05-09] 核心洞察：ring 在 vLLM block 层面运作。详见 `docs/BLOCK_RING_FUSION.md` |
