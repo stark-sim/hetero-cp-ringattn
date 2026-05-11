@@ -57,6 +57,7 @@
 
 ## 下一步
 
+- [x] [2026-05-11] **Rust lib.rs 重构 Commits 3-7**：提取 report types (`src/report.rs`)、reference algorithm (`src/smoke/reference_algo.rs`)、correctness tests (`src/smoke/correctness.rs`)、C++/tch bridge wrappers (`src/smoke/bridges/cxx.rs`, `src/smoke/bridges/tch.rs`)、remote networking (`src/remote.rs`)。lib.rs 从 ~2500 行降至 555 行。`cargo check --features tch-backend` 通过，`cargo test --features tch-backend` 45/45 通过。
 - [x] [2026-05-09] **验证跨机器 E2E通过**：`scripts/run_python_distributed_2node.sh` 成功运行，Mac vllm-metal (MPS, 8.39s 初始化) + white RTX 4090 (CUDA) 完整端到端通过，生成 `. I am`。QUIC 超时修复（peer accept 180s）生效。
 - [x] [2026-05-09] **大规模跨机器验证矩阵完成**（一个节点一个 worker）：
   - T0 回归（2 tokens + 3 decode）：`. I am` ✅ ~40s
