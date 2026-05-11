@@ -7,7 +7,7 @@ use crate::distributed_protocol::{
     recv_response_quic, send_command_quic, WorkerCommand, WorkerResponse,
 };
 use crate::model::config::ModelConfig;
-use crate::model::generate::sample_token;
+use crate::model::sampling::sample_token;
 use std::net::SocketAddr;
 use std::path::Path;
 use tch::Tensor;

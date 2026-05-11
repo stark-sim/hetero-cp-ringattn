@@ -1,7 +1,9 @@
 pub mod attention;
 pub mod cache;
 pub mod config;
-pub mod generate;
+pub mod sampling;
+pub mod generator;
+pub mod distributed_generator;
 pub mod kv_transport;
 pub mod layers;
 #[allow(clippy::module_inception)]

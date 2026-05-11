@@ -1,6 +1,6 @@
 use crate::model::{ModelConfig, ModelWeights};
 use crate::model::model::LlamaModel;
-use crate::model::generate::Generator;
+use crate::model::generator::Generator;
 use std::path::Path;
 
 #[cfg(feature = "tch-backend")]

@@ -1,53 +1,9 @@
 use crate::model::{LlamaModel, ModelError};
+use crate::model::sampling::sample_token;
 use tokenizers::Tokenizer;
 
 #[cfg(feature = "tch-backend")]
 use tch::{Device, Kind, Tensor};
-
-/// Sample a single token from logits.
-///
-/// - `temperature == 0.0`: greedy argmax.
-/// - `temperature > 0.0`: temperature scaling + optional top-p filtering + multinomial sampling.
-#[cfg(feature = "tch-backend")]
-pub(crate) fn sample_token(logits: &Tensor, temperature: f64, top_p: f64) -> Result<u32, ModelError> {
-    // Greedy decoding
-    if temperature <= 0.0 {
-        return Ok(logits.argmax(-1, false).int64_value(&[]) as u32);
-    }
-
-    // Temperature scaling
-    let scaled_logits = logits / temperature;
-
-    // Top-p (nucleus) filtering
-    let filtered_logits = if top_p > 0.0 && top_p < 1.0 {
-        let probs = scaled_logits.softmax(-1, Kind::Float);
-        // Sort descending: (values, indices)
-        let sorted = probs.sort(-1, true);
-        let sorted_probs = sorted.0;
-        let sorted_indices = sorted.1;
-        // Cumulative sum
-        let cumsum = sorted_probs.cumsum(-1, Kind::Float);
-        // Find tokens to remove: cumsum > top_p
-        let remove_mask = cumsum.gt(top_p);
-        // Set removed probabilities to 0
-        let filtered_sorted = sorted_probs * remove_mask.logical_not().to_kind(Kind::Float);
-        // Scatter back to original positions and renormalize
-        let filtered = Tensor::zeros_like(&probs)
-            .scatter_add(-1, &sorted_indices, &filtered_sorted);
-        // Avoid log(0) by adding epsilon
-        let epsilon = 1e-10;
-        (filtered.clamp_min(epsilon)).log()
-    } else {
-        scaled_logits.shallow_clone()
-    };
-
-    // Convert to probabilities and sample
-    let probs = filtered_logits.softmax(-1, Kind::Float);
-    // Clamp to avoid numerical issues
-    let safe_probs = probs.clamp_min(1e-10);
-    let sampled = safe_probs.multinomial(1, true);
-    Ok(sampled.int64_value(&[]) as u32)
-}
 
 /// Autoregressive text generator (single-node).
 ///
@@ -293,130 +249,6 @@ impl BatchGenerator {
     }
 }
 
-/// Distributed autoregressive text generator.
-///
-/// Simulates multi-domain CP inference in a single process.
-/// Each domain holds a `LlamaModel` with its own KV cache; KV blocks are
-/// exchanged via `LinkedMockKvTransport` during decode.
-#[cfg(feature = "tch-backend")]
-#[allow(dead_code)]
-pub struct DistributedGenerator {
-    models: Vec<LlamaModel>,
-    tokenizer: Tokenizer,
-    device: Device,
-    num_domains: usize,
-}
-
-#[cfg(feature = "tch-backend")]
-#[allow(dead_code)]
-impl DistributedGenerator {
-    /// Create a distributed generator from pre-configured models.
-    ///
-    /// Caller must have already called `setup_distributed_domain` on each model
-    /// with appropriate transports and `seq_offset`.
-    pub fn new(models: Vec<LlamaModel>, tokenizer_path: &str, device: Device) -> Result<Self, ModelError> {
-        let num_domains = models.len();
-        let tokenizer = Tokenizer::from_file(tokenizer_path)
-            .map_err(|e| ModelError::Tokenizer(e.to_string()))?;
-        Ok(Self { models, tokenizer, device, num_domains })
-    }
-
-    /// Generate text from a prompt.
-    pub fn generate(&mut self, prompt: &str, max_new_tokens: usize, temperature: f64, top_p: f64) -> Result<String, ModelError> {
-        let prompt_ids = self.tokenize(prompt)?;
-        let generated_ids = self.generate_tokens(&prompt_ids, max_new_tokens, temperature, top_p)?;
-        self.decode_tokens(&generated_ids)
-    }
-
-    /// Tokenize prompt text into IDs.
-    fn tokenize(&self, prompt: &str) -> Result<Vec<i64>, ModelError> {
-        let encoding = self.tokenizer.encode(prompt, true)
-            .map_err(|e| ModelError::Tokenizer(e.to_string()))?;
-        Ok(encoding.get_ids().iter().map(|&id| id as i64).collect())
-    }
-
-    /// Decode generated IDs back to text.
-    fn decode_tokens(&self, ids: &[u32]) -> Result<String, ModelError> {
-        self.tokenizer.decode(ids, true)
-            .map_err(|e| ModelError::Tokenizer(e.to_string()))
-    }
-
-    /// Core distributed autoregressive generation from token IDs.
-    ///
-    /// Prefill is split across domains; decode broadcasts the sampled token to
-    /// all domains and collects logits from any domain (they should be identical).
-    pub fn generate_tokens(&mut self, prompt_ids: &[i64], max_new_tokens: usize, temperature: f64, top_p: f64) -> Result<Vec<u32>, ModelError> {
-        if prompt_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut kv_caches_list: Vec<_> = self.models.iter().map(|m| m.create_kv_caches()).collect();
-
-        // ====== Prefill: split prompt into domain chunks ======
-        let seq_len = prompt_ids.len() as i64;
-        let chunk_size = (seq_len as usize).div_ceil(self.num_domains).max(1) as i64;
-        let mut prefill_logits = Vec::with_capacity(self.num_domains);
-
-        for (domain_id, model) in self.models.iter_mut().enumerate() {
-            let start = (domain_id as i64 * chunk_size).min(seq_len);
-            let end = ((domain_id as i64 + 1) * chunk_size).min(seq_len);
-            let chunk_len = end - start;
-            if chunk_len <= 0 {
-                continue;
-            }
-            let chunk = Tensor::from_slice(&prompt_ids[start as usize..end as usize])
-                .unsqueeze(0)
-                .to_device(self.device);
-            let logits = model.forward(&chunk, &mut kv_caches_list[domain_id])?;
-            prefill_logits.push(logits);
-        }
-
-        // Synchronize global_seq_len across all domains for decode.
-        // In a real multi-process setup, the coordinator broadcasts the global prompt length.
-        let max_global_seq_len = self.models.iter().map(|m| m.global_seq_len).max().unwrap_or(0);
-        for model in self.models.iter_mut() {
-            model.global_seq_len = max_global_seq_len;
-        }
-
-        // ====== Decode loop ======
-        let mut generated_ids: Vec<u32> = Vec::new();
-        let eos_token = self.models[0].config.eos_token_id();
-
-        // Sample first token from the last domain's prefill output
-        let last_domain = self.num_domains.saturating_sub(1);
-        let first_logits = prefill_logits[last_domain]
-            .narrow(1, prefill_logits[last_domain].size()[1] - 1, 1)
-            .squeeze();
-        let mut next_token_id = sample_token(&first_logits, temperature, top_p)? as i64;
-
-        for _ in 0..max_new_tokens {
-            let token = next_token_id as u32;
-            generated_ids.push(token);
-
-            if Some(token) == eos_token {
-                break;
-            }
-
-            let decode_input = Tensor::from_slice(&[next_token_id])
-                .unsqueeze(0)
-                .to_device(self.device);
-
-            // All domains perform distributed decode
-            let mut decode_logits_list = Vec::with_capacity(self.num_domains);
-            for (domain_id, model) in self.models.iter_mut().enumerate() {
-                let logits = model.forward(&decode_input, &mut kv_caches_list[domain_id])?;
-                decode_logits_list.push(logits);
-            }
-
-            // All domains should produce identical logits; sample from domain0.
-            let sample_logits = decode_logits_list[0].squeeze();
-            next_token_id = sample_token(&sample_logits, temperature, top_p)? as i64;
-        }
-
-        Ok(generated_ids)
-    }
-}
-
 #[cfg(test)]
 #[cfg(feature = "tch-backend")]
 mod tests {
@@ -574,7 +406,7 @@ mod tests {
     /// 这是 batching 的端到端 correctness 基线。
     #[test]
     fn test_batch_generator_correctness() {
-        use crate::model::generate::BatchGenerator;
+        use crate::model::generator::BatchGenerator;
 
         let device = Device::Cpu;
         let config = ModelConfig {
