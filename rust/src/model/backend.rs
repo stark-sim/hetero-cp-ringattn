@@ -362,6 +362,9 @@ impl HcpRingAttentionBackend {
             for round in 0..self.num_domains.saturating_sub(1) {
                 match transport.exchange_kv_block(&current_block) {
                     Ok(Some(peer_block)) => {
+                        let sent_bytes = current_block.k.numel() * 4 + current_block.v.numel() * 4;
+                        let recv_bytes = peer_block.k.numel() * 4 + peer_block.v.numel() * 4;
+                        println!("[ring_attention] round {round} layer {}: sent KV block {sent_bytes} bytes, received {recv_bytes} bytes", self.layer_idx);
                         peer_blocks.push(peer_block.clone());
                         current_block = peer_block;
                     }
