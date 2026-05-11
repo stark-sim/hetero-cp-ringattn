@@ -1,0 +1,22 @@
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+#[allow(dead_code)]
+pub enum ModelError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("JSON parse error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("Safetensors error: {0}")]
+    Safetensors(String),
+    #[error("Tokenizer error: {0}")]
+    Tokenizer(String),
+    #[error("Shape error: expected {expected:?}, got {got:?}")]
+    Shape { expected: Vec<usize>, got: Vec<usize> },
+    #[error("Missing weight: {0}")]
+    MissingWeight(String),
+    #[error("Backend error: {0}")]
+    Backend(String),
+    #[error("Generation error: {0}")]
+    Generation(String),
+}
