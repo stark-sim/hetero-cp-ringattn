@@ -470,7 +470,7 @@ impl GqaAttention {
 pub struct DecoderLayer {
     pub input_layernorm: RmsNorm,        // Attention 之前的归一化
     pub post_attention_layernorm: RmsNorm, // MLP 之前的归一化
-    pub attention: Box<dyn crate::model::backend::AttentionBackend>, // Attention 计算后端（可切换）
+    pub attention: Box<dyn crate::model::attention::AttentionBackend>, // Attention 计算后端（可切换）
     pub mlp: Mlp,                        // 前馈网络
 }
 

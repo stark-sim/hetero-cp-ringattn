@@ -74,8 +74,8 @@ impl LlamaModel {
             // Always use HcpRingAttentionBackend (even for single-node).
             // It implements online softmax with fixed chunk-size上限,
             // avoiding the O(seq²) scores materialization in GqaAttention::forward.
-            let backend: Box<dyn crate::model::backend::AttentionBackend> =
-                Box::new(crate::model::backend::HcpRingAttentionBackend::from_weights(
+            let backend: Box<dyn crate::model::attention::AttentionBackend> =
+                Box::new(crate::model::attention::HcpRingAttentionBackend::from_weights(
                     weights, layer_idx, &config, &rope, num_domains,
                 )?);
 

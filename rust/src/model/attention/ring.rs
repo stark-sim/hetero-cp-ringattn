@@ -1,56 +1,10 @@
 use crate::model::ModelError;
+use super::backend::AttentionBackend;
 
 #[cfg(feature = "tch-backend")]
 use tch::{Device, Kind, Tensor};
 #[cfg(feature = "tch-backend")]
 use crate::model::kv_transport::{KvBlock, KvTransport};
-
-/// Trait for attention computation backends.
-#[cfg(feature = "tch-backend")]
-pub trait AttentionBackend: Send {
-    /// Forward pass: compute attention output for the given hidden states.
-    ///
-    /// `hidden_states`: `[batch, seq_len, hidden_size]`
-    /// `position_ids`: `[batch, seq_len]` (Int64)
-    /// `kv_cache`: Optional KV cache for autoregressive decoding
-    /// `attention_mask`: Optional causal mask for prefill (shape `[1, 1, seq_len, seq_len]`)
-    ///
-    /// Returns: `[batch, seq_len, hidden_size]`
-    fn forward(
-        &mut self,
-        hidden_states: &Tensor,
-        position_ids: &Tensor,
-        kv_cache: Option<&mut crate::model::cache::KvCache>,
-        attention_mask: Option<&Tensor>,
-    ) -> Result<Tensor, ModelError>;
-
-    /// Optional: configure distributed transport, domain id, and sequence offset.
-    /// Only `HcpRingAttentionBackend` implements this; others are no-ops.
-    #[cfg(feature = "tch-backend")]
-    #[allow(dead_code)]
-    fn set_distributed(&mut self, _domain_id: usize, _seq_offset: usize, _transport: Option<Box<dyn KvTransport>>) {
-        // Local backend 不需要分布式配置，noop
-    }
-}
-
-/// Local (non-distributed) attention backend using standard GQA.
-#[cfg(feature = "tch-backend")]
-pub struct LocalAttentionBackend {
-    pub attention: super::layers::GqaAttention,
-}
-
-#[cfg(feature = "tch-backend")]
-impl AttentionBackend for LocalAttentionBackend {
-    fn forward(
-        &mut self,
-        hidden_states: &Tensor,
-        position_ids: &Tensor,
-        kv_cache: Option<&mut crate::model::cache::KvCache>,
-        attention_mask: Option<&Tensor>,
-    ) -> Result<Tensor, ModelError> {
-        self.attention.forward(hidden_states, position_ids, kv_cache, attention_mask)
-    }
-}
 
 /// Ring-attention backend that splits sequence into chunks and computes
 /// attention via online softmax over K/V blocks.
@@ -66,7 +20,7 @@ pub struct HcpRingAttentionBackend {
     q_bias: Option<Tensor>,
     k_bias: Option<Tensor>,
     v_bias: Option<Tensor>,
-    rope: super::layers::RotaryEmbedding,
+    rope: crate::model::layers::RotaryEmbedding,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -88,20 +42,20 @@ pub struct HcpRingAttentionBackend {
 #[cfg(feature = "tch-backend")]
 impl HcpRingAttentionBackend {
     pub fn from_weights(
-        weights: &super::ModelWeights,
+        weights: &crate::model::ModelWeights,
         layer: usize,
-        config: &super::ModelConfig,
-        rope: &super::layers::RotaryEmbedding,
+        config: &crate::model::ModelConfig,
+        rope: &crate::model::layers::RotaryEmbedding,
         num_domains: usize,
     ) -> Result<Self, ModelError> {
-        let q_bias = weights.get(&super::WeightNames::q_proj_bias(layer)).ok().map(|t| t.shallow_clone());
-        let k_bias = weights.get(&super::WeightNames::k_proj_bias(layer)).ok().map(|t| t.shallow_clone());
-        let v_bias = weights.get(&super::WeightNames::v_proj_bias(layer)).ok().map(|t| t.shallow_clone());
+        let q_bias = weights.get(&crate::model::WeightNames::q_proj_bias(layer)).ok().map(|t| t.shallow_clone());
+        let k_bias = weights.get(&crate::model::WeightNames::k_proj_bias(layer)).ok().map(|t| t.shallow_clone());
+        let v_bias = weights.get(&crate::model::WeightNames::v_proj_bias(layer)).ok().map(|t| t.shallow_clone());
         Ok(Self {
-            q_proj: weights.get(&super::WeightNames::q_proj_weight(layer))?.shallow_clone(),
-            k_proj: weights.get(&super::WeightNames::k_proj_weight(layer))?.shallow_clone(),
-            v_proj: weights.get(&super::WeightNames::v_proj_weight(layer))?.shallow_clone(),
-            o_proj: weights.get(&super::WeightNames::o_proj_weight(layer))?.shallow_clone(),
+            q_proj: weights.get(&crate::model::WeightNames::q_proj_weight(layer))?.shallow_clone(),
+            k_proj: weights.get(&crate::model::WeightNames::k_proj_weight(layer))?.shallow_clone(),
+            v_proj: weights.get(&crate::model::WeightNames::v_proj_weight(layer))?.shallow_clone(),
+            o_proj: weights.get(&crate::model::WeightNames::o_proj_weight(layer))?.shallow_clone(),
             q_bias,
             k_bias,
             v_bias,
@@ -337,7 +291,7 @@ impl HcpRingAttentionBackend {
         //
         // 【decode 阶段特殊处理】seq_len == 1 时，只发送 prefill 阶段产生的 KV 分区
         //（记录在 self.prefill_kv_len 中），decode 新 token 的 KV 完全由每个节点本地持有。
-        let mut peer_blocks: Vec<super::kv_transport::KvBlock> = Vec::new();
+        let mut peer_blocks: Vec<crate::model::kv_transport::KvBlock> = Vec::new();
 
         if let Some(ref mut transport) = self.kv_transport {
             let (k_to_send, v_to_send, send_seq_end) = if seq_len == 1 {
@@ -690,15 +644,16 @@ impl AttentionBackend for HcpRingAttentionBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::attention::backend::LocalAttentionBackend;
 
     #[cfg(feature = "tch-backend")]
-    fn create_test_attention(device: tch::Device) -> super::super::layers::GqaAttention {
+    fn create_test_attention(device: tch::Device) -> crate::model::layers::GqaAttention {
         let hidden_size = 64i64;
         let num_heads = 8usize;
         let num_kv_heads = 2usize;
         let head_dim = 8usize;
 
-        super::super::layers::GqaAttention {
+        crate::model::layers::GqaAttention {
             q_proj: Tensor::randn([(num_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),
             k_proj: Tensor::randn([(num_kv_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),
             v_proj: Tensor::randn([(num_kv_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),
@@ -709,7 +664,7 @@ mod tests {
             num_heads,
             num_kv_heads,
             head_dim,
-            rope: super::super::layers::RotaryEmbedding::new(head_dim, 128, 10000.0, device),
+            rope: crate::model::layers::RotaryEmbedding::new(head_dim, 128, 10000.0, device),
             scale: 1.0 / (head_dim as f64).sqrt(),
         }
     }
@@ -751,7 +706,7 @@ mod tests {
         let expected = attn.matmul(&v);
 
         // 用 process_kv_block（非因果模式）计算
-        let rope = super::super::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
+        let rope = crate::model::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
         let backend = HcpRingAttentionBackend {
             q_proj: Tensor::randn([1, 1], (Kind::Float, device)),
             k_proj: Tensor::randn([1, 1], (Kind::Float, device)),
@@ -840,7 +795,7 @@ mod tests {
         let expected = attn.matmul(&v);
 
         // Create a minimal backend (only needs q/k/v/o_proj for local_attention_scores)
-        let rope = super::super::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
+        let rope = crate::model::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
         let mut backend = HcpRingAttentionBackend {
             q_proj: Tensor::randn([1, 1], (Kind::Float, device)),
             k_proj: Tensor::randn([1, 1], (Kind::Float, device)),
@@ -892,7 +847,7 @@ mod tests {
         let attn = scores_masked.softmax(-1, Kind::Float);
         let expected = attn.matmul(&v);
 
-        let rope = super::super::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
+        let rope = crate::model::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
         let mut backend = HcpRingAttentionBackend {
             q_proj: Tensor::randn([1, 1], (Kind::Float, device)),
             k_proj: Tensor::randn([1, 1], (Kind::Float, device)),
@@ -942,7 +897,7 @@ mod tests {
         let attn = scores.softmax(-1, Kind::Float);
         let expected = attn.matmul(&v);
 
-        let rope = super::super::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
+        let rope = crate::model::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
         let mut backend = HcpRingAttentionBackend {
             q_proj: Tensor::randn([1, 1], (Kind::Float, device)),
             k_proj: Tensor::randn([1, 1], (Kind::Float, device)),
@@ -978,7 +933,7 @@ mod tests {
     #[test]
     #[cfg(feature = "tch-backend")]
     fn test_ring_attention_decode_with_peer_kv() {
-        use super::super::kv_transport::MockKvTransport;
+        use crate::model::kv_transport::MockKvTransport;
 
         let device = tch::Device::Cpu;
         let num_heads = 4i64;
@@ -1015,11 +970,11 @@ mod tests {
         let k1_hist = k_all.narrow(2, half, half);
         let v1_hist = v_all.narrow(2, half, half);
 
-        let rope = super::super::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
+        let rope = crate::model::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
 
         // Worker 0: receives peer KV [8..15] from worker 1
         let mut transport0 = MockKvTransport::new();
-        transport0.push(super::super::kv_transport::KvBlock {
+        transport0.push(crate::model::kv_transport::KvBlock {
             layer_idx: 0,
             global_seq_start: half as usize,
             global_seq_end: kv_len as usize - 1,
@@ -1050,7 +1005,7 @@ mod tests {
 
         // Worker 1: receives peer KV [0..7] from worker 0
         let mut transport1 = MockKvTransport::new();
-        transport1.push(super::super::kv_transport::KvBlock {
+        transport1.push(crate::model::kv_transport::KvBlock {
             layer_idx: 0,
             global_seq_start: 0,
             global_seq_end: half as usize,
@@ -1107,7 +1062,7 @@ mod tests {
         tch::manual_seed(555);
 
         // Create GqaAttention
-        let gqa = super::super::layers::GqaAttention {
+        let gqa = crate::model::layers::GqaAttention {
             q_proj: Tensor::randn([(num_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),
             k_proj: Tensor::randn([(num_kv_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),
             v_proj: Tensor::randn([(num_kv_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),
@@ -1118,7 +1073,7 @@ mod tests {
             num_heads,
             num_kv_heads,
             head_dim,
-            rope: super::super::layers::RotaryEmbedding::new(head_dim, 128, 10000.0, device),
+            rope: crate::model::layers::RotaryEmbedding::new(head_dim, 128, 10000.0, device),
             scale: 1.0 / (head_dim as f64).sqrt(),
         };
 
@@ -1152,10 +1107,10 @@ mod tests {
         let history_k = Tensor::randn([1, num_kv_heads as i64, cache_len - 1, head_dim as i64], (Kind::Float, device));
         let history_v = Tensor::randn([1, num_kv_heads as i64, cache_len - 1, head_dim as i64], (Kind::Float, device));
 
-        let mut gqa_cache = super::super::cache::KvCache::new();
+        let mut gqa_cache = crate::model::cache::KvCache::new();
         let _ = gqa_cache.update(&history_k, &history_v).unwrap();
 
-        let mut ring_cache = super::super::cache::KvCache::new();
+        let mut ring_cache = crate::model::cache::KvCache::new();
         let _ = ring_cache.update(&history_k, &history_v).unwrap();
 
         // Run both forwards
@@ -1171,7 +1126,7 @@ mod tests {
     #[test]
     #[cfg(feature = "tch-backend")]
     fn test_ring_attention_with_mock_transport() {
-        use super::super::kv_transport::MockKvTransport;
+        use crate::model::kv_transport::MockKvTransport;
 
         let device = tch::Device::Cpu;
         let num_heads = 4i64;
@@ -1200,11 +1155,11 @@ mod tests {
         let k1 = k.narrow(2, half, half);
         let v1 = v.narrow(2, half, half);
 
-        let rope = super::super::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
+        let rope = crate::model::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
 
         // Worker 0: receives peer KV from worker 1
         let mut transport0 = MockKvTransport::new();
-        transport0.push(super::super::kv_transport::KvBlock {
+        transport0.push(crate::model::kv_transport::KvBlock {
             layer_idx: 0,
             global_seq_start: half as usize,
             global_seq_end: seq_len as usize,
@@ -1235,7 +1190,7 @@ mod tests {
 
         // Worker 1: receives peer KV from worker 0
         let mut transport1 = MockKvTransport::new();
-        transport1.push(super::super::kv_transport::KvBlock {
+        transport1.push(crate::model::kv_transport::KvBlock {
             layer_idx: 0,
             global_seq_start: 0,
             global_seq_end: half as usize,
