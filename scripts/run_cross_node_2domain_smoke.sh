@@ -88,9 +88,13 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# === Environment (must be exported before any libtorch-linked binary) ===
+export DYLD_LIBRARY_PATH="/Users/stark_sim/libtorch/lib:${DYLD_LIBRARY_PATH:-}"
+export HCP_TCH_DEVICE=mps
+
 # === Launch Coordinator (Mac) — start first so workers can connect ===
 echo "=== Launching Coordinator ==="
-DYLD_LIBRARY_PATH="/Users/stark_sim/libtorch/lib:${DYLD_LIBRARY_PATH:-}" "${BINARY}" --distributed-role coordinator \
+"${BINARY}" --distributed-role coordinator \
     --model-dir "${MODEL_DIR}" \
     --prompt-file "${PROMPT_FILE}" \
     --max-tokens "${MAX_NEW_TOKENS}" \
@@ -106,7 +110,7 @@ sleep 2
 
 # === Launch Worker 1 (GPU, domain 1) — MUST start before domain 0 ===
 echo "=== Launching Worker 1 (GPU, domain 1) ==="
-remote_worker_cmd="cd $(shell_quote "${GPU_REPO_DIR}") && HCP_TCH_DEVICE=cuda:0 \
+remote_worker_cmd="cd $(shell_quote "${GPU_REPO_DIR}") && export HCP_TCH_DEVICE=cuda:0 && export LD_LIBRARY_PATH=/home/stark/libtorch/lib:\${LD_LIBRARY_PATH:-} && \
   ./rust/target/release/hcp-ringattn-rust \
     --distributed-role worker \
     --domain-id 1 \
@@ -126,7 +130,7 @@ sleep 5
 
 # === Launch Worker 0 (Mac, domain 0) — dials to domain 1 ===
 echo "=== Launching Worker 0 (Mac, domain 0) ==="
-DYLD_LIBRARY_PATH="/Users/stark_sim/libtorch/lib:${DYLD_LIBRARY_PATH:-}" HCP_TCH_DEVICE=mps "${BINARY}" --distributed-role worker \
+"${BINARY}" --distributed-role worker \
     --domain-id 0 \
     --model-dir "${MODEL_DIR}" \
     --listen-addr "0.0.0.0:${W0_PORT}" \

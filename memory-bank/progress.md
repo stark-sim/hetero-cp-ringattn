@@ -248,6 +248,10 @@
   - Worker 优雅退出：`WorkerRuntime::run()` 检测到 connection lost / stream closed 时正常返回 Ok，不再 panic
   - Coordinator 多请求串行处理：新增 `--prompts-file` 参数（每行一个 prompt），循环处理每个请求，错误只影响当前请求
   - 本地 2-domain CPU smoke 验证：2 个短 prompt 串行处理（`The answer to life` → ` is not a`，`Once upon a time` → `, there was`），Worker 优雅退出，无 panic，全部 45 tests 通过 ✅
+- [x] [2026-05-11] **跨节点异构多请求 E2E 验证通过**（Mac MPS + white RTX 4090 CUDA）：
+  - 根因：启动脚本 `DYLD_LIBRARY_PATH` export 在 coordinator 启动之后，dyld 找不到 `libtorch_cpu.dylib` → SIGABRT（Abort trap 6）
+  - 修复：环境变量 export 提到所有 libtorch-linked binary 启动之前；远程 worker 补 `LD_LIBRARY_PATH`
+  - 验证：2 个 prompt 串行处理，exit=0，Worker 0/1 均优雅退出，零 panic ✅
 - [x] [2026-04-30] **手动部署指南** (`docs/DEPLOYMENT_GUIDE.md`)：从零开始的手动部署文档，覆盖：
   - 单节点本地部署（Mac MPS / GPU CUDA 独立验证）
   - 双节点异构部署（Mac MPS + remote RTX 4090 CUDA）完整步骤

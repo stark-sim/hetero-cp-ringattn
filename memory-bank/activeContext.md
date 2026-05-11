@@ -2,7 +2,7 @@
 
 ## 当前焦点
 
-[2026-05-09] **Rust 分布式推理服务化已完成**。Coordinator 从单请求 smoke 工具升级为支持多请求串行处理的完整推理服务。commit 待填。
+[2026-05-11] **跨节点异构多请求 E2E 验证通过**。Mac MPS (domain 0) + white RTX 4090 CUDA (domain 1) 跨 Tailscale VPN 完成 2 个 prompt 串行处理（`The answer to life` → ` is not a`，`Once upon a time` → `, there was`），exit code 0，worker 优雅退出，零 panic。根因是启动脚本中 `DYLD_LIBRARY_PATH` 环境变量设置顺序错误（coordinator 启动后才 export，导致 dyld 找不到 libtorch → SIGABRT）。修复后验证通过。
 
 上一阶段 **跨机器异构 E2E（Mac vllm-metal + white RTX 4090）** 已在 Python 层完成验证并冻结。Python 层不再扩展。
 
@@ -17,6 +17,7 @@
   - Coordinator 多请求串行处理：新增 `--prompts-file` 参数（每行一个 prompt），循环处理每个请求，全部完成后统一 Shutdown workers
   - Coordinator 错误处理改进：单个请求的失败（logits size mismatch、sample_token error）只影响当前请求，继续处理下一个请求
   - 本地 2-domain CPU smoke 验证：2 个短 prompt 串行处理，Request 1 → ` is not a`，Request 2 → `, there was`，Worker 优雅退出，无 panic ✅
+  - **跨节点异构验证**（Mac MPS + white RTX 4090 CUDA）：2 个 prompt 串行处理，Worker 0/1 均优雅退出，exit=0，零 panic ✅
   - 全部 45 个 tests 通过，无 regression
 - [2026-05-09] **Rust Static Batching 实现与验证**：
   - `BatchGenerator`：等长 prompts 约束 + 0-token EOS 填充 + greedy/temperature/top-p 采样
