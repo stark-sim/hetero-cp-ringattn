@@ -156,6 +156,19 @@ fn select_device() -> Device {
     }
 }
 
+/// Worker 进程主入口。
+///
+/// 整体流程：
+/// 1. 解析参数（支持单 domain 和 `--local-domain-ids` 多 domain 模式）
+/// 2. 选择计算设备（env > MPS > CUDA > CPU）
+/// 3. 加载 ModelConfig 和 ModelWeights（只加载一次）
+/// 4. 为每个 domain 创建一个线程：
+///    a. shallow_clone 权重（共享参数，不复制内存）
+///    b. 创建独立的 LlamaModel（每个 domain 有自己的 KV cache）
+///    c. 创建 WorkerRuntime（网络初始化 + handshake）
+///    d. ResetBarrier 同步所有 domain
+///    e. 进入 runtime.run() 事件循环
+/// 5. 等待所有线程结束
 pub fn run() {
     // Install rustls ring crypto provider once per process (required by rustls 0.23)
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -171,6 +184,8 @@ pub fn run() {
     println!("[multi-worker] loaded model weights once for {} domain(s)", args.domain_configs.len());
 
     // Barrier to synchronize all domains before command loop.
+    // 所有 domain 必须在 runtime.run() 之前到达 barrier，
+    // 确保 peer 连接在任何一个 domain 开始发送 KV 之前全部建立。
     let barrier = Arc::new(ResetBarrier::new(args.domain_configs.len()));
 
     let num_domains = args.num_domains;
@@ -183,6 +198,8 @@ pub fn run() {
         let cfg = config.clone();
         let coord = coordinator_addr.clone();
         let _dir = model_dir.clone();
+        // shallow_clone 权重：复制 Tensor 的 metadata 指针，不复制底层数据。
+        // 这样多个 domain 共享同一份模型参数，显著降低显存占用。
         let w = ModelWeights {
             #[cfg(feature = "tch-backend")]
             tensors: weights.tensors.iter().map(|(k, v)| (k.clone(), v.shallow_clone())).collect(),
@@ -190,8 +207,8 @@ pub fn run() {
             tensors: weights.tensors.clone(),
         };
         let handle = std::thread::spawn(move || {
-            // 多 domain 模式下，每个 domain 需要自己的 LlamaModel（共享权重）。
-            // 这里通过 TchWorkerBackend::from_model 创建，权重 shallow_clone。
+            // 每个 domain 需要独立的 LlamaModel（因为 KV cache 是 domain-specific 的），
+            // 但权重共享（shallow_clone）。
             let backend = TchWorkerBackend::from_model(
                 LlamaModel::from_weights(cfg, &w, device, num_domains)
                     .expect("build model failed"),
@@ -216,6 +233,7 @@ pub fn run() {
             )
             .expect("create runtime failed");
 
+            // 同步点：所有 domain 的网络初始化完成后才能开始处理命令。
             b.wait();
             runtime.run().expect("runtime failed");
         });

@@ -89,6 +89,22 @@ fn parse_args() -> CoordinatorArgs {
     }
 }
 
+/// Coordinator 主入口。
+///
+/// 整体流程：
+/// 1. 加载 tokenizer 和 config（coordinator 不加载模型权重）
+/// 2. 读取所有 prompt（支持 --prompts-file 多请求串行处理）
+/// 3. 创建 QUIC endpoint，等待所有 worker 连接并完成 handshake
+/// 4. 按 domain_id 排序 worker，确保分片顺序正确
+/// 5. 对每个 request 循环：
+///    a. Tokenize prompt
+///    b. 三 tier 分片（显式 chunk-sizes > capacity-aware > 均分）
+///    c. 发送 Prefill chunk 到每个 worker
+///    d. 收集 PrefillDone，取 max(global_seq_len)，广播 SyncGlobalSeqLen
+///    e. 从最后一个 worker 的 logits 采样第一个 token
+///    f. Decode 循环：广播 token → 收集 worker 0 logits → 采样 → 重复
+///    g. 遇到 EOS 或 max_tokens 停止
+/// 6. 所有 request 完成后发送 Shutdown
 pub fn run() {
     // Install rustls ring crypto provider once per process (required by rustls 0.23)
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -105,6 +121,7 @@ pub fn run() {
 
     // Load prompts: --prompts-file (one per line) takes precedence,
     // then --prompt-file (single file), then --prompt (inline string).
+    // 多请求串行处理：一个请求失败只影响当前请求，不会导致后续请求中断。
     let prompts: Vec<String> = if let Some(ref path) = args.prompts_file {
         let content = std::fs::read_to_string(path).expect("read prompts-file failed");
         content.lines().map(|s| s.to_string()).filter(|s| !s.is_empty()).collect()
@@ -119,7 +136,10 @@ pub fn run() {
     }
     println!("[coordinator] loaded {} prompt(s)", prompts.len());
 
-    // Create QUIC endpoint and wait for workers to connect
+    // Create QUIC endpoint and wait for workers to connect.
+    // Coordinator 作为 server 被动接受 worker 连接。
+    // 每个 worker 连接后发送 16-byte handshake（domain_id + capacity_mb），
+    // coordinator 按 domain_id 排序，确保分片顺序与 ring 拓扑一致。
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime failed");
     let listen_addr: SocketAddr = args.listen_addr.parse().expect("invalid listen_addr");
 
@@ -131,6 +151,7 @@ pub fn run() {
     let mut worker_handshakes: Vec<(usize, u64, quinn::SendStream, quinn::RecvStream)> =
         Vec::with_capacity(args.num_domains);
     for i in 0..args.num_domains {
+        // 接受 worker 连接，超时 600s（覆盖 vllm-metal 长初始化时间）
         let (send, mut recv) = rt.block_on(async {
             let incoming = loop {
                 match tokio::time::timeout(
@@ -160,6 +181,8 @@ pub fn run() {
             recv,
         ));
     }
+    // 按 domain_id 排序，确保 worker[0] 永远是 domain 0，worker[1] 是 domain 1。
+    // 这是 ring topology 正确性的前提：domain i 的 next_peer 是 domain (i+1) % n。
     worker_handshakes.sort_by_key(|(domain_id, _, _, _)| *domain_id);
     let worker_capacities: Vec<u64> = worker_handshakes.iter().map(|(_, cap, _, _)| *cap).collect();
     let mut worker_streams: Vec<(quinn::SendStream, quinn::RecvStream)> = worker_handshakes
@@ -168,6 +191,9 @@ pub fn run() {
         .collect();
 
     // Process each prompt sequentially
+
+    // 逐个 request 串行处理。每个 request 有独立的 request_id，
+    // worker 在收到新的 Prefill 时会自动重建 KV cache，避免跨请求污染。
     let eos_token = config.eos_token_id();
     let vocab_size = config.vocab_size as usize;
 
@@ -182,7 +208,10 @@ pub fn run() {
 
         let seq_len = prompt_ids.len() as i64;
 
-        // Three-tier allocation priority
+        // Three-tier allocation priority（三 tier 分片策略）：
+        // 1. --chunk-sizes：用户显式指定每个 domain 的 chunk 长度
+        // 2. --capacity-aware：根据 worker 报告的 capacity_mb 比例分配
+        // 3. 默认均分：prompt token 数 / num_domains，最后一个 domain 收余数
         let chunk_sizes: Vec<usize> = if let Some(ref sizes) = args.chunk_sizes {
             assert_eq!(sizes.len(), args.num_domains,
                 "--chunk-sizes length ({}) must match --num-domains ({})",
@@ -218,7 +247,9 @@ pub fn run() {
             chunk_boundaries.push(chunk_boundaries.last().unwrap() + size);
         }
 
-        // Prefill
+        // Prefill phase：把 prompt 切成 chunk，每个 worker 处理一个 chunk。
+        // seq_offset 告诉 worker 这个 chunk 在全局序列中的起始位置，
+        // 用于 causal mask 和 RoPE 位置编码。
         for (domain_id, (send, _recv)) in worker_streams.iter_mut().enumerate() {
             let start = chunk_boundaries[domain_id];
             let end = chunk_boundaries[domain_id + 1];
@@ -232,6 +263,11 @@ pub fn run() {
             println!("[coordinator] sent Prefill chunk [{}, {}) to worker {}", start, end, domain_id);
         }
 
+        // 收集所有 worker 的 PrefillDone 响应。
+        // max_global_seq_len 是所有 worker 本地 seq_len 的最大值，
+        // 用于 SyncGlobalSeqLen 确保 decode 时 position_ids 正确。
+        // last_logits_bytes 取自最后一个 worker（domain n-1），
+        // 因为 ring attention 中最后一个 domain 拥有最完整的 KV（收齐了所有 peer）。
         let mut max_global_seq_len = 0usize;
         let mut last_logits_bytes: Vec<u8> = Vec::new();
         for (domain_id, (_send, recv)) in worker_streams.iter_mut().enumerate() {
@@ -251,14 +287,17 @@ pub fn run() {
             }
         }
 
-        // Sync global_seq_len
+        // Sync global_seq_len：广播给所有 worker，确保 decode 阶段
+        // position_ids 从正确的全局位置开始，避免 RoPE 应用错误位置。
         println!("[coordinator] max_global_seq_len = {}", max_global_seq_len);
         for (send, _recv) in worker_streams.iter_mut() {
             let cmd = WorkerCommand::SyncGlobalSeqLen { request_id, len: max_global_seq_len };
             send_command_quic(send, &cmd, rt.handle()).expect("send SyncGlobalSeqLen failed");
         }
 
-        // Sample first token
+        // 从最后一个 worker 的 logits 采样第一个 token。
+        // 理论上任何 worker 的 logits 都一样（KV ring 交换后等价），
+        // 但取最后一个 worker 是最稳妥的，因为它的 KV 最完整。
         let logits_vec: Vec<f32> = last_logits_bytes.chunks_exact(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect();
@@ -277,7 +316,11 @@ pub fn run() {
 
         let mut generated_ids: Vec<u32> = Vec::new();
 
-        // Decode loop
+        // Decode loop：自回归生成。
+        // 每一步：coordinator 广播 token → 所有 worker 做单步 forward →
+        // worker 0 返回 logits → coordinator 采样下一个 token。
+        // 其他 worker 也返回 DecodeDone，但 coordinator 只验证收到（不读 logits），
+        // 这是为了清空它们的响应队列，避免流堆积。
         for step in 0..args.max_tokens {
             let token = next_token as u32;
             generated_ids.push(token);
@@ -325,7 +368,8 @@ pub fn run() {
         println!("[coordinator] generated: {}", text);
     }
 
-    // Shutdown workers after all requests are done
+    // Shutdown：所有 request 完成后统一发送 Shutdown 命令。
+    // Worker 收到 Shutdown 后退出 run() 循环，返回 Ok，进程结束。
     println!("\n[coordinator] all requests done, shutting down workers");
     for (send, _recv) in worker_streams.iter_mut() {
         let _ = send_command_quic(send, &WorkerCommand::Shutdown, rt.handle());
