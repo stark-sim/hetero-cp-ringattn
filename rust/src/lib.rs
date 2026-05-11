@@ -2,12 +2,7 @@ mod cli;
 mod compute_runtime;
 #[cfg(feature = "tch-backend")]
 mod capacity;
-#[cfg(feature = "tch-backend")]
-mod distributed_coordinator;
-#[cfg(feature = "tch-backend")]
-mod distributed_protocol;
-#[cfg(feature = "tch-backend")]
-mod distributed_worker;
+mod distributed;
 mod error;
 mod infer;
 mod model;
@@ -18,8 +13,6 @@ mod smoke;
 mod tch_backend;
 #[cfg(feature = "tch-backend")]
 mod worker_sdk;
-#[cfg(feature = "tch-backend")]
-mod quic_transport;
 
 pub use cli::{CliArgs, parse_cli_args, next_cli_value};
 pub use error::{RingError, Tolerance, ToleranceTier};
@@ -190,10 +183,10 @@ pub fn run_cli() -> Result<(), RingError> {
     #[cfg(feature = "tch-backend")]
     if let Some(ref role) = args.distributed_role {
         if role == "worker" {
-            distributed_worker::run();
+            distributed::worker::run();
             return Ok(());
         } else if role == "coordinator" {
-            distributed_coordinator::run();
+            distributed::coordinator::run();
             return Ok(());
         } else {
             return Err(RingError::InvalidCli(format!(

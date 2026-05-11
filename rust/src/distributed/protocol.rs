@@ -225,14 +225,14 @@ pub fn write_frame_quic(send: &mut SendStream, payload: &[u8], rt: &Handle) -> R
 pub fn read_frame_quic(recv: &mut RecvStream, rt: &Handle) -> Result<Vec<u8>, String> {
     let mut len_bytes = [0u8; 4];
     rt.block_on(async {
-        crate::quic_transport::read_exact(recv, &mut len_bytes).await
+        crate::distributed::transport::quic::read_exact(recv, &mut len_bytes).await
             .map_err(|e| format!("read_frame_quic length failed: {e}"))?;
         let len = u32::from_be_bytes(len_bytes) as usize;
         if len > 64 * 1024 * 1024 {
             return Err(format!("read_frame_quic: frame too large ({len} bytes)"));
         }
         let mut payload = vec![0u8; len];
-        crate::quic_transport::read_exact(recv, &mut payload).await
+        crate::distributed::transport::quic::read_exact(recv, &mut payload).await
             .map_err(|e| format!("read_frame_quic payload failed: {e}"))?;
         Ok(payload)
     })
@@ -286,7 +286,7 @@ pub fn write_handshake_quic(
 pub fn read_handshake_quic(recv: &mut RecvStream, rt: &Handle) -> Result<WorkerHandshake, String> {
     let mut buf = [0u8; WorkerHandshake::SIZE];
     rt.block_on(async {
-        crate::quic_transport::read_exact(recv, &mut buf).await
+        crate::distributed::transport::quic::read_exact(recv, &mut buf).await
             .map_err(|e| format!("read_handshake_quic failed: {e}"))
     })?;
     Ok(WorkerHandshake::from_bytes(&buf))

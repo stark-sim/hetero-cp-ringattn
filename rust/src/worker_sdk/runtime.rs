@@ -9,7 +9,7 @@
 //!
 //! 模型计算层通过 `WorkerBackend` trait 解耦，默认实现为 `TchWorkerBackend`。
 
-use crate::distributed_protocol::{
+use crate::distributed::protocol::{
     recv_command_quic, send_response_quic, write_handshake_quic, WorkerCommand, WorkerResponse,
     WorkerHandshake,
 };
@@ -188,7 +188,7 @@ impl<B: WorkerBackend> WorkerRuntime<B> {
         next_peer_addr: SocketAddr,
         coordinator_addr: SocketAddr,
     ) -> Result<(Vec<Box<dyn KvTransport>>, SendStream, RecvStream), String> {
-        let endpoint = crate::quic_transport::create_endpoint(listen_addr)
+        let endpoint = crate::distributed::transport::quic::create_endpoint(listen_addr)
             .map_err(|e| format!("QUIC endpoint bind failed: {e}"))?;
         let endpoint_for_accept = endpoint.clone();
         println!("[worker {domain_id}] QUIC endpoint bound to {listen_addr}");
@@ -282,7 +282,7 @@ impl<B: WorkerBackend> WorkerRuntime<B> {
             .into_iter()
             .zip(inbound.into_iter())
             .map(|((send, _recv), (_peer_send, peer_recv))| {
-                let transport = crate::quic_transport::QuicKvTransport::new(
+                let transport = crate::distributed::transport::quic::QuicKvTransport::new(
                     send,
                     peer_recv,
                     tokio::runtime::Handle::current(),

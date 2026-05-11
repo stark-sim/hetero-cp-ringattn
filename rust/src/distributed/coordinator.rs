@@ -3,7 +3,7 @@
 //! Orchestrates prefill and decode across multiple workers.
 //! Does NOT load model weights; only needs tokenizer and config.
 
-use crate::distributed_protocol::{
+use crate::distributed::protocol::{
     recv_response_quic, send_command_quic, WorkerCommand, WorkerResponse,
 };
 use crate::model::config::ModelConfig;
@@ -124,7 +124,7 @@ pub fn run() {
     let listen_addr: SocketAddr = args.listen_addr.parse().expect("invalid listen_addr");
 
     let endpoint = rt.block_on(async {
-        crate::quic_transport::create_endpoint(listen_addr)
+        crate::distributed::transport::quic::create_endpoint(listen_addr)
     }).expect("create_endpoint failed");
     println!("[coordinator] QUIC endpoint listening on {}", args.listen_addr);
 
@@ -149,7 +149,7 @@ pub fn run() {
             Ok::<_, String>((send, recv))
         }).unwrap_or_else(|e| panic!("accept worker {i} failed: {e}"));
 
-        let handshake = crate::distributed_protocol::read_handshake_quic(&mut recv, rt.handle())
+        let handshake = crate::distributed::protocol::read_handshake_quic(&mut recv, rt.handle())
             .expect("handshake read failed");
         println!("[coordinator] worker {} connected (accept order {i}), capacity={} MB",
                  handshake.domain_id, handshake.capacity_mb);

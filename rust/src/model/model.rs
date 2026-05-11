@@ -196,7 +196,7 @@ impl LlamaModel {
 
         let logits = if seq_len > LM_HEAD_CHUNK_SIZE {
             // Long prefill: only compute logits for the last position.
-            // All callers (Generator, distributed_worker) only use the last
+            // All callers (Generator, distributed::worker) only use the last
             // token's logits for sampling. Avoids ~20GB peak.
             let last_hidden = hidden_states.narrow(1, seq_len - 1, 1);
             if let Some(ref lm_head) = self.lm_head {
