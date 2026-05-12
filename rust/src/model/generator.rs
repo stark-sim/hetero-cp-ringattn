@@ -5,7 +5,23 @@ use tokenizers::Tokenizer;
 #[cfg(feature = "tch-backend")]
 use tch::{Device, Kind, Tensor};
 
-/// Autoregressive text generator (single-node).
+/// 【单节点自回归文本生成器】
+///
+/// 负责完整的文本生成流程：tokenize → prefill → decode loop → detokenize。
+///
+/// 使用方式：
+/// ```rust,ignore
+/// let mut gen = Generator::new(model, "tokenizer.json", Device::Mps)?;
+/// let text = gen.generate("Hello", 100, 0.7, 0.9)?;
+/// ```
+///
+/// 内部流程：
+/// 1. tokenize: 用 HuggingFace tokenizer 把文本转成 token ID 列表
+/// 2. prefill: 把完整 prompt 一次性输入模型，计算 KV cache
+/// 3. decode loop: 每次取最后一个 token 的 logits，采样得到 next_token
+/// 4. 把 next_token 喂回模型，重复直到 max_new_tokens 或遇到 EOS
+///
+/// 注意：这是单节点版本，分布式生成由 coordinator + worker 负责。
 ///
 /// Handles tokenization, prefill, decode loop, and sampling.
 #[cfg(feature = "tch-backend")]

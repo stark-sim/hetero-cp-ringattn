@@ -1,3 +1,12 @@
+//! 【KV 传输层模块】
+//!
+//! 定义分布式 worker 之间交换 KV block 的接口和实现：
+//! - `trait`: KvTransport trait（send/recv/exchange）
+//! - `block`: KvBlock 数据结构
+//! - `tcp`: TCP 传输实现（测试用）
+//! - `mock`: 内存传输实现（单元测试用）
+//! - `quic`: QUIC 传输实现（生产环境，在 distributed/transport/quic.rs）
+
 #![allow(dead_code)]
 
 pub mod block;

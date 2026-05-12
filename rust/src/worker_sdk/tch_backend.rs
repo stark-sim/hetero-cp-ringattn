@@ -1,9 +1,20 @@
-//! 默认后端：`TchWorkerBackend`
+//! 【默认后端：`TchWorkerBackend`】
 //!
 //! 包装现有的 `LlamaModel`（tch-rs），使其适配 `WorkerBackend` trait。
 //! 这是 HCP 的默认分布式 Worker 后端；在同构 tch-rs 环境下无需任何改动即可使用。
 //!
-//! 对于外部框架（vLLM、TensorRT-LLM、MLX 等），需要实现自定义的 `WorkerBackend`。
+//! 【生命周期】
+//! 1. `TchWorkerBackend::load()` / `from_model()`: 加载权重，创建 KV cache
+//! 2. `setup_kv_transports()`: 把 per-layer QUIC transports 绑定到 attention layers
+//! 3. `prefill()`: 处理 prompt chunk，计算 logits，更新 KV cache
+//! 4. `decode()`: 单 token forward，复用 KV cache
+//! 5. `sync_global_seq_len()`: coordinator 广播后同步全局序列长度
+//!
+//! 【与真实分布式的关系】
+//! `prefill` 和 `decode` 内部调用 `LlamaModel::forward()`，
+//! 而 `LlamaModel` 内的 `HcpRingAttentionBackend` 会在 forward 过程中
+//! 通过已设置的 `KvTransport` 自动完成 KV ring 交换。
+//! 所以 `TchWorkerBackend` 本身不需要关心网络细节。
 
 use crate::model::cache::KvCaches;
 use crate::model::transport::KvTransport;

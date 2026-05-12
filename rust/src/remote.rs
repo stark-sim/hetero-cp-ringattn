@@ -1,3 +1,9 @@
+//! 【远程 P2P 和 CP Node 入口】
+//!
+//! 根据 CLI 参数分发到 protocol/node.rs 中的具体 smoke test 函数：
+//! - `run_remote_p2p`: server/client 模式
+//! - `run_remote_cp_node`: CP ring node 模式
+
 use crate::cli::CliArgs;
 use crate::error::RingError;
 use crate::protocol;

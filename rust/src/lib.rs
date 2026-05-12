@@ -1,3 +1,19 @@
+//! 【HCP Ring Attention — Rust 核心库】
+//!
+//! 模块结构（按依赖关系从底层到上层）：
+//! - `error` / `report`: 错误类型和报告结构
+//! - `protocol`: 分布式通信协议（消息格式、序列化、帧、传输 trait）
+//! - `model`: 深度学习模型（LlamaModel、Attention、Layers、Cache、Weights）
+//! - `compute_runtime`: 协议 smoke test 中的 attention 计算运行时
+//! - `tch_backend`: tch-rs 设备选择和 attention smoke test
+//! - `worker_sdk`: Worker 后端 trait + 默认 tch-rs 实现 + 协议运行时
+//! - `distributed`: 生产环境分布式推理（coordinator、worker、QUIC 传输）
+//! - `capacity`: 设备容量查询和 prompt 分片分配
+//! - `infer`: 单节点推理入口
+//! - `cli`: 命令行参数解析
+//! - `remote`: 远程 smoke test 入口
+//! - `smoke`: correctness 验证基础设施
+
 mod cli;
 mod compute_runtime;
 #[cfg(feature = "tch-backend")]

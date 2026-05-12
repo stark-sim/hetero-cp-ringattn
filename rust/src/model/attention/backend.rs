@@ -5,7 +5,17 @@ use tch::Tensor;
 #[cfg(feature = "tch-backend")]
 use crate::model::transport::KvTransport;
 
-/// Trait for attention computation backends.
+/// 【Attention 计算后端 Trait】
+///
+/// HCP 支持多种 attention 实现方式，这个 trait 是统一接口。
+/// 目前只有 `HcpRingAttentionBackend` 一个实现（单节点和分布式共用）。
+///
+/// 设计意图：解耦 Attention 算法与上层模型结构，方便未来扩展
+/// （如 FlashAttention、内存优化版等）。
+///
+/// 关键方法：
+/// - forward: 给定 hidden_states，计算 attention 输出
+/// - set_distributed: 配置分布式 KV 传输（只有 ring backend 需要）
 #[cfg(feature = "tch-backend")]
 pub trait AttentionBackend: Send {
     /// Forward pass: compute attention output for the given hidden states.

@@ -1,9 +1,16 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// 【协议版本号】用于消息兼容性检查。
+/// 如果 sender 和 receiver 的版本不匹配，receiver 会拒绝消息。
 pub const SCHEMA_VERSION: u16 = 1;
+/// 【f32 的字节数】用于计算 payload 大小和偏移量。
 pub(crate) const FLOAT32_BYTES: usize = 4;
 
+/// 【协议层错误类型】
+///
+/// 涵盖序列化、网络 IO、消息校验、域配置等各种错误场景。
+/// 使用 `thiserror` 宏自动生成 Display 实现。
 #[derive(Debug, Error)]
 pub enum ProtocolError {
     #[error("json error: {0}")]
@@ -49,6 +56,11 @@ pub enum ProtocolError {
     NodeThreadPanic { domain_id: String },
 }
 
+/// 【Ring Attention 消息类型】
+///
+/// - KvBlock: 携带 KV tensor 数据的主体消息
+/// - SoftmaxState: 用于 online softmax 状态同步（预留，当前未使用）
+/// - Terminate: 优雅关闭信号
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RingAttnMessageKind {
@@ -57,6 +69,7 @@ pub(crate) enum RingAttnMessageKind {
     Terminate,
 }
 
+/// 【Payload 数据类型】与 MessageKind 对应，用于协议校验。
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PayloadKind {
@@ -65,6 +78,7 @@ pub(crate) enum PayloadKind {
     Control,
 }
 
+/// 【KV Block 元数据】描述 payload 中 KV 数据的序列位置信息。
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct BlockMetadata {
     pub(crate) global_offset: usize,
@@ -72,6 +86,7 @@ pub(crate) struct BlockMetadata {
     pub(crate) source_seq_offset: usize,
 }
 
+/// 【Tensor 元数据】描述 payload 中 tensor 的形状和校验信息。
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct TensorMetadata {
     pub(crate) dtype: String,
@@ -81,6 +96,14 @@ pub(crate) struct TensorMetadata {
     pub(crate) checksum: u64,
 }
 
+/// 【Ring Attention 协议消息】
+///
+/// 这是 worker 之间交换的完整消息结构，包含：
+/// - 路由信息（source/sender/receiver domain, ring_step）
+/// - 负载元数据（block/tensor）
+/// - 二进制 payload（实际的 KV bytes）
+///
+/// 使用 bincode 序列化（比 JSON 更紧凑、更快）。
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct RingAttnMessage {
     pub(crate) schema_version: u16,

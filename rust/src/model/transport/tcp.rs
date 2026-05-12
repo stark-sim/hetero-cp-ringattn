@@ -10,7 +10,24 @@ use tch::{Device, Tensor};
 use super::block::KvBlock;
 use super::r#trait::KvTransport;
 
-/// TCP-based KV block transport using length-prefixed JSON metadata + raw f32 bytes.
+/// 【基于 TCP 的 KV Block 传输】
+///
+/// 帧格式（length-prefixed）：
+/// ```text
+/// [meta_len: u32 BE] [meta_json] [k_raw_bytes] [v_raw_bytes]
+/// ```
+///
+/// meta_json 包含：layer_idx, global_seq_start/end, k/v shape, k/v bytes 长度。
+/// raw bytes 是 f32 的小端序二进制表示。
+///
+/// 【为什么不直接用 bincode 序列化整个 KvBlock？】
+/// - JSON meta 便于人工调试和抓包分析
+/// - raw bytes 避免 JSON 对大浮点数组的编码开销（JSON 编码 f32 数组体积大 2~3 倍）
+///
+/// 【局限性】
+/// - TCP 没有内置流控和拥塞控制优化，大 KV block 可能阻塞
+/// - 没有加密（生产环境应使用 QUIC 或 TLS）
+/// - 超时较短（30s），不适合超慢网络
 #[cfg(feature = "tch-backend")]
 pub struct TcpKvTransport {
     stream: TcpStream,

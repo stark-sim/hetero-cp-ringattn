@@ -34,6 +34,8 @@ const QUERY_CHUNK_LEN: usize = 4;
 
 
 
+/// 【Domain 规格（协议层内部使用）】
+/// 与 report.rs 中的 DomainSpec 不同，这个多了 device 字段。
 #[derive(Clone, Debug)]
 struct DomainSpec {
     domain_id: String,
@@ -871,6 +873,15 @@ impl LocalP2pTransport {
     }
 }
 
+/// 【协议层本地 smoke test】验证消息序列化、本地队列传输和消息校验逻辑。
+///
+/// 在单进程内模拟 3 个 domain 的 ring 通信：
+/// - 每个 domain 生成若干 KV block
+/// - block 沿 ring 传递，每个节点验证消息后转发
+/// - 最后发送 SoftmaxState 和 Terminate 控制消息
+///
+/// 这个测试不执行实际 attention 计算（用 NoOpComputeRuntime），
+/// 只验证消息格式、路由、校验和的正确性。
 pub fn run_protocol_smoke() -> Result<ProtocolSmokeReport, ProtocolError> {
     let domains = default_domains()?;
     let model_states = DomainModelState::build_all(&domains);
@@ -973,6 +984,15 @@ fn maybe_load_weights_json() -> Option<ModelWeightsJson> {
     }
 }
 
+/// 【CP Ring Node smoke test】验证多线程 ring 节点的消息转发和计算更新。
+///
+/// 每个 domain 运行在一个独立线程中：
+/// - 发送自己的 source blocks 给下一个节点
+/// - 接收并验证来自上一个节点的消息
+/// - 用 ComputeRuntime 执行 attention 计算（如果启用了 tch-backend）
+/// - 如果需要，转发消息给下一个节点
+///
+/// 所有线程通过 mpsc channel 通信（内存队列，非网络）。
 pub fn run_cp_ring_node_smoke() -> Result<CpRingNodeSmokeReport, ProtocolError> {
     let domains = default_domains()?;
     let domain_count = domains.len();
@@ -1072,6 +1092,11 @@ pub fn run_cp_ring_node_smoke() -> Result<CpRingNodeSmokeReport, ProtocolError> 
     })
 }
 
+/// 【远程 P2P smoke test — Server 端】
+/// 在指定地址监听 TCP 连接，接收 client 的 KV block 消息，
+/// 回复 SoftmaxState ACK，最后接收 Terminate 消息。
+///
+/// 用于验证跨机器 TCP 通信的基本连通性。
 pub fn run_remote_p2p_server(bind_addr: &str) -> Result<RemoteP2pReport, ProtocolError> {
     let bind_socket = parse_socket_addr(bind_addr)?;
     let listener = TcpListener::bind(bind_socket)?;
@@ -1113,6 +1138,8 @@ pub fn run_remote_p2p_server(bind_addr: &str) -> Result<RemoteP2pReport, Protoco
     })
 }
 
+/// 【远程 P2P smoke test — Client 端】
+/// 连接到 server，发送 KV block 消息，接收 ACK，发送 Terminate 消息。
 pub fn run_remote_p2p_client(connect_addr: &str) -> Result<RemoteP2pReport, ProtocolError> {
     let connect_socket = parse_socket_addr(connect_addr)?;
     let mut stream = TcpStream::connect(connect_socket)?;
@@ -1151,6 +1178,22 @@ pub fn run_remote_p2p_client(connect_addr: &str) -> Result<RemoteP2pReport, Prot
     })
 }
 
+/// 【远程 CP Node smoke test】模拟真实跨节点 ring attention 的单个节点。
+///
+/// 每个节点同时做两件事：
+/// 1. 监听 inbound TCP 连接（接收上一个节点的消息）
+/// 2. 主动连接 outbound TCP（发送消息给下一个节点）
+///
+/// 节点行为：
+/// - 发送自己的 source blocks 给下一个节点
+/// - 接收来自上一个节点的消息，验证后 optionally 转发
+/// - 用 ComputeRuntime 执行 attention 计算
+///
+/// 这是最接近真实分布式环境的 smoke test，用于验证：
+/// - TCP 双向通信
+/// - 消息序列化/反序列化
+/// - ring routing 逻辑
+/// - attention 计算与网络 I/O 的并发
 pub fn run_remote_cp_node(
     node_index: usize,
     bind_addr: &str,

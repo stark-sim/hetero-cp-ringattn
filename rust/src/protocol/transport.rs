@@ -4,12 +4,12 @@ use std::sync::mpsc::{Receiver, Sender};
 use crate::protocol::{ProtocolError, RingAttnMessage};
 use crate::protocol::framing::{read_frame_from_stream, write_frame_to_stream, FRAME_LEN_BYTES};
 
-/// 发送端：负责把 RingAttnMessage 序列化后发出，返回实际发出的字节数。
+/// 【消息发送端 Trait】负责把 RingAttnMessage 序列化后发出，返回实际发出的字节数。
 pub trait MessageSender {
     fn send_message(&mut self, message: &RingAttnMessage) -> Result<usize, ProtocolError>;
 }
 
-/// 接收端：负责接收 bytes 并反序列化为 RingAttnMessage，返回 (message, bytes_received)。
+/// 【消息接收端 Trait】负责接收 bytes 并反序列化为 RingAttnMessage，返回 (message, bytes_received)。
 pub trait MessageReceiver {
     fn recv_message(&mut self) -> Result<(RingAttnMessage, usize), ProtocolError>;
 }
@@ -59,7 +59,7 @@ mod tests {
     use super::*;
     use crate::protocol::message::sample_kv_message;
 
-    /// 验证 MessageSender / MessageReceiver trait 通过本地 TCP 端到端工作正常。
+    /// 【验证 MessageSender / MessageReceiver trait 通过本地 TCP 端到端工作正常】
     #[test]
     fn test_message_sender_receiver_tcp_roundtrip() {
         use std::net::{TcpListener, TcpStream};

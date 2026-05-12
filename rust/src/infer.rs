@@ -3,6 +3,19 @@ use crate::model::model::LlamaModel;
 use crate::model::generator::Generator;
 use std::path::Path;
 
+/// 【单节点推理入口】加载模型并执行完整的文本生成。
+///
+/// 流程：加载 config → 加载权重 → 构建模型 → 加载 tokenizer → 生成文本。
+///
+/// 【设备选择优先级】
+/// 1. `HCP_TCH_DEVICE` / `HCP_TORCH_DEVICE` 环境变量（手动指定）
+/// 2. Mac 自动检测 MPS（如果可用）
+/// 3. CUDA 自动检测（如果可用）
+/// 4. CPU fallback
+///
+/// `num_domains` 参数：
+/// - 1: 单节点，不使用 KV 交换（但底层仍用 HcpRingAttentionBackend）
+/// - >1: 准备分布式（但实际分布式推理由 coordinator/worker 模式处理）
 #[cfg(feature = "tch-backend")]
 pub fn run_inference(model_dir: &str, prompt: &str, max_tokens: usize, temperature: f64, top_p: f64, num_domains: usize) -> Result<String, String> {
     use tch::Device;

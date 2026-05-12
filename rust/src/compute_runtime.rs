@@ -3,8 +3,13 @@ use crate::protocol::{DomainModelState, OnlineSoftmaxAccumulator, RingAttnMessag
 #[cfg(feature = "tch-backend")]
 use tch::Tensor;
 
-/// Parse the target compute device from environment variables.
-/// Checks `HCP_TCH_DEVICE`, then `HCP_TORCH_DEVICE`, defaulting to "cpu".
+/// 【从环境变量解析目标计算设备】
+/// 检查优先级：`HCP_TCH_DEVICE` → `HCP_TORCH_DEVICE` → 默认 "cpu"
+///
+/// 返回值中的 `success_code` 用于 smoke test 报告：
+/// - 1: CPU
+/// - 2: MPS
+/// - 3: CUDA
 #[cfg(feature = "tch-backend")]
 pub fn select_tch_device_from_env() -> Result<(tch::Device, i32), String> {
     let name = std::env::var("HCP_TCH_DEVICE")
@@ -35,6 +40,16 @@ pub fn select_tch_device_from_env() -> Result<(tch::Device, i32), String> {
     Ok((device, success_code))
 }
 
+/// 【计算运行时 Trait】用于 protocol smoke test 中的 attention 计算。
+///
+/// 这是协议层（protocol/node.rs）与计算层之间的抽象接口。
+/// `TchComputeRuntime` 使用 tch-rs 执行真实的 online softmax attention；
+/// `NoOpComputeRuntime` 在禁用 tch-backend feature 时空转。
+///
+/// 【为什么有这个抽象？】
+/// protocol smoke test 需要验证消息序列化和网络传输的正确性，
+/// 但不需要验证 attention 算法的数学正确性（那是 model/ 层的职责）。
+/// 这个 trait 让 protocol 测试可以独立运行，不强制依赖 tch-backend。
 pub trait ComputeRuntime {
     type Error: std::fmt::Display;
 
@@ -52,6 +67,8 @@ pub trait ComputeRuntime {
     ) -> f64;
 }
 
+/// 【空操作计算运行时】当未启用 tch-backend feature 时使用。
+/// 所有方法都是 no-op，只返回默认值。
 #[cfg(not(feature = "tch-backend"))]
 pub struct NoOpComputeRuntime;
 
@@ -97,6 +114,13 @@ impl ComputeRuntime for NoOpComputeRuntime {
     }
 }
 
+/// 【tch-rs 计算运行时】在 protocol smoke test 中执行真实的 attention 计算。
+///
+/// 从 message payload 中解析 Q/K/V tensor，执行 online softmax update，
+/// 然后把结果写回 accumulator。
+///
+/// 注意：这里的计算逻辑与 `model/attention/ring.rs` 中的 `process_kv_block` 
+/// 数学上等价，但实现方式不同（因为输入格式不同）。
 #[cfg(feature = "tch-backend")]
 pub struct TchComputeRuntime {
     device: tch::Device,

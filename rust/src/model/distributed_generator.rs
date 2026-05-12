@@ -5,11 +5,25 @@ use tokenizers::Tokenizer;
 #[cfg(feature = "tch-backend")]
 use tch::{Device, Tensor};
 
-/// Distributed autoregressive text generator.
+/// 【分布式自回归文本生成器（单进程模拟）】
 ///
-/// Simulates multi-domain CP inference in a single process.
-/// Each domain holds a `LlamaModel` with its own KV cache; KV blocks are
-/// exchanged via `LinkedMockKvTransport` during decode.
+/// 在单个进程内模拟多 domain 的 CP 分布式推理。
+/// 每个 domain 持有独立的 `LlamaModel` 和 KV cache；
+/// decode 阶段通过 `LinkedMockKvTransport` 在内存中交换 KV block。
+///
+/// 【与真实分布式的区别】
+/// - 真实分布式：domain 运行在不同机器上，通过网络（QUIC/TCP）交换 KV
+/// - 这个模拟器：domain 在同一个进程内，通过共享内存队列交换 KV
+///
+/// 【用途】
+/// - 快速验证分布式正确性（不需要启动多个进程）
+/// - 调试 ring attention 算法
+/// - 单元测试中的端到端验证
+///
+/// 【流程】
+/// 1. Prefill: 把 prompt 均分到各 domain，各自独立 prefill
+/// 2. Sync: 同步 global_seq_len（真实场景由 coordinator 广播）
+/// 3. Decode: 每次把采样到的 token 广播给所有 domain，各自做 ring attention
 #[cfg(feature = "tch-backend")]
 #[allow(dead_code)]
 pub struct DistributedGenerator {

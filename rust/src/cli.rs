@@ -2,6 +2,14 @@ use crate::error::RingError;
 use crate::error::ToleranceTier;
 use std::env;
 
+/// 【命令行参数结构体】
+///
+/// HCP 的二进制支持多种运行模式：
+/// - 单节点推理：`--infer-model-dir` + `--infer-prompt`
+/// - 分布式 coordinator：`--distributed-role coordinator`
+/// - 分布式 worker：`--distributed-role worker`
+/// - 协议 smoke test：`--remote-p2p-role server/client`
+/// - correctness test：默认模式，生成 JSON 报告
 #[derive(Debug)]
 pub struct CliArgs {
     pub report_path: String,

@@ -1,8 +1,20 @@
-//! `WorkerBackend` trait — 分布式 Worker 后端抽象接口。
+//! 【`WorkerBackend` trait — 分布式 Worker 后端抽象接口】
 //!
-//! 框架适配器（vLLM FFI、TensorRT-LLM、MLX 等）必须实现此 trait。
-//! HCP 的 `WorkerRuntime` 负责协议循环和 coordinator 通信，
-//! 后端负责模型加载、forward 计算和 KV ring 交换。
+//! 这是 HCP 的插件化核心：任何深度学习框架只要实现这个 trait，
+//! 就能接入 HCP 的分布式推理网络。
+//!
+//! 【当前实现】
+//! - `TchWorkerBackend`: 基于 tch-rs（libtorch）的默认实现
+//!
+//! 【未来可扩展】
+//! - vLLM FFI 后端：复用 vLLM 的 CUDA kernel 和 PagedAttention
+//! - TensorRT-LLM 后端：利用 NVIDIA 优化 kernel
+//! - MLX 后端：Apple Silicon 原生优化
+//!
+//! 【设计原则】
+//! - `WorkerRuntime` 负责协议、网络、事件循环（与框架无关）
+//! - `WorkerBackend` 负责模型加载、forward、KV ring（与框架相关）
+//! - 两者通过 trait 接口解耦，互不影响
 
 use crate::model::transport::KvTransport;
 use tch::Device;

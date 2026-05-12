@@ -1,4 +1,15 @@
-//! Cross-platform device capacity query and chunk-size allocation.
+//! 【跨平台设备容量查询和分片分配】
+//!
+//! 提供两个核心功能：
+//! - `query_device_capacity_mb`: 启发式估算各设备的可用内存
+//! - `allocate_by_capacity`: 按容量比例分配 prompt tokens（最大余数法）
+//!
+//! 【设计原理】
+//! - 内存是硬约束（OOM 立即失败），吞吐量可以通过调度缓解。
+//!   因此 Phase 2 用内存作为容量代理。
+//! - 不引入新的 cargo 依赖：CUDA 通过 `nvidia-smi` 子进程查询，
+//!   系统内存通过 `/proc/meminfo`（Linux）或 `sysctl`（macOS）查询。
+//! - 对 MPS（统一内存）和 CPU（计算较慢）使用保守的启发式估算。
 //!
 //! This module provides:
 //! - `query_device_capacity_mb`: Heuristic free-memory estimation per device type.

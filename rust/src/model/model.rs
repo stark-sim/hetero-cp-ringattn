@@ -10,7 +10,10 @@ use crate::model::{
 #[cfg(feature = "tch-backend")]
 use tch::{Device, Kind, Tensor};
 
-/// A Llama-family causal language model.
+/// 【Llama 家族因果语言模型】
+///
+/// 支持 Llama、Mistral、Qwen2 等同家族架构。
+/// 这是 HCP 的核心模型结构，负责完整的 transformer forward pass。
 ///
 /// Supports Llama, Mistral, Qwen2, and compatible architectures.
 #[cfg(feature = "tch-backend")]
@@ -36,7 +39,13 @@ pub struct LlamaModel {
 
 #[cfg(feature = "tch-backend")]
 impl LlamaModel {
-    /// Build model from loaded safetensors weights and config.
+    /// 【从已加载的 safetensors 权重和配置构建模型】
+    ///
+    /// 遍历所有 layer，为每个 layer 创建：
+    /// - 输入 RMSNorm（attention 之前）
+    /// - Attention 后端（HcpRingAttentionBackend）
+    /// - MLP（SwiGLU）
+    /// - 输出 RMSNorm（attention 之后、MLP 之前）
     pub fn from_weights(config: ModelConfig, weights: &ModelWeights, device: Device, num_domains: usize) -> Result<Self, ModelError> {
         let embedding = weights.get(WeightNames::embedding())?.shallow_clone();
 
@@ -90,7 +99,12 @@ impl LlamaModel {
         Ok(Self { config, embedding, layers, norm, lm_head, seq_offset: 0, num_domains, global_seq_len: 0, is_prefill_done: false })
     }
 
-    /// Configure distributed transport for all attention backends in this model.
+    /// 【为模型中所有 attention 后端配置分布式传输】
+    ///
+    /// 遍历所有 layer，为每个 layer 的 attention 注入对应的 KvTransport。
+    /// `transport_factory` 是一个闭包，根据 layer_idx 返回对应的 transport。
+    ///
+    /// 注意：每个 layer 必须有独立的 transport，layer 之间不能共享。
     /// Only affects layers using `HcpRingAttentionBackend`.
     #[cfg(feature = "tch-backend")]
     #[allow(dead_code)]
@@ -105,7 +119,19 @@ impl LlamaModel {
         }
     }
 
-    /// Full forward pass (prefill or single step).
+    /// 【完整前向传播】支持 prefill（多 token）和 decode（单 token）两种模式。
+    ///
+    /// 流程：
+    /// 1. Embedding lookup
+    /// 2. 生成 position_ids（prefill 用递增序列，decode 用 global_seq_len）
+    /// 3. 生成 attention mask（prefill 需要 causal mask，decode 不需要）
+    /// 4. 逐层 forward（每层 = Norm → Attention → Norm → MLP）
+    /// 5. 最终 Norm + LM Head
+    ///
+    /// 【内存优化】
+    /// - no_grad_guard: 禁用梯度计算，避免推理时保留计算图
+    /// - LM Head chunked: 长序列时只计算最后一个位置的 logits
+    ///   （避免分配 [batch, seq_len, vocab_size] 的完整 logits 张量）
     ///
     /// `input_ids`: `[batch, seq_len]` (Int64)
     /// `kv_caches`: per-layer KV caches; `None` means no caching for that layer

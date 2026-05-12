@@ -2,6 +2,13 @@ use serde::Serialize;
 use crate::error::{Tolerance, ToleranceTier};
 use crate::protocol::{CpRingNodeSmokeReport, ProtocolSmokeReport, RemoteCpNodeReport};
 
+/// 【Domain 规格】用于 correctness test 和报告生成。
+///
+/// 描述一个计算域的基本参数：
+/// - domain_id: 唯一标识
+/// - seq_offset: 在全局序列中的起始位置
+/// - seq_chunk_len: 本 domain 负责的序列长度
+/// - block_size: KV block 的粒度（用于 ring exchange 的分块大小）
 #[derive(Clone, Debug)]
 pub struct DomainSpec {
     pub domain_id: String,

@@ -1,6 +1,15 @@
 use serde::Serialize;
 use thiserror::Error;
 
+/// 【HCP 顶层错误类型】
+///
+/// 涵盖所有子系统的错误：
+/// - InvalidChunkSum: 分布式分片长度之和不等于全局序列长度
+/// - InvalidDomain: domain 配置不合法（seq_chunk_len 或 block_size 为 0）
+/// - Io: 文件/网络 IO 错误
+/// - Json: JSON 解析错误
+/// - Protocol: 协议层错误（来自 protocol/message.rs）
+/// - InvalidCli: 命令行参数错误
 #[derive(Debug, Error)]
 pub enum RingError {
     #[error("sum(seq_chunk_len)={actual} does not match global_seq_len={expected}")]

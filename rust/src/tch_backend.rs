@@ -1,3 +1,18 @@
+//! 【tch-rs 后端模块】
+//!
+//! 提供基于 libtorch（tch-rs）的计算功能，包括：
+//! - 设备选择（CPU / MPS / CUDA）
+//! - Attention 计算 smoke test（block / online / chunk / query chunk）
+//! - Payload 解析和 tensor 重建
+//!
+//! 这个模块有两个 feature gate 版本：
+//! - `tch-backend` enabled: 真实的 torch 计算
+//! - `tch-backend` disabled: 所有函数返回错误（编译占位）
+//!
+//! 【设计意图】
+//! 让 protocol smoke test 和 correctness test 能够验证真实 GPU/MPS 上的
+//! attention 计算数值正确性，而不只是验证消息格式。
+
 #![allow(dead_code)]
 #![allow(clippy::needless_borrows_for_generic_args)]
 

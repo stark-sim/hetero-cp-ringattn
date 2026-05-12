@@ -3,7 +3,9 @@ use std::net::TcpStream;
 
 use crate::protocol::ProtocolError;
 
+/// 【帧长度字段的字节数】每个消息帧前面有 4 字节表示 payload 长度。
 pub(crate) const FRAME_LEN_BYTES: usize = 4;
+/// 【最大帧大小】16MB，防止恶意/损坏数据导致内存爆炸。
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 pub(crate) fn write_frame_to_stream(stream: &mut TcpStream, frame: &[u8]) -> Result<usize, ProtocolError> {
