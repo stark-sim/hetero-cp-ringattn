@@ -193,9 +193,37 @@ impl<B: WorkerBackend> WorkerRuntime<B> {
         let endpoint_for_accept = endpoint.clone();
         println!("[worker {domain_id}] QUIC endpoint bound to {listen_addr}");
 
-        let dial_fut = endpoint
-            .connect(next_peer_addr, "localhost")
-            .map_err(|e| format!("connect to next peer failed: {e}"))?;
+        let endpoint_for_dial = endpoint.clone();
+        let dial_fut = async move {
+            loop {
+                match endpoint_for_dial.connect(next_peer_addr, "localhost") {
+                    Ok(connecting) => {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            connecting,
+                        )
+                        .await
+                        {
+                            Ok(Ok(conn)) => break conn,
+                            Ok(Err(e)) => {
+                                println!("[worker {domain_id}] dial error: {e}, retrying...");
+                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                continue;
+                            }
+                            Err(_) => {
+                                println!("[worker {domain_id}] dial timeout, retrying...");
+                                continue;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("[worker {domain_id}] connect setup error: {e}, retrying...");
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
+                }
+            }
+        };
 
         let accept_fut = async move {
             loop {
@@ -221,8 +249,7 @@ impl<B: WorkerBackend> WorkerRuntime<B> {
         let accept_handle = tokio::spawn(accept_fut);
         let conn = dial_handle
             .await
-            .map_err(|e| format!("dial task panicked: {e}"))?
-            .map_err(|e| format!("connect to next peer failed: {e}"))?;
+            .map_err(|e| format!("dial task panicked: {e}"))?;
         println!("[worker {domain_id}] QUIC connection to next peer established");
         let prev_conn = accept_handle
             .await
