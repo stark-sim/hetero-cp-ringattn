@@ -215,32 +215,19 @@ impl<B: WorkerBackend> WorkerRuntime<B> {
             }
         };
 
-        let (conn, prev_conn) = if num_domains == 2 {
-            if domain_id == 0 {
-                let c = dial_fut
-                    .await
-                    .map_err(|e| format!("connect to next peer failed: {e}"))?;
-                println!("[worker {domain_id}] QUIC connection to next peer established");
-                (c.clone(), c)
-            } else {
-                let c = accept_fut.await;
-                println!("[worker {domain_id}] QUIC connection from prev peer established");
-                (c.clone(), c)
-            }
-        } else {
-            let dial_handle = tokio::spawn(dial_fut);
-            let accept_handle = tokio::spawn(accept_fut);
-            let c = dial_handle
-                .await
-                .map_err(|e| format!("dial task panicked: {e}"))?
-                .map_err(|e| format!("connect to next peer failed: {e}"))?;
-            println!("[worker {domain_id}] QUIC connection to next peer established");
-            let p = accept_handle
-                .await
-                .map_err(|e| format!("accept task panicked: {e}"))?;
-            println!("[worker {domain_id}] QUIC connection from prev peer established");
-            (c, p)
-        };
+        // 【并发 dial + accept】N-domain ring 中每个节点同时连接 next peer 和接受 prev peer。
+        // 2-domain 只是 N=2 的特例，不需要特殊处理。
+        let dial_handle = tokio::spawn(dial_fut);
+        let accept_handle = tokio::spawn(accept_fut);
+        let conn = dial_handle
+            .await
+            .map_err(|e| format!("dial task panicked: {e}"))?
+            .map_err(|e| format!("connect to next peer failed: {e}"))?;
+        println!("[worker {domain_id}] QUIC connection to next peer established");
+        let prev_conn = accept_handle
+            .await
+            .map_err(|e| format!("accept task panicked: {e}"))?;
+        println!("[worker {domain_id}] QUIC connection from prev peer established");
 
         // 为每层创建 bidirectional stream
         let mut outbound = Vec::with_capacity(num_layers);

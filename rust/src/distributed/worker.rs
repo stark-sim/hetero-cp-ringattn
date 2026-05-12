@@ -19,6 +19,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tch::Device;
 
+/// 【Domain 配置】在 ring 拓扑中，每个 domain 需要：
+/// - listen_addr: 本 domain 的监听地址（prev peer 会主动连这里）
+/// - next_peer_addr: 本 domain 的 next peer 地址（本 domain 会主动 dial 这里）
+///
+/// Ring 拓扑由所有 domain 的 listen_addr + next_peer_addr 共同定义：
+/// domain(i).next_peer_addr == domain(i+1).listen_addr
+/// domain(i).prev 不需要地址，因为 prev 会主动 dial domain(i).listen_addr
 #[derive(Debug)]
 struct DomainConfig {
     domain_id: usize,

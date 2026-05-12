@@ -61,27 +61,34 @@ pub struct LinkedMockKvTransport {
 
 #[cfg(feature = "tch-backend")]
 impl LinkedMockKvTransport {
+    /// 【创建 N-domain ring 传输通道】返回 N 个 transport，组成一个 ring。
+    ///
+    /// domain i 的 send 会进入 domain (i+1)%N 的 recv：
+    /// - t[i].peer_inbox = q[(i+1)%N]（t[i] 发送 → 写入 q[(i+1)%N]）
+    /// - t[i].self_inbox = q[i]（t[i] 接收 → 从 q[i] 读取）
+    ///
+    /// 在 ring attention 中：
+    /// - Round 0: domain i 发送本地 KV → domain (i+1)%N 收到
+    /// - Round 1: domain i 转发收到的 KV → domain (i+1)%N 收到
+    /// - 经过 N-1 轮后，每个 domain 都收到了所有其他 domain 的 KV。
+    pub fn create_ring(n: usize) -> Vec<Self> {
+        assert!(n >= 2, "ring must have at least 2 domains");
+        let queues: Vec<_> = (0..n)
+            .map(|_| std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())))
+            .collect();
+        (0..n)
+            .map(|i| Self {
+                peer_inbox: queues[(i + 1) % n].clone(),
+                self_inbox: queues[i].clone(),
+            })
+            .collect()
+    }
+
     /// 【创建一对互通的传输通道】返回 (t0, t1)。
-    /// 
-    /// 核心设计：交叉共享队列，让 t0 的发送等于 t1 的接收，反之亦然。
-    /// 
-    /// 具体做法：
-    /// - 创建两个空队列 q0 和 q1。
-    /// - t0.peer_inbox = q1（t0 发送 → 写入 q1）
-    /// - t0.self_inbox = q0（t0 接收 → 从 q0 读取）
-    /// - t1.peer_inbox = q0（t1 发送 → 写入 q0）
-    /// - t1.self_inbox = q1（t1 接收 → 从 q1 读取）
-    /// 
-    /// 结果：
-    /// - t0.send() 的数据会被 t1.recv() 读到
-    /// - t1.send() 的数据会被 t0.recv() 读到
+    /// 等价于 create_ring(2)。
     pub fn create_pair() -> (Self, Self) {
-        let q0 = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-        let q1 = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-        (
-            Self { peer_inbox: q1.clone(), self_inbox: q0.clone() },
-            Self { peer_inbox: q0.clone(), self_inbox: q1.clone() },
-        )
+        let ring = Self::create_ring(2);
+        (ring[0].clone(), ring[1].clone())
     }
 }
 
