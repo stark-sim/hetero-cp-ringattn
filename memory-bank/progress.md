@@ -136,6 +136,7 @@
   - 本地 2-domain CPU smoke：pipeline 与 serial 模式输出完全一致（`generated:  is not a`），correctness 无 regression
   - 45 cargo tests 通过，commit `7a2d33f` 已推送至 main
   - 新建 `scripts/run_cross_node_ab_test.sh`：自动化跨节点 A/B 对比测试脚本，支持 baseline/optimized 多配置批量运行和 TSV 报告输出
+  - **跨节点异构 A/B 验证通过**（Mac MPS + white RTX 4090 CUDA，64-token prompt）：Serial vs Pipeline 输出完全一致（`jumps over the`），correctness 无 regression
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 
 ## 已知问题
