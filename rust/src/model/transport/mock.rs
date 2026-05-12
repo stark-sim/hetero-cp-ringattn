@@ -25,10 +25,20 @@ impl MockKvTransport {
 
 #[cfg(feature = "tch-backend")]
 impl KvTransport for MockKvTransport {
-    fn send_kv_block(&mut self, _block: &KvBlock) -> Result<(), String> {
+    fn submit_send(&mut self, _block: &KvBlock) -> Result<(), String> {
         Ok(())
     }
 
+    fn poll_recv(&mut self) -> Result<Option<KvBlock>, String> {
+        Ok(self.queue.pop_front())
+    }
+
+    fn flush_send(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// 【覆盖默认 recv_kv_block】避免 trait 默认的 1ms 忙等循环。
+    /// Mock transport 中队列为空就意味着没有数据，不需要等待。
     fn recv_kv_block(&mut self) -> Result<Option<KvBlock>, String> {
         Ok(self.queue.pop_front())
     }
@@ -94,10 +104,11 @@ impl LinkedMockKvTransport {
 
 #[cfg(feature = "tch-backend")]
 impl KvTransport for LinkedMockKvTransport {
-    /// 【发送 KV block】把 block 的副本放入对方的收件箱（peer_inbox）。
-    /// 
-    // shallow_clone() 不拷贝底层浮点数据，只增加引用计数，所以很高效。
-    fn send_kv_block(&mut self, block: &KvBlock) -> Result<(), String> {
+    /// 【提交发送】把 block 的副本放入对方的收件箱（peer_inbox）。
+    ///
+    /// shallow_clone() 不拷贝底层浮点数据，只增加引用计数，所以很高效。
+    /// 在内存传输中，submit_send 立即完成（没有网络延迟）。
+    fn submit_send(&mut self, block: &KvBlock) -> Result<(), String> {
         let cloned = KvBlock {
             layer_idx: block.layer_idx,
             global_seq_start: block.global_seq_start,
@@ -109,9 +120,20 @@ impl KvTransport for LinkedMockKvTransport {
         Ok(())
     }
 
-    /// 【接收 KV block】从自己的收件箱（self_inbox）头部取出一个 block。
-    /// 
-    /// 如果队列为空，返回 Ok(None)，表示暂时没有数据。
+    /// 【轮询接收】从自己的收件箱（self_inbox）头部取出一个 block。
+    ///
+    /// 如果队列为空，返回 Ok(None)，表示暂时没有数据（非阻塞）。
+    fn poll_recv(&mut self) -> Result<Option<KvBlock>, String> {
+        Ok(self.self_inbox.lock().unwrap().pop_front())
+    }
+
+    /// 【刷新发送】内存传输中无 pending 操作，no-op。
+    fn flush_send(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// 【覆盖默认 recv_kv_block】避免 trait 默认的 1ms 忙等循环。
+    /// 内存 transport 中队列为空即表示无数据，直接返回 None。
     fn recv_kv_block(&mut self) -> Result<Option<KvBlock>, String> {
         Ok(self.self_inbox.lock().unwrap().pop_front())
     }

@@ -259,13 +259,27 @@ impl HcpRingAttentionBackend {
         *rs = new_sum;
     }
 
-    /// 【Ring Attention 核心算法】
-    /// 
+    /// 【Ring Attention 核心算法 — Split-Phase Pipeline 版】
+    ///
     /// 传统 Attention 需要一次性加载整个 K/V 矩阵到显存，当序列很长时（如 1M tokens）会爆显存。
     /// Ring Attention 的思想：把 Q 切成多个小 chunk，把 K/V 也切成多个 block，
     /// 一次只处理一个 Q chunk + 一个 K/V block，用 online softmax 逐步合并结果。
-    /// 
-    /// 在分布式场景下，每个 domain 只持有本地序列的 K/V，peer domain 的 K/V 需要通过网络传输获取。
+    ///
+    /// 【Step 2 Pipeline 改进】
+    /// 旧实现是"先全部 exchange KV → 再统一 compute"的两阶段串行：
+    ///   网络时间 = (num_domains-1) * round_trip_time
+    ///   计算时间 = num_q_chunks * (local_compute + peer_compute)
+    ///   总时间 = 网络时间 + 计算时间（无重叠）
+    ///
+    /// 新实现是"compute-communication overlap"的 pipeline：
+    ///   Phase 0: submit_send(first_block)       ← 启动网络发送
+    ///   Phase 1: 本地 KV compute                ← 和 Phase 0 的 send 重叠
+    ///   Phase 2: for round: poll_recv → process → submit_send  ← 每轮 compute 和下一轮的网络 I/O 重叠
+    ///   Phase 3: flush_send()                   ← 确保所有数据已发出
+    ///   Phase 4: 提取输出
+    ///
+    /// 总时间 ≈ max(网络时间, 计算时间) 而不是两者相加。
+    /// 在慢网络（如 Tailscale VPN ~380ms RTT）下，overlap 收益显著。
     fn ring_attention(
         &mut self,
         q: &Tensor,                  // Query，shape: [batch, num_heads, seq_len, head_dim]
@@ -279,21 +293,70 @@ impl HcpRingAttentionBackend {
         let seq_len = q.size()[2];
         let head_dim = q.size()[3];
 
-        // ====== 第一步 + 第二步：Ring KV 交换 ======
-        // 在真正的 N-domain ring 中，每个 domain 只与 next/prev 两个邻居直接通信。
-        // 每个 domain 把自己的 KV 发给 next，从 prev 接收 KV；收到的 KV 在下一轮再转发给 next。
-        // 经过 num_domains - 1 轮后，每个 domain 都收到了所有其他 domain 的 KV。
-        //
-        // 例如 3-domain (0→1→2→0):
-        //   Round 0: 0 发 K0→1，收 K2；1 发 K1→2，收 K0；2 发 K2→0，收 K1
-        //   Round 1: 0 发 K2→1，收 K1；1 发 K0→2，收 K2；2 发 K1→0，收 K0
-        //   最终每个 domain 持有 K0/K1/K2 全部三块。
-        //
+        // ====== 确定 chunk 大小 ======
+        let q_chunk_size = (seq_len as usize)
+            .div_ceil(self.num_domains)
+            .max(1)
+            .min(2048);
+        let kv_chunk_size = if seq_len == 1 { 2048 } else { q_chunk_size };
+
+        // 本地 KV 总长度（decode 阶段可能比 seq_len 长，因为包含 KV cache）
+        let local_kv_len = k.size()[2] as usize;
+        let kv_chunks: Vec<(usize, usize)> = (0..local_kv_len)
+            .step_by(kv_chunk_size)
+            .map(|start| (start, (start + kv_chunk_size).min(local_kv_len)))
+            .collect();
+
+        // 是否应用因果掩码
+        let apply_causal = attention_mask.is_some();
+
+        // ====== 预创建所有 Q chunk 的状态 ======
+        // 每个 Q chunk 独立维护 (rm, rs, obh) 状态，这样本地 KV 和 peer KV
+        // 可以分阶段处理，状态在阶段之间持久化。
+        struct QChunkState {
+            q_chunk: Tensor,
+            q_global_start: usize,
+            q_global_end: usize,
+            rm: Tensor,
+            rs: Tensor,
+            obh: Tensor,
+        }
+
+        let mut q_states: Vec<QChunkState> = Vec::new();
+        for q_start in (0..seq_len as usize).step_by(q_chunk_size) {
+            let q_end = (q_start + q_chunk_size).min(seq_len as usize);
+            let q_chunk_len = (q_end - q_start) as i64;
+            let q_chunk = q.narrow(2, q_start as i64, q_chunk_len);
+
+            let (q_gs, q_ge) = if apply_causal {
+                (global_seq_start + q_start, global_seq_start + q_end)
+            } else {
+                (0, seq_len as usize)
+            };
+
+            q_states.push(QChunkState {
+                q_chunk,
+                q_global_start: q_gs,
+                q_global_end: q_ge,
+                rm: Tensor::full(
+                    [batch, num_heads, q_chunk_len],
+                    f64::NEG_INFINITY,
+                    (Kind::Float, q.device()),
+                ),
+                rs: Tensor::zeros([batch, num_heads, q_chunk_len], (Kind::Float, q.device())),
+                obh: Tensor::zeros(
+                    [batch, num_heads, q_chunk_len, head_dim],
+                    (Kind::Float, q.device()),
+                ),
+            });
+        }
+
+        // ====== Phase 0: 准备并启动发送（和本地 compute 重叠）======
         // 【decode 阶段特殊处理】seq_len == 1 时，只发送 prefill 阶段产生的 KV 分区
         //（记录在 self.prefill_kv_len 中），decode 新 token 的 KV 完全由每个节点本地持有。
-        let mut peer_blocks: Vec<crate::model::transport::KvBlock> = Vec::new();
-
-        if let Some(ref mut transport) = self.kv_transport {
+        let has_transport = self.kv_transport.is_some();
+        if has_transport {
+            let transport = self.kv_transport.as_mut().unwrap();
             let (k_to_send, v_to_send, send_seq_end) = if seq_len == 1 {
                 let history_len = self.prefill_kv_len as i64;
                 (
@@ -305,7 +368,7 @@ impl HcpRingAttentionBackend {
                 (k.shallow_clone(), v.shallow_clone(), global_seq_start + k.size()[2] as usize)
             };
 
-            let mut current_block = KvBlock {
+            let first_block = KvBlock {
                 layer_idx: self.layer_idx,
                 global_seq_start,
                 global_seq_end: send_seq_end,
@@ -313,177 +376,142 @@ impl HcpRingAttentionBackend {
                 v: v_to_send,
             };
 
-            for round in 0..self.num_domains.saturating_sub(1) {
-                match transport.exchange_kv_block(&current_block) {
-                    Ok(Some(peer_block)) => {
-                        let sent_bytes = current_block.k.numel() * 4 + current_block.v.numel() * 4;
-                        let recv_bytes = peer_block.k.numel() * 4 + peer_block.v.numel() * 4;
-                        println!("[ring_attention] round {round} layer {}: sent KV block {sent_bytes} bytes, received {recv_bytes} bytes", self.layer_idx);
-                        peer_blocks.push(peer_block.clone());
-                        current_block = peer_block;
-                    }
-                    Ok(None) => {
-                        eprintln!("[ring_attention] round {round} exchange_kv_block returned None");
-                        break;
-                    }
-                    Err(e) => {
-                        eprintln!("[ring_attention] round {round} exchange_kv_block failed: {e}");
-                        break;
-                    }
-                }
+            if let Err(e) = transport.submit_send(&first_block) {
+                eprintln!("[ring_attention] submit_send first_block failed: {e}");
             }
         }
 
-        // ====== 第三步：确定 chunk 大小 ======
-        // 限制 q_chunk_size 上限，避免单 domain 时一次性处理过长序列导致 OOM。
-        // 2048 是一个保守值：scores [batch, 14, 2048, 2048] × 4B ≈ 234MB，加上 exp 等
-        // 中间 tensor 峰值约 500MB-1GB，可轻松放入 16GB 显存。
-        let q_chunk_size = (seq_len as usize)
-            .div_ceil(self.num_domains)
-            .max(1)
-            .min(2048);
-        // decode phase (seq_len == 1): avoid tiny-chunk overhead by using larger
-        // KV chunks. 70001 chunks of size 1 causes ~10min decode; 2048 reduces
-        // it to ~35 chunks per domain, cutting kernel launch overhead by 2000x.
-        let kv_chunk_size = if seq_len == 1 { 2048 } else { q_chunk_size };
+        // ====== Phase 1: 本地 KV compute（与网络发送重叠）======
+        for state in &mut q_states {
+            for (kv_start, kv_end) in &kv_chunks {
+                let kv_chunk_len = (*kv_end - *kv_start) as i64;
+                let k_chunk = k.narrow(2, *kv_start as i64, kv_chunk_len);
+                let v_chunk = v.narrow(2, *kv_start as i64, kv_chunk_len);
 
-        // 存储每个 Q chunk 的输出，最后 cat 拼接。
-        let mut outputs = Vec::new();
+                let (kv_gs, kv_ge) = if apply_causal {
+                    (global_seq_start + kv_start, global_seq_start + kv_end)
+                } else {
+                    (0, seq_len as usize)
+                };
 
-        // ====== 第四步：逐个处理 Q chunk ======
-        // 外层循环遍历每个 Q chunk（比如 [0,4) 和 [4,8)）。
-        for q_start in (0..seq_len as usize).step_by(q_chunk_size) {
-            let q_end = (q_start + q_chunk_size).min(seq_len as usize);
-            let q_chunk_len = (q_end - q_start) as i64;
-
-            // narrow(2, start, len) 在第 2 维（seq_len 维）上截取一段。
-            // q_chunk shape: [batch, num_heads, q_chunk_len, head_dim]
-            let q_chunk = q.narrow(2, q_start as i64, q_chunk_len);
-
-            // 把本地 K/V 也切成多个 block，方便逐个处理。
-            // 注意：KV 的长度可能与 Q 不同（decode 阶段 Q len=1，但 KV cache 很长）。
-            // 因此用 k.size()[2]（本地 KV 的 seq_len 维）而不是 q 的 seq_len。
-            let local_kv_len = k.size()[2] as usize;
-            let kv_chunks: Vec<(usize, usize)> = (0..local_kv_len)
-                .step_by(kv_chunk_size)
-                .map(|start| (start, (start + kv_chunk_size).min(local_kv_len)))
-                .collect();
-
-            // 区分两种路径：
-            // - attention_mask.is_some()：因果 prefill，用纯 tensor 在线 softmax（在 GPU 上执行）。
-            // - attention_mask.is_none()：非因果路径（协议 smoke 测试），用 CPU buffer。
-            if attention_mask.is_some() {
-                // ====== Online Softmax 状态初始化 ======
-                // Ring Attention 的核心是 online softmax：不需要一次性看到所有 K/V，
-                // 而是逐块处理，每处理一块就更新当前的最佳估计。
-                // 
-                // 三个状态变量：
-                // - rm (running max): 当前见过的最大 score 值，shape [batch, num_heads, q_chunk_len]
-                //   初始化为负无穷，表示还没有处理任何 KV block。
-                // - rs (running sum): 当前 softmax 分母的累加和，shape 同上。
-                //   初始化为 0。
-                // - obh (output buffer head): 当前加权累加的输出，shape [batch, num_heads, q_chunk_len, head_dim]
-                //   初始化为 0。
-                let mut rm = Tensor::full(
-                    [batch, num_heads, q_chunk_len],
-                    f64::NEG_INFINITY,
-                    (Kind::Float, q.device()),
+                self.process_kv_block(
+                    &state.q_chunk, state.q_global_start, state.q_global_end,
+                    &k_chunk, &v_chunk,
+                    kv_gs, kv_ge,
+                    &mut state.rm, &mut state.rs, &mut state.obh,
+                    apply_causal,
                 );
-                let mut rs = Tensor::zeros([batch, num_heads, q_chunk_len], (Kind::Float, q.device()));
-                let mut obh = Tensor::zeros(
-                    [batch, num_heads, q_chunk_len, head_dim],
-                    (Kind::Float, q.device()),
-                );
+            }
+        }
 
-                // 计算当前 Q chunk 的全局位置范围。
-                // 例如 domain1 的 q_start=0 → q_global_start=8+0=8，q_global_end=8+4=12。
-                let q_global_start = global_seq_start + q_start;
-                let q_global_end = global_seq_start + q_end;
+        // ====== Phase 2: Peer KV loop（compute + communication overlap）======
+        // 每轮：poll_recv 等 peer block → 所有 Q chunks 处理 → submit_send 转发
+        // 在"处理"期间，send task 在后台发送上一个 block，recv task 在后台等下一个 block。
+        if has_transport {
+            let num_rounds = self.num_domains.saturating_sub(1);
 
-                // 4a. 先处理【本地 KV blocks】
-                // 本地 KV 是当前 domain 自己计算的 K/V，不需要网络传输。
-                for (kv_start, kv_end) in &kv_chunks {
-                    let kv_chunk_len = (*kv_end - *kv_start) as i64;
+            for round in 0..num_rounds {
+                // 2a. 等待接收 peer block
+                // 用内部作用域限制 transport 的 mutable borrow，避免和 process_kv_block 冲突。
+                //
+                // 【poll_recv vs recv_kv_block 的协作策略】
+                // - poll_recv 是非阻塞的：适合 overlap 场景下主线程"顺便检查"是否有数据
+                // - 但 poll_recv 返回 None 时，无法区分"数据还没到"和"不会再有数据"
+                // - recv_kv_block 是阻塞的：对于 QUIC 会等待到数据到达；对于 Mock 会直接返回 None
+                //
+                // 因此策略：先用 poll_recv 非阻塞检查，返回 None 时再用 recv_kv_block
+                // 做一次"确认性"阻塞尝试。这样 Mock 测试不会死等，QUIC 生产环境仍能正确阻塞。
+                let peer_block = {
+                    let transport = self.kv_transport.as_mut().unwrap();
+                    loop {
+                        match transport.poll_recv() {
+                            Ok(Some(block)) => {
+                                let recv_bytes = block.k.numel() * 4 + block.v.numel() * 4;
+                                println!("[ring_attention] round {round} layer {}: received {recv_bytes} bytes", self.layer_idx);
+                                break block;
+                            }
+                            Ok(None) => {
+                                // poll_recv 返回 None：尝试用 recv_kv_block 确认是"暂未到"还是"已关闭"
+                                match transport.recv_kv_block() {
+                                    Ok(Some(block)) => {
+                                        let recv_bytes = block.k.numel() * 4 + block.v.numel() * 4;
+                                        println!("[ring_attention] round {round} layer {}: received {recv_bytes} bytes (via recv_kv_block)", self.layer_idx);
+                                        break block;
+                                    }
+                                    Ok(None) => {
+                                        // 确认没有更多 peer block（stream 已关闭或 peer 不会发送）
+                                        break KvBlock {
+                                            layer_idx: self.layer_idx,
+                                            global_seq_start: 0,
+                                            global_seq_end: 0,
+                                            k: Tensor::zeros([1], (Kind::Float, q.device())),
+                                            v: Tensor::zeros([1], (Kind::Float, q.device())),
+                                        };
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[ring_attention] round {round} recv_kv_block failed: {e}");
+                                        break KvBlock {
+                                            layer_idx: self.layer_idx,
+                                            global_seq_start: 0,
+                                            global_seq_end: 0,
+                                            k: Tensor::zeros([1], (Kind::Float, q.device())),
+                                            v: Tensor::zeros([1], (Kind::Float, q.device())),
+                                        };
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[ring_attention] round {round} poll_recv failed: {e}");
+                                break KvBlock {
+                                    layer_idx: self.layer_idx,
+                                    global_seq_start: 0,
+                                    global_seq_end: 0,
+                                    k: Tensor::zeros([1], (Kind::Float, q.device())),
+                                    v: Tensor::zeros([1], (Kind::Float, q.device())),
+                                };
+                            }
+                        }
+                    }
+                };
 
-                    // 从本地 K/V tensor 中截取当前 block
-                    let k_chunk = k.narrow(2, *kv_start as i64, kv_chunk_len);
-                    let v_chunk = v.narrow(2, *kv_start as i64, kv_chunk_len);
-
-                    // 调用 process_kv_block 更新 online softmax 状态。
-                    // 注意：kv_start/kv_end 是本地索引，需要加上 global_seq_start 才能得到全局位置。
-                    self.process_kv_block(
-                        &q_chunk, q_global_start, q_global_end,
-                        &k_chunk, &v_chunk,
-                        global_seq_start + kv_start, global_seq_start + kv_end,
-                        &mut rm, &mut rs, &mut obh,
-                        true,  // 因果路径
-                    );
+                // 空 block（出错或 stream 关闭），跳过
+                if peer_block.global_seq_end <= peer_block.global_seq_start {
+                    continue;
                 }
 
-                // 4b. 再处理【peer KV blocks】
-                // peer KV 是从其他 domain 通过网络接收到的 K/V。
-                // 这些 block 已经被预取到 peer_blocks 向量中，所有 Q chunk 共享。
-                for peer_block in &peer_blocks {
+                // 2b. 所有 Q chunks 处理这个 peer block（compute 期间网络在后台运行）
+                for state in &mut q_states {
                     self.process_kv_block(
-                        &q_chunk, q_global_start, q_global_end,
+                        &state.q_chunk, state.q_global_start, state.q_global_end,
                         &peer_block.k, &peer_block.v,
                         peer_block.global_seq_start, peer_block.global_seq_end,
-                        &mut rm, &mut rs, &mut obh,
-                        true,  // 因果路径
+                        &mut state.rm, &mut state.rs, &mut state.obh,
+                        apply_causal,
                     );
                 }
 
-                // 这个 Q chunk 的处理完成，obh 就是该 chunk 的 attention 输出。
-                outputs.push(obh); // shape: [batch, num_heads, q_chunk_len, head_dim]
-            } else {
-                // ====== 非因果路径（protocol smoke / 全可见 attention）======
-                // 非因果路径意味着每个 Q 都能看到所有 K/V（没有 causal mask）。
-                // 之前这里调用 C++ compute_chunk_attention_step（CPU buffer 方式），
-                // 现在改为和因果路径相同的纯 tch tensor online softmax，全程在设备上执行。
-                let mut rm = Tensor::full(
-                    [batch, num_heads, q_chunk_len],
-                    f64::NEG_INFINITY,
-                    (Kind::Float, q.device()),
-                );
-                let mut rs = Tensor::zeros([batch, num_heads, q_chunk_len], (Kind::Float, q.device()));
-                let mut obh = Tensor::zeros(
-                    [batch, num_heads, q_chunk_len, head_dim],
-                    (Kind::Float, q.device()),
-                );
-
-                // 非因果路径下，所有本地 KV 和 peer KV 都是可见的。
-                // global_seq_start 对 non-causal 没有实际意义（因为不用 causal mask），
-                // 但为了接口统一，传入 0。
-                for (kv_start, kv_end) in &kv_chunks {
-                    let kv_chunk_len = (*kv_end - *kv_start) as i64;
-                    let k_chunk = k.narrow(2, *kv_start as i64, kv_chunk_len);
-                    let v_chunk = v.narrow(2, *kv_start as i64, kv_chunk_len);
-                    self.process_kv_block(
-                        &q_chunk, 0, seq_len as usize,
-                        &k_chunk, &v_chunk,
-                        0, seq_len as usize,
-                        &mut rm, &mut rs, &mut obh,
-                        false,  // 非因果路径，不应用 causal mask
-                    );
+                // 2c. 转发：把收到的 block 发给 next peer（最后一轮不需要转发）
+                if round < num_rounds.saturating_sub(1) {
+                    let sent_bytes = peer_block.k.numel() * 4 + peer_block.v.numel() * 4;
+                    println!("[ring_attention] round {round} layer {}: forwarding {sent_bytes} bytes", self.layer_idx);
+                    let transport = self.kv_transport.as_mut().unwrap();
+                    if let Err(e) = transport.submit_send(&peer_block) {
+                        eprintln!("[ring_attention] round {round} submit_send failed: {e}");
+                        break;
+                    }
                 }
+            }
 
-                for peer_block in &peer_blocks {
-                    self.process_kv_block(
-                        &q_chunk, 0, seq_len as usize,
-                        &peer_block.k, &peer_block.v,
-                        0, seq_len as usize,
-                        &mut rm, &mut rs, &mut obh,
-                        false,  // 非因果路径
-                    );
-                }
-
-                outputs.push(obh);
+            // ====== Phase 3: Flush ======
+            // 确保所有已 submit 的 block 都被 send task 写入 QUIC stream。
+            let transport = self.kv_transport.as_mut().unwrap();
+            if let Err(e) = transport.flush_send() {
+                eprintln!("[ring_attention] flush_send failed: {e}");
             }
         }
 
-        // ====== 第五步：拼接所有 Q chunk 的输出 ======
-        // 无论因果还是非因果路径，每个 output 的 shape 都是 [batch, num_heads, q_chunk_len, head_dim]。
-        // 在第 2 维（seq_len 维）上拼接，恢复完整的 seq_len。
+        // ====== Phase 4: 提取输出 ======
+        let outputs: Vec<Tensor> = q_states.into_iter().map(|s| s.obh).collect();
         Tensor::cat(&outputs, 2)
     }
 

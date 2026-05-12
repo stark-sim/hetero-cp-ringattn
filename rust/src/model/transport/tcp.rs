@@ -32,6 +32,10 @@ use super::r#trait::KvTransport;
 pub struct TcpKvTransport {
     stream: TcpStream,
     device: Device,
+    /// 【内部发送缓冲区】用于 submit_send 的异步化。
+    /// TCP 本身是同步流，submit_send 会把完整 frame 先序列化到 buffer，
+    /// 在 flush_send 时才一次性写入 stream。
+    send_buffer: Vec<u8>,
 }
 
 #[cfg(feature = "tch-backend")]
@@ -43,7 +47,7 @@ impl TcpKvTransport {
         stream
             .set_write_timeout(Some(std::time::Duration::from_secs(30)))
             .map_err(|e| format!("set_write_timeout failed: {e}"))?;
-        Ok(Self { stream, device })
+        Ok(Self { stream, device, send_buffer: Vec::new() })
     }
 
     fn tensor_to_bytes(t: &Tensor) -> Result<Vec<u8>, String> {
@@ -72,40 +76,74 @@ impl TcpKvTransport {
     }
 }
 
+/// 【把序列化 KV block 追加到 buffer，但不实际写入网络】
+#[cfg(feature = "tch-backend")]
+fn serialize_block_to_buffer(
+    send_buffer: &mut Vec<u8>,
+    block: &KvBlock,
+) -> Result<(), String> {
+    let k_bytes = TcpKvTransport::tensor_to_bytes(&block.k)?;
+    let v_bytes = TcpKvTransport::tensor_to_bytes(&block.v)?;
+    let k_shape: Vec<i64> = block.k.size();
+    let v_shape: Vec<i64> = block.v.size();
+
+    let meta = serde_json::json!({
+        "layer_idx": block.layer_idx,
+        "global_seq_start": block.global_seq_start,
+        "global_seq_end": block.global_seq_end,
+        "k_shape": k_shape,
+        "v_shape": v_shape,
+        "k_bytes": k_bytes.len(),
+        "v_bytes": v_bytes.len(),
+    });
+    let meta_bytes = meta.to_string().into_bytes();
+    let meta_len = meta_bytes.len() as u32;
+
+    // Frame: [meta_len: u32 BE] [meta_bytes] [k_bytes] [v_bytes]
+    send_buffer.extend_from_slice(&meta_len.to_be_bytes());
+    send_buffer.extend_from_slice(&meta_bytes);
+    send_buffer.extend_from_slice(&k_bytes);
+    send_buffer.extend_from_slice(&v_bytes);
+    Ok(())
+}
+
 #[cfg(feature = "tch-backend")]
 impl KvTransport for TcpKvTransport {
-    fn send_kv_block(&mut self, block: &KvBlock) -> Result<(), String> {
-        let k_bytes = Self::tensor_to_bytes(&block.k)?;
-        let v_bytes = Self::tensor_to_bytes(&block.v)?;
-        let k_shape: Vec<i64> = block.k.size();
-        let v_shape: Vec<i64> = block.v.size();
+    fn submit_send(&mut self, block: &KvBlock) -> Result<(), String> {
+        serialize_block_to_buffer(&mut self.send_buffer, block)
+    }
 
-        let meta = serde_json::json!({
-            "layer_idx": block.layer_idx,
-            "global_seq_start": block.global_seq_start,
-            "global_seq_end": block.global_seq_end,
-            "k_shape": k_shape,
-            "v_shape": v_shape,
-            "k_bytes": k_bytes.len(),
-            "v_bytes": v_bytes.len(),
-        });
-        let meta_bytes = meta.to_string().into_bytes();
-        let meta_len = meta_bytes.len() as u32;
-
-        // Frame: [meta_len: u32 BE] [meta_bytes] [k_bytes] [v_bytes]
-        let total_len = 4 + meta_bytes.len() + k_bytes.len() + v_bytes.len();
-        let mut frame = Vec::with_capacity(total_len);
-        frame.extend_from_slice(&meta_len.to_be_bytes());
-        frame.extend_from_slice(&meta_bytes);
-        frame.extend_from_slice(&k_bytes);
-        frame.extend_from_slice(&v_bytes);
-
+    fn poll_recv(&mut self) -> Result<Option<KvBlock>, String> {
+        // TCP 是同步流，poll_recv 需要非阻塞读取一个完整 frame。
+        // 为了简化实现，这里切换到非阻塞模式尝试读取，如果读不到就切回阻塞模式返回 None。
+        // 实际测试中使用 Mock 或 QUIC，TCP transport 使用较少。
         self.stream
-            .write_all(&frame)
-            .map_err(|e| format!("send_kv_block write failed: {e}"))?;
+            .set_nonblocking(true)
+            .map_err(|e| format!("set_nonblocking failed: {e}"))?;
+
+        let result = self.recv_kv_block();
+
+        // 恢复阻塞模式（不影响 send）
+        let _ = self.stream.set_nonblocking(false);
+
+        match result {
+            Ok(opt) => Ok(opt),
+            Err(e) if e.contains("WouldBlock") => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn flush_send(&mut self) -> Result<(), String> {
+        if !self.send_buffer.is_empty() {
+            self.stream
+                .write_all(&self.send_buffer)
+                .map_err(|e| format!("flush_send write failed: {e}"))?;
+            self.send_buffer.clear();
+        }
         Ok(())
     }
 
+    /// 【保留阻塞接收实现】避免 trait 默认实现的 1ms 忙等。
     fn recv_kv_block(&mut self) -> Result<Option<KvBlock>, String> {
         // Read meta_len
         let mut len_bytes = [0u8; 4];

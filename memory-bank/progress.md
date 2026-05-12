@@ -120,6 +120,15 @@
   - **验证**：42/42 单元测试通过，clippy 零警告；本地 2-node CPU smoke 三种模式（baseline even / `--capacity-aware` / `--chunk-sizes 7,4` override）输出均一致（`" in the universe."`）。
 - [x] [2026-05-02] **修复 QUIC KV ring 大 block 死锁**：quinn 默认 `stream_receive_window` (~1.2MB) 不足以容纳 GQA repeat 后的 KV block（~15MB for 2K seq），导致所有 worker 在 `SendStream::write_all` 中阻塞等待 window update，但接收方也在 `write_all` 中发送自己的 block → 分布式死锁。修复：显式设置 `stream_receive_window=32MB`、`receive_window=128MB`；`write_frame` 添加 `flush`。2-domain CPU 4K ✅ 43s、3-domain CPU 4K ✅ 49s、短 prompt regression ✅。
 - [x] [2026-05-11] **Rust lib.rs 重构 Commits 3-7/15**：提取 report types、reference algorithm、correctness tests、C++/tch bridges、remote networking。lib.rs 从 ~2500 行降至 555 行（含 384 行 run_cli，待 Commit 14 提取 distributed 内容后将进一步精简）。cargo check 通过，45 tests 通过。
+- [x] [2026-05-11] **Step 1: N-domain ring 拓扑去硬编码**：`runtime.rs` 移除 `num_domains == 2` 硬编码分支，统一为并发 dial+accept；`mock.rs` 新增 `create_ring(n)` 支持任意 N-domain 环形连接；45/45 tests passed，commit `b0c040d`
+- [x] [2026-05-11] **Step 2: Layer 内 Overlap — Split-Phase Transport + Pipeline**：
+  - `KvTransport` trait 扩展为 split-phase API：`submit_send`（提交异步发送）、`poll_recv`（非阻塞轮询接收）、`flush_send`（等待发送完成）；旧同步方法（`send_kv_block`/`recv_kv_block`/`exchange_kv_block`）基于新 API 提供默认实现，保持向后兼容
+  - `quic.rs` 重写为 async task + channel 架构：独立 send task（mpsc channel → QUIC write_all）和 recv task（QUIC read → 反序列化 → mpsc channel），主线程通过 `block_on` 与 channel 交互
+  - `tcp.rs` / `mock.rs` 实现同步 split-phase：submit 缓冲到内部 buffer，flush 时统一写入；Mock 覆盖 `recv_kv_block` 避免 trait 默认忙等
+  - `ring_attention` 从"先全部 exchange → 再统一 compute"串行结构，重构为 4-phase pipeline：Phase 0 启动 send → Phase 1 本地 KV compute（与 send 重叠）→ Phase 2 循环接收→处理→转发（compute 与下一轮 I/O 重叠）→ Phase 3 flush → Phase 4 提取输出
+  - `QChunkState` 结构：每个 Q chunk 独立维护 (rm, rs, obh)，支持本地 KV 和 peer KV 分阶段处理，状态在阶段间持久化
+  - 关键 bug 修复：串行 Mock 测试中先运行 domain 的 inbox 为空，`poll_recv` 返回 None 时如果简单忙等会死循环；修复策略为 `poll_recv` 返回 None 后改用 `recv_kv_block` 做确认性阻塞尝试（Mock 直接返回 None → break；QUIC 阻塞等待数据 → 正确）
+  - 全部 45 cargo tests 通过（含 4 个端到端分布式 model tests），零 regression
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 
 ## 已知问题

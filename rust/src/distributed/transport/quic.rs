@@ -1,4 +1,19 @@
 //! QUIC-based KV transport for distributed ring attention.
+//!
+//! 【Step 2 架构：Async Task + Channel Split-Phase】
+//!
+//! 内部维护两个独立的 tokio spawned tasks：
+//! - **send task**：从 mpsc channel 接收序列化后的 frame，写入 QUIC send stream
+//! - **recv task**：从 QUIC recv stream 读取 frame，反序列化后推入 mpsc channel
+//!
+//! 主线程通过 split-phase API 与 tasks 交互：
+//! - `submit_send()`：序列化 block → 推入 send channel（不等待网络写入完成）
+//! - `poll_recv()`：非阻塞检查 recv channel，有数据就返回
+//! - `flush_send()`：发送 flush marker，等待 send task 确认所有之前的数据已交给 QUIC
+//!
+//! 这种架构使得 attention 计算可以与 KV 传输完全重叠：
+//! 主线程在 `process_kv_block()` 计算的同时，send task 在后台把下一个 block
+//! 写入网络，recv task 在后台等待接收 peer block。
 use crate::model::transport::{KvBlock, KvTransport};
 use quinn::{ClientConfig, Endpoint, RecvStream, SendStream, ServerConfig};
 use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
@@ -7,6 +22,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tch::{Device, Tensor};
 use tokio::runtime::Handle;
+use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug)]
 struct SkipServerVerification;
@@ -112,25 +128,100 @@ pub fn create_endpoint(listen_addr: SocketAddr) -> Result<Endpoint, String> {
     Ok(endpoint)
 }
 
+/// 【发送命令】Data = 序列化后的 frame；Flush = 要求 send task 确认所有数据已提交。
+enum SendCmd {
+    Data(Vec<u8>),
+    Flush(oneshot::Sender<()>),
+}
+
+/// 【QUIC KV Transport — Split-Phase 实现】
+///
+/// 内部包含两个独立的 tokio tasks（send / recv），主线程通过 channel 与之交互。
+/// 所有 Tensor 序列化/反序列化发生在主线程（submit_send）和 recv task 中，
+/// channel 中只传递 `Vec<u8>`，避免 Tensor 跨线程移动的问题。
 pub struct QuicKvTransport {
-    send: SendStream,
-    recv: RecvStream,
+    /// 向 send task 发送命令（序列化 frame 或 flush marker）
+    send_tx: mpsc::Sender<SendCmd>,
+    /// 从 recv task 接收反序列化后的 KvBlock
+    recv_rx: mpsc::Receiver<KvBlock>,
+    /// send task 的 JoinHandle（Drop 时需要 abort）
+    #[allow(dead_code)]
+    send_task: tokio::task::JoinHandle<()>,
+    /// recv task 的 JoinHandle（Drop 时需要 abort）
+    #[allow(dead_code)]
+    recv_task: tokio::task::JoinHandle<()>,
     rt: Handle,
     device: Device,
-    handshake_done: bool,
 }
 
 impl QuicKvTransport {
     pub fn new(send: SendStream, recv: RecvStream, rt: Handle, device: Device) -> Self {
-        Self { send, recv, rt, device, handshake_done: false }
+        // Channel buffer = 2：允许网络传输前一个 block 的同时，主线程序列化下一个 block
+        let (send_tx, send_rx) = mpsc::channel::<SendCmd>(2);
+        let (recv_tx, recv_rx) = mpsc::channel::<KvBlock>(2);
+
+        let send_task = rt.spawn(send_task_loop(send, send_rx));
+        let recv_task = rt.spawn(recv_task_loop(recv, recv_tx, device));
+
+        Self {
+            send_tx,
+            recv_rx,
+            send_task,
+            recv_task,
+            rt,
+            device,
+        }
     }
 }
 
-/// Send a KV block over a QUIC send stream (async, no self reference).
-async fn send_kv_block_to_stream(
-    send: &mut SendStream,
-    block: &KvBlock,
-) -> Result<(), String> {
+/// 【Send Task】从 channel 接收序列化 frame，写入 QUIC send stream。
+///
+/// 这个 task 独立运行，即使主线程在进行 attention 计算，它也在后台
+/// 把 KV block 写入网络，实现计算-通信重叠。
+async fn send_task_loop(mut send: SendStream, mut cmd_rx: mpsc::Receiver<SendCmd>) {
+    while let Some(cmd) = cmd_rx.recv().await {
+        match cmd {
+            SendCmd::Data(frame) => {
+                if let Err(e) = send.write_all(&frame).await {
+                    eprintln!("[quic send_task] write_all failed: {e}");
+                    break;
+                }
+            }
+            SendCmd::Flush(ack) => {
+                // 所有之前的数据已经 write_all 进入 QUIC 发送缓冲区，直接 ack。
+                // 注意：不调用 send.finish()，那样会关闭整个 stream。
+                let _ = ack.send(());
+            }
+        }
+    }
+    // channel 关闭或出错，优雅退出。recv_task 会自行处理 stream 的另一端。
+}
+
+/// 【Recv Task】从 QUIC recv stream 读取 frame，反序列化后推入 channel。
+///
+/// 这个 task 独立运行，即使主线程在进行 attention 计算，它也在后台
+/// 等待接收 peer block，一有数据就推入 channel 供 poll_recv() 消费。
+async fn recv_task_loop(mut recv: RecvStream, block_tx: mpsc::Sender<KvBlock>, device: Device) {
+    let mut handshake_done = false;
+    loop {
+        match recv_kv_block_from_stream(&mut recv, &mut handshake_done, device).await {
+            Ok(Some(block)) => {
+                if block_tx.send(block).await.is_err() {
+                    break; // 主线程已 drop recv_rx，不需要继续接收
+                }
+            }
+            Ok(None) => break, // stream 正常关闭（peer 发送了 FIN）
+            Err(e) => {
+                eprintln!("[quic recv_task] error: {e}");
+                break;
+            }
+        }
+    }
+    // block_tx 在这里被 drop，recv_rx.recv() 会返回 None，通知主线程 stream 已关闭
+}
+
+/// 【序列化 KV block 为 Vec<u8> frame】
+fn serialize_kv_block(block: &KvBlock) -> Result<Vec<u8>, String> {
     let k_bytes = tensor_to_bytes(&block.k)?;
     let v_bytes = tensor_to_bytes(&block.v)?;
     let k_shape: Vec<i64> = block.k.size();
@@ -153,13 +244,10 @@ async fn send_kv_block_to_stream(
     frame.extend_from_slice(&meta_bytes);
     frame.extend_from_slice(&k_bytes);
     frame.extend_from_slice(&v_bytes);
-
-    send.write_all(&frame).await
-        .map_err(|e| format!("quic send failed: {e}"))?;
-    Ok(())
+    Ok(frame)
 }
 
-/// Receive a KV block from a QUIC recv stream (async, no self reference).
+/// 【接收一个 KV block 从 QUIC recv stream】（async，可被 recv task 调用）
 async fn recv_kv_block_from_stream(
     recv: &mut RecvStream,
     handshake_done: &mut bool,
@@ -218,39 +306,59 @@ async fn recv_kv_block_from_stream(
     Ok(Some(KvBlock { layer_idx, global_seq_start, global_seq_end, k, v }))
 }
 
+#[cfg(feature = "tch-backend")]
 impl KvTransport for QuicKvTransport {
-    fn send_kv_block(&mut self, block: &KvBlock) -> Result<(), String> {
-        self.rt.block_on(send_kv_block_to_stream(&mut self.send, block))
-    }
-
-    fn recv_kv_block(&mut self) -> Result<Option<KvBlock>, String> {
-        self.rt.block_on(recv_kv_block_from_stream(
-            &mut self.recv,
-            &mut self.handshake_done,
-            self.device,
-        ))
-    }
-
-    /// Concurrent send+recv exchange: runs both directions in parallel via
-    /// `tokio::join!` so that a blocked send does not starve the receive side.
-    /// This prevents the classic ring-deadlock where both peers simultaneously
-    /// fill the stream send buffer and then wait for each other to read.
-    fn exchange_kv_block(&mut self, block: &KvBlock) -> Result<Option<KvBlock>, String> {
-        let send = &mut self.send;
-        let recv = &mut self.recv;
-        let handshake_done = &mut self.handshake_done;
-        let device = self.device;
+    /// 【提交异步发送】序列化 block 后推入 send channel，立即返回。
+    ///
+    /// send task 在后台把 frame 写入 QUIC stream，主线程无需等待。
+    /// 如果 channel 已满（send task 还在传输前一个 block），这里会 block_on
+    /// 直到有空间，这是自然的 backpressure。
+    fn submit_send(&mut self, block: &KvBlock) -> Result<(), String> {
+        let frame = serialize_kv_block(block)?;
         self.rt.block_on(async {
-            let send_fut = send_kv_block_to_stream(send, block);
-            let recv_fut = recv_kv_block_from_stream(recv, handshake_done, device);
-            let exchange_fut = async {
-                let (send_res, recv_res) = tokio::join!(send_fut, recv_fut);
-                send_res?;
-                recv_res
-            };
-            match tokio::time::timeout(std::time::Duration::from_secs(120), exchange_fut).await {
-                Ok(result) => result,
-                Err(_) => Err("exchange_kv_block timeout after 120s".to_string()),
+            self.send_tx.send(SendCmd::Data(frame)).await
+                .map_err(|e| format!("quic send channel closed: {e}"))
+        })
+    }
+
+    /// 【轮询接收】非阻塞检查 recv channel。
+    ///
+    /// - Some(block): peer block 已到达
+    /// - None: 暂时没有数据（主线程应继续做其他计算，稍后重试 poll）
+    fn poll_recv(&mut self) -> Result<Option<KvBlock>, String> {
+        match self.recv_rx.try_recv() {
+            Ok(block) => Ok(Some(block)),
+            Err(mpsc::error::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::error::TryRecvError::Disconnected) => Ok(None),
+        }
+    }
+
+    /// 【刷新发送】等待所有已 submit 的数据被 send task 处理。
+    ///
+    /// 发送一个 Flush marker 到 send channel，等待 send task ack。
+    /// 因为 channel 是有序的，当 ack 返回时，所有之前的数据都已经 write_all。
+    fn flush_send(&mut self) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        self.rt.block_on(async {
+            self.send_tx.send(SendCmd::Flush(tx)).await
+                .map_err(|e| format!("quic send channel closed during flush: {e}"))?;
+            rx.await.map_err(|e| format!("quic flush ack dropped: {e}"))
+        })
+    }
+
+    /// 【覆盖默认 recv_kv_block】避免 trait 默认的 1ms 忙等循环。
+    ///
+    /// 直接使用 block_on + recv() 阻塞等待，效率更高。
+    /// 120s 超时防止永久挂起。
+    fn recv_kv_block(&mut self) -> Result<Option<KvBlock>, String> {
+        self.rt.block_on(async {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                self.recv_rx.recv()
+            ).await {
+                Ok(Some(block)) => Ok(Some(block)),
+                Ok(None) => Ok(None), // channel closed（stream 已关闭）
+                Err(_) => Err("recv_kv_block timeout after 120s".to_string()),
             }
         })
     }

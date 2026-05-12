@@ -68,6 +68,14 @@
 ## 下一步
 
 - [x] [2026-05-11] **Rust lib.rs 重构 Commits 3-7**：提取 report types (`src/report.rs`)、reference algorithm (`src/smoke/reference_algo.rs`)、correctness tests (`src/smoke/correctness.rs`)、C++/tch bridge wrappers (`src/smoke/bridges/cxx.rs`, `src/smoke/bridges/tch.rs`)、remote networking (`src/remote.rs`)。lib.rs 从 ~2500 行降至 555 行。`cargo check --features tch-backend` 通过，`cargo test --features tch-backend` 45/45 通过。
+- [x] [2026-05-11] **Step 1: N-domain ring 拓扑去硬编码**：`runtime.rs` 移除 `num_domains == 2` 硬编码分支，统一为并发 dial+accept；`mock.rs` 新增 `create_ring(n)`；45/45 tests passed，已提交 `b0c040d`
+- [x] [2026-05-11] **Step 2: Layer 内 Overlap — Split-Phase Transport + Pipeline**：
+  - `KvTransport` trait 扩展 split-phase API：`submit_send` / `poll_recv` / `flush_send`，旧方法提供默认阻塞实现（向后兼容）
+  - QUIC transport 重写为内部 async task + channel 架构：send task / recv task 独立运行，主线程通过 mpsc channel 交互，channel 中只传 `Vec<u8>`（避免 Tensor 跨线程移动）
+  - TCP/Mock transport 同步 split-phase 实现：submit 缓冲到内部 buffer，recv 覆盖默认实现避免忙等
+  - `ring_attention` 重构为 4-phase pipeline：Phase 0 submit_send(first_block) → Phase 1 本地 KV compute（与 send 重叠）→ Phase 2 循环 poll_recv→process→submit_send 转发（compute 与下一轮 network I/O 重叠）→ Phase 3 flush_send → Phase 4 提取输出
+  - 关键修复：Mock 测试中先运行 domain 的 inbox 为空，`poll_recv` 返回 None 后改用 `recv_kv_block` 做确认性阻塞尝试，区分"数据暂未到"和"stream 已关闭/peer 不会发送"，避免死循环
+  - 全部 45 cargo tests 通过（含 `test_distributed_llama_model_prefill/decode/multi_step_decode`），零 regression
 - [x] [2026-05-09] **验证跨机器 E2E通过**：`scripts/run_python_distributed_2node.sh` 成功运行，Mac vllm-metal (MPS, 8.39s 初始化) + white RTX 4090 (CUDA) 完整端到端通过，生成 `. I am`。QUIC 超时修复（peer accept 180s）生效。
 - [x] [2026-05-09] **大规模跨机器验证矩阵完成**（一个节点一个 worker）：
   - T0 回归（2 tokens + 3 decode）：`. I am` ✅ ~40s
