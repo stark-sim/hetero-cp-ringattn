@@ -22,6 +22,20 @@ pub struct KvBlock {
     pub global_seq_end: usize,
     pub k: Tensor,
     pub v: Tensor,
+    /// 【micro block 索引】当 KV block 被切分成更小的 micro blocks 时，
+    /// 表示这是第几个 micro block（从 0 开始）。
+    /// 默认 0 表示未切分（单个 block）。
+    pub micro_block_idx: usize,
+    /// 【micro block 总数】该 domain 在这一 round 中总共有多少个 micro blocks。
+    /// 默认 1 表示未切分（单个 block）。
+    pub total_micro_blocks: usize,
+}
+
+impl KvBlock {
+    /// 【创建单个未切分的 KV block】向后兼容的便捷构造函数。
+    pub fn single(layer_idx: usize, global_seq_start: usize, global_seq_end: usize, k: Tensor, v: Tensor) -> Self {
+        Self { layer_idx, global_seq_start, global_seq_end, k, v, micro_block_idx: 0, total_micro_blocks: 1 }
+    }
 }
 
 impl Clone for KvBlock {
@@ -32,6 +46,8 @@ impl Clone for KvBlock {
             global_seq_end: self.global_seq_end,
             k: self.k.shallow_clone(),
             v: self.v.shallow_clone(),
+            micro_block_idx: self.micro_block_idx,
+            total_micro_blocks: self.total_micro_blocks,
         }
     }
 }

@@ -231,6 +231,8 @@ fn serialize_kv_block(block: &KvBlock) -> Result<Vec<u8>, String> {
         "layer_idx": block.layer_idx,
         "global_seq_start": block.global_seq_start,
         "global_seq_end": block.global_seq_end,
+        "micro_block_idx": block.micro_block_idx,
+        "total_micro_blocks": block.total_micro_blocks,
         "k_shape": k_shape,
         "v_shape": v_shape,
         "k_bytes": k_bytes.len(),
@@ -284,6 +286,8 @@ async fn recv_kv_block_from_stream(
     let layer_idx = meta["layer_idx"].as_u64().ok_or("missing layer_idx")? as usize;
     let global_seq_start = meta["global_seq_start"].as_u64().ok_or("missing global_seq_start")? as usize;
     let global_seq_end = meta["global_seq_end"].as_u64().ok_or("missing global_seq_end")? as usize;
+    let micro_block_idx = meta["micro_block_idx"].as_u64().unwrap_or(0) as usize;
+    let total_micro_blocks = meta["total_micro_blocks"].as_u64().unwrap_or(1) as usize;
     let k_bytes_len = meta["k_bytes"].as_u64().ok_or("missing k_bytes")? as usize;
     let v_bytes_len = meta["v_bytes"].as_u64().ok_or("missing v_bytes")? as usize;
     let k_shape: Vec<i64> = meta["k_shape"].as_array().ok_or("missing k_shape")?
@@ -303,7 +307,7 @@ async fn recv_kv_block_from_stream(
     let k = bytes_to_tensor(&k_bytes, &k_shape, device)?;
     let v = bytes_to_tensor(&v_bytes, &v_shape, device)?;
 
-    Ok(Some(KvBlock { layer_idx, global_seq_start, global_seq_end, k, v }))
+    Ok(Some(KvBlock { layer_idx, global_seq_start, global_seq_end, k, v, micro_block_idx, total_micro_blocks }))
 }
 
 #[cfg(feature = "tch-backend")]

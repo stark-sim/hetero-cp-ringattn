@@ -115,6 +115,8 @@ impl KvTransport for LinkedMockKvTransport {
             global_seq_end: block.global_seq_end,
             k: block.k.shallow_clone(),
             v: block.v.shallow_clone(),
+            micro_block_idx: block.micro_block_idx,
+            total_micro_blocks: block.total_micro_blocks,
         };
         self.peer_inbox.lock().unwrap().push_back(cloned);
         Ok(())

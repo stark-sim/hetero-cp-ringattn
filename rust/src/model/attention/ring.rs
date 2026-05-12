@@ -37,6 +37,14 @@ pub struct HcpRingAttentionBackend {
     prefill_kv_len: usize,
     /// Whether the first forward (prefill) has completed.
     is_prefill_done: bool,
+    /// 【micro KV block 大小】用于跨 domain KV 传输的粒度控制。
+    /// 大 seq 时整个 KV block 可能几十 MB，小 domain 无法一次性接收。
+    /// 把 KV 切成 micro blocks 后，可以流水化传输和逐块处理。
+    /// 默认 0 表示使用 kv_chunk_size 作为 micro block 大小。
+    micro_kv_block_size: usize,
+    /// 【禁用 overlap】当设置 HCP_DISABLE_OVERLAP=1 时，回到串行模式
+    ///（先全部 exchange 完，再统一 compute），用于对比测试。
+    disable_overlap: bool,
 }
 
 #[cfg(feature = "tch-backend")]
@@ -71,6 +79,13 @@ impl HcpRingAttentionBackend {
             seq_offset: 0,
             prefill_kv_len: 0,
             is_prefill_done: false,
+            micro_kv_block_size: std::env::var("HCP_MICRO_KV_BLOCK_SIZE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+            disable_overlap: std::env::var("HCP_DISABLE_OVERLAP")
+                .map(|v| v == "1" || v == "true")
+                .unwrap_or(false),
         })
     }
 
@@ -259,34 +274,27 @@ impl HcpRingAttentionBackend {
         *rs = new_sum;
     }
 
-    /// 【Ring Attention 核心算法 — Split-Phase Pipeline 版】
+    /// 【Ring Attention 核心算法 — Split-Phase Pipeline + micro_KV_block 版】
     ///
-    /// 传统 Attention 需要一次性加载整个 K/V 矩阵到显存，当序列很长时（如 1M tokens）会爆显存。
-    /// Ring Attention 的思想：把 Q 切成多个小 chunk，把 K/V 也切成多个 block，
-    /// 一次只处理一个 Q chunk + 一个 K/V block，用 online softmax 逐步合并结果。
+    /// 【micro_KV_block 设计动机】
+    /// 在异构分布式场景中（如 Mac MPS + RTX 4090），各 domain 的 seq 长度差异巨大：
+    /// - 大 domain 可能产生 50MB+ 的 KV block
+    /// - 小 domain 显存/内存有限，无法一次性缓冲这么大的 block
+    /// - 把整个 KV block 切成 micro blocks（如 512/1024/2048 tokens）后：
+    ///   1. 小 domain 可以逐个接收 micro block，不需要一次性缓冲整个大 block
+    ///   2. 传输可以流水化：发送 micro block 0 → 接收方处理 → 发送 micro block 1 → ...
+    ///   3. 提升并发性：多个 micro blocks 可以交错传输
     ///
-    /// 【Step 2 Pipeline 改进】
-    /// 旧实现是"先全部 exchange KV → 再统一 compute"的两阶段串行：
-    ///   网络时间 = (num_domains-1) * round_trip_time
-    ///   计算时间 = num_q_chunks * (local_compute + peer_compute)
-    ///   总时间 = 网络时间 + 计算时间（无重叠）
-    ///
-    /// 新实现是"compute-communication overlap"的 pipeline：
-    ///   Phase 0: submit_send(first_block)       ← 启动网络发送
-    ///   Phase 1: 本地 KV compute                ← 和 Phase 0 的 send 重叠
-    ///   Phase 2: for round: poll_recv → process → submit_send  ← 每轮 compute 和下一轮的网络 I/O 重叠
-    ///   Phase 3: flush_send()                   ← 确保所有数据已发出
-    ///   Phase 4: 提取输出
-    ///
-    /// 总时间 ≈ max(网络时间, 计算时间) 而不是两者相加。
-    /// 在慢网络（如 Tailscale VPN ~380ms RTT）下，overlap 收益显著。
+    /// 【两种运行模式】
+    /// - Pipeline 模式（默认）：Phase 0 submit_send → Phase 1 本地 compute → Phase 2 循环 recv→process→转发
+    /// - 串行模式（HCP_DISABLE_OVERLAP=1）：先全部 exchange 完，再统一 compute，用于 baseline 对比测试
     fn ring_attention(
         &mut self,
-        q: &Tensor,                  // Query，shape: [batch, num_heads, seq_len, head_dim]
-        k: &Tensor,                  // Key（GQA repeat 后），shape: [batch, num_heads, seq_len, head_dim]
-        v: &Tensor,                  // Value（GQA repeat 后），shape: [batch, num_heads, seq_len, head_dim]
-        attention_mask: Option<&Tensor>, // 因果掩码，Some 表示 prefill 阶段，None 表示非因果测试
-        global_seq_start: usize,     // 本地序列在全局序列中的起始位置（domain0=0, domain1=8）
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        attention_mask: Option<&Tensor>,
+        global_seq_start: usize,
     ) -> Tensor {
         let batch = q.size()[0];
         let num_heads = q.size()[1];
@@ -300,19 +308,22 @@ impl HcpRingAttentionBackend {
             .min(2048);
         let kv_chunk_size = if seq_len == 1 { 2048 } else { q_chunk_size };
 
-        // 本地 KV 总长度（decode 阶段可能比 seq_len 长，因为包含 KV cache）
+        // micro KV block 大小：默认使用 kv_chunk_size，可通过 HCP_MICRO_KV_BLOCK_SIZE 覆盖
+        let micro_kv_block_size = if self.micro_kv_block_size > 0 {
+            self.micro_kv_block_size
+        } else {
+            kv_chunk_size
+        };
+
         let local_kv_len = k.size()[2] as usize;
         let kv_chunks: Vec<(usize, usize)> = (0..local_kv_len)
             .step_by(kv_chunk_size)
             .map(|start| (start, (start + kv_chunk_size).min(local_kv_len)))
             .collect();
 
-        // 是否应用因果掩码
         let apply_causal = attention_mask.is_some();
 
         // ====== 预创建所有 Q chunk 的状态 ======
-        // 每个 Q chunk 独立维护 (rm, rs, obh) 状态，这样本地 KV 和 peer KV
-        // 可以分阶段处理，状态在阶段之间持久化。
         struct QChunkState {
             q_chunk: Tensor,
             q_global_start: usize,
@@ -327,36 +338,24 @@ impl HcpRingAttentionBackend {
             let q_end = (q_start + q_chunk_size).min(seq_len as usize);
             let q_chunk_len = (q_end - q_start) as i64;
             let q_chunk = q.narrow(2, q_start as i64, q_chunk_len);
-
             let (q_gs, q_ge) = if apply_causal {
                 (global_seq_start + q_start, global_seq_start + q_end)
             } else {
                 (0, seq_len as usize)
             };
-
             q_states.push(QChunkState {
                 q_chunk,
                 q_global_start: q_gs,
                 q_global_end: q_ge,
-                rm: Tensor::full(
-                    [batch, num_heads, q_chunk_len],
-                    f64::NEG_INFINITY,
-                    (Kind::Float, q.device()),
-                ),
+                rm: Tensor::full([batch, num_heads, q_chunk_len], f64::NEG_INFINITY, (Kind::Float, q.device())),
                 rs: Tensor::zeros([batch, num_heads, q_chunk_len], (Kind::Float, q.device())),
-                obh: Tensor::zeros(
-                    [batch, num_heads, q_chunk_len, head_dim],
-                    (Kind::Float, q.device()),
-                ),
+                obh: Tensor::zeros([batch, num_heads, q_chunk_len, head_dim], (Kind::Float, q.device())),
             });
         }
 
-        // ====== Phase 0: 准备并启动发送（和本地 compute 重叠）======
-        // 【decode 阶段特殊处理】seq_len == 1 时，只发送 prefill 阶段产生的 KV 分区
-        //（记录在 self.prefill_kv_len 中），decode 新 token 的 KV 完全由每个节点本地持有。
+        // ====== 准备本地 KV micro blocks ======
         let has_transport = self.kv_transport.is_some();
-        if has_transport {
-            let transport = self.kv_transport.as_mut().unwrap();
+        let local_micro_blocks: Vec<KvBlock> = if has_transport {
             let (k_to_send, v_to_send, send_seq_end) = if seq_len == 1 {
                 let history_len = self.prefill_kv_len as i64;
                 (
@@ -367,146 +366,225 @@ impl HcpRingAttentionBackend {
             } else {
                 (k.shallow_clone(), v.shallow_clone(), global_seq_start + k.size()[2] as usize)
             };
+            let send_kv_len = k_to_send.size()[2] as usize;
+            let num_micro = send_kv_len.div_ceil(micro_kv_block_size);
+            (0..num_micro)
+                .map(|i| {
+                    let start = i * micro_kv_block_size;
+                    let end = ((i + 1) * micro_kv_block_size).min(send_kv_len);
+                    KvBlock {
+                        layer_idx: self.layer_idx,
+                        global_seq_start: global_seq_start + start,
+                        global_seq_end: global_seq_start + end,
+                        k: k_to_send.narrow(2, start as i64, (end - start) as i64),
+                        v: v_to_send.narrow(2, start as i64, (end - start) as i64),
+                        micro_block_idx: i,
+                        total_micro_blocks: num_micro,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
-            let first_block = KvBlock {
-                layer_idx: self.layer_idx,
-                global_seq_start,
-                global_seq_end: send_seq_end,
-                k: k_to_send,
-                v: v_to_send,
-            };
-
-            if let Err(e) = transport.submit_send(&first_block) {
-                eprintln!("[ring_attention] submit_send first_block failed: {e}");
+        // ====== 接收一个 micro block（poll_recv + recv_kv_block fallback）======
+        let recv_micro_block = |transport: &mut dyn KvTransport| -> Result<Option<KvBlock>, String> {
+            loop {
+                match transport.poll_recv() {
+                    Ok(Some(block)) => return Ok(Some(block)),
+                    Ok(None) => {
+                        match transport.recv_kv_block() {
+                            Ok(Some(block)) => return Ok(Some(block)),
+                            Ok(None) => return Ok(None),
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
             }
-        }
+        };
 
-        // ====== Phase 1: 本地 KV compute（与网络发送重叠）======
-        for state in &mut q_states {
-            for (kv_start, kv_end) in &kv_chunks {
-                let kv_chunk_len = (*kv_end - *kv_start) as i64;
-                let k_chunk = k.narrow(2, *kv_start as i64, kv_chunk_len);
-                let v_chunk = v.narrow(2, *kv_start as i64, kv_chunk_len);
-
-                let (kv_gs, kv_ge) = if apply_causal {
-                    (global_seq_start + kv_start, global_seq_start + kv_end)
-                } else {
-                    (0, seq_len as usize)
-                };
-
-                self.process_kv_block(
-                    &state.q_chunk, state.q_global_start, state.q_global_end,
-                    &k_chunk, &v_chunk,
-                    kv_gs, kv_ge,
-                    &mut state.rm, &mut state.rs, &mut state.obh,
-                    apply_causal,
-                );
-            }
-        }
-
-        // ====== Phase 2: Peer KV loop（compute + communication overlap）======
-        // 每轮：poll_recv 等 peer block → 所有 Q chunks 处理 → submit_send 转发
-        // 在"处理"期间，send task 在后台发送上一个 block，recv task 在后台等下一个 block。
         if has_transport {
             let num_rounds = self.num_domains.saturating_sub(1);
 
-            for round in 0..num_rounds {
-                // 2a. 等待接收 peer block
-                // 用内部作用域限制 transport 的 mutable borrow，避免和 process_kv_block 冲突。
-                //
-                // 【poll_recv vs recv_kv_block 的协作策略】
-                // - poll_recv 是非阻塞的：适合 overlap 场景下主线程"顺便检查"是否有数据
-                // - 但 poll_recv 返回 None 时，无法区分"数据还没到"和"不会再有数据"
-                // - recv_kv_block 是阻塞的：对于 QUIC 会等待到数据到达；对于 Mock 会直接返回 None
-                //
-                // 因此策略：先用 poll_recv 非阻塞检查，返回 None 时再用 recv_kv_block
-                // 做一次"确认性"阻塞尝试。这样 Mock 测试不会死等，QUIC 生产环境仍能正确阻塞。
-                let peer_block = {
+            if self.disable_overlap {
+                // ====== 【串行模式】先全部 exchange，再统一 compute ======
+                let all_peer_micro_blocks: Vec<Vec<KvBlock>> = {
                     let transport = self.kv_transport.as_mut().unwrap();
-                    loop {
-                        match transport.poll_recv() {
-                            Ok(Some(block)) => {
-                                let recv_bytes = block.k.numel() * 4 + block.v.numel() * 4;
-                                println!("[ring_attention] round {round} layer {}: received {recv_bytes} bytes", self.layer_idx);
-                                break block;
-                            }
-                            Ok(None) => {
-                                // poll_recv 返回 None：尝试用 recv_kv_block 确认是"暂未到"还是"已关闭"
-                                match transport.recv_kv_block() {
-                                    Ok(Some(block)) => {
-                                        let recv_bytes = block.k.numel() * 4 + block.v.numel() * 4;
-                                        println!("[ring_attention] round {round} layer {}: received {recv_bytes} bytes (via recv_kv_block)", self.layer_idx);
-                                        break block;
-                                    }
-                                    Ok(None) => {
-                                        // 确认没有更多 peer block（stream 已关闭或 peer 不会发送）
-                                        break KvBlock {
-                                            layer_idx: self.layer_idx,
-                                            global_seq_start: 0,
-                                            global_seq_end: 0,
-                                            k: Tensor::zeros([1], (Kind::Float, q.device())),
-                                            v: Tensor::zeros([1], (Kind::Float, q.device())),
-                                        };
-                                    }
-                                    Err(e) => {
-                                        eprintln!("[ring_attention] round {round} recv_kv_block failed: {e}");
-                                        break KvBlock {
-                                            layer_idx: self.layer_idx,
-                                            global_seq_start: 0,
-                                            global_seq_end: 0,
-                                            k: Tensor::zeros([1], (Kind::Float, q.device())),
-                                            v: Tensor::zeros([1], (Kind::Float, q.device())),
-                                        };
-                                    }
+
+                    // 1. 发送所有本地 micro blocks
+                    for micro_block in &local_micro_blocks {
+                        transport.submit_send(micro_block).unwrap_or_else(|e| panic!("submit_send failed: {e}"));
+                    }
+                    transport.flush_send().unwrap_or_else(|e| panic!("flush_send failed: {e}"));
+
+                    // 2. 收集所有 peer micro blocks（所有 rounds）
+                    let mut all_blocks: Vec<Vec<KvBlock>> = Vec::new();
+                    for round in 0..num_rounds {
+                        let mut round_blocks = Vec::new();
+                        loop {
+                            match recv_micro_block(transport.as_mut()).unwrap_or_else(|e| panic!("recv_micro_block failed: {e}")) {
+                                Some(block) => {
+                                    let is_last = block.micro_block_idx + 1 == block.total_micro_blocks;
+                                    round_blocks.push(block);
+                                    if is_last { break; }
                                 }
-                            }
-                            Err(e) => {
-                                eprintln!("[ring_attention] round {round} poll_recv failed: {e}");
-                                break KvBlock {
-                                    layer_idx: self.layer_idx,
-                                    global_seq_start: 0,
-                                    global_seq_end: 0,
-                                    k: Tensor::zeros([1], (Kind::Float, q.device())),
-                                    v: Tensor::zeros([1], (Kind::Float, q.device())),
-                                };
+                                None => break,
                             }
                         }
-                    }
-                };
+                        all_blocks.push(round_blocks);
 
-                // 空 block（出错或 stream 关闭），跳过
-                if peer_block.global_seq_end <= peer_block.global_seq_start {
-                    continue;
+                        // 转发（最后一轮不需要）
+                        if round < num_rounds - 1 {
+                            for block in &all_blocks[round] {
+                                transport.submit_send(block).unwrap_or_else(|e| panic!("submit_send failed: {e}"));
+                            }
+                            transport.flush_send().unwrap_or_else(|e| panic!("flush_send failed: {e}"));
+                        }
+                    }
+                    all_blocks
+                }; // transport borrow 结束
+
+                // 3. 本地 KV compute
+                for state in q_states.iter_mut() {
+                    for (kv_start, kv_end) in &kv_chunks {
+                        let kv_chunk_len = (*kv_end - *kv_start) as i64;
+                        let k_chunk = k.narrow(2, *kv_start as i64, kv_chunk_len);
+                        let v_chunk = v.narrow(2, *kv_start as i64, kv_chunk_len);
+                        let (kv_gs, kv_ge) = if apply_causal {
+                            (global_seq_start + kv_start, global_seq_start + kv_end)
+                        } else {
+                            (0, seq_len as usize)
+                        };
+                        self.process_kv_block(
+                            &state.q_chunk, state.q_global_start, state.q_global_end,
+                            &k_chunk, &v_chunk, kv_gs, kv_ge,
+                            &mut state.rm, &mut state.rs, &mut state.obh,
+                            apply_causal,
+                        );
+                    }
                 }
 
-                // 2b. 所有 Q chunks 处理这个 peer block（compute 期间网络在后台运行）
-                for state in &mut q_states {
+                // 4. Peer KV compute（按 round 顺序，每个 round 内按 seq 排序）
+                for round_blocks in &all_peer_micro_blocks {
+                    let mut sorted = round_blocks.clone();
+                    sorted.sort_by_key(|b| b.global_seq_start);
+                    for micro_block in &sorted {
+                        for state in q_states.iter_mut() {
+                            self.process_kv_block(
+                                &state.q_chunk, state.q_global_start, state.q_global_end,
+                                &micro_block.k, &micro_block.v,
+                                micro_block.global_seq_start, micro_block.global_seq_end,
+                                &mut state.rm, &mut state.rs, &mut state.obh,
+                                apply_causal,
+                            );
+                        }
+                    }
+                }
+            } else {
+                // ====== 【Pipeline 模式】compute-communication overlap ======
+                {
+                    let transport = self.kv_transport.as_mut().unwrap();
+                    // Phase 0: 逐个 submit_send 本地 micro blocks（send task 后台传输）
+                    for micro_block in &local_micro_blocks {
+                        transport.submit_send(micro_block).unwrap_or_else(|e| panic!("submit_send failed: {e}"));
+                    }
+                } // transport borrow 结束
+
+                // Phase 1: 本地 KV compute（与 Phase 0 的网络传输重叠）
+                for state in q_states.iter_mut() {
+                    for (kv_start, kv_end) in &kv_chunks {
+                        let kv_chunk_len = (*kv_end - *kv_start) as i64;
+                        let k_chunk = k.narrow(2, *kv_start as i64, kv_chunk_len);
+                        let v_chunk = v.narrow(2, *kv_start as i64, kv_chunk_len);
+                        let (kv_gs, kv_ge) = if apply_causal {
+                            (global_seq_start + kv_start, global_seq_start + kv_end)
+                        } else {
+                            (0, seq_len as usize)
+                        };
+                        self.process_kv_block(
+                            &state.q_chunk, state.q_global_start, state.q_global_end,
+                            &k_chunk, &v_chunk, kv_gs, kv_ge,
+                            &mut state.rm, &mut state.rs, &mut state.obh,
+                            apply_causal,
+                        );
+                    }
+                }
+
+                // Phase 2: 循环接收 peer micro blocks，process，转发
+                for round in 0..num_rounds {
+                    // 收集这个 round 的所有 peer micro blocks
+                    let peer_micro_blocks: Vec<KvBlock> = {
+                        let transport = self.kv_transport.as_mut().unwrap();
+                        let mut blocks = Vec::new();
+                        loop {
+                            match recv_micro_block(transport.as_mut()).unwrap_or_else(|e| panic!("recv_micro_block failed: {e}")) {
+                                Some(block) => {
+                                    let recv_bytes = block.k.numel() * 4 + block.v.numel() * 4;
+                                    let is_last = block.micro_block_idx + 1 == block.total_micro_blocks;
+                                    if is_last {
+                                        println!("[ring_attention] round {round} layer {}: received micro_block {}/{}, {recv_bytes} bytes (last)",
+                                            self.layer_idx, block.micro_block_idx + 1, block.total_micro_blocks);
+                                    }
+                                    blocks.push(block);
+                                    if is_last { break; }
+                                }
+                                None => break,
+                            }
+                        }
+
+                        // 转发（最后一轮不需要）
+                        if round < num_rounds.saturating_sub(1) {
+                            for micro_block in &blocks {
+                                transport.submit_send(micro_block).unwrap_or_else(|e| panic!("submit_send failed: {e}"));
+                            }
+                        }
+                        blocks
+                    }; // transport borrow 结束
+
+                    // 按 global_seq_start 排序（确保 online softmax 顺序正确）
+                    let mut sorted = peer_micro_blocks;
+                    sorted.sort_by_key(|b| b.global_seq_start);
+
+                    // 处理每个 peer micro block
+                    for micro_block in &sorted {
+                        for state in q_states.iter_mut() {
+                            self.process_kv_block(
+                                &state.q_chunk, state.q_global_start, state.q_global_end,
+                                &micro_block.k, &micro_block.v,
+                                micro_block.global_seq_start, micro_block.global_seq_end,
+                                &mut state.rm, &mut state.rs, &mut state.obh,
+                                apply_causal,
+                            );
+                        }
+                    }
+                }
+
+                // Phase 3: Flush
+                {
+                    let transport = self.kv_transport.as_mut().unwrap();
+                    transport.flush_send().unwrap_or_else(|e| panic!("flush_send failed: {e}"));
+                }
+            }
+        } else {
+            // 无 transport：只做本地 KV compute
+            for state in q_states.iter_mut() {
+                for (kv_start, kv_end) in &kv_chunks {
+                    let kv_chunk_len = (*kv_end - *kv_start) as i64;
+                    let k_chunk = k.narrow(2, *kv_start as i64, kv_chunk_len);
+                    let v_chunk = v.narrow(2, *kv_start as i64, kv_chunk_len);
+                    let (kv_gs, kv_ge) = if apply_causal {
+                        (global_seq_start + kv_start, global_seq_start + kv_end)
+                    } else {
+                        (0, seq_len as usize)
+                    };
                     self.process_kv_block(
                         &state.q_chunk, state.q_global_start, state.q_global_end,
-                        &peer_block.k, &peer_block.v,
-                        peer_block.global_seq_start, peer_block.global_seq_end,
+                        &k_chunk, &v_chunk, kv_gs, kv_ge,
                         &mut state.rm, &mut state.rs, &mut state.obh,
                         apply_causal,
                     );
                 }
-
-                // 2c. 转发：把收到的 block 发给 next peer（最后一轮不需要转发）
-                if round < num_rounds.saturating_sub(1) {
-                    let sent_bytes = peer_block.k.numel() * 4 + peer_block.v.numel() * 4;
-                    println!("[ring_attention] round {round} layer {}: forwarding {sent_bytes} bytes", self.layer_idx);
-                    let transport = self.kv_transport.as_mut().unwrap();
-                    if let Err(e) = transport.submit_send(&peer_block) {
-                        eprintln!("[ring_attention] round {round} submit_send failed: {e}");
-                        break;
-                    }
-                }
-            }
-
-            // ====== Phase 3: Flush ======
-            // 确保所有已 submit 的 block 都被 send task 写入 QUIC stream。
-            let transport = self.kv_transport.as_mut().unwrap();
-            if let Err(e) = transport.flush_send() {
-                eprintln!("[ring_attention] flush_send failed: {e}");
             }
         }
 
@@ -753,6 +831,8 @@ mod tests {
             seq_offset: 0,
             prefill_kv_len: 0,
             is_prefill_done: false,
+            disable_overlap: false,
+            micro_kv_block_size: 0,
         };
 
         let mut rm = Tensor::full(
@@ -842,6 +922,8 @@ mod tests {
             seq_offset: 0,
             prefill_kv_len: 0,
             is_prefill_done: false,
+            disable_overlap: false,
+            micro_kv_block_size: 0,
         };
 
         let actual = backend.ring_attention(&q, &k, &v, None, 0);
@@ -894,6 +976,8 @@ mod tests {
             seq_offset: 0,
             prefill_kv_len: 0,
             is_prefill_done: false,
+            disable_overlap: false,
+            micro_kv_block_size: 0,
         };
 
         let actual = backend.ring_attention(&q, &k, &v, Some(&mask), 0);
@@ -944,6 +1028,8 @@ mod tests {
             seq_offset: 0,
             prefill_kv_len: 0,
             is_prefill_done: false,
+            disable_overlap: false,
+            micro_kv_block_size: 0,
         };
 
         // Without transport, ring_attention processes only local KV.
@@ -1008,6 +1094,8 @@ mod tests {
             global_seq_end: kv_len as usize - 1,
             k: k1_hist.shallow_clone(),
             v: v1_hist.shallow_clone(),
+            micro_block_idx: 0,
+            total_micro_blocks: 1,
         });
 
         let mut backend0 = HcpRingAttentionBackend {
@@ -1028,6 +1116,8 @@ mod tests {
             seq_offset: 0,
             prefill_kv_len: 0,
             is_prefill_done: false,
+            disable_overlap: false,
+            micro_kv_block_size: 0,
         };
         let out0 = backend0.ring_attention(&q_all, &k0_local, &v0_local, None, 0);
 
@@ -1039,6 +1129,8 @@ mod tests {
             global_seq_end: half as usize,
             k: k0_hist.shallow_clone(),
             v: v0_hist.shallow_clone(),
+            micro_block_idx: 0,
+            total_micro_blocks: 1,
         });
 
         let mut backend1 = HcpRingAttentionBackend {
@@ -1059,6 +1151,8 @@ mod tests {
             seq_offset: half as usize,
             prefill_kv_len: 0,
             is_prefill_done: false,
+            disable_overlap: false,
+            micro_kv_block_size: 0,
         };
         let out1 = backend1.ring_attention(&q_all, &k1_local, &v1_local, None, half as usize);
 
@@ -1125,6 +1219,8 @@ mod tests {
             seq_offset: 0,
             prefill_kv_len: 0,
             is_prefill_done: false,
+            disable_overlap: false,
+            micro_kv_block_size: 0,
         };
 
         // hidden states for decode step
@@ -1193,6 +1289,8 @@ mod tests {
             global_seq_end: seq_len as usize,
             k: k1.shallow_clone(),
             v: v1.shallow_clone(),
+            micro_block_idx: 0,
+            total_micro_blocks: 1,
         });
 
         let mut backend0 = HcpRingAttentionBackend {
@@ -1213,6 +1311,8 @@ mod tests {
             seq_offset: 0,
             prefill_kv_len: 0,
             is_prefill_done: false,
+            disable_overlap: false,
+            micro_kv_block_size: 0,
         };
         let out0 = backend0.ring_attention(&q0, &k0, &v0, Some(&mask), 0);
 
@@ -1224,6 +1324,8 @@ mod tests {
             global_seq_end: half as usize,
             k: k0.shallow_clone(),
             v: v0.shallow_clone(),
+            micro_block_idx: 0,
+            total_micro_blocks: 1,
         });
 
         let mut backend1 = HcpRingAttentionBackend {
@@ -1244,6 +1346,8 @@ mod tests {
             seq_offset: half as usize,
             prefill_kv_len: 0,
             is_prefill_done: false,
+            disable_overlap: false,
+            micro_kv_block_size: 0,
         };
         let out1 = backend1.ring_attention(&q1, &k1, &v1, Some(&mask), half as usize);
 

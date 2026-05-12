@@ -171,6 +171,8 @@ impl KvTransport for TcpKvTransport {
         let global_seq_end = meta["global_seq_end"]
             .as_u64()
             .ok_or("missing global_seq_end")? as usize;
+        let micro_block_idx = meta["micro_block_idx"].as_u64().unwrap_or(0) as usize;
+        let total_micro_blocks = meta["total_micro_blocks"].as_u64().unwrap_or(1) as usize;
         let k_bytes_len = meta["k_bytes"].as_u64().ok_or("missing k_bytes")? as usize;
         let v_bytes_len = meta["v_bytes"].as_u64().ok_or("missing v_bytes")? as usize;
         let k_shape: Vec<i64> = meta["k_shape"]
@@ -209,6 +211,8 @@ impl KvTransport for TcpKvTransport {
             global_seq_end,
             k,
             v,
+            micro_block_idx,
+            total_micro_blocks,
         }))
     }
 }
