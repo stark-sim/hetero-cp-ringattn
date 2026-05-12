@@ -76,6 +76,15 @@
   - `ring_attention` 重构为 4-phase pipeline：Phase 0 submit_send(first_block) → Phase 1 本地 KV compute（与 send 重叠）→ Phase 2 循环 poll_recv→process→submit_send 转发（compute 与下一轮 network I/O 重叠）→ Phase 3 flush_send → Phase 4 提取输出
   - 关键修复：Mock 测试中先运行 domain 的 inbox 为空，`poll_recv` 返回 None 后改用 `recv_kv_block` 做确认性阻塞尝试，区分"数据暂未到"和"stream 已关闭/peer 不会发送"，避免死循环
   - 全部 45 cargo tests 通过（含 `test_distributed_llama_model_prefill/decode/multi_step_decode`），零 regression
+- [x] [2026-05-12] **Step 3: Micro KV Block + A/B Overlap Quantification**：
+  - `KvBlock` 新增 `micro_block_idx` / `total_micro_blocks` 字段，支持 KV block 的细粒度切分
+  - `HcpRingAttentionBackend` 新增 `disable_overlap`（串行对照模式）和 `micro_kv_block_size`（环境变量 `HCP_MICRO_KV_BLOCK_SIZE` 配置，默认 0=禁用）
+  - `ring_attention` 重构为支持 micro block 的双模式：
+    * Pipeline 模式（默认）：Phase0 submit_send → Phase1 本地 compute → Phase2 循环 recv→process→forward → Phase3 flush
+    * 串行模式（`HCP_DISABLE_OVERLAP=1`）：先全部 exchange 再统一 compute，用于 A/B baseline 对比
+  - 本地 2-domain CPU smoke 验证：pipeline 与 serial 模式输出完全一致（`generated:  is not a`），correctness 无 regression
+  - 45 cargo tests 通过，commit `7a2d33f` 已推送至 main
+  - 新建 `scripts/run_cross_node_ab_test.sh`：自动化跨节点 A/B 对比测试脚本，支持 baseline/optimized 多配置批量运行
 - [x] [2026-05-09] **验证跨机器 E2E通过**：`scripts/run_python_distributed_2node.sh` 成功运行，Mac vllm-metal (MPS, 8.39s 初始化) + white RTX 4090 (CUDA) 完整端到端通过，生成 `. I am`。QUIC 超时修复（peer accept 180s）生效。
 - [x] [2026-05-09] **大规模跨机器验证矩阵完成**（一个节点一个 worker）：
   - T0 回归（2 tokens + 3 decode）：`. I am` ✅ ~40s

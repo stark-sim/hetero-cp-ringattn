@@ -129,6 +129,13 @@
   - `QChunkState` 结构：每个 Q chunk 独立维护 (rm, rs, obh)，支持本地 KV 和 peer KV 分阶段处理，状态在阶段间持久化
   - 关键 bug 修复：串行 Mock 测试中先运行 domain 的 inbox 为空，`poll_recv` 返回 None 时如果简单忙等会死循环；修复策略为 `poll_recv` 返回 None 后改用 `recv_kv_block` 做确认性阻塞尝试（Mock 直接返回 None → break；QUIC 阻塞等待数据 → 正确）
   - 全部 45 cargo tests 通过（含 4 个端到端分布式 model tests），零 regression
+- [x] [2026-05-12] **Step 3: Micro KV Block + A/B Overlap Quantification**：
+  - `KvBlock` 新增 `micro_block_idx` / `total_micro_blocks` 字段，支持 KV block 细粒度切分
+  - `HcpRingAttentionBackend` 新增 `disable_overlap`（串行对照模式）和 `micro_kv_block_size`（环境变量 `HCP_MICRO_KV_BLOCK_SIZE`，0=禁用）
+  - `ring_attention` 双模式实现：Pipeline 模式（默认，4-phase overlap）vs Serial 模式（`HCP_DISABLE_OVERLAP=1`，先 exchange 再 compute）
+  - 本地 2-domain CPU smoke：pipeline 与 serial 模式输出完全一致（`generated:  is not a`），correctness 无 regression
+  - 45 cargo tests 通过，commit `7a2d33f` 已推送至 main
+  - 新建 `scripts/run_cross_node_ab_test.sh`：自动化跨节点 A/B 对比测试脚本，支持 baseline/optimized 多配置批量运行和 TSV 报告输出
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 
 ## 已知问题
