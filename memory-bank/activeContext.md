@@ -92,8 +92,12 @@
   - **256-token A/B 量化对比**（Tailscale VPN，非 LAN，带宽受限）：
     * Serial: **151s** | Pipeline: **147s** | 差异: **-4s (~2.6%)**
     * 输出一致（`the`），correctness 无 regression
-    * 收益有限的原因：(1) 256 token 规模下 KV block 较小（~230KB/layer）；(2) micro block 默认未启用（`micro_kv_block_size=0`），overlap 粒度为整 block；(3) 跨 VPN 带宽受限，网络仍是瓶颈
-    * 下一步：4K/8K 规模 + micro block 切分（64/128）可进一步放大 overlap 收益
+  - **512-token A/B 量化对比**（Tailscale VPN，非 LAN，带宽受限）：
+    * Serial: **~5min (300s)** | Pipeline: **~3min (180s)** | **Pipeline 快 ~40%**
+    * 输出一致（`brown`），correctness 无 regression
+    * 收益显著提升原因：512 token 下 KV block 增大到 ~900KB/layer，网络传输占比提高，overlap 收益开始显现
+  - **4K 本地验证**：Serial 和 Pipeline 均正常（CPU 本地 ~30s），代码逻辑无 bug
+  - **4K 跨节点失败**：网络不稳定导致连接断开。根因：7.3MB/layer × 24 layers ≈ 175MB 总传输量，跨 VPN 慢网络下大 block 传输触发连接丢失。需要 micro block 切分或更稳定网络才能进行 4K+ 跨节点对比
 - [x] [2026-05-09] **验证跨机器 E2E通过**：`scripts/run_python_distributed_2node.sh` 成功运行，Mac vllm-metal (MPS, 8.39s 初始化) + white RTX 4090 (CUDA) 完整端到端通过，生成 `. I am`。QUIC 超时修复（peer accept 180s）生效。
 - [x] [2026-05-09] **大规模跨机器验证矩阵完成**（一个节点一个 worker）：
   - T0 回归（2 tokens + 3 decode）：`. I am` ✅ ~40s
