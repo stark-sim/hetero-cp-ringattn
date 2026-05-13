@@ -89,6 +89,11 @@
     * Baseline Serial (`HCP_DISABLE_OVERLAP=1`)：`generated:  jumps over the` ✅
     * Pipeline Default（overlap on）：`generated:  jumps over the` ✅
     * 两种模式输出完全一致，correctness 无 regression；micro block 传输日志正常（`received micro_block 1/1, 229376 bytes`）
+  - **256-token A/B 量化对比**（Tailscale VPN，非 LAN，带宽受限）：
+    * Serial: **151s** | Pipeline: **147s** | 差异: **-4s (~2.6%)**
+    * 输出一致（`the`），correctness 无 regression
+    * 收益有限的原因：(1) 256 token 规模下 KV block 较小（~230KB/layer）；(2) micro block 默认未启用（`micro_kv_block_size=0`），overlap 粒度为整 block；(3) 跨 VPN 带宽受限，网络仍是瓶颈
+    * 下一步：4K/8K 规模 + micro block 切分（64/128）可进一步放大 overlap 收益
 - [x] [2026-05-09] **验证跨机器 E2E通过**：`scripts/run_python_distributed_2node.sh` 成功运行，Mac vllm-metal (MPS, 8.39s 初始化) + white RTX 4090 (CUDA) 完整端到端通过，生成 `. I am`。QUIC 超时修复（peer accept 180s）生效。
 - [x] [2026-05-09] **大规模跨机器验证矩阵完成**（一个节点一个 worker）：
   - T0 回归（2 tokens + 3 decode）：`. I am` ✅ ~40s

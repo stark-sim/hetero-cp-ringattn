@@ -137,6 +137,7 @@
   - 45 cargo tests 通过，commit `7a2d33f` 已推送至 main
   - 新建 `scripts/run_cross_node_ab_test.sh`：自动化跨节点 A/B 对比测试脚本，支持 baseline/optimized 多配置批量运行和 TSV 报告输出
   - **跨节点异构 A/B 验证通过**（Mac MPS + white RTX 4090 CUDA，64-token prompt）：Serial vs Pipeline 输出完全一致（`jumps over the`），correctness 无 regression
+  - **256-token 量化对比**（Tailscale VPN 非 LAN）：Serial 151s vs Pipeline 147s，差异 -4s (~2.6%)。收益有限因规模较小 + micro block 未启用 + 带宽瓶颈。4K/8K + micro block 切分可进一步放大收益
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 
 ## 已知问题
