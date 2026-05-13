@@ -353,16 +353,17 @@ impl KvTransport for QuicKvTransport {
     /// 【覆盖默认 recv_kv_block】避免 trait 默认的 1ms 忙等循环。
     ///
     /// 直接使用 block_on + recv() 阻塞等待，效率更高。
-    /// 120s 超时防止永久挂起。
+    /// 600s 超时防止永久挂起。大 KV block（4K+ seq）在跨 VPN 慢网络下
+    /// 传输可能超过 120s，需要更长的超时。
     fn recv_kv_block(&mut self) -> Result<Option<KvBlock>, String> {
         self.rt.block_on(async {
             match tokio::time::timeout(
-                std::time::Duration::from_secs(120),
+                std::time::Duration::from_secs(600),
                 self.recv_rx.recv()
             ).await {
                 Ok(Some(block)) => Ok(Some(block)),
                 Ok(None) => Ok(None), // channel closed（stream 已关闭）
-                Err(_) => Err("recv_kv_block timeout after 120s".to_string()),
+                Err(_) => Err("recv_kv_block timeout after 600s".to_string()),
             }
         })
     }
