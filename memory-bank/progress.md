@@ -146,6 +146,7 @@
     * **根因**：sd-1+white 双 CUDA 计算快 + RTT 更好（78ms vs 107ms）→ compute_time >> network_time → overlap 能隐藏的网络时间很少
     * **Micro block 是稳定性必需品**：无 micro block 时大传输导致 connection lost；micro block 本身增加 ~10% 开销（299s→330s）
     * **公式验证**：Pipeline 收益 ≈ 1 - compute/(compute+network)。Mac MPS 计算慢 → compute≈network → 收益大；双 CUDA 计算快 → compute>>network → 收益趋近于 0
+    * **Scaling insight**：当前 512-token 传输量太小（~22MB/round），不足以拉开差距。随着 seq_len 增加（4K→175MB/round, 8K→350MB/round）和 domain 增加（4-domain→3 rounds），network_time 线性增长而 compute_time 增长较慢 → ratio 逆转 → Pipeline 收益将显著增大。4K/8K+多 domain 才是 Pipeline 真正的战场
   - **4K 本地验证**：Serial/Pipeline 均正常（CPU 本地 ~30s），代码逻辑无 bug
   - **4K 跨节点失败**：网络不稳定导致连接丢失。根因：7.3MB/layer × 24 layers ≈ 175MB 总传输量，跨 VPN 慢网络下大 block 传输不稳定。需 micro block 切分改善
   - **QUIC recv_kv_block timeout 修复**：120s → 600s（`3759811`），覆盖大 block + 慢网络场景
