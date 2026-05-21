@@ -1,0 +1,20 @@
+executor_verdict: EXECUTED
+pre_check:
+  memory_verified: true
+  risk_level: low
+  target_registered: true
+execution:
+  steps:
+    - step: "rustup default stable"
+      status: ok
+      output: "cargo 1.95.0, rustc 1.95.0"
+      note: "Initial rustup download repeatedly failed (partial install, missing manifest). Resolved by copying working stable-x86_64-unknown-linux-gnu toolchain from sd-1 (100.64.0.93) to sd-2."
+    - step: "Copy Qwen2-0.5B from sd-1"
+      status: ok
+      output: "config.json present (661 bytes)"
+    - step: "Quick smoke test"
+      status: ok
+      output: "cargo build --features tch-backend finished in 3m 40s with 9 warnings (all unused code/dead_code), 0 errors"
+disk_after:
+  available: "93G free, 95% used on /dev/sda2"
+notes: "sd-2 blockers resolved. Both rustc/cargo working. Model copied. Cargo build with tch-backend passes."

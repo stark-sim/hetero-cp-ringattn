@@ -21,11 +21,8 @@ ssh_hosts:
     hostname: "100.64.0.94"
     username: "user"
     port: 22
-    note: "4x RTX 4080 SUPER, CUDA 12.8, NOT READY (2 blockers remaining)"
-    status: "not_ready"
-    blockers:
-      - "RUST: no default toolchain — run 'rustup default stable'"
-      - "MODEL: Qwen2-0.5B missing — download after rust fix"
+    note: "4x RTX 4080 SUPER, CUDA 12.8, READY"
+    status: "ready"
     disk_after_cleanup: "95% used, 97G free (was 98%/45G)"
     tags: ["gpu", "cuda", "sd-cluster"]
 
