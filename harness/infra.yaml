@@ -1,0 +1,74 @@
+# hetero-cp-ringattn 项目基础设施清单
+# ⚠️ 禁止写入密码、密钥、token 等敏感信息
+
+ssh_hosts:
+  - host: "white"
+    hostname: "100.64.0.2"
+    username: "stark"
+    port: 22
+    note: "RTX 4090 CUDA, Tailscale VPN 访问"
+    tags: ["gpu", "cuda", "remote"]
+
+paths:
+  mac:
+    libtorch: "/Users/stark_sim/libtorch"
+    models: "/Users/stark_sim/models/qwen2-0.5b"
+    cargo_bin: "~/.cargo/bin"
+    project_root: "/Users/stark_sim/VSCodeProjects/hetero-cp-ringattn"
+  white:
+    libtorch: "/home/stark/libtorch"
+    models: "/home/stark/models/Qwen2-0.5B"
+    cargo_bin: "~/.cargo/bin"
+    project_root: "~/hetero-cp-ringattn"
+
+env:
+  mac:
+    DYLD_LIBRARY_PATH: "/Users/stark_sim/libtorch/lib"
+    HCP_TCH_DEVICE: "mps"
+  white:
+    LD_LIBRARY_PATH: "/home/stark/libtorch/lib"
+    HCP_TCH_DEVICE: "cuda:0"
+    PATH_PREFIX: "/home/stark/.cargo/bin:$PATH"
+
+build:
+  cargo_features: "tch-backend"
+  release_binary: "rust/target/release/hcp-ringattn-rust"
+  test_cmd: "cargo test --features tch-backend --lib"
+
+test:
+  local_smoke_ports:
+    coord: "127.0.0.1:9000"
+    w0: "127.0.0.1:9100"
+    w1: "127.0.0.1:9101"
+  cross_node_ports:
+    coord: "0.0.0.0:29500"
+    w0: "0.0.0.0:29501"
+    w1: "0.0.0.0:29502"
+
+network:
+  type: "Tailscale VPN"
+  mac_addr: "100.64.0.95"
+  white_addr: "100.64.0.2"
+  note: "非 LAN，带宽受限，RTT ~380ms"
+
+dependencies:
+  - name: cargo
+    check: "cargo --version"
+    note: "Mac 本机 stable toolchain"
+  - name: libtorch-mac
+    check: "ls /Users/stark_sim/libtorch/lib/libtorch_cpu.dylib"
+  - name: libtorch-white
+    check: "ssh stark@100.64.0.2 'ls /home/stark/libtorch/lib/libtorch.so'"
+  - name: model-mac
+    check: "ls /Users/stark_sim/models/qwen2-0.5b/config.json"
+  - name: model-white
+    check: "ssh stark@100.64.0.2 'ls /home/stark/models/Qwen2-0.5B/config.json'"
+
+config:
+  known_issues:
+    - "跨 VPN 大 block 传输不稳定（7.3MB/layer × 24 layers ≈ 175MB）"
+    - "端口占用后需等待 TIME_WAIT 释放或换端口"
+    - "非交互式 SSH 不加载 Cargo，需显式 PATH=/home/stark/.cargo/bin:$PATH"
+  env_vars:
+    HCP_DISABLE_OVERLAP: "1 表示串行对照模式"
+    HCP_MICRO_KV_BLOCK_SIZE: "micro block 粒度，0=禁用"
