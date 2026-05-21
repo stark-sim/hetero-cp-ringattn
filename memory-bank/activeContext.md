@@ -98,6 +98,9 @@
     * 收益显著提升原因：512 token 下 KV block 增大到 ~900KB/layer，网络传输占比提高，overlap 收益开始显现
   - **4K 本地验证**：Serial 和 Pipeline 均正常（CPU 本地 ~30s），代码逻辑无 bug
   - **4K 跨节点失败**：网络不稳定导致连接断开。根因：7.3MB/layer × 24 layers ≈ 175MB 总传输量，跨 VPN 慢网络下大 block 传输触发连接丢失。需要 micro block 切分或更稳定网络才能进行 4K+ 跨节点对比
+  - **QUIC recv_kv_block timeout 修复**：120s → 600s（commit `3759811`）。4K 跨节点 KV block 传输超过 120s 导致 timeout panic，600s 覆盖大 block + 慢网络场景。512-token 验证通过
+  - **核心公式化结论**：Pipeline 收益 ≈ 1 - (compute_time / (compute_time + network_time))。本地/小 scale 收益 ≈ 0%；跨节点 512-token 收益 ≈ 40%；跨节点 4K+ 理论收益趋近上限，但受网络稳定性限制
+  - **分析报告**：`reports/ab-analysis-20260513/README.md` 完整记录测试矩阵、量化数据、根因分析、下一步建议
 - [x] [2026-05-09] **验证跨机器 E2E通过**：`scripts/run_python_distributed_2node.sh` 成功运行，Mac vllm-metal (MPS, 8.39s 初始化) + white RTX 4090 (CUDA) 完整端到端通过，生成 `. I am`。QUIC 超时修复（peer accept 180s）生效。
 - [x] [2026-05-09] **大规模跨机器验证矩阵完成**（一个节点一个 worker）：
   - T0 回归（2 tokens + 3 decode）：`. I am` ✅ ~40s

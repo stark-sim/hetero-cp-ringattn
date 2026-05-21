@@ -141,6 +141,8 @@
   - **512-token 量化对比**（Tailscale VPN 非 LAN）：Serial ~5min vs Pipeline ~3min，**Pipeline 快 ~40%**。收益显著提升因 KV block 增大到 ~900KB/layer
   - **4K 本地验证**：Serial/Pipeline 均正常（CPU 本地 ~30s），代码逻辑无 bug
   - **4K 跨节点失败**：网络不稳定导致连接丢失。根因：7.3MB/layer × 24 layers ≈ 175MB 总传输量，跨 VPN 慢网络下大 block 传输不稳定。需 micro block 切分改善
+  - **QUIC recv_kv_block timeout 修复**：120s → 600s（`3759811`），覆盖大 block + 慢网络场景
+  - **分析报告**：`reports/ab-analysis-20260513/README.md`
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 
 ## 已知问题
