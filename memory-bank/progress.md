@@ -138,7 +138,14 @@
   - 新建 `scripts/run_cross_node_ab_test.sh`：自动化跨节点 A/B 对比测试脚本，支持 baseline/optimized 多配置批量运行和 TSV 报告输出
   - **跨节点异构 A/B 验证通过**（Mac MPS + white RTX 4090 CUDA，64-token prompt）：Serial vs Pipeline 输出完全一致（`jumps over the`），correctness 无 regression
   - **256-token 量化对比**（Tailscale VPN 非 LAN）：Serial 151s vs Pipeline 147s，差异 -4s (~2.6%)
-  - **512-token 量化对比**（Tailscale VPN 非 LAN）：Serial ~5min vs Pipeline ~3min，**Pipeline 快 ~40%**。收益显著提升因 KV block 增大到 ~900KB/layer
+  - **512-token 量化对比**（Mac MPS + white RTX 4090，Tailscale VPN ~107ms RTT）：Serial ~5min (300s) vs Pipeline ~3min (180s)，**Pipeline 快 ~40%**。收益因 KV block 增大到 ~900KB/layer，网络传输占比提高
+  - **512-token 量化对比**（sd-1 RTX 4080 SUPER + white RTX 4090，Tailscale VPN ~78ms RTT）—— **关键新发现**：
+    * Serial no-micro-block: **299s** | Serial micro-block=64: **330s** | Pipeline micro-block=64: **319s**
+    * Pipeline no-micro-block: **connection lost**（917KB/layer 大传输导致 QUIC 不稳定）
+    * **同 micro-block 条件下 Pipeline 仅快 3.3%**（319s vs 330s），远低于 Mac+white 的 40%
+    * **根因**：sd-1+white 双 CUDA 计算快 + RTT 更好（78ms vs 107ms）→ compute_time >> network_time → overlap 能隐藏的网络时间很少
+    * **Micro block 是稳定性必需品**：无 micro block 时大传输导致 connection lost；micro block 本身增加 ~10% 开销（299s→330s）
+    * **公式验证**：Pipeline 收益 ≈ 1 - compute/(compute+network)。Mac MPS 计算慢 → compute≈network → 收益大；双 CUDA 计算快 → compute>>network → 收益趋近于 0
   - **4K 本地验证**：Serial/Pipeline 均正常（CPU 本地 ~30s），代码逻辑无 bug
   - **4K 跨节点失败**：网络不稳定导致连接丢失。根因：7.3MB/layer × 24 layers ≈ 175MB 总传输量，跨 VPN 慢网络下大 block 传输不稳定。需 micro block 切分改善
   - **QUIC recv_kv_block timeout 修复**：120s → 600s（`3759811`），覆盖大 block + 慢网络场景

@@ -2,19 +2,14 @@
 
 ## 当前焦点
 
-[2026-05-11] **工程化代码重构完成**。14 个 commit 将纯 binary crate 重构为 lib + bin 结构，按域深度拆分所有大文件：
-- `main.rs` 2,694 → 3 行（thin wrapper）
-- `lib.rs` 新建 → 548 行（模块声明 + re-exports）
-- `protocol.rs` 2,671 → 拆为 message.rs + transport.rs + framing.rs + node.rs
-- `model/backend.rs` 1,282 → 拆为 attention/backend.rs + attention/ring.rs
-- `model/generate.rs` 678 → 拆为 sampling.rs + generator.rs + distributed_generator.rs
-- `model/layers.rs` 584 → 拆为 layers/norm.rs + rotary.rs + mlp.rs + attention.rs
-- `model/kv_transport.rs` 367 → 拆为 transport/block.rs + trait.rs + tcp.rs + mock.rs
-- 新建 `cli.rs`, `error.rs`, `report.rs`, `remote.rs`, `smoke/` 目录, `distributed/` 目录
-- 全部 45 cargo tests 通过，零 regression
-- 已推送至 main 分支
+[2026-05-21] **sd-1 + white 异构跨节点 512-token A/B 完成** — 关键发现：Pipeline overlap 收益强烈依赖于 compute/network 比例：
+- **Serial no-micro-block**: 299s | **Serial micro-block=64**: 330s | **Pipeline micro-block=64**: 319s
+- Pipeline 仅比 Serial 快 3.3%（同 micro-block 条件），远低于 Mac+white 的 40%
+- 根因：sd-1 (RTX 4080 SUPER) + white (RTX 4090) 双 CUDA 计算快 + RTT 更好（78ms vs Mac↔white 107ms）→ compute_time >> network_time → overlap 能隐藏的时间很少
+- **Micro block 是稳定性必需品**：Pipeline no-micro-block → connection lost（917KB/layer 传输导致 QUIC 不稳定）
+- 公式验证：Pipeline 收益 ≈ 1 - compute/(compute+network)。异构慢计算+慢网络 → 收益大；同构快计算+较好网络 → 收益趋近于 0
 
-上一阶段 **跨机器异构 E2E（Mac vllm-metal + white RTX 4090）** 已在 Python 层完成验证并冻结。Python 层不再扩展。
+上一阶段 **工程化代码重构**（14 commits lib+bin 拆分）和 **跨机器异构 E2E（Mac vllm-metal + white RTX 4090）** 均已完成。Python 层冻结不再扩展。
 
 ---
 
@@ -92,14 +87,20 @@
   - **256-token A/B 量化对比**（Tailscale VPN，非 LAN，带宽受限）：
     * Serial: **151s** | Pipeline: **147s** | 差异: **-4s (~2.6%)**
     * 输出一致（`the`），correctness 无 regression
-  - **512-token A/B 量化对比**（Tailscale VPN，非 LAN，带宽受限）：
+  - **512-token A/B 量化对比**（Mac MPS + white RTX 4090，Tailscale VPN ~107ms RTT）：
     * Serial: **~5min (300s)** | Pipeline: **~3min (180s)** | **Pipeline 快 ~40%**
     * 输出一致（`brown`），correctness 无 regression
-    * 收益显著提升原因：512 token 下 KV block 增大到 ~900KB/layer，网络传输占比提高，overlap 收益开始显现
+  - **512-token A/B 量化对比**（sd-1 RTX 4080 SUPER + white RTX 4090，Tailscale VPN ~78ms RTT）—— **关键新发现**：
+    * Serial no-micro-block: **299s** | Serial micro-block=64: **330s** | Pipeline micro-block=64: **319s**
+    * Pipeline no-micro-block: **connection lost**（大传输导致 QUIC 不稳定）
+    * **同 micro-block 下 Pipeline 仅快 3.3%**，远低于 Mac+white 的 40%
+    * **根因**：双 CUDA 计算快 + RTT 更好（78ms vs 107ms）→ compute >> network → overlap 收益趋近于 0
+    * **Micro block 是稳定性必需品**：无 micro block → connection lost；micro block 增加 ~10% 开销
+    * **公式验证**：Pipeline 收益 ≈ 1 - compute/(compute+network)。计算越慢/网络越差 → 收益越大
   - **4K 本地验证**：Serial 和 Pipeline 均正常（CPU 本地 ~30s），代码逻辑无 bug
   - **4K 跨节点失败**：网络不稳定导致连接断开。根因：7.3MB/layer × 24 layers ≈ 175MB 总传输量，跨 VPN 慢网络下大 block 传输触发连接丢失。需要 micro block 切分或更稳定网络才能进行 4K+ 跨节点对比
   - **QUIC recv_kv_block timeout 修复**：120s → 600s（commit `3759811`）。4K 跨节点 KV block 传输超过 120s 导致 timeout panic，600s 覆盖大 block + 慢网络场景。512-token 验证通过
-  - **核心公式化结论**：Pipeline 收益 ≈ 1 - (compute_time / (compute_time + network_time))。本地/小 scale 收益 ≈ 0%；跨节点 512-token 收益 ≈ 40%；跨节点 4K+ 理论收益趋近上限，但受网络稳定性限制
+  - **核心公式化结论**：Pipeline 收益 ≈ 1 - (compute_time / (compute_time + network_time))。本地/小 scale 收益 ≈ 0%；异构慢计算+慢网络 ≈ 40%；同构快计算+较好网络 ≈ 0-5%；micro block 是稳定性必需品但增加 5-15% 开销
   - **分析报告**：`reports/ab-analysis-20260513/README.md` 完整记录测试矩阵、量化数据、根因分析、下一步建议
 - [x] [2026-05-09] **验证跨机器 E2E通过**：`scripts/run_python_distributed_2node.sh` 成功运行，Mac vllm-metal (MPS, 8.39s 初始化) + white RTX 4090 (CUDA) 完整端到端通过，生成 `. I am`。QUIC 超时修复（peer accept 180s）生效。
 - [x] [2026-05-09] **大规模跨机器验证矩阵完成**（一个节点一个 worker）：
