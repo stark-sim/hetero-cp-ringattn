@@ -2,14 +2,13 @@
 
 ## 当前焦点
 
-[2026-05-21] **sd-1 + white 异构跨节点 512-token A/B 完成** — 关键发现：Pipeline overlap 收益强烈依赖于 compute/network 比例：
-- **Serial no-micro-block**: 299s | **Serial micro-block=64**: 330s | **Pipeline micro-block=64**: 319s
-- Pipeline 仅比 Serial 快 3.3%（同 micro-block 条件），远低于 Mac+white 的 40%
-- 根因：sd-1 (RTX 4080 SUPER) + white (RTX 4090) 双 CUDA 计算快 + RTT 更好（78ms vs Mac↔white 107ms）→ compute_time >> network_time → overlap 能隐藏的时间很少
-- **Micro block 是稳定性必需品**：Pipeline no-micro-block → connection lost（917KB/layer 传输导致 QUIC 不稳定）
-- 公式验证：Pipeline 收益 ≈ 1 - compute/(compute+network)。异构慢计算+慢网络 → 收益大；同构快计算+较好网络 → 收益趋近于 0
+[2026-05-21] **4-domain 4K 异构测试完成** — 发现了 Serial 死锁 bug 和 VPN 稳定性上限：
+- **Serial 模式**：❌ decode 死锁。根因：`exchange_kv_block` 默认实现只支持 2-domain（发 1 收 1），4-domain 下发 1 收 3 → `recv_kv_block` 永远等待。需修复为逐 round 转发
+- **Pipeline 模式**：❌ prefill connection lost（2166s）。d2/d3 在 ~36min 大传输后断开。Tailscale VPN 不适合 4K+ 长时测试（~528MB/worker）
+- **512-token 仍是 VPN 可靠上限**：已验证 Serial/Pipeline 均可行
+- **Pipeline 逻辑本身正确**：d0 日志证实 3 rounds × 24 layers KV 交换正常推进
 
-上一阶段 **工程化代码重构**（14 commits lib+bin 拆分）和 **跨机器异构 E2E（Mac vllm-metal + white RTX 4090）** 均已完成。Python 层冻结不再扩展。
+上一阶段 **sd-1+white 512-token A/B**（Pipeline 收益 3.3% vs Mac+white 40%，公式验证 compute/network 比例决定收益）已完成。Python 层冻结。
 
 ---
 

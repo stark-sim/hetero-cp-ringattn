@@ -147,6 +147,10 @@
     * **Micro block 是稳定性必需品**：无 micro block 时大传输导致 connection lost；micro block 本身增加 ~10% 开销（299s→330s）
     * **公式验证**：Pipeline 收益 ≈ 1 - compute/(compute+network)。Mac MPS 计算慢 → compute≈network → 收益大；双 CUDA 计算快 → compute>>network → 收益趋近于 0
     * **Scaling insight**：当前 512-token 传输量太小（~22MB/round），不足以拉开差距。随着 seq_len 增加（4K→175MB/round, 8K→350MB/round）和 domain 增加（4-domain→3 rounds），network_time 线性增长而 compute_time 增长较慢 → ratio 逆转 → Pipeline 收益将显著增大。4K/8K+多 domain 才是 Pipeline 真正的战场
+  - **4K 4-domain 异构测试**（Mac MPS + sd-1 + sd-2 + white）：
+    * **Serial 模式**：❌ decode 死锁。根因：`exchange_kv_block` 默认实现只支持 2-domain（发 1 收 1），4-domain 下发 1 收 3 → `recv_kv_block` 永远等待。Prefill 能完成是因为 prefill 不走 `exchange_kv_block` 或路径不同。需要修复 Serial 模式为逐 round 转发
+    * **Pipeline 模式**：❌ prefill 阶段 connection lost（2166s，~36min）。d0/d1 PrefillDone 收到后 d2/d3 连接断开。根因：Tailscale VPN 大传输量（~528MB/worker）+ 长时间 → QUIC 连接不稳定。Pipeline 逻辑本身正确（d0 日志显示 3 rounds × 24 layers 正常推进）
+    * **结论**：512-token 是 Tailscale VPN 可靠上限；4K+ 需要更稳定网络（LAN/RDMA）或修复 Serial 死锁后重试
   - **4K 本地验证**：Serial/Pipeline 均正常（CPU 本地 ~30s），代码逻辑无 bug
   - **4K 跨节点失败**：网络不稳定导致连接丢失。根因：7.3MB/layer × 24 layers ≈ 175MB 总传输量，跨 VPN 慢网络下大 block 传输不稳定。需 micro block 切分改善
   - **QUIC recv_kv_block timeout 修复**：120s → 600s（`3759811`），覆盖大 block + 慢网络场景
