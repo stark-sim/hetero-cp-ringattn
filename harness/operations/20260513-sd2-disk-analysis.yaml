@@ -1,0 +1,154 @@
+executor_verdict: EXECUTED
+pre_check:
+  memory_verified: true
+  risk_level: low
+  target_registered: true
+execution:
+  command: "SSH disk analysis on sd-2"
+  findings:
+    home_total: "224G"
+    disk_usage:
+      filesystem: "/dev/sda2"
+      size: "1.8T"
+      used: "1.6T"
+      available: "45G"
+      use_percent: "98%"
+      mounted_on: "/"
+    top_dirs:
+      - path: "/home/user/PycharmProjects/"
+        size: "60G"
+        note: "6 projects; largest is dage_gpu (53G)"
+      - path: "/home/user/Megatron-DeepSpeed/"
+        size: "48G"
+        note: "Almost entirely checkpoints/ (48G)"
+      - path: "/home/user/miniconda3/"
+        size: "30G"
+        note: "28G in envs/, 806M in pkgs/"
+      - path: "/home/user/models/"
+        size: "13G"
+        note: "llama-7b-hf only visible model (13G)"
+      - path: "/home/user/libtorch/"
+        size: "5.9G"
+        note: "Extracted libtorch runtime"
+    hidden_dirs:
+      - path: "/home/user/.cache/"
+        size: "65G"
+        note: "huggingface 62G, pip 2.6G, torch_extensions 46M"
+      - path: "/home/user/.vscode-server/"
+        size: "693M"
+        note: "IDE remote server artifacts"
+      - path: "/home/user/.windsurf-server/"
+        size: "384M"
+        note: "IDE remote server artifacts"
+      - path: "/home/user/.local/"
+        size: "188M"
+      - path: "/home/user/.rustup/"
+        size: "46M"
+    large_files:
+      - path: "/home/user/libtorch-shared-with-deps-2.11.0+cu128.zip"
+        size: "3.5G"
+        note: "Already extracted to /home/user/libtorch/"
+      - path: "/home/user/libtorch/lib/libtorch_cuda_linalg.so"
+        note: "~1.3G (part of extracted libtorch)"
+      - path: "/home/user/libtorch/lib/libtorch_cuda.so"
+        note: "~1.1G (part of extracted libtorch)"
+      - path: "/home/user/libtorch/lib/libcublasLt-10b5e663.so.12"
+        note: "~500M+ (part of extracted libtorch)"
+      - path: "/home/user/models/llama-7b-hf/model-00001-of-00002.safetensors"
+        note: "~6-7G"
+      - path: "/home/user/models/llama-7b-hf/model-00002-of-00002.safetensors"
+        note: "~6-7G"
+    cache_size: "65G total (.cache); 62G huggingface hub; 2.6G pip; 46M torch_extensions"
+    huggingface_models:
+      - name: "models--Qwen--Qwen3-4B-Instruct-2507"
+        size: "23G"
+      - name: "models--Qwen--Qwen2.5-7B-Instruct"
+        size: "15G"
+      - name: "models--Qwen--Qwen2.5-3B-Instruct"
+        size: "5.8G"
+      - name: "models--Qwen--Qwen2.5-1.5B-Instruct"
+        size: "2.9G"
+      - name: "models--Qwen--Qwen2.5-1.5B"
+        size: "2.9G"
+      - name: "models--bert-base-uncased"
+        size: "421M"
+      - name: "models--distilbert--distilbert-base-uncased"
+        size: "257M"
+      - name: "models--intfloat--e5-small"
+        size: "129M"
+    docker_size: "N/A (docker command failed / no access or no images)"
+    tmp_files:
+      - path: "/tmp/torchelastic_*"
+        size: "~28K each"
+        count: "10+ entries"
+        note: "Negligible total size"
+    conda_envs:
+      status: "miniconda3 present but 'conda' command not on PATH"
+      envs_dir: "/home/user/miniconda3/envs/ (28G)"
+      pkgs_cache: "/home/user/miniconda3/pkgs/ (806M)"
+    build_artifacts:
+      - path: "/home/user/src/apex_270523af/build"
+        size: "40M"
+        note: "Apex build artifacts"
+  cleanup_candidates:
+    - path: "/home/user/libtorch-shared-with-deps-2.11.0+cu128.zip"
+      size: "3.5G"
+      safe_to_delete: true
+      note: "Already extracted to /home/user/libtorch/; zip is redundant"
+    - path: "/home/user/Megatron-DeepSpeed/checkpoints/"
+      size: "48G"
+      safe_to_delete: false
+      note: "Old training checkpoints; VERIFY not needed before deletion. Huge impact."
+    - path: "/home/user/.cache/huggingface/hub/models--Qwen--Qwen3-4B-Instruct-2507/"
+      size: "23G"
+      safe_to_delete: false
+      note: "VERIFY not needed for current work; largest single HF model"
+    - path: "/home/user/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/"
+      size: "15G"
+      safe_to_delete: false
+      note: "VERIFY not needed for current work"
+    - path: "/home/user/.cache/huggingface/hub/models--Qwen--Qwen2.5-3B-Instruct/"
+      size: "5.8G"
+      safe_to_delete: false
+      note: "VERIFY not needed for current work"
+    - path: "/home/user/.cache/huggingface/hub/models--Qwen--Qwen2.5-1.5B-Instruct/"
+      size: "2.9G"
+      safe_to_delete: false
+      note: "VERIFY not needed for current work"
+    - path: "/home/user/.cache/huggingface/hub/models--Qwen--Qwen2.5-1.5B/"
+      size: "2.9G"
+      safe_to_delete: false
+      note: "VERIFY not needed for current work"
+    - path: "/home/user/models/llama-7b-hf/"
+      size: "13G"
+      safe_to_delete: false
+      note: "VERIFY not needed for current work"
+    - path: "/home/user/.cache/pip/"
+      size: "2.6G"
+      safe_to_delete: true
+      note: "pip wheel cache; can be cleared with 'pip cache purge'"
+    - path: "/home/user/miniconda3/pkgs/"
+      size: "806M"
+      safe_to_delete: true
+      note: "conda package cache; can be cleared with 'conda clean --all'"
+    - path: "/home/user/.vscode-server/"
+      size: "693M"
+      safe_to_delete: true
+      note: "Remote VSCode server data; will re-download on next connect"
+    - path: "/home/user/.windsurf-server/"
+      size: "384M"
+      safe_to_delete: true
+      note: "Remote Windsurf server data; will re-download on next connect"
+    - path: "/home/user/PycharmProjects/dage_gpu/"
+      size: "53G"
+      safe_to_delete: false
+      note: "Largest project dir; VERIFY not active before deletion"
+notes: >
+  Disk is at 98% (45G free). Immediate safe wins (~8G): delete the libtorch zip (3.5G),
+  purge pip cache (2.6G), and clean conda pkgs (806M). Medium wins (~1G): remove
+  .vscode-server and .windsurf-server (will auto-recreate). Major wins require
+  verification: Megatron-DeepSpeed checkpoints (48G), unused HF models (62G total),
+  llama-7b-hf (13G), and PycharmProjects/dage_gpu (53G). If this project only needs
+  Qwen2-0.5B, the entire HF cache except that model could be reclaimed (~59G).
+  Recommend: (1) safe deletions first, (2) verify which HF models / projects are
+  actually needed, (3) download Qwen2-0.5B after cleanup if missing.
