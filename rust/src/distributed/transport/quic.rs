@@ -156,9 +156,11 @@ pub struct QuicKvTransport {
 
 impl QuicKvTransport {
     pub fn new(send: SendStream, recv: RecvStream, rt: Handle, device: Device) -> Self {
-        // Channel buffer = 2：允许网络传输前一个 block 的同时，主线程序列化下一个 block
-        let (send_tx, send_rx) = mpsc::channel::<SendCmd>(2);
-        let (recv_tx, recv_rx) = mpsc::channel::<KvBlock>(2);
+        // Channel buffer = 64：允许网络传输多个 block 的同时，主线程序列化后续 block。
+        // 这是 N-domain Serial 模式必需的：一次性 submit N 个 layer 的 blocks 时，
+        // 如果 buffer 太小（如 2），send_task 和 recv_task 会在网络/缓冲区阻塞时互相死锁。
+        let (send_tx, send_rx) = mpsc::channel::<SendCmd>(64);
+        let (recv_tx, recv_rx) = mpsc::channel::<KvBlock>(64);
 
         let send_task = rt.spawn(send_task_loop(send, send_rx));
         let recv_task = rt.spawn(recv_task_loop(recv, recv_tx, device));
