@@ -1,0 +1,48 @@
+executor_verdict: EXECUTED
+pre_check:
+  memory_verified: true
+  risk_level: medium
+  target_registered: true
+execution:
+  steps:
+    - step: "Delete libtorch zip"
+      status: ok
+      path: "/home/user/libtorch-shared-with-deps-2.11.0+cu128.zip"
+      size_freed: "3.5G"
+      verified_gone: true
+    - step: "Purge pip cache"
+      status: skipped
+      size_freed: "0B"
+      note: "pip cache not present (NO_PIP_CACHE)"
+    - step: "Remove .vscode-server/"
+      status: ok
+      path: "/home/user/.vscode-server/"
+      size_freed: "693M"
+      verified_gone: true
+    - step: "Remove .windsurf-server/"
+      status: ok
+      path: "/home/user/.windsurf-server/"
+      size_freed: "384M"
+      verified_gone: true
+    - step: "Conda clean --all"
+      status: ok
+      size_freed: "420M"
+      detail: "Removed 23 tarballs (84.5 MB), 1 index cache, 20 packages (335.6 MB)"
+    - step: "Delete Megatron-DeepSpeed/checkpoints/"
+      status: ok
+      path: "/home/user/Megatron-DeepSpeed/checkpoints/"
+      size_freed: "48G"
+      verified_gone: true
+  disk_after:
+    filesystem: "/dev/sda2"
+    total: "1.8T"
+    used: "1.6T"
+    available: "97G"
+    use_percent: "95%"
+    home_user_size: "172G"
+  total_freed_estimate: "~52.9G"
+notes: >
+  Cleanup complete. Disk usage reduced from 98% (45G free) to 95% (97G free).
+  All deletions verified: paths existed under /home/user only, sizes matched
+  expectations, and post-deletion checks confirm removal. pip cache was not
+  present so that step was skipped.
