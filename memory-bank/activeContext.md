@@ -2,13 +2,13 @@
 
 ## 当前焦点
 
-[2026-05-21] **4-domain 4K 异构测试完成** — 发现了 Serial 死锁 bug 和 VPN 稳定性上限：
-- **Serial 模式**：❌ decode 死锁。根因：`exchange_kv_block` 默认实现只支持 2-domain（发 1 收 1），4-domain 下发 1 收 3 → `recv_kv_block` 永远等待。需修复为逐 round 转发
-- **Pipeline 模式**：❌ prefill connection lost（2166s）。d2/d3 在 ~36min 大传输后断开。Tailscale VPN 不适合 4K+ 长时测试（~528MB/worker）
-- **512-token 仍是 VPN 可靠上限**：已验证 Serial/Pipeline 均可行
-- **Pipeline 逻辑本身正确**：d0 日志证实 3 rounds × 24 layers KV 交换正常推进
+[2026-05-22] **4-domain 4K Serial 异构测试首次成功** — 4988s（1h 23m）：
+- **Serial 模式**：✅ **成功完成**。`quic.rs` mpsc channel buffer 2→64 修复了 N-domain Serial 死锁。4 个 worker（Mac MPS + sd-1 4080S + sd-2 4080S + white 4090）全部完成 prefill（4096 tokens），decode 生成 1 token（`over`）。exit=0。报告：`reports/cross-node-4domain-4k-serial-20260522/`
+- **关键数据点**：Serial 无 overlap 模式下，跨 VPN 传输 ~168MB/worker × 4 rounds = 主要时间消耗。Mac MPS 计算慢进一步放大总时间。
+- **Pipeline 模式**：❌ 仍待验证。上次尝试 2166s 后 connection lost（Tailscale VPN 大传输不稳定）。需要 LAN 环境才能做 Serial vs Pipeline 4K 4-domain A/B 对比。
+- **512-token A/B 已完成**：Mac+white Pipeline 快 40%，sd-1+white Pipeline 仅快 3.3%。公式 `benefit ≈ 1 - compute/(compute+network)` 已验证。
 
-上一阶段 **sd-1+white 512-token A/B**（Pipeline 收益 3.3% vs Mac+white 40%，公式验证 compute/network 比例决定收益）已完成。Python 层冻结。
+Python 层冻结。Rust 层为主干。
 
 ---
 
