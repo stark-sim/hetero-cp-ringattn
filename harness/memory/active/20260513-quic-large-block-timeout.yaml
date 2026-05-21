@@ -1,0 +1,14 @@
+# Harness Experience Record
+# Status: PENDING_CONFIRMATION
+
+timestamp: "20260513-114300"
+project: "/Users/stark_sim/VSCodeProjects/hetero-cp-ringattn"
+context:
+  problem: "4K token 跨节点测试时 worker panic: recv_kv_block timeout after 120s"
+  solution: "QUIC recv_kv_block timeout 从 120s 增加到 600s (rust/src/distributed/transport/quic.rs:360)"
+  verification: "512-token 跨节点 Serial/Pipeline 两种模式均通过"
+  pitfalls:
+    - "120s 对于 4K token KV block (~7.3MB/layer) 在慢 VPN 下不够"
+    - "超时 panic 发生在 decode 阶段，容易被误判为 decode bug"
+  tags: ["quic", "timeout", "cross-node", "4K", "transport"]
+reusable: true

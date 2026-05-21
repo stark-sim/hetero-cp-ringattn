@@ -1,0 +1,14 @@
+# Harness Experience Record
+# Status: PENDING_CONFIRMATION
+
+timestamp: "20260513-114400"
+project: "/Users/stark_sim/VSCodeProjects/hetero-cp-ringattn"
+context:
+  problem: "coordinator 启动失败: 'bind failed: Address already in use (os error 48)'"
+  solution: "两种方案: (1) 等待 TIME_WAIT 释放 (sleep 3-5s); (2) 换一组端口"
+  verification: "使用 29600/29601/29602 替代 29500/29501/29502 后成功启动"
+  pitfalls:
+    - "pkill 后 QUIC endpoint 的端口可能仍在 TIME_WAIT"
+    - "lsof 有时显示空，但实际 bind 仍会失败"
+  tags: ["port", "bind", "quic", "cleanup"]
+reusable: true

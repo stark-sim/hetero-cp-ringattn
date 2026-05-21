@@ -1,0 +1,14 @@
+# Harness Experience Record
+# Status: PENDING_CONFIRMATION
+
+timestamp: "20260513-114500"
+project: "/Users/stark_sim/VSCodeProjects/hetero-cp-ringattn"
+context:
+  problem: "Workers 先于 coordinator 启动时，dial coordinator 超时失败"
+  solution: "严格启动顺序: (1) coordinator 先启动并 bind; (2) sleep 2s; (3) worker 1 (white) 启动; (4) sleep 5s; (5) worker 0 (Mac) 启动"
+  verification: "64/256/512 token 跨节点测试均按此顺序成功"
+  pitfalls:
+    - "worker 0 和 worker 1 同时启动会导致 dial/accept 竞争"
+    - "coordinator 必须在 workers 之前，否则 workers 的 dial_fut  retry 循环会 timeout"
+  tags: ["cross-node", "launch-order", "coordinator", "worker"]
+reusable: true

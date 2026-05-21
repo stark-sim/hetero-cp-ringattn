@@ -1,0 +1,88 @@
+executor_verdict: EXECUTED
+pre_check:
+  memory_verified: false
+  risk_level: low
+  target_registered: false
+  user_authorized: true
+execution:
+  - host: sd-1
+    status: ok
+    findings:
+      os_arch: "Linux sd-1 6.11.0-17-generic #17~24.04.2-Ubuntu SMP PREEMPT_DYNAMIC x86_64 GNU/Linux"
+      gpu: "4x NVIDIA GeForce RTX 4080 SUPER, Driver 575.51.03, CUDA Version 12.9 (driver API)"
+      cuda: "nvcc 12.8.93 (release 12.8, V12.8.93)"
+      libtorch: "/home/user/libtorch/lib/libtorch.so, /home/user/libtorch/lib/libtorch_cpu.so"
+      rust:
+        cargo: "cargo 1.95.0 (f2d3ce0bd 2026-03-21)"
+        rustc: "rustc 1.95.0 (59807616e 2026-04-14)"
+        path: "~/.cargo/bin"
+      model:
+        path: "/home/user/models/qwen2-0.5b/config.json"
+        exists: true
+      network:
+        tailscale_ip: "100.64.0.93"
+        eth0_ip: "192.168.66.121/24"
+        docker0_ip: "172.17.0.1/16"
+      python: "Python 3.12.3"
+      python_env: "no uv/conda/venv found"
+      tailscale_peers: "sd-1 (100.64.0.93), sd-2 reachable"
+      disk: "/dev/mapper/vg0-root 5.3T total, 4.3T used, 820G avail (85%)"
+      memory: "100Gi total, 1.3Gi used, 92Gi free, 6.4Gi buff/cache"
+      ssh_pubkey_auth: true
+      project_repo: "~/hetero-cp-ringattn exists (rust/ src/ tests/ target/)"
+  - host: sd-2
+    status: ok
+    findings:
+      os_arch: "Linux sd-2 6.14.0-36-generic #36~24.04.1-Ubuntu SMP PREEMPT_DYNAMIC x86_64 GNU/Linux"
+      gpu: "4x NVIDIA GeForce RTX 4080 SUPER, Driver 570.172.08, CUDA Version 12.8 (driver API)"
+      cuda: "nvcc 12.8.93 (release 12.8, V12.8.93)"
+      libtorch: "/home/user/libtorch/lib/libtorch.so, /home/user/libtorch/lib/libtorch_cpu.so"
+      rust:
+        cargo: "rustup installed but NO ACTIVE TOOLCHAIN (cargo/rustc fail with 'no default configured')"
+        rustc: "not available (needs: rustup default stable)"
+        path: "~/.cargo/bin"
+      model:
+        path: "not found at ~/models/, ~/hetero-cp-ringattn/models/, or common paths"
+        exists: false
+        hf_cache: "Qwen models cached in ~/.cache/huggingface/hub/ but NOT Qwen2-0.5B"
+      network:
+        tailscale_ip: "100.64.0.94"
+        eth0_ip: "192.168.66.163/24"
+        docker0_ip: "172.17.0.1/16"
+      python: "Python 3.12.3"
+      python_env: "no uv/conda/venv found"
+      tailscale_peers: "sd-2 (100.64.0.94), sd-1 reachable"
+      disk: "/dev/sda2 1.8T total, 1.6T used, 45G avail (98% FULL — CRITICAL)"
+      memory: "100Gi total, 718Mi used, 92Gi free, 6.6Gi buff/cache, 8.0Gi swap"
+      ssh_pubkey_auth: true
+      project_repo: "~/hetero-cp-ringattn exists (rust/ src/ tests/)"
+  - host: sd-1-to-sd-2
+    status: ok
+    findings:
+      connectivity: "sd-1 (100.64.0.93) <-> sd-2 (100.64.0.94) via Tailscale"
+      rtt_sd1_to_sd2: "~6.12 ms"
+      rtt_sd2_to_sd1: "~1.16 ms"
+      packet_loss: "0%"
+notes: |
+  Environment readiness summary for hetero-cp-ringattn distributed inference:
+
+  SD-1: READY for build/test.
+    - 4x RTX 4080 SUPER, CUDA 12.8 toolchain, libtorch present.
+    - Rust stable 1.95.0 active and working.
+    - Qwen2-0.5B model present at /home/user/models/qwen2-0.5b.
+    - Project repo already cloned.
+    - Disk at 85% — monitor but not blocking.
+
+  SD-2: NOT READY — requires 3 fixes before distributed inference:
+    1. CRITICAL DISK: Root filesystem 98% full (1.8T, only 45G free). Clean up
+       Megatron-DeepSpeed experiments or expand storage before model download/build.
+    2. RUST TOOLCHAIN: rustup is installed but no default toolchain configured.
+       Run: rustup default stable
+    3. MISSING MODEL: Qwen2-0.5B not present. Must download/copy after disk cleanup.
+       Target path should be /home/user/models/qwen2-0.5b (or symlink to match
+       project convention). HuggingFace cache contains larger Qwen variants but
+       not the 0.5B variant needed for smoke tests.
+
+  Network: Both hosts are on the same Tailscale tailnet (100.64.0.x) with
+  sub-10ms latency. Cross-node ring-attention KV exchange should work, but
+  note bandwidth will be limited by Tailscale/ISP, not LAN.

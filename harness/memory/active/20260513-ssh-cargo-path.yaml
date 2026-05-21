@@ -1,0 +1,14 @@
+# Harness Experience Record
+# Status: PENDING_CONFIRMATION
+
+timestamp: "20260513-114200"
+project: "/Users/stark_sim/VSCodeProjects/hetero-cp-ringattn"
+context:
+  problem: "SSH 到 white 执行 cargo 命令时提示 'cargo: command not found'"
+  solution: "非交互式 SSH 不加载 shell profile，必须显式设置 PATH=/home/stark/.cargo/bin:$PATH"
+  verification: "PATH=/home/stark/.cargo/bin:$PATH cargo --version 成功输出"
+  pitfalls:
+    - "export PATH=... 在 ssh 命令字符串中只作用于第一个命令，需要用 ; 连接或写成一行"
+    - "不能依赖 ~/.bashrc 或 ~/.profile 中的 PATH 设置"
+  tags: ["ssh", "cargo", "white", "env"]
+reusable: true

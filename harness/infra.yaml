@@ -9,6 +9,26 @@ ssh_hosts:
     note: "RTX 4090 CUDA, Tailscale VPN 访问"
     tags: ["gpu", "cuda", "remote"]
 
+  - host: "sd-1"
+    hostname: "100.64.0.93"
+    username: "user"
+    port: 22
+    note: "4x RTX 4080 SUPER, CUDA 12.8, READY"
+    status: "ready"
+    tags: ["gpu", "cuda", "sd-cluster"]
+
+  - host: "sd-2"
+    hostname: "100.64.0.94"
+    username: "user"
+    port: 22
+    note: "4x RTX 4080 SUPER, CUDA 12.8, NOT READY (3 blockers)"
+    status: "not_ready"
+    blockers:
+      - "DISK CRITICAL: 98% full (1.8T, only 45G free) — must cleanup"
+      - "RUST: no default toolchain — run 'rustup default stable'"
+      - "MODEL: Qwen2-0.5B missing — download after disk cleanup"
+    tags: ["gpu", "cuda", "sd-cluster"]
+
 paths:
   mac:
     libtorch: "/Users/stark_sim/libtorch"
@@ -20,6 +40,16 @@ paths:
     models: "/home/stark/models/Qwen2-0.5B"
     cargo_bin: "~/.cargo/bin"
     project_root: "~/hetero-cp-ringattn"
+  sd-1:
+    libtorch: "/home/user/libtorch"
+    models: "/home/user/models/qwen2-0.5b"
+    cargo_bin: "~/.cargo/bin"
+    project_root: "~/hetero-cp-ringattn"
+  sd-2:
+    libtorch: "/home/user/libtorch"
+    models: "/home/user/models/qwen2-0.5b"
+    cargo_bin: "~/.cargo/bin"
+    project_root: "~/hetero-cp-ringattn"
 
 env:
   mac:
@@ -29,6 +59,14 @@ env:
     LD_LIBRARY_PATH: "/home/stark/libtorch/lib"
     HCP_TCH_DEVICE: "cuda:0"
     PATH_PREFIX: "/home/stark/.cargo/bin:$PATH"
+  sd-1:
+    LD_LIBRARY_PATH: "/home/user/libtorch/lib"
+    HCP_TCH_DEVICE: "cuda:0"
+    PATH_PREFIX: "~/.cargo/bin:$PATH"
+  sd-2:
+    LD_LIBRARY_PATH: "/home/user/libtorch/lib"
+    HCP_TCH_DEVICE: "cuda:0"
+    PATH_PREFIX: "~/.cargo/bin:$PATH"
 
 build:
   cargo_features: "tch-backend"
@@ -46,10 +84,18 @@ test:
     w1: "0.0.0.0:29502"
 
 network:
-  type: "Tailscale VPN"
-  mac_addr: "100.64.0.95"
-  white_addr: "100.64.0.2"
-  note: "非 LAN，带宽受限，RTT ~380ms"
+  white:
+    type: "Tailscale VPN"
+    mac_addr: "100.64.0.95"
+    white_addr: "100.64.0.2"
+    rtt: "~380ms"
+    note: "非 LAN，带宽受限"
+  sd-cluster:
+    type: "Tailscale VPN"
+    sd1_addr: "100.64.0.93"
+    sd2_addr: "100.64.0.94"
+    rtt: "~1-6ms"
+    note: "sd-1/sd-2 同 Tailscale tailnet，延迟低"
 
 dependencies:
   - name: cargo
@@ -63,12 +109,17 @@ dependencies:
     check: "ls /Users/stark_sim/models/qwen2-0.5b/config.json"
   - name: model-white
     check: "ssh stark@100.64.0.2 'ls /home/stark/models/Qwen2-0.5B/config.json'"
+  - name: model-sd1
+    check: "ssh user@100.64.0.93 'ls /home/user/models/qwen2-0.5b/config.json'"
+  - name: model-sd2
+    check: "ssh user@100.64.0.94 'ls /home/user/models/qwen2-0.5b/config.json'"
 
 config:
   known_issues:
     - "跨 VPN 大 block 传输不稳定（7.3MB/layer × 24 layers ≈ 175MB）"
     - "端口占用后需等待 TIME_WAIT 释放或换端口"
     - "非交互式 SSH 不加载 Cargo，需显式 PATH=/home/stark/.cargo/bin:$PATH"
+    - "sd-2 磁盘 98% 满，需清理后才能部署"
   env_vars:
     HCP_DISABLE_OVERLAP: "1 表示串行对照模式"
     HCP_MICRO_KV_BLOCK_SIZE: "micro block 粒度，0=禁用"

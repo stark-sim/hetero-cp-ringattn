@@ -1,0 +1,32 @@
+isolated_context: true
+verdict: APPROVE
+dimensions:
+  guard:
+    verdict: APPROVE
+    notes: >-
+      Targets sd-1 and sd-2 were NOT pre-registered in infra.yaml (only 'white'
+      is listed under ssh_hosts). This is acceptable because the operation result
+      explicitly records user_authorized: true for first-time reconnaissance,
+      matching the pre-authorized exception. Operation was strictly read-only:
+      no file writes, installations, deletions, or state mutations occurred. No
+      credentials, passwords, keys, or tokens were exposed in output. Tailscale
+      IPs (100.64.0.x) are internal overlay addresses, not secrets. infra.yaml
+      itself contains a prohibition comment against writing sensitive data.
+  examiner:
+    verdict: APPROVE
+    notes: >-
+      All required environment checks were performed on both hosts: OS/arch,
+      GPU (count, model, driver, CUDA driver API version), CUDA toolkit (nvcc
+      version), libtorch (so paths), Rust (cargo, rustc, toolchain status),
+      model (path, existence, HF cache probing on sd-2), network (Tailscale IP,
+      eth0, docker0, peer reachability), disk (filesystem, total/used/avail/%),
+      and memory (total/used/free/cache). Cross-host connectivity was also
+      verified with bidirectional RTT and packet-loss measurements. Findings are
+      accurate and complete: sd-1 correctly flagged as READY; sd-2 correctly
+      flagged as NOT READY with three specific, actionable blockers (98% disk,
+      missing Rust default toolchain, missing Qwen2-0.5B model). Known issues
+      from harness/memory/active/ were implicitly consistent with findings (e.g.,
+      Tailscale bandwidth limitation noted aligns with quic-large-block-timeout
+      and infra.yaml known_issues), though the recon did not explicitly cite
+      memory records—acceptable for a read-only reconnaissance scope.
+confidence: high
