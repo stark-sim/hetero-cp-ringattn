@@ -389,9 +389,7 @@ pub fn run() {
             }
         }
         println!("\n[coordinator] all requests done, shutting down workers");
-        for (send, _recv) in worker_streams.iter_mut() {
-            let _ = send_command_quic(send, &WorkerCommand::Shutdown, rt.handle());
-        }
+        shutdown_workers(&mut worker_streams, &endpoint, &rt);
         return;
     }
 
@@ -471,7 +469,29 @@ pub fn run() {
     }
 
     println!("\n[coordinator] shutting down workers");
+    shutdown_workers(&mut worker_streams, &endpoint, &rt);
+}
+
+/// Gracefully shutdown all workers with timeout protection.
+///
+/// 1. Try to send Shutdown command to each worker with a short timeout.
+/// 2. Finish send streams so workers see EOF.
+/// 3. Close the QUIC endpoint explicitly.
+/// 4. Sleep briefly to let connections clean up before runtime drop.
+fn shutdown_workers(
+    worker_streams: &mut [(quinn::SendStream, quinn::RecvStream)],
+    endpoint: &quinn::Endpoint,
+    rt: &tokio::runtime::Runtime,
+) {
     for (send, _recv) in worker_streams.iter_mut() {
-        let _ = send_command_quic(send, &WorkerCommand::Shutdown, rt.handle());
+        let _ = crate::distributed::protocol::send_command_quic_timeout(
+            send, &WorkerCommand::Shutdown, rt.handle(), 10,
+        );
+        let _ = send.finish();
     }
+    endpoint.close(0u32.into(), b"coordinator shutdown");
+    rt.block_on(async {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    });
+    println!("[coordinator] shutdown complete");
 }

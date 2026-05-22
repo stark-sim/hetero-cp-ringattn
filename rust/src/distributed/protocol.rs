@@ -210,30 +210,64 @@ pub fn read_handshake(stream: &mut TcpStream) -> Result<WorkerHandshake, String>
 
 /// Write a length-prefixed frame to a QUIC send stream.
 pub fn write_frame_quic(send: &mut SendStream, payload: &[u8], rt: &Handle) -> Result<(), String> {
+    write_frame_quic_timeout(send, payload, rt, 600)
+}
+
+/// Write a length-prefixed frame with an explicit timeout.
+pub fn write_frame_quic_timeout(
+    send: &mut SendStream,
+    payload: &[u8],
+    rt: &Handle,
+    timeout_secs: u64,
+) -> Result<(), String> {
     let len = payload.len() as u32;
     let mut buf = Vec::with_capacity(4 + payload.len());
     buf.extend_from_slice(&len.to_be_bytes());
     buf.extend_from_slice(payload);
 
     rt.block_on(async {
-        send.write_all(&buf).await
-            .map_err(|e| format!("write_frame_quic failed: {e}"))
+        tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            send.write_all(&buf),
+        )
+        .await
+        .map_err(|_| format!("write_frame_quic timeout after {timeout_secs}s"))?
+        .map_err(|e| format!("write_frame_quic failed: {e}"))
     })
 }
 
 /// Read a length-prefixed frame from a QUIC recv stream.
 pub fn read_frame_quic(recv: &mut RecvStream, rt: &Handle) -> Result<Vec<u8>, String> {
+    read_frame_quic_timeout(recv, rt, 600)
+}
+
+/// Read a length-prefixed frame with an explicit timeout.
+pub fn read_frame_quic_timeout(
+    recv: &mut RecvStream,
+    rt: &Handle,
+    timeout_secs: u64,
+) -> Result<Vec<u8>, String> {
     let mut len_bytes = [0u8; 4];
     rt.block_on(async {
-        crate::distributed::transport::quic::read_exact(recv, &mut len_bytes).await
-            .map_err(|e| format!("read_frame_quic length failed: {e}"))?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            crate::distributed::transport::quic::read_exact(recv, &mut len_bytes),
+        )
+        .await
+        .map_err(|_| format!("read_frame_quic length timeout after {timeout_secs}s"))?
+        .map_err(|e| format!("read_frame_quic length failed: {e}"))?;
         let len = u32::from_be_bytes(len_bytes) as usize;
         if len > 64 * 1024 * 1024 {
             return Err(format!("read_frame_quic: frame too large ({len} bytes)"));
         }
         let mut payload = vec![0u8; len];
-        crate::distributed::transport::quic::read_exact(recv, &mut payload).await
-            .map_err(|e| format!("read_frame_quic payload failed: {e}"))?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            crate::distributed::transport::quic::read_exact(recv, &mut payload),
+        )
+        .await
+        .map_err(|_| format!("read_frame_quic payload timeout after {timeout_secs}s"))?
+        .map_err(|e| format!("read_frame_quic payload failed: {e}"))?;
         Ok(payload)
     })
 }
@@ -244,13 +278,32 @@ pub fn send_command_quic(
     cmd: &WorkerCommand,
     rt: &Handle,
 ) -> Result<(), String> {
+    send_command_quic_timeout(send, cmd, rt, 600)
+}
+
+/// Send a command with an explicit timeout.
+pub fn send_command_quic_timeout(
+    send: &mut SendStream,
+    cmd: &WorkerCommand,
+    rt: &Handle,
+    timeout_secs: u64,
+) -> Result<(), String> {
     let bytes = serialize(cmd)?;
-    write_frame_quic(send, &bytes, rt)
+    write_frame_quic_timeout(send, &bytes, rt, timeout_secs)
 }
 
 /// Receive a command from a QUIC recv stream.
 pub fn recv_command_quic(recv: &mut RecvStream, rt: &Handle) -> Result<WorkerCommand, String> {
-    let bytes = read_frame_quic(recv, rt)?;
+    recv_command_quic_timeout(recv, rt, 600)
+}
+
+/// Receive a command with an explicit timeout.
+pub fn recv_command_quic_timeout(
+    recv: &mut RecvStream,
+    rt: &Handle,
+    timeout_secs: u64,
+) -> Result<WorkerCommand, String> {
+    let bytes = read_frame_quic_timeout(recv, rt, timeout_secs)?;
     deserialize(&bytes)
 }
 
