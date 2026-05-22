@@ -309,10 +309,12 @@ impl HcpRingAttentionBackend {
         let kv_chunk_size = if seq_len == 1 { 2048 } else { q_chunk_size };
 
         // micro KV block 大小：默认使用 kv_chunk_size，可通过 HCP_MICRO_KV_BLOCK_SIZE 覆盖
+        // 弱网络下小 micro block 的 QUIC round-trip overhead 很大，默认至少 1024 tokens
+        // 在保持一定流水粒度的同时减少往返次数。
         let micro_kv_block_size = if self.micro_kv_block_size > 0 {
             self.micro_kv_block_size
         } else {
-            kv_chunk_size
+            kv_chunk_size.max(1024)
         };
 
         let local_kv_len = k.size()[2] as usize;
@@ -516,10 +518,14 @@ impl HcpRingAttentionBackend {
                 // 通过 inner scope 释放 transport borrow，让 process_kv_block 可以获取 &self。
                 // 原因：process_kv_block 需要 &self，而 kv_transport 持有 &mut self，
                 // 两者不能同时存在。inner scope 每轮释放 transport borrow。
+                let mut total_recv_time = std::time::Duration::ZERO;
+                let mut total_compute_time = std::time::Duration::ZERO;
+                let mut micro_block_count = 0usize;
                 for round in 0..num_rounds {
                     let mut expected_micro_idx = 0;
                     loop {
                         // Step 1: 接收一个 micro block（inner scope 释放 transport borrow）
+                        let recv_start = std::time::Instant::now();
                         let block = {
                             let transport = self.kv_transport.as_mut().unwrap();
                             match recv_micro_block(transport.as_mut()).map_err(|e| ModelError::Backend(format!("recv_micro_block: {e}")))? {
@@ -527,6 +533,8 @@ impl HcpRingAttentionBackend {
                                 None => break,
                             }
                         }; // transport borrow 结束
+                        let recv_elapsed = recv_start.elapsed();
+                        total_recv_time += recv_elapsed;
 
                         // 动态计算 element size（支持 Float/Half/BFloat16/Double）
                         let elem_bytes = match block.k.kind() {
@@ -547,6 +555,7 @@ impl HcpRingAttentionBackend {
                         }
 
                         // Step 2: 立刻处理这个 block（transport borrow 已释放）
+                        let compute_start = std::time::Instant::now();
                         for state in q_states.iter_mut() {
                             self.process_kv_block(
                                 &state.q_chunk, state.q_global_start, state.q_global_end,
@@ -556,21 +565,34 @@ impl HcpRingAttentionBackend {
                                 apply_causal,
                             );
                         }
+                        let compute_elapsed = compute_start.elapsed();
+                        total_compute_time += compute_elapsed;
+                        micro_block_count += 1;
 
                         // Step 3: 转发（最后一轮不需要）
                         if round < num_rounds.saturating_sub(1) {
                             let transport = self.kv_transport.as_mut().unwrap();
-                            transport.submit_send(&block).unwrap_or_else(|e| panic!("submit_send failed: {e}"));
+                            transport.submit_send(&block).map_err(|e| ModelError::Backend(format!("forward submit_send: {e}")))?;
                         }
 
                         if is_last { break; }
                     }
                 }
+                if micro_block_count > 0 {
+                    let avg_recv_ms = total_recv_time.as_secs_f64() * 1000.0 / micro_block_count as f64;
+                    let avg_compute_ms = total_compute_time.as_secs_f64() * 1000.0 / micro_block_count as f64;
+                    // overlap hint: 如果 compute > recv 说明网络没拖后腿；反之说明网络是瓶颈
+                    let overlap_ratio = if total_compute_time.as_secs_f64() > 0.0 {
+                        total_recv_time.as_secs_f64() / total_compute_time.as_secs_f64()
+                    } else { 0.0 };
+                    println!("[ring_attention] layer {} Phase 2 summary: {micro_block_count} micro blocks, avg recv={avg_recv_ms:.2}ms, avg compute={avg_compute_ms:.2}ms, recv/compute={overlap_ratio:.2}x",
+                        self.layer_idx);
+                }
 
                 // Phase 3: Flush
                 {
                     let transport = self.kv_transport.as_mut().unwrap();
-                    transport.flush_send().unwrap_or_else(|e| panic!("flush_send failed: {e}"));
+                    transport.flush_send().map_err(|e| ModelError::Backend(format!("flush_send: {e}")))?;
                 }
             }
         } else {
