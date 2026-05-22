@@ -14,6 +14,7 @@
 //! - `remote`: 远程 smoke test 入口
 //! - `smoke`: correctness 验证基础设施
 
+mod api;
 mod cli;
 mod compute_runtime;
 #[cfg(feature = "tch-backend")]

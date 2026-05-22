@@ -2,7 +2,15 @@
 //!
 //! Orchestrates prefill and decode across multiple workers.
 //! Does NOT load model weights; only needs tokenizer and config.
+//!
+//! Two serving modes:
+//! 1. **Batch mode**: `--prompts-file` (one per line) — process all prompts then exit.
+//! 2. **HTTP API mode**: default when no `--prompts-file`/`--prompt-file`/`--prompt` is given.
+//!    Starts an OpenAI-compatible HTTP server on `--http-addr` (default 0.0.0.0:8080)
+//!    and serves `/v1/completions`, `/health`, `/metrics`.
 
+use crate::api::types::{InferenceJob, InferenceResult};
+use crate::api::{build_router, ApiState};
 use crate::distributed::protocol::{
     recv_response_quic, send_command_quic, WorkerCommand, WorkerResponse,
 };
@@ -10,6 +18,8 @@ use crate::model::config::ModelConfig;
 use crate::model::sampling::sample_token;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tch::Tensor;
 
 #[derive(Debug)]
@@ -22,11 +32,11 @@ struct CoordinatorArgs {
     num_domains: usize,
     worker_addrs: Vec<String>,
     listen_addr: String,
+    /// HTTP API bind address. Default "0.0.0.0:8080" when in HTTP mode.
+    http_addr: String,
     /// Optional explicit chunk sizes for uneven sharding.
-    /// If provided, length must equal num_domains and sum must equal prompt length.
     chunk_sizes: Option<Vec<usize>>,
     /// Enable capacity-aware automatic chunk sharding.
-    /// Workers report free memory; coordinator allocates proportionally.
     capacity_aware: bool,
     /// Read prompt from file instead of inline --prompt.
     prompt_file: Option<String>,
@@ -43,6 +53,7 @@ fn parse_args() -> CoordinatorArgs {
     let mut num_domains = 2usize;
     let mut worker_addrs = Vec::new();
     let mut listen_addr = String::new();
+    let mut http_addr = "0.0.0.0:8080".to_string();
     let mut chunk_sizes: Option<Vec<usize>> = None;
     let mut capacity_aware = false;
     let mut prompt_file = None;
@@ -62,6 +73,7 @@ fn parse_args() -> CoordinatorArgs {
                 worker_addrs = args.next().unwrap().split(',').map(|s| s.to_string()).collect();
             }
             "--listen-addr" => listen_addr = args.next().unwrap(),
+            "--http-addr" => http_addr = args.next().unwrap(),
             "--chunk-sizes" => {
                 let s = args.next().unwrap();
                 chunk_sizes = Some(s.split(',').map(|x| x.parse().unwrap()).collect());
@@ -82,6 +94,7 @@ fn parse_args() -> CoordinatorArgs {
         num_domains,
         worker_addrs,
         listen_addr,
+        http_addr,
         chunk_sizes,
         capacity_aware,
         prompt_file,
@@ -89,24 +102,190 @@ fn parse_args() -> CoordinatorArgs {
     }
 }
 
-/// Coordinator 主入口。
+/// Process a single inference request against the connected workers.
 ///
-/// 整体流程：
-/// 1. 加载 tokenizer 和 config（coordinator 不加载模型权重）
-/// 2. 读取所有 prompt（支持 --prompts-file 多请求串行处理）
-/// 3. 创建 QUIC endpoint，等待所有 worker 连接并完成 handshake
-/// 4. 按 domain_id 排序 worker，确保分片顺序正确
-/// 5. 对每个 request 循环：
-///    a. Tokenize prompt
-///    b. 三 tier 分片（显式 chunk-sizes > capacity-aware > 均分）
-///    c. 发送 Prefill chunk 到每个 worker
-///    d. 收集 PrefillDone，取 max(global_seq_len)，广播 SyncGlobalSeqLen
-///    e. 从最后一个 worker 的 logits 采样第一个 token
-///    f. Decode 循环：广播 token → 收集 worker 0 logits → 采样 → 重复
-///    g. 遇到 EOS 或 max_tokens 停止
-/// 6. 所有 request 完成后发送 Shutdown
+/// Returns `InferenceResult` on success, `String` error message on failure.
+fn process_single_request(
+    request_id: u64,
+    prompt_text: &str,
+    max_tokens: usize,
+    temperature: f64,
+    top_p: f64,
+    tokenizer: &tokenizers::Tokenizer,
+    config: &ModelConfig,
+    worker_streams: &mut [(quinn::SendStream, quinn::RecvStream)],
+    chunk_sizes_override: &Option<Vec<usize>>,
+    capacity_aware: bool,
+    worker_capacities: &[u64],
+    rt: &tokio::runtime::Runtime,
+) -> Result<InferenceResult, String> {
+    let eos_token = config.eos_token_id();
+    let vocab_size = config.vocab_size as usize;
+    let num_domains = worker_streams.len();
+
+    let encoding = tokenizer
+        .encode(prompt_text, true)
+        .map_err(|e| format!("encode failed: {e}"))?;
+    let prompt_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
+    let prompt_tokens = prompt_ids.len();
+
+    let seq_len = prompt_ids.len() as i64;
+
+    // Three-tier allocation priority
+    let chunk_sizes: Vec<usize> = if let Some(ref sizes) = chunk_sizes_override {
+        if sizes.len() != num_domains {
+            return Err(format!(
+                "--chunk-sizes length ({}) must match num_domains ({})",
+                sizes.len(), num_domains
+            ));
+        }
+        let sum: usize = sizes.iter().sum();
+        if sum != seq_len as usize {
+            return Err(format!(
+                "--chunk-sizes sum ({}) must equal prompt length ({})",
+                sum, seq_len
+            ));
+        }
+        sizes.clone()
+    } else if capacity_aware {
+        crate::capacity::allocate_by_capacity(seq_len as usize, worker_capacities)
+    } else {
+        let chunk_size = (seq_len as usize).div_ceil(num_domains).max(1);
+        let mut chunks = Vec::with_capacity(num_domains);
+        let mut offset = 0usize;
+        for i in 0..num_domains {
+            let end = if i == num_domains - 1 {
+                seq_len as usize
+            } else {
+                (offset + chunk_size).min(seq_len as usize)
+            };
+            chunks.push(end - offset);
+            offset = end;
+        }
+        chunks
+    };
+
+    let mut chunk_boundaries = vec![0usize];
+    for size in &chunk_sizes {
+        chunk_boundaries.push(chunk_boundaries.last().unwrap() + size);
+    }
+
+    // Prefill
+    for (domain_id, (send, _recv)) in worker_streams.iter_mut().enumerate() {
+        let start = chunk_boundaries[domain_id];
+        let end = chunk_boundaries[domain_id + 1];
+        let chunk = &prompt_ids[start..end];
+        let cmd = WorkerCommand::Prefill {
+            request_id,
+            chunk: chunk.to_vec(),
+            seq_offset: start as i64,
+        };
+        send_command_quic(send, &cmd, rt.handle()).map_err(|e| format!("send Prefill failed: {e}"))?;
+    }
+
+    let mut max_global_seq_len = 0usize;
+    let mut last_logits_bytes: Vec<u8> = Vec::new();
+    for (domain_id, (_send, recv)) in worker_streams.iter_mut().enumerate() {
+        let resp = recv_response_quic(recv, rt.handle())
+            .map_err(|e| format!("recv PrefillDone failed: {e}"))?;
+        match resp {
+            WorkerResponse::PrefillDone { last_logits_bytes: bytes, global_seq_len, .. } => {
+                max_global_seq_len = max_global_seq_len.max(global_seq_len);
+                if domain_id == num_domains - 1 {
+                    last_logits_bytes = bytes;
+                }
+            }
+            WorkerResponse::Error { message, .. } => {
+                return Err(format!("worker {domain_id} prefill error: {message}"));
+            }
+            _ => return Err(format!("unexpected response from worker {domain_id}: {resp:?}")),
+        }
+    }
+
+    // Sync global_seq_len
+    for (send, _recv) in worker_streams.iter_mut() {
+        let cmd = WorkerCommand::SyncGlobalSeqLen { request_id, len: max_global_seq_len };
+        let _ = send_command_quic(send, &cmd, rt.handle());
+    }
+
+    // Sample first token from last worker's logits
+    let logits_vec: Vec<f32> = last_logits_bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    if logits_vec.len() != vocab_size {
+        return Err(format!(
+            "logits size mismatch: expected {}, got {}",
+            vocab_size, logits_vec.len()
+        ));
+    }
+    let logits_tensor = Tensor::from_slice(&logits_vec);
+    let mut next_token = match sample_token(&logits_tensor, temperature, top_p) {
+        Ok(t) => t as i64,
+        Err(e) => return Err(format!("sample_token failed: {e}")),
+    };
+
+    let mut generated_ids: Vec<u32> = Vec::new();
+
+    // Decode loop
+    let mut finish_reason = None;
+    for step in 0..max_tokens {
+        let token = next_token as u32;
+        generated_ids.push(token);
+
+        if Some(token) == eos_token {
+            finish_reason = Some("stop".to_string());
+            break;
+        }
+
+        for (send, _recv) in worker_streams.iter_mut() {
+            let cmd = WorkerCommand::Decode { request_id, token: next_token };
+            let _ = send_command_quic(send, &cmd, rt.handle());
+        }
+
+        let resp = recv_response_quic(&mut worker_streams[0].1, rt.handle())
+            .map_err(|e| format!("recv DecodeDone failed: {e}"))?;
+        let logits_bytes = match resp {
+            WorkerResponse::DecodeDone { logits_bytes, .. } => logits_bytes,
+            WorkerResponse::Error { message, .. } => {
+                return Err(format!("worker 0 decode error: {message}"));
+            }
+            _ => return Err(format!("unexpected response from worker 0: {resp:?}")),
+        };
+
+        for (_send, recv) in worker_streams.iter_mut().skip(1) {
+            let _ = recv_response_quic(recv, rt.handle());
+        }
+
+        let decode_logits: Vec<f32> = logits_bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let decode_tensor = Tensor::from_slice(&decode_logits);
+        next_token = match sample_token(&decode_tensor, temperature, top_p) {
+            Ok(t) => t as i64,
+            Err(e) => return Err(format!("sample_token failed at step {step}: {e}")),
+        };
+    }
+
+    if finish_reason.is_none() && !generated_ids.is_empty() {
+        finish_reason = Some("length".to_string());
+    }
+
+    let text = tokenizer
+        .decode(&generated_ids, true)
+        .map_err(|e| format!("decode failed: {e}"))?;
+
+    Ok(InferenceResult {
+        text,
+        prompt_tokens,
+        completion_tokens: generated_ids.len(),
+        finish_reason,
+    })
+}
+
+/// Coordinator 主入口。
 pub fn run() {
-    // Install rustls ring crypto provider once per process (required by rustls 0.23)
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let args = parse_args();
@@ -119,10 +298,12 @@ pub fn run() {
     let tokenizer_path = Path::new(&args.model_dir).join("tokenizer.json");
     let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).expect("load tokenizer failed");
 
-    // Load prompts: --prompts-file (one per line) takes precedence,
-    // then --prompt-file (single file), then --prompt (inline string).
-    // 多请求串行处理：一个请求失败只影响当前请求，不会导致后续请求中断。
-    let prompts: Vec<String> = if let Some(ref path) = args.prompts_file {
+    // Determine serving mode
+    let has_cli_prompts = args.prompts_file.is_some()
+        || args.prompt_file.is_some()
+        || !args.prompt.is_empty();
+
+    let cli_prompts: Vec<String> = if let Some(ref path) = args.prompts_file {
         let content = std::fs::read_to_string(path).expect("read prompts-file failed");
         content.lines().map(|s| s.to_string()).filter(|s| !s.is_empty()).collect()
     } else if let Some(ref path) = args.prompt_file {
@@ -130,16 +311,8 @@ pub fn run() {
     } else {
         vec![args.prompt.clone()]
     };
-    if prompts.is_empty() {
-        eprintln!("[coordinator] no prompts to process");
-        return;
-    }
-    println!("[coordinator] loaded {} prompt(s)", prompts.len());
 
-    // Create QUIC endpoint and wait for workers to connect.
-    // Coordinator 作为 server 被动接受 worker 连接。
-    // 每个 worker 连接后发送 16-byte handshake（domain_id + capacity_mb），
-    // coordinator 按 domain_id 排序，确保分片顺序与 ring 拓扑一致。
+    // Create QUIC endpoint and wait for workers
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime failed");
     let listen_addr: SocketAddr = args.listen_addr.parse().expect("invalid listen_addr");
 
@@ -151,7 +324,6 @@ pub fn run() {
     let mut worker_handshakes: Vec<(usize, u64, quinn::SendStream, quinn::RecvStream)> =
         Vec::with_capacity(args.num_domains);
     for i in 0..args.num_domains {
-        // 接受 worker 连接，超时 600s（覆盖 vllm-metal 长初始化时间）
         let (send, mut recv) = rt.block_on(async {
             let incoming = loop {
                 match tokio::time::timeout(
@@ -181,8 +353,6 @@ pub fn run() {
             recv,
         ));
     }
-    // 按 domain_id 排序，确保 worker[0] 永远是 domain 0，worker[1] 是 domain 1。
-    // 这是 ring topology 正确性的前提：domain i 的 next_peer 是 domain (i+1) % n。
     worker_handshakes.sort_by_key(|(domain_id, _, _, _)| *domain_id);
     let worker_capacities: Vec<u64> = worker_handshakes.iter().map(|(_, cap, _, _)| *cap).collect();
     let mut worker_streams: Vec<(quinn::SendStream, quinn::RecvStream)> = worker_handshakes
@@ -190,187 +360,117 @@ pub fn run() {
         .map(|(_, _, send, recv)| (send, recv))
         .collect();
 
-    // Process each prompt sequentially
-
-    // 逐个 request 串行处理。每个 request 有独立的 request_id，
-    // worker 在收到新的 Prefill 时会自动重建 KV cache，避免跨请求污染。
-    let eos_token = config.eos_token_id();
-    let vocab_size = config.vocab_size as usize;
-
-    for (req_idx, prompt_text) in prompts.iter().enumerate() {
-        let request_id = (req_idx + 1) as u64;
-        println!("\n[coordinator] === Request {} / {} ===", request_id, prompts.len());
-        println!("[coordinator] prompt length: {} chars", prompt_text.len());
-
-        let encoding = tokenizer.encode(prompt_text.as_str(), true).expect("encode failed");
-        let prompt_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
-        println!("[coordinator] prompt tokens: {}", prompt_ids.len());
-
-        let seq_len = prompt_ids.len() as i64;
-
-        // Three-tier allocation priority（三 tier 分片策略）：
-        // 1. --chunk-sizes：用户显式指定每个 domain 的 chunk 长度
-        // 2. --capacity-aware：根据 worker 报告的 capacity_mb 比例分配
-        // 3. 默认均分：prompt token 数 / num_domains，最后一个 domain 收余数
-        let chunk_sizes: Vec<usize> = if let Some(ref sizes) = args.chunk_sizes {
-            assert_eq!(sizes.len(), args.num_domains,
-                "--chunk-sizes length ({}) must match --num-domains ({})",
-                sizes.len(), args.num_domains);
-            let sum: usize = sizes.iter().sum();
-            assert_eq!(sum, seq_len as usize,
-                "--chunk-sizes sum ({}) must equal prompt length ({})",
-                sum, seq_len);
-            sizes.clone()
-        } else if args.capacity_aware {
-            let chunks = crate::capacity::allocate_by_capacity(seq_len as usize, &worker_capacities);
-            println!("[coordinator] capacity-aware chunks: {:?} (capacities: {:?} MB)",
-                     chunks, worker_capacities);
-            chunks
-        } else {
-            let chunk_size = (seq_len as usize).div_ceil(args.num_domains).max(1);
-            let mut chunks = Vec::with_capacity(args.num_domains);
-            let mut offset = 0usize;
-            for i in 0..args.num_domains {
-                let end = if i == args.num_domains - 1 {
-                    seq_len as usize
-                } else {
-                    (offset + chunk_size).min(seq_len as usize)
-                };
-                chunks.push(end - offset);
-                offset = end;
-            }
-            chunks
-        };
-
-        let mut chunk_boundaries = vec![0usize];
-        for size in &chunk_sizes {
-            chunk_boundaries.push(chunk_boundaries.last().unwrap() + size);
-        }
-
-        // Prefill phase：把 prompt 切成 chunk，每个 worker 处理一个 chunk。
-        // seq_offset 告诉 worker 这个 chunk 在全局序列中的起始位置，
-        // 用于 causal mask 和 RoPE 位置编码。
-        for (domain_id, (send, _recv)) in worker_streams.iter_mut().enumerate() {
-            let start = chunk_boundaries[domain_id];
-            let end = chunk_boundaries[domain_id + 1];
-            let chunk = &prompt_ids[start..end];
-            let cmd = WorkerCommand::Prefill {
+    if has_cli_prompts && !cli_prompts.is_empty() {
+        // Batch mode: process CLI prompts then exit
+        println!("[coordinator] loaded {} prompt(s)", cli_prompts.len());
+        for (req_idx, prompt_text) in cli_prompts.iter().enumerate() {
+            let request_id = (req_idx + 1) as u64;
+            println!("\n[coordinator] === Request {} / {} ===", request_id, cli_prompts.len());
+            match process_single_request(
                 request_id,
-                chunk: chunk.to_vec(),
-                seq_offset: start as i64,
-            };
-            send_command_quic(send, &cmd, rt.handle()).expect("send Prefill failed");
-            println!("[coordinator] sent Prefill chunk [{}, {}) to worker {}", start, end, domain_id);
-        }
-
-        // 收集所有 worker 的 PrefillDone 响应。
-        // max_global_seq_len 是所有 worker 本地 seq_len 的最大值，
-        // 用于 SyncGlobalSeqLen 确保 decode 时 position_ids 正确。
-        // last_logits_bytes 取自最后一个 worker（domain n-1），
-        // 因为 ring attention 中最后一个 domain 拥有最完整的 KV（收齐了所有 peer）。
-        let mut max_global_seq_len = 0usize;
-        let mut last_logits_bytes: Vec<u8> = Vec::new();
-        for (domain_id, (_send, recv)) in worker_streams.iter_mut().enumerate() {
-            let resp = recv_response_quic(recv, rt.handle()).expect("recv PrefillDone failed");
-            match resp {
-                WorkerResponse::PrefillDone { request_id: _, last_logits_bytes: bytes, global_seq_len } => {
-                    println!("[coordinator] worker {} prefill done, global_seq_len={}", domain_id, global_seq_len);
-                    max_global_seq_len = max_global_seq_len.max(global_seq_len);
-                    if domain_id == args.num_domains - 1 {
-                        last_logits_bytes = bytes;
-                    }
+                prompt_text,
+                args.max_tokens,
+                args.temperature,
+                args.top_p,
+                &tokenizer,
+                &config,
+                &mut worker_streams,
+                &args.chunk_sizes,
+                args.capacity_aware,
+                &worker_capacities,
+                &rt,
+            ) {
+                Ok(result) => {
+                    println!("[coordinator] generated: {}", result.text);
                 }
-                WorkerResponse::Error { request_id: _, message } => {
-                    eprintln!("[coordinator] worker {} prefill error: {}", domain_id, message);
-                }
-                _ => panic!("unexpected response from worker {}: {:?}", domain_id, resp),
-            }
-        }
-
-        // Sync global_seq_len：广播给所有 worker，确保 decode 阶段
-        // position_ids 从正确的全局位置开始，避免 RoPE 应用错误位置。
-        println!("[coordinator] max_global_seq_len = {}", max_global_seq_len);
-        for (send, _recv) in worker_streams.iter_mut() {
-            let cmd = WorkerCommand::SyncGlobalSeqLen { request_id, len: max_global_seq_len };
-            send_command_quic(send, &cmd, rt.handle()).expect("send SyncGlobalSeqLen failed");
-        }
-
-        // 从最后一个 worker 的 logits 采样第一个 token。
-        // 理论上任何 worker 的 logits 都一样（KV ring 交换后等价），
-        // 但取最后一个 worker 是最稳妥的，因为它的 KV 最完整。
-        let logits_vec: Vec<f32> = last_logits_bytes.chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect();
-        if logits_vec.len() != vocab_size {
-            eprintln!("[coordinator] logits size mismatch: expected {}, got {}", vocab_size, logits_vec.len());
-            continue;
-        }
-        let logits_tensor = Tensor::from_slice(&logits_vec);
-        let mut next_token = match sample_token(&logits_tensor, args.temperature, args.top_p) {
-            Ok(t) => t as i64,
-            Err(e) => {
-                eprintln!("[coordinator] sample_token failed: {}", e);
-                continue;
-            }
-        };
-
-        let mut generated_ids: Vec<u32> = Vec::new();
-
-        // Decode loop：自回归生成。
-        // 每一步：coordinator 广播 token → 所有 worker 做单步 forward →
-        // worker 0 返回 logits → coordinator 采样下一个 token。
-        // 其他 worker 也返回 DecodeDone，但 coordinator 只验证收到（不读 logits），
-        // 这是为了清空它们的响应队列，避免流堆积。
-        for step in 0..args.max_tokens {
-            let token = next_token as u32;
-            generated_ids.push(token);
-
-            if Some(token) == eos_token {
-                println!("[coordinator] EOS at step {}", step);
-                break;
-            }
-
-            for (send, _recv) in worker_streams.iter_mut() {
-                let cmd = WorkerCommand::Decode { request_id, token: next_token };
-                send_command_quic(send, &cmd, rt.handle()).expect("send Decode failed");
-            }
-
-            let resp = recv_response_quic(&mut worker_streams[0].1, rt.handle())
-                .expect("recv DecodeDone failed");
-            let logits_bytes = match resp {
-                WorkerResponse::DecodeDone { request_id: _, logits_bytes } => logits_bytes,
-                WorkerResponse::Error { request_id: _, message } => {
-                    eprintln!("[coordinator] worker 0 decode error: {}", message);
-                    break;
-                }
-                _ => panic!("unexpected response from worker 0: {:?}", resp),
-            };
-
-            for (_send, recv) in worker_streams.iter_mut().skip(1) {
-                let _ = recv_response_quic(recv, rt.handle()).expect("recv DecodeDone failed");
-            }
-
-            let decode_logits: Vec<f32> = logits_bytes.chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                .collect();
-            let decode_tensor = Tensor::from_slice(&decode_logits);
-            next_token = match sample_token(&decode_tensor, args.temperature, args.top_p) {
-                Ok(t) => t as i64,
                 Err(e) => {
-                    eprintln!("[coordinator] sample_token failed at step {}: {}", step, e);
-                    break;
+                    eprintln!("[coordinator] request {request_id} failed: {e}");
                 }
-            };
+            }
         }
-
-        // Decode to text
-        let text = tokenizer.decode(&generated_ids, true).expect("decode failed");
-        println!("[coordinator] generated: {}", text);
+        println!("\n[coordinator] all requests done, shutting down workers");
+        for (send, _recv) in worker_streams.iter_mut() {
+            let _ = send_command_quic(send, &WorkerCommand::Shutdown, rt.handle());
+        }
+        return;
     }
 
-    // Shutdown：所有 request 完成后统一发送 Shutdown 命令。
-    // Worker 收到 Shutdown 后退出 run() 循环，返回 Ok，进程结束。
-    println!("\n[coordinator] all requests done, shutting down workers");
+    // HTTP API mode
+    let (job_tx, mut job_rx) = tokio::sync::mpsc::unbounded_channel::<InferenceJob>();
+
+    let api_state = ApiState {
+        job_tx,
+        request_counter: Arc::new(AtomicU64::new(0)),
+        completed_counter: Arc::new(AtomicU64::new(0)),
+        failed_counter: Arc::new(AtomicU64::new(0)),
+        workers_connected: Arc::new(AtomicU64::new(args.num_domains as u64)),
+        num_domains: args.num_domains,
+        model_name: "qwen2-0.5b".to_string(), // TODO: derive from config
+    };
+
+    let http_addr = args.http_addr.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("http tokio runtime failed");
+        rt.block_on(async {
+            let app = build_router(api_state);
+            let listener = match tokio::net::TcpListener::bind(&http_addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("[coordinator] failed to bind HTTP server on {http_addr}: {e}");
+                    return;
+                }
+            };
+            println!("[coordinator] HTTP API listening on {http_addr}");
+            if let Err(e) = axum::serve(listener, app).await {
+                eprintln!("[coordinator] HTTP server error: {e}");
+            }
+        });
+    });
+
+    println!("[coordinator] entering HTTP service mode. Press Ctrl+C to exit.");
+
+    // Service loop: pull jobs from the queue and process them
+    loop {
+        let job = match rt.block_on(job_rx.recv()) {
+            Some(j) => j,
+            None => {
+                println!("[coordinator] job channel closed, exiting");
+                break;
+            }
+        };
+
+        let result = process_single_request(
+            job.request_id,
+            &job.prompt,
+            job.max_tokens,
+            job.temperature,
+            job.top_p,
+            &tokenizer,
+            &config,
+            &mut worker_streams,
+            &args.chunk_sizes,
+            args.capacity_aware,
+            &worker_capacities,
+            &rt,
+        );
+
+        match result {
+            Ok(inference_result) => {
+                let _ = job.tx.send(inference_result);
+            }
+            Err(e) => {
+                eprintln!("[coordinator] request {} failed: {e}", job.request_id);
+                let _ = job.tx.send(InferenceResult {
+                    text: format!("[error: {e}]"),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    finish_reason: Some("error".to_string()),
+                });
+            }
+        }
+    }
+
+    println!("\n[coordinator] shutting down workers");
     for (send, _recv) in worker_streams.iter_mut() {
         let _ = send_command_quic(send, &WorkerCommand::Shutdown, rt.handle());
     }
