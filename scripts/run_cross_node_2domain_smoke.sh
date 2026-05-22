@@ -114,7 +114,7 @@ remote_worker_cmd="cd $(shell_quote "${GPU_REPO_DIR}") && export HCP_TCH_DEVICE=
   ./rust/target/release/hcp-ringattn-rust \
     --distributed-role worker \
     --domain-id 1 \
-    --model-dir ~/models/qwen2-0.5b \
+    --model-dir ~/models/Qwen2-0.5B \
     --listen-addr 0.0.0.0:${W1_PORT} \
     --next-peer-addr ${MAC_ADDR}:${W0_PORT} \
     --coordinator-addr ${MAC_ADDR}:${COORD_PORT} \
