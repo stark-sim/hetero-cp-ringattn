@@ -2,6 +2,15 @@
 
 ## 当前焦点
 
+[2026-05-22] **M10.2 HTTP API 服务化完成** — Coordinator 新增 axum OpenAI-compatible API：
+- `POST /v1/completions` — 标准 completions API（prompt, max_tokens, temperature, top_p）
+- `GET /health` — workers_connected, num_domains
+- `GET /metrics` — total/completed/failed request counters
+- 双模式：Batch mode（`--prompts-file` 处理完退出）vs HTTP API mode（默认无 prompt 时启动服务）
+- `process_single_request()` 从 `run()` 提取，batch 和 HTTP 复用同一核心逻辑
+- HTTP server 独立线程 + tokio runtime，通过 `mpsc::unbounded_channel` + `oneshot` 与 coordinator 主循环通信
+- 45/45 tests passed，零 regression。Commit `e3eafe9`
+
 [2026-05-22] **Mac + white 弱网 A/B 测试完成 + Pipeline Phase 2 修复**：
 - **测试**: 64/256/512 tokens 全部完成（Serial + Pipeline），512 是弱网可靠上限
 - **Pipeline 收益递减**: 64-token +5% → 256-token +2% → 512-token **-2%**
@@ -134,10 +143,12 @@ Python 层冻结。Rust 层为主干。
   - correctness 验证：`test_batch_forward_correctness`（batch=2 vs batch=1，prefill + 4-step decode，logits diff ~1e-6，token 完全一致）✅
   - correctness 验证：`test_batch_generator_correctness`（`BatchGenerator` batch=2 vs 两个独立 `Generator`，token 序列完全一致）✅
   - 无 regression：全部 24 个 model tests 通过 ✅
-- [ ] **Phase 4.2: Rust 层 HTTP API 服务化**：
-  - Coordinator 添加 HTTP server（axum），提供 OpenAI-compatible `/v1/completions` API
-  - Request queue + 异步处理，支持并发请求接入
-  - Health check `/health` 和 metrics `/metrics` endpoint
+- [x] [2026-05-22] **Phase 4.2: Rust 层 HTTP API 服务化**：
+  - Coordinator 添加 axum HTTP server，OpenAI-compatible `/v1/completions` API
+  - `GET /health` + `GET /metrics` endpoints
+  - Request queue (`tokio::sync::mpsc`) + oneshot result channel
+  - 双模式：batch mode（`--prompts-file`）vs HTTP API mode（默认）
+  - Commit `e3eafe9`，45/45 tests passed ✅
 - [ ] **Phase 4.3: Rust 层性能优化与生产化**（长期）：
   - 量化支持（FP8/INT8 KV cache）— **暂不实施**，correctness 流程尚未完全走完
   - 连续 batching / 动态 request 调度
