@@ -295,7 +295,7 @@ impl HcpRingAttentionBackend {
         v: &Tensor,
         attention_mask: Option<&Tensor>,
         global_seq_start: usize,
-    ) -> Tensor {
+    ) -> Result<Tensor, ModelError> {
         let batch = q.size()[0];
         let num_heads = q.size()[1];
         let seq_len = q.size()[2];
@@ -414,16 +414,16 @@ impl HcpRingAttentionBackend {
 
                     // 1. 发送所有本地 micro blocks
                     for micro_block in &local_micro_blocks {
-                        transport.submit_send(micro_block).unwrap_or_else(|e| panic!("submit_send failed: {e}"));
+                        transport.submit_send(micro_block).map_err(|e| ModelError::Backend(format!("submit_send: {e}")))?;
                     }
-                    transport.flush_send().unwrap_or_else(|e| panic!("flush_send failed: {e}"));
+                    transport.flush_send().map_err(|e| ModelError::Backend(format!("flush_send: {e}")))?;
 
                     // 2. 收集所有 peer micro blocks（所有 rounds）
                     let mut all_blocks: Vec<Vec<KvBlock>> = Vec::new();
                     for round in 0..num_rounds {
                         let mut round_blocks = Vec::new();
                         loop {
-                            match recv_micro_block(transport.as_mut()).unwrap_or_else(|e| panic!("recv_micro_block failed: {e}")) {
+                            match recv_micro_block(transport.as_mut()).map_err(|e| ModelError::Backend(format!("recv_micro_block: {e}")))? {
                                 Some(block) => {
                                     let is_last = block.micro_block_idx + 1 == block.total_micro_blocks;
                                     round_blocks.push(block);
@@ -437,9 +437,9 @@ impl HcpRingAttentionBackend {
                         // 转发（最后一轮不需要）
                         if round < num_rounds - 1 {
                             for block in &all_blocks[round] {
-                                transport.submit_send(block).unwrap_or_else(|e| panic!("submit_send failed: {e}"));
+                                transport.submit_send(block).map_err(|e| ModelError::Backend(format!("forward submit_send: {e}")))?;
                             }
-                            transport.flush_send().unwrap_or_else(|e| panic!("flush_send failed: {e}"));
+                            transport.flush_send().map_err(|e| ModelError::Backend(format!("flush_send: {e}")))?;
                         }
                     }
                     all_blocks
@@ -487,7 +487,7 @@ impl HcpRingAttentionBackend {
                     let transport = self.kv_transport.as_mut().unwrap();
                     // Phase 0: 逐个 submit_send 本地 micro blocks（send task 后台传输）
                     for micro_block in &local_micro_blocks {
-                        transport.submit_send(micro_block).unwrap_or_else(|e| panic!("submit_send failed: {e}"));
+                        transport.submit_send(micro_block).map_err(|e| ModelError::Backend(format!("submit_send: {e}")))?;
                     }
                 } // transport borrow 结束
 
@@ -514,19 +514,33 @@ impl HcpRingAttentionBackend {
                 // Phase 2: 循环接收 peer micro blocks，逐个 process，转发
                 // 【streaming compute】收到一个 block 就立刻处理，不等全部收完。
                 // 通过 inner scope 释放 transport borrow，让 process_kv_block 可以获取 &self。
+                // 原因：process_kv_block 需要 &self，而 kv_transport 持有 &mut self，
+                // 两者不能同时存在。inner scope 每轮释放 transport borrow。
                 for round in 0..num_rounds {
+                    let mut expected_micro_idx = 0;
                     loop {
                         // Step 1: 接收一个 micro block（inner scope 释放 transport borrow）
                         let block = {
                             let transport = self.kv_transport.as_mut().unwrap();
-                            match recv_micro_block(transport.as_mut()).unwrap_or_else(|e| panic!("recv_micro_block failed: {e}")) {
+                            match recv_micro_block(transport.as_mut()).map_err(|e| ModelError::Backend(format!("recv_micro_block: {e}")))? {
                                 Some(block) => block,
                                 None => break,
                             }
                         }; // transport borrow 结束
 
-                        let recv_bytes = block.k.numel() * 4 + block.v.numel() * 4;
+                        // 动态计算 element size（支持 Float/Half/BFloat16/Double）
+                        let elem_bytes = match block.k.kind() {
+                            Kind::Float => 4,
+                            Kind::Half => 2,
+                            Kind::BFloat16 => 2,
+                            Kind::Double => 8,
+                            _ => 4,
+                        };
+                        let recv_bytes = block.k.numel() * elem_bytes + block.v.numel() * elem_bytes;
                         let is_last = block.micro_block_idx + 1 == block.total_micro_blocks;
+                        // 防御性断言：micro blocks 必须按顺序到达（QUIC stream 保证有序）
+                        debug_assert_eq!(block.micro_block_idx, expected_micro_idx, "micro blocks must arrive in order; expected {expected_micro_idx}, got {}", block.micro_block_idx);
+                        expected_micro_idx += 1;
                         if is_last {
                             println!("[ring_attention] round {round} layer {}: received micro_block {}/{}, {recv_bytes} bytes (last)",
                                 self.layer_idx, block.micro_block_idx + 1, block.total_micro_blocks);
@@ -583,7 +597,7 @@ impl HcpRingAttentionBackend {
 
         // ====== Phase 4: 提取输出 ======
         let outputs: Vec<Tensor> = q_states.into_iter().map(|s| s.obh).collect();
-        Tensor::cat(&outputs, 2)
+        Ok(Tensor::cat(&outputs, 2))
     }
 
     /// Standard local attention for short sequences or single-token decode.
@@ -728,7 +742,7 @@ impl AttentionBackend for HcpRingAttentionBackend {
 
         // ====== 第七步：Ring Attention（核心分布式注意力计算）======
         // 把 Q 切成多个 chunk，逐个处理本地 KV 和 peer KV，用 online softmax 合并结果。
-        let attn_output = self.ring_attention(&q, &k, &v, attention_mask, global_seq_start);
+        let attn_output = self.ring_attention(&q, &k, &v, attention_mask, global_seq_start)?;
 
         // ====== 第八步：输出投影（O-projection）======
         // attn_output 的 shape: [batch, num_heads, seq_len, head_dim]
@@ -919,7 +933,7 @@ mod tests {
             micro_kv_block_size: 0,
         };
 
-        let actual = backend.ring_attention(&q, &k, &v, None, 0);
+        let actual = backend.ring_attention(&q, &k, &v, None, 0).unwrap();
 
         let diff = (&expected - &actual).abs().mean(Kind::Float);
         let diff_val: f64 = diff.double_value(&[]);
@@ -973,7 +987,7 @@ mod tests {
             micro_kv_block_size: 0,
         };
 
-        let actual = backend.ring_attention(&q, &k, &v, Some(&mask), 0);
+        let actual = backend.ring_attention(&q, &k, &v, Some(&mask), 0).unwrap();
 
         let diff = (&expected - &actual).abs().mean(Kind::Float);
         let diff_val: f64 = diff.double_value(&[]);
@@ -1027,7 +1041,7 @@ mod tests {
 
         // Without transport, ring_attention processes only local KV.
         // Since local KV = full KV (17 tokens), output should match local_attention_scores.
-        let actual = backend.ring_attention(&q, &k, &v, None, 0);
+        let actual = backend.ring_attention(&q, &k, &v, None, 0).unwrap();
 
         let diff = (&expected - &actual).abs().mean(Kind::Float);
         let diff_val: f64 = diff.double_value(&[]);
@@ -1112,7 +1126,7 @@ mod tests {
             disable_overlap: false,
             micro_kv_block_size: 0,
         };
-        let out0 = backend0.ring_attention(&q_all, &k0_local, &v0_local, None, 0);
+        let out0 = backend0.ring_attention(&q_all, &k0_local, &v0_local, None, 0).unwrap();
 
         // Worker 1: receives peer KV [0..7] from worker 0
         let mut transport1 = MockKvTransport::new();
@@ -1147,7 +1161,7 @@ mod tests {
             disable_overlap: false,
             micro_kv_block_size: 0,
         };
-        let out1 = backend1.ring_attention(&q_all, &k1_local, &v1_local, None, half as usize);
+        let out1 = backend1.ring_attention(&q_all, &k1_local, &v1_local, None, half as usize).unwrap();
 
         let diff0 = (&expected - &out0).abs().mean(Kind::Float).double_value(&[]);
         let diff1 = (&expected - &out1).abs().mean(Kind::Float).double_value(&[]);
@@ -1307,7 +1321,7 @@ mod tests {
             disable_overlap: false,
             micro_kv_block_size: 0,
         };
-        let out0 = backend0.ring_attention(&q0, &k0, &v0, Some(&mask), 0);
+        let out0 = backend0.ring_attention(&q0, &k0, &v0, Some(&mask), 0).unwrap();
 
         // Worker 1: receives peer KV from worker 0
         let mut transport1 = MockKvTransport::new();
@@ -1342,7 +1356,7 @@ mod tests {
             disable_overlap: false,
             micro_kv_block_size: 0,
         };
-        let out1 = backend1.ring_attention(&q1, &k1, &v1, Some(&mask), half as usize);
+        let out1 = backend1.ring_attention(&q1, &k1, &v1, Some(&mask), half as usize).unwrap();
 
         // Compare each worker against expected slice before concatenation
         let expected0 = expected.narrow(2, 0, half);
