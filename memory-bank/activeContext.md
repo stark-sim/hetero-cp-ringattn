@@ -15,6 +15,10 @@
   - `/metrics` → counters all zero ✅
   - `/v1/completions` → `{"text":" jumps over the lazy dog","finish_reason":"length"}` ✅
   - 21s 完成，commit `4a08293`
+- **跨节点异构 E2E 验证**（`scripts/test_http_api_cross_node.sh`）：Mac MPS (coordinator+worker0) + white RTX 4090 CUDA (worker1)，Tailscale VPN
+  - `/health` → `{"status":"ok","workers_connected":2,"num_domains":2}` ✅
+  - `/v1/completions` (512-token prompt, max_tokens=1) → `{"text":"1","finish_reason":"length"}` ✅
+  - 59s 完成，commit `a8507d3`
 
 [2026-05-22] **Coordinator shutdown hang 修复**（commit `c4dcfc5`）：
 - Root cause: `write_frame_quic` 无 timeout，worker 断开时 `send.write_all` 无限期 hang

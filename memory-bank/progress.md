@@ -357,6 +357,6 @@
 | M9: 冻结 Python 层，聚焦 Rust + C++ + libtorch | **已决策** | [2026-05-09] Python 层进入维护模式不再扩展，Rust 层是唯一主干 |
 | M10: Rust Static Batching | **已完成** | [2026-05-09] `BatchGenerator` 支持 batch > 1 的 prefill/decode，correctness 验证通过（batch=2 vs 两个独立 batch=1 完全一致），24/24 tests 无 regression |
 | M10.1: Rust 分布式推理服务化 | **已完成** | [2026-05-09] Protocol 添加 request_id、Worker 新请求自动隔离 KV cache、Coordinator 支持 `--prompts-file` 多请求串行处理、Worker 优雅退出。本地 2-domain CPU smoke 验证 2 个 prompt 串行通过，无 panic |
-| M10.2: Rust HTTP API 服务化 | **已完成** | [2026-05-22] axum OpenAI-compatible `/v1/completions` + `/health` + `/metrics`。Coordinator 双模式：batch vs HTTP API（默认）。Request queue + oneshot。45/45 tests passed。Commit `e3eafe9`。本地 2-domain E2E 验证通过（`scripts/test_http_api_local.sh`）：`jumps over the lazy dog` ✅ |
+| M10.2: Rust HTTP API 服务化 | **已完成** | [2026-05-22] axum OpenAI-compatible `/v1/completions` + `/health` + `/metrics`。Coordinator 双模式：batch vs HTTP API（默认）。Request queue + oneshot。45/45 tests passed。Commit `e3eafe9`。本地 E2E (`test_http_api_local.sh`) 21s ✅ `jumps over the lazy dog`。跨节点异构 E2E (`test_http_api_cross_node.sh`) 59s ✅ Mac MPS + white RTX 4090 CUDA，Tailscale VPN，`generated: 1` |
 | M10.3: Rust 性能优化与生产化 | **待启动** | 量化（暂不实施，correctness 优先）、连续 batching、RDMA transport |
 | M11: vLLM Block-Aware Ring | **远景** | [2026-05-09] 核心洞察：ring 在 vLLM block 层面运作。详见 `docs/BLOCK_RING_FUSION.md` |
