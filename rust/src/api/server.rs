@@ -29,6 +29,8 @@ pub struct ApiState {
     pub workers_connected: Arc<AtomicU64>,
     pub num_domains: usize,
     pub model_name: String,
+    pub queued_counter: Arc<AtomicU64>,
+    pub active_counter: Arc<AtomicU64>,
 }
 
 /// Build the axum router.
@@ -72,6 +74,7 @@ async fn completions_handler(
             "Coordinator queue is closed".to_string(),
         ));
     }
+    state.queued_counter.fetch_add(1, Ordering::SeqCst);
 
     let result = match rx.await {
         Ok(r) => r,
@@ -127,5 +130,7 @@ async fn metrics_handler(State(state): State<ApiState>) -> Json<MetricsResponse>
         total_requests: state.request_counter.load(Ordering::SeqCst),
         completed_requests: state.completed_counter.load(Ordering::SeqCst),
         failed_requests: state.failed_counter.load(Ordering::SeqCst),
+        queued_requests: state.queued_counter.load(Ordering::SeqCst),
+        active_requests: state.active_counter.load(Ordering::SeqCst),
     })
 }

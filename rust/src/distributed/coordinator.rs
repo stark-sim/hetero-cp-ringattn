@@ -360,12 +360,16 @@ pub fn run() {
         .map(|(_, _, send, recv)| (send, recv))
         .collect();
 
+    // Wrap worker_streams in Arc<Mutex> for shared access between concurrent requests.
+    let worker_streams = Arc::new(std::sync::Mutex::new(worker_streams));
+
     if has_cli_prompts && !cli_prompts.is_empty() {
-        // Batch mode: process CLI prompts then exit
+        // Batch mode: process CLI prompts then exit (serial, no concurrency needed)
         println!("[coordinator] loaded {} prompt(s)", cli_prompts.len());
         for (req_idx, prompt_text) in cli_prompts.iter().enumerate() {
             let request_id = (req_idx + 1) as u64;
             println!("\n[coordinator] === Request {} / {} ===", request_id, cli_prompts.len());
+            let mut guard = worker_streams.lock().unwrap_or_else(|e| e.into_inner());
             match process_single_request(
                 request_id,
                 prompt_text,
@@ -374,7 +378,7 @@ pub fn run() {
                 args.top_p,
                 &tokenizer,
                 &config,
-                &mut worker_streams,
+                &mut *guard,
                 &args.chunk_sizes,
                 args.capacity_aware,
                 &worker_capacities,
@@ -389,12 +393,22 @@ pub fn run() {
             }
         }
         println!("\n[coordinator] all requests done, shutting down workers");
+        let mut worker_streams = match Arc::try_unwrap(worker_streams) {
+            Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| e.into_inner()),
+            Err(_) => {
+                eprintln!("[coordinator] warning: worker_streams still shared, cannot shutdown cleanly");
+                return;
+            }
+        };
         shutdown_workers(&mut worker_streams, &endpoint, &rt);
         return;
     }
 
     // HTTP API mode
     let (job_tx, mut job_rx) = tokio::sync::mpsc::unbounded_channel::<InferenceJob>();
+
+    let queued_counter = Arc::new(AtomicU64::new(0));
+    let active_counter = Arc::new(AtomicU64::new(0));
 
     let api_state = ApiState {
         job_tx,
@@ -404,6 +418,8 @@ pub fn run() {
         workers_connected: Arc::new(AtomicU64::new(args.num_domains as u64)),
         num_domains: args.num_domains,
         model_name: "qwen2-0.5b".to_string(), // TODO: derive from config
+        queued_counter: queued_counter.clone(),
+        active_counter: active_counter.clone(),
     };
 
     let http_addr = args.http_addr.clone();
@@ -425,9 +441,13 @@ pub fn run() {
         });
     });
 
-    println!("[coordinator] entering HTTP service mode. Press Ctrl+C to exit.");
+    let max_concurrent = 4usize;
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+    println!("[coordinator] entering HTTP service mode (max_concurrent={max_concurrent}). Press Ctrl+C to exit.");
 
-    // Service loop: pull jobs from the queue and process them
+    // Service loop: pull jobs from the queue and process them concurrently.
+    // Each request runs in a spawn_blocking task; Mutex ensures only one request
+    // uses the worker_streams at a time, preventing command interleaving.
     loop {
         let job = match rt.block_on(job_rx.recv()) {
             Some(j) => j,
@@ -437,39 +457,112 @@ pub fn run() {
             }
         };
 
-        let result = process_single_request(
-            job.request_id,
-            &job.prompt,
-            job.max_tokens,
-            job.temperature,
-            job.top_p,
-            &tokenizer,
-            &config,
-            &mut worker_streams,
-            &args.chunk_sizes,
-            args.capacity_aware,
-            &worker_capacities,
-            &rt,
-        );
+        queued_counter.fetch_sub(1, Ordering::SeqCst);
+        active_counter.fetch_add(1, Ordering::SeqCst);
 
-        match result {
-            Ok(inference_result) => {
-                let _ = job.tx.send(inference_result);
+        let streams = worker_streams.clone();
+        let permit = rt.block_on(semaphore.clone().acquire_owned()).expect("semaphore closed");
+        let tokenizer = tokenizer.clone();
+        let config = config.clone();
+        let worker_capacities = worker_capacities.clone();
+        let chunk_sizes = args.chunk_sizes.clone();
+        let capacity_aware = args.capacity_aware;
+        let request_id = job.request_id;
+        let prompt = job.prompt;
+        let max_tokens = job.max_tokens;
+        let temperature = job.temperature;
+        let top_p = job.top_p;
+        let job_result_tx = job.tx;
+
+        let active_counter_clone = active_counter.clone();
+        let _ = rt.spawn_blocking(move || {
+            let _permit = permit; // hold until done
+            let _active_decrement = ActiveRequestGuard(active_counter_clone);
+            let mut guard = match streams.lock() {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("[coordinator] mutex poisoned: {e}");
+                    let _ = job_result_tx.send(InferenceResult {
+                        text: "[error: internal mutex poisoned]".to_string(),
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        finish_reason: Some("error".to_string()),
+                    });
+                    return;
+                }
+            };
+            let local_rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("[coordinator] failed to create local runtime: {e}");
+                    let _ = job_result_tx.send(InferenceResult {
+                        text: format!("[error: failed to create local runtime: {e}]"),
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        finish_reason: Some("error".to_string()),
+                    });
+                    return;
+                }
+            };
+            let result = process_single_request(
+                request_id,
+                &prompt,
+                max_tokens,
+                temperature,
+                top_p,
+                &tokenizer,
+                &config,
+                &mut *guard,
+                &chunk_sizes,
+                capacity_aware,
+                &worker_capacities,
+                &local_rt,
+            );
+            match result {
+                Ok(inference_result) => {
+                    let _ = job_result_tx.send(inference_result);
+                }
+                Err(e) => {
+                    eprintln!("[coordinator] request {request_id} failed: {e}");
+                    let _ = job_result_tx.send(InferenceResult {
+                        text: format!("[error: {e}]"),
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        finish_reason: Some("error".to_string()),
+                    });
+                }
             }
-            Err(e) => {
-                eprintln!("[coordinator] request {} failed: {e}", job.request_id);
-                let _ = job.tx.send(InferenceResult {
-                    text: format!("[error: {e}]"),
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    finish_reason: Some("error".to_string()),
-                });
-            }
-        }
+        });
     }
 
+    // Wait for all spawned tasks to finish before shutdown.
+    println!("[coordinator] waiting for all requests to finish...");
+    let shutdown_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while Arc::strong_count(&worker_streams) > 1 && std::time::Instant::now() < shutdown_deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if Arc::strong_count(&worker_streams) > 1 {
+        eprintln!("[coordinator] warning: some requests still active after 30s, forcing shutdown");
+    }
+
+    let mut worker_streams = match Arc::try_unwrap(worker_streams) {
+        Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| e.into_inner()),
+        Err(_) => {
+            eprintln!("[coordinator] warning: worker_streams still shared, using best-effort shutdown");
+            return;
+        }
+    };
     println!("\n[coordinator] shutting down workers");
     shutdown_workers(&mut worker_streams, &endpoint, &rt);
+}
+
+/// RAII guard that decrements the active request counter on drop.
+struct ActiveRequestGuard(Arc<AtomicU64>);
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Gracefully shutdown all workers with timeout protection.

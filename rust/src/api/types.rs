@@ -64,6 +64,8 @@ pub struct MetricsResponse {
     pub total_requests: u64,
     pub completed_requests: u64,
     pub failed_requests: u64,
+    pub queued_requests: u64,
+    pub active_requests: u64,
 }
 
 /// Internal job submitted from HTTP handler to the coordinator loop.
