@@ -1,0 +1,36 @@
+id: "ISSUE-001"
+timestamp: "2026-05-22T10:35:34Z"
+
+type: "bug"
+severity: "high"
+
+# 问题描述
+description: |
+  Pipeline Phase 2 in ring.rs does NOT stream compute: recv blocks are collected into Vec before processing, defeating the intended compute-communication overlap. Design: recv→process→forward per block. Implementation: recv ALL → sort → process ALL. Root cause: inner scope collects all blocks to release transport borrow before process_kv_block(&self). Fix: release transport borrow per block, process immediately, then re-acquire for forwarding.
+
+# 根本原因分析（待补充）
+root_cause: |
+  TODO: 分析根本原因
+
+# 影响评估（待补充）
+impact:
+  tokens_wasted: 0
+  time_wasted_minutes: 0
+  steps_wasted: 0
+  other: |
+    TODO: 评估影响
+
+# 解决方案（待补充）
+resolution: |
+  TODO: 记录解决方案
+
+# 预防措施（待补充）
+prevention: |
+  TODO: 记录预防措施
+
+status: "active"
+related_issues: []
+tags: []
+
+# 复盘记录
+retrospectives: []

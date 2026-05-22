@@ -511,52 +511,45 @@ impl HcpRingAttentionBackend {
                     }
                 }
 
-                // Phase 2: 循环接收 peer micro blocks，process，转发
+                // Phase 2: 循环接收 peer micro blocks，逐个 process，转发
+                // 【streaming compute】收到一个 block 就立刻处理，不等全部收完。
+                // 通过 inner scope 释放 transport borrow，让 process_kv_block 可以获取 &self。
                 for round in 0..num_rounds {
-                    // 收集这个 round 的所有 peer micro blocks
-                    let peer_micro_blocks: Vec<KvBlock> = {
-                        let transport = self.kv_transport.as_mut().unwrap();
-                        let mut blocks = Vec::new();
-                        loop {
+                    loop {
+                        // Step 1: 接收一个 micro block（inner scope 释放 transport borrow）
+                        let block = {
+                            let transport = self.kv_transport.as_mut().unwrap();
                             match recv_micro_block(transport.as_mut()).unwrap_or_else(|e| panic!("recv_micro_block failed: {e}")) {
-                                Some(block) => {
-                                    let recv_bytes = block.k.numel() * 4 + block.v.numel() * 4;
-                                    let is_last = block.micro_block_idx + 1 == block.total_micro_blocks;
-                                    if is_last {
-                                        println!("[ring_attention] round {round} layer {}: received micro_block {}/{}, {recv_bytes} bytes (last)",
-                                            self.layer_idx, block.micro_block_idx + 1, block.total_micro_blocks);
-                                    }
-                                    blocks.push(block);
-                                    if is_last { break; }
-                                }
+                                Some(block) => block,
                                 None => break,
                             }
+                        }; // transport borrow 结束
+
+                        let recv_bytes = block.k.numel() * 4 + block.v.numel() * 4;
+                        let is_last = block.micro_block_idx + 1 == block.total_micro_blocks;
+                        if is_last {
+                            println!("[ring_attention] round {round} layer {}: received micro_block {}/{}, {recv_bytes} bytes (last)",
+                                self.layer_idx, block.micro_block_idx + 1, block.total_micro_blocks);
                         }
 
-                        // 转发（最后一轮不需要）
-                        if round < num_rounds.saturating_sub(1) {
-                            for micro_block in &blocks {
-                                transport.submit_send(micro_block).unwrap_or_else(|e| panic!("submit_send failed: {e}"));
-                            }
-                        }
-                        blocks
-                    }; // transport borrow 结束
-
-                    // 按 global_seq_start 排序（确保 online softmax 顺序正确）
-                    let mut sorted = peer_micro_blocks;
-                    sorted.sort_by_key(|b| b.global_seq_start);
-
-                    // 处理每个 peer micro block
-                    for micro_block in &sorted {
+                        // Step 2: 立刻处理这个 block（transport borrow 已释放）
                         for state in q_states.iter_mut() {
                             self.process_kv_block(
                                 &state.q_chunk, state.q_global_start, state.q_global_end,
-                                &micro_block.k, &micro_block.v,
-                                micro_block.global_seq_start, micro_block.global_seq_end,
+                                &block.k, &block.v,
+                                block.global_seq_start, block.global_seq_end,
                                 &mut state.rm, &mut state.rs, &mut state.obh,
                                 apply_causal,
                             );
                         }
+
+                        // Step 3: 转发（最后一轮不需要）
+                        if round < num_rounds.saturating_sub(1) {
+                            let transport = self.kv_transport.as_mut().unwrap();
+                            transport.submit_send(&block).unwrap_or_else(|e| panic!("submit_send failed: {e}"));
+                        }
+
+                        if is_last { break; }
                     }
                 }
 
