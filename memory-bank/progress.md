@@ -151,8 +151,8 @@
     * 2-domain ring: Mac MPS + white RTX 4090 CUDA, Tailscale VPN (~380ms RTT)
     * **成功**: 64/256/512 tokens 全部完成（Serial + Pipeline）
     * **Pipeline 收益递减**: 64-token +5% (60s→57s) → 256-token +2% (211s→207s) → 512-token **-2%** (383s→390s)
-    * **512 tokens 是弱网可靠上限**: 1024/2048/4096 全部失败
-    * **1024+ 失败根因**: coordinator shutdown 阶段卡住（已知 bug），600s timeout 后强制 kill
+    * **512 tokens 是弱网可靠上限**: 1024/2048/4096 全部失败（但根因不同）
+    * **[x] 1024+ shutdown hang 已修复**（commit `c4dcfc5`）: `write_frame_quic` 无 timeout，worker 断开时 `send.write_all` 无限期 hang。新增 `write_frame_quic_timeout` / `send_command_quic_timeout`，coordinator `shutdown_workers()` 使用 10s timeout + `finish()` streams + `endpoint.close()` + 2s cleanup sleep。
     * **4096 pipeline**: 2404s (~40min) 后 network failed
     * 报告: `reports/mac-white-weaknet-ab-20260522/README.md`
     * **公式验证**: `benefit ≈ 1 - compute/(compute+network)` — Mac MPS 计算慢，小序列时 compute≈network 有收益；512+ 时 network>>compute，Pipeline overhead 超过收益
@@ -357,6 +357,6 @@
 | M9: 冻结 Python 层，聚焦 Rust + C++ + libtorch | **已决策** | [2026-05-09] Python 层进入维护模式不再扩展，Rust 层是唯一主干 |
 | M10: Rust Static Batching | **已完成** | [2026-05-09] `BatchGenerator` 支持 batch > 1 的 prefill/decode，correctness 验证通过（batch=2 vs 两个独立 batch=1 完全一致），24/24 tests 无 regression |
 | M10.1: Rust 分布式推理服务化 | **已完成** | [2026-05-09] Protocol 添加 request_id、Worker 新请求自动隔离 KV cache、Coordinator 支持 `--prompts-file` 多请求串行处理、Worker 优雅退出。本地 2-domain CPU smoke 验证 2 个 prompt 串行通过，无 panic |
-| M10.2: Rust HTTP API 服务化 | **已完成** | [2026-05-22] axum OpenAI-compatible `/v1/completions` + `/health` + `/metrics`。Coordinator 双模式：batch（`--prompts-file`）vs HTTP API（默认）。Request queue + oneshot result channel。`process_single_request()` 提取复用。45/45 tests passed。Commit `e3eafe9` |
+| M10.2: Rust HTTP API 服务化 | **已完成** | [2026-05-22] axum OpenAI-compatible `/v1/completions` + `/health` + `/metrics`。Coordinator 双模式：batch vs HTTP API（默认）。Request queue + oneshot。45/45 tests passed。Commit `e3eafe9`。本地 2-domain E2E 验证通过（`scripts/test_http_api_local.sh`）：`jumps over the lazy dog` ✅ |
 | M10.3: Rust 性能优化与生产化 | **待启动** | 量化（暂不实施，correctness 优先）、连续 batching、RDMA transport |
 | M11: vLLM Block-Aware Ring | **远景** | [2026-05-09] 核心洞察：ring 在 vLLM block 层面运作。详见 `docs/BLOCK_RING_FUSION.md` |

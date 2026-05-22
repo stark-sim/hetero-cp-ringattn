@@ -2,7 +2,7 @@
 
 ## 当前焦点
 
-[2026-05-22] **M10.2 HTTP API 服务化完成** — Coordinator 新增 axum OpenAI-compatible API：
+[2026-05-22] **M10.2 HTTP API 服务化完成 + 本地 E2E 验证通过**：
 - `POST /v1/completions` — 标准 completions API（prompt, max_tokens, temperature, top_p）
 - `GET /health` — workers_connected, num_domains
 - `GET /metrics` — total/completed/failed request counters
@@ -10,6 +10,17 @@
 - `process_single_request()` 从 `run()` 提取，batch 和 HTTP 复用同一核心逻辑
 - HTTP server 独立线程 + tokio runtime，通过 `mpsc::unbounded_channel` + `oneshot` 与 coordinator 主循环通信
 - 45/45 tests passed，零 regression。Commit `e3eafe9`
+- **本地 E2E 验证**（`scripts/test_http_api_local.sh`）：coordinator HTTP mode + 2 local workers
+  - `/health` → `{"status":"ok","workers_connected":2,"num_domains":2}` ✅
+  - `/metrics` → counters all zero ✅
+  - `/v1/completions` → `{"text":" jumps over the lazy dog","finish_reason":"length"}` ✅
+  - 21s 完成，commit `4a08293`
+
+[2026-05-22] **Coordinator shutdown hang 修复**（commit `c4dcfc5`）：
+- Root cause: `write_frame_quic` 无 timeout，worker 断开时 `send.write_all` 无限期 hang
+- Fix: `write_frame_quic_timeout` / `read_frame_quic_timeout` / `send_command_quic_timeout` / `recv_command_quic_timeout`
+- Coordinator `shutdown_workers()` 使用 10s timeout 发送 Shutdown，finish() streams，close endpoint，sleep 2s
+- 45/45 tests passed
 
 [2026-05-22] **Mac + white 弱网 A/B 测试完成 + Pipeline Phase 2 修复**：
 - **测试**: 64/256/512 tokens 全部完成（Serial + Pipeline），512 是弱网可靠上限
