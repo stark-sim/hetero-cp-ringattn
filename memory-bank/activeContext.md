@@ -2,6 +2,18 @@
 
 ## 当前焦点
 
+[2026-05-22] **M10.3 Request-Level Parallelism 完成**：
+- Coordinator 并发请求处理：`worker_streams` 用 `Arc<std::sync::Mutex>` 保护，`rt.spawn_blocking()` 并发处理 HTTP 请求
+- `max_concurrent=4` 信号量限制并发数，防止 worker 过载
+- `ActiveRequestGuard` RAII 自动管理 `active_counter`
+- `/metrics` 新增 `queued_requests` 和 `active_requests` 字段
+- **本地并发 E2E 验证**（`scripts/test_http_api_concurrent_local.sh`）：同时提交 2 个请求
+  - Request 1: `jumps over the lazy dog` ✅
+  - Request 2: `there was a man` ✅
+  - `/metrics` → `{"total_requests":2,"completed_requests":2,"queued_requests":0,"active_requests":0}` ✅
+  - 无 panic，无 command 交错，correctness 无 regression
+- 45/45 cargo tests passed。Commit `5ffa83f`
+
 [2026-05-22] **M10.2 HTTP API 服务化完成 + 本地 E2E 验证通过**：
 - `POST /v1/completions` — 标准 completions API（prompt, max_tokens, temperature, top_p）
 - `GET /health` — workers_connected, num_domains
