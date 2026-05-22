@@ -156,6 +156,8 @@
     * **4096 pipeline**: 2404s (~40min) 后 network failed
     * 报告: `reports/mac-white-weaknet-ab-20260522/README.md`
     * **公式验证**: `benefit ≈ 1 - compute/(compute+network)` — Mac MPS 计算慢，小序列时 compute≈network 有收益；512+ 时 network>>compute，Pipeline overhead 超过收益
+    * **根因排查**: Pipeline Phase 2 实现缺陷（ISSUE-001）— 收集完全部 peer blocks 后才统一 process，receive 与 compute 完全不重叠。Serial 已天然双向并发，Pipeline 额外 overlap 被 micro block overhead 抵消
+    * **已修复**（commit `cbefc49`）: Pipeline Phase 2 改为逐个 block 接收→立刻 process→转发。45/45 tests passed，零 regression
   - **4K 4-domain 异构测试**（Mac MPS + sd-1 + sd-2 + white）：
     * **Serial 模式**：✅ **成功完成，4988s（1h 23m）**。根因修复：`quic.rs` mpsc channel buffer 从 2 增大到 64，解决了 N-domain Serial 模式下 24 个 layer blocks 同时提交导致的分布式死锁。4 个 worker 全部完成 prefill（global_seq_len=4096），decode 生成 1 token（`over`），exit=0。报告：`reports/cross-node-4domain-4k-serial-20260522/`
     * **Pipeline 模式**：❌ prefill 阶段 connection lost（2166s，~36min）。d0/d1 PrefillDone 收到后 d2/d3 连接断开。根因：Tailscale VPN 大传输量（~528MB/worker）+ 长时间 → QUIC 连接不稳定。Pipeline 逻辑本身正确（d0 日志显示 3 rounds × 24 layers 正常推进）

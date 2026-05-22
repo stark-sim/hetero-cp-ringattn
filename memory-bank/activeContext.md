@@ -2,12 +2,12 @@
 
 ## 当前焦点
 
-[2026-05-22] **Mac + white 弱网 A/B 测试完成** — 512 tokens 是可靠上限：
-- **成功**: 64/256/512 tokens 全部完成（Serial + Pipeline）
+[2026-05-22] **Mac + white 弱网 A/B 测试完成 + Pipeline Phase 2 修复**：
+- **测试**: 64/256/512 tokens 全部完成（Serial + Pipeline），512 是弱网可靠上限
 - **Pipeline 收益递减**: 64-token +5% → 256-token +2% → 512-token **-2%**
-- **512 tokens 是弱网可靠上限**: 1024/2048/4096 全部因 coordinator shutdown 卡住而超时失败
-- **4096 pipeline**: 2404s (~40min) 后 network failed
-- **公式验证**: `benefit ≈ 1 - compute/(compute+network)` — Mac MPS 计算慢，小序列有收益；512+ 时 network>>compute，Pipeline overhead 超过收益
+- **根因排查**（ISSUE-001）: Pipeline Phase 2 收集完全部 blocks 后才 process，receive 阻塞 compute，overlap 未实现
+- **已修复**（`cbefc49`）: Phase 2 改为逐个 block 接收→立刻 process→转发，实现 true streaming compute
+- 45/45 tests passed，零 regression
 - 报告: `reports/mac-white-weaknet-ab-20260522/README.md`
 
 [2026-05-22] **4-domain 4K Serial 异构测试首次成功** — 4988s（1h 23m）：
