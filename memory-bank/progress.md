@@ -147,6 +147,15 @@
     * **Micro block 是稳定性必需品**：无 micro block 时大传输导致 connection lost；micro block 本身增加 ~10% 开销（299s→330s）
     * **公式验证**：Pipeline 收益 ≈ 1 - compute/(compute+network)。Mac MPS 计算慢 → compute≈network → 收益大；双 CUDA 计算快 → compute>>network → 收益趋近于 0
     * **Scaling insight**：当前 512-token 传输量太小（~22MB/round），不足以拉开差距。随着 seq_len 增加（4K→175MB/round, 8K→350MB/round）和 domain 增加（4-domain→3 rounds），network_time 线性增长而 compute_time 增长较慢 → ratio 逆转 → Pipeline 收益将显著增大。4K/8K+多 domain 才是 Pipeline 真正的战场
+  - **Mac + white 弱网 A/B 测试**（2026-05-22）：
+    * 2-domain ring: Mac MPS + white RTX 4090 CUDA, Tailscale VPN (~380ms RTT)
+    * **成功**: 64/256/512 tokens 全部完成（Serial + Pipeline）
+    * **Pipeline 收益递减**: 64-token +5% (60s→57s) → 256-token +2% (211s→207s) → 512-token **-2%** (383s→390s)
+    * **512 tokens 是弱网可靠上限**: 1024/2048/4096 全部失败
+    * **1024+ 失败根因**: coordinator shutdown 阶段卡住（已知 bug），600s timeout 后强制 kill
+    * **4096 pipeline**: 2404s (~40min) 后 network failed
+    * 报告: `reports/mac-white-weaknet-ab-20260522/README.md`
+    * **公式验证**: `benefit ≈ 1 - compute/(compute+network)` — Mac MPS 计算慢，小序列时 compute≈network 有收益；512+ 时 network>>compute，Pipeline overhead 超过收益
   - **4K 4-domain 异构测试**（Mac MPS + sd-1 + sd-2 + white）：
     * **Serial 模式**：✅ **成功完成，4988s（1h 23m）**。根因修复：`quic.rs` mpsc channel buffer 从 2 增大到 64，解决了 N-domain Serial 模式下 24 个 layer blocks 同时提交导致的分布式死锁。4 个 worker 全部完成 prefill（global_seq_len=4096），decode 生成 1 token（`over`），exit=0。报告：`reports/cross-node-4domain-4k-serial-20260522/`
     * **Pipeline 模式**：❌ prefill 阶段 connection lost（2166s，~36min）。d0/d1 PrefillDone 收到后 d2/d3 连接断开。根因：Tailscale VPN 大传输量（~528MB/worker）+ 长时间 → QUIC 连接不稳定。Pipeline 逻辑本身正确（d0 日志显示 3 rounds × 24 layers 正常推进）

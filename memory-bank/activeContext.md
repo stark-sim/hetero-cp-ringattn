@@ -2,11 +2,17 @@
 
 ## 当前焦点
 
+[2026-05-22] **Mac + white 弱网 A/B 测试完成** — 512 tokens 是可靠上限：
+- **成功**: 64/256/512 tokens 全部完成（Serial + Pipeline）
+- **Pipeline 收益递减**: 64-token +5% → 256-token +2% → 512-token **-2%**
+- **512 tokens 是弱网可靠上限**: 1024/2048/4096 全部因 coordinator shutdown 卡住而超时失败
+- **4096 pipeline**: 2404s (~40min) 后 network failed
+- **公式验证**: `benefit ≈ 1 - compute/(compute+network)` — Mac MPS 计算慢，小序列有收益；512+ 时 network>>compute，Pipeline overhead 超过收益
+- 报告: `reports/mac-white-weaknet-ab-20260522/README.md`
+
 [2026-05-22] **4-domain 4K Serial 异构测试首次成功** — 4988s（1h 23m）：
-- **Serial 模式**：✅ **成功完成**。`quic.rs` mpsc channel buffer 2→64 修复了 N-domain Serial 死锁。4 个 worker（Mac MPS + sd-1 4080S + sd-2 4080S + white 4090）全部完成 prefill（4096 tokens），decode 生成 1 token（`over`）。exit=0。报告：`reports/cross-node-4domain-4k-serial-20260522/`
-- **关键数据点**：Serial 无 overlap 模式下，跨 VPN 传输 ~168MB/worker × 4 rounds = 主要时间消耗。Mac MPS 计算慢进一步放大总时间。
+- **Serial 模式**：✅ **成功完成**。`quic.rs` mpsc channel buffer 2→64 修复了 N-domain Serial 死锁。4 个 worker 全部完成 prefill（4096 tokens），decode 生成 1 token（`over`）。exit=0。报告：`reports/cross-node-4domain-4k-serial-20260522/`
 - **Pipeline 模式**：❌ 仍待验证。上次尝试 2166s 后 connection lost（Tailscale VPN 大传输不稳定）。需要 LAN 环境才能做 Serial vs Pipeline 4K 4-domain A/B 对比。
-- **512-token A/B 已完成**：Mac+white Pipeline 快 40%，sd-1+white Pipeline 仅快 3.3%。公式 `benefit ≈ 1 - compute/(compute+network)` 已验证。
 
 Python 层冻结。Rust 层为主干。
 
