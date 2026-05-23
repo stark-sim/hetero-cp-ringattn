@@ -652,6 +652,11 @@ impl AttentionBackend for HcpRingAttentionBackend {
         if let Some(t) = transport {
             self.kv_transport = Some(t);
         }
+        // Reset per-request state when seq_offset is explicitly updated (new prefill).
+        // Without this, subsequent requests reuse stale prefill_kv_len from previous
+        // requests, causing narrow() to fail when the new KV cache is shorter.
+        self.is_prefill_done = false;
+        self.prefill_kv_len = 0;
     }
     fn forward(
         &mut self,

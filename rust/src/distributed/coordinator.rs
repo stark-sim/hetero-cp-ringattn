@@ -165,6 +165,16 @@ fn process_single_request(
         chunks
     };
 
+    for (i, size) in chunk_sizes.iter().enumerate() {
+        if *size == 0 {
+            return Err(format!(
+                "prompt too short: domain {} received 0 tokens (total {} tokens, {} domains). \
+                 Each domain needs at least 1 token.",
+                i, prompt_ids.len(), num_domains
+            ));
+        }
+    }
+
     let mut chunk_boundaries = vec![0usize];
     for size in &chunk_sizes {
         chunk_boundaries.push(chunk_boundaries.last().unwrap() + size);
