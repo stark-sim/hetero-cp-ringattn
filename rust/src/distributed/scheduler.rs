@@ -261,4 +261,128 @@ mod tests {
         scheduler.remove_active(j.request_id);
         assert!(!scheduler.has_work());
     }
+
+    #[test]
+    fn test_scheduler_dynamic_batch_size() {
+        let mut scheduler = BatchScheduler::new(2);
+
+        // Enqueue 3 jobs
+        scheduler.enqueue(make_job(1));
+        scheduler.enqueue(make_job(2));
+        scheduler.enqueue(make_job(3));
+
+        // Admit 2 into active (batch full)
+        let j1 = scheduler.try_dequeue_pending().unwrap();
+        let (tx1, _rx1) = tokio::sync::oneshot::channel();
+        scheduler.add_active(ActiveRequest {
+            request_id: j1.request_id,
+            prompt: j1.prompt,
+            max_tokens: j1.max_tokens,
+            temperature: j1.temperature,
+            top_p: j1.top_p,
+            prompt_ids: vec![1],
+            prompt_tokens: 1,
+            chunk_boundaries: vec![0, 1],
+            generated_ids: vec![10],
+            next_token: 100,
+            finish_reason: None,
+            result_tx: tx1,
+        });
+
+        let j2 = scheduler.try_dequeue_pending().unwrap();
+        let (tx2, _rx2) = tokio::sync::oneshot::channel();
+        scheduler.add_active(ActiveRequest {
+            request_id: j2.request_id,
+            prompt: j2.prompt,
+            max_tokens: j2.max_tokens,
+            temperature: j2.temperature,
+            top_p: j2.top_p,
+            prompt_ids: vec![2],
+            prompt_tokens: 1,
+            chunk_boundaries: vec![0, 1],
+            generated_ids: vec![20],
+            next_token: 200,
+            finish_reason: None,
+            result_tx: tx2,
+        });
+
+        assert_eq!(scheduler.active_len(), 2);
+        assert!(!scheduler.can_admit());
+        assert!(scheduler.try_dequeue_pending().is_none()); // batch full
+
+        // Simulate iteration: collect tokens from all active requests
+        let tokens: Vec<(u64, i64)> = scheduler.active_requests()
+            .values()
+            .map(|req| (req.request_id, req.next_token))
+            .collect();
+        assert_eq!(tokens.len(), 2);
+        assert!(tokens.iter().any(|(id, _)| *id == 1));
+        assert!(tokens.iter().any(|(id, _)| *id == 2));
+
+        // Request 1 completes — remove it
+        scheduler.remove_active(1);
+        assert_eq!(scheduler.active_len(), 1);
+        assert!(scheduler.can_admit());
+
+        // Now job 3 can be admitted
+        let j3 = scheduler.try_dequeue_pending().unwrap();
+        assert_eq!(j3.request_id, 3);
+        let (tx3, _rx3) = tokio::sync::oneshot::channel();
+        scheduler.add_active(ActiveRequest {
+            request_id: j3.request_id,
+            prompt: j3.prompt,
+            max_tokens: j3.max_tokens,
+            temperature: j3.temperature,
+            top_p: j3.top_p,
+            prompt_ids: vec![3],
+            prompt_tokens: 1,
+            chunk_boundaries: vec![0, 1],
+            generated_ids: vec![30],
+            next_token: 300,
+            finish_reason: None,
+            result_tx: tx3,
+        });
+
+        assert_eq!(scheduler.active_len(), 2);
+        assert!(!scheduler.can_admit());
+
+        // Verify active request IDs
+        let ids = scheduler.active_request_ids();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&2));
+        assert!(ids.contains(&3));
+    }
+
+    #[test]
+    fn test_scheduler_active_requests_mut() {
+        let mut scheduler = BatchScheduler::new(2);
+        scheduler.enqueue(make_job(1));
+
+        let j = scheduler.try_dequeue_pending().unwrap();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        scheduler.add_active(ActiveRequest {
+            request_id: j.request_id,
+            prompt: j.prompt,
+            max_tokens: j.max_tokens,
+            temperature: j.temperature,
+            top_p: j.top_p,
+            prompt_ids: vec![1],
+            prompt_tokens: 1,
+            chunk_boundaries: vec![0, 1],
+            generated_ids: vec![10],
+            next_token: 100,
+            finish_reason: None,
+            result_tx: tx,
+        });
+
+        // Modify next_token via mutable access
+        if let Some(req) = scheduler.get_active_mut(1) {
+            req.next_token = 999;
+            req.generated_ids.push(42);
+        }
+
+        let req = scheduler.get_active_mut(1).unwrap();
+        assert_eq!(req.next_token, 999);
+        assert_eq!(req.generated_ids, vec![10, 42]);
+    }
 }

@@ -251,3 +251,148 @@ impl WorkerBackend for TchWorkerBackend {
         self.device
     }
 }
+
+
+#[cfg(test)]
+#[cfg(feature = "tch-backend")]
+mod tests {
+    use super::*;
+    use crate::model::config::ModelConfig;
+    use crate::model::model::{LlamaModel, create_synthetic_weights};
+    use crate::worker_sdk::backend::WorkerBackend;
+    use tch::{Device, Kind, Tensor};
+
+    /// Verify that `decode_batch` produces identical logits to individual `decode_request`
+    /// calls, and that per-request KV caches remain isolated (no cross-contamination).
+    #[test]
+    fn test_decode_batch_isolation() {
+        let device = Device::Cpu;
+
+        let config = ModelConfig {
+            architectures: Some(vec!["LlamaForCausalLM".to_string()]),
+            hidden_size: 32,
+            num_layers: 2,
+            num_heads: 4,
+            num_kv_heads: Some(1),
+            intermediate_size: 64,
+            vocab_size: 100,
+            rope_theta: 10000.0,
+            rms_norm_eps: 1e-6,
+            tie_word_embeddings: false,
+            torch_dtype: Some("float32".to_string()),
+            hidden_act: "silu".to_string(),
+            max_position_embeddings: Some(128),
+            attention_dropout: 0.0,
+            bos_token_id: None,
+            eos_token_id: None,
+            use_cache: true,
+            sliding_window: None,
+            use_sliding_window: None,
+            partial_rotary_factor: 1.0,
+        };
+
+        let weights = create_synthetic_weights(&config, device);
+
+        // Create two independent backends from identical weights.
+        let model_batch = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+        let model_ref = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+
+        let mut backend_batch = TchWorkerBackend::from_model(model_batch, device, 0);
+        let mut backend_ref = TchWorkerBackend::from_model(model_ref, device, 0);
+
+        // Two different prompts (same length to keep things simple)
+        let seq_len = 12i64;
+        let prompt_a: Vec<i64> = (0..seq_len).collect();
+        let prompt_b: Vec<i64> = (10..10 + seq_len).collect();
+
+        // Prefill both requests on both backends
+        let (logits_a_batch, _) = backend_batch.prefill_request(1, &prompt_a, 0).unwrap();
+        let (logits_b_batch, _) = backend_batch.prefill_request(2, &prompt_b, 0).unwrap();
+
+        let (logits_a_ref, _) = backend_ref.prefill_request(1, &prompt_a, 0).unwrap();
+        let (logits_b_ref, _) = backend_ref.prefill_request(2, &prompt_b, 0).unwrap();
+
+        // Verify prefill logits match (sanity check)
+        let prefill_diff_a = Tensor::from_slice(&logits_a_batch)
+            .f_sub(&Tensor::from_slice(&logits_a_ref)).unwrap()
+            .abs().mean(Kind::Float).double_value(&[]);
+        let prefill_diff_b = Tensor::from_slice(&logits_b_batch)
+            .f_sub(&Tensor::from_slice(&logits_b_ref)).unwrap()
+            .abs().mean(Kind::Float).double_value(&[]);
+        assert!(prefill_diff_a < 1e-6, "prefill logits mismatch for request A: {}", prefill_diff_a);
+        assert!(prefill_diff_b < 1e-6, "prefill logits mismatch for request B: {}", prefill_diff_b);
+
+        // Sample deterministic tokens (argmax, temperature=0)
+        let token_a = Tensor::from_slice(&logits_a_batch).argmax(-1, false).int64_value(&[]) as i64;
+        let token_b = Tensor::from_slice(&logits_b_batch).argmax(-1, false).int64_value(&[]) as i64;
+
+        // ====== Single-step decode: batch vs individual ======
+        let ref_logits_a = backend_ref.decode_request(1, token_a).unwrap();
+        let ref_logits_b = backend_ref.decode_request(2, token_b).unwrap();
+
+        let batch_results = backend_batch
+            .decode_batch(&[(1, token_a), (2, token_b)])
+            .unwrap();
+
+        let batch_logits_a = batch_results.iter().find(|(id, _)| *id == 1).unwrap().1.clone();
+        let batch_logits_b = batch_results.iter().find(|(id, _)| *id == 2).unwrap().1.clone();
+
+        let diff_a = Tensor::from_slice(&batch_logits_a)
+            .f_sub(&Tensor::from_slice(&ref_logits_a)).unwrap()
+            .abs().mean(Kind::Float).double_value(&[]);
+        let diff_b = Tensor::from_slice(&batch_logits_b)
+            .f_sub(&Tensor::from_slice(&ref_logits_b)).unwrap()
+            .abs().mean(Kind::Float).double_value(&[]);
+
+        println!("decode_batch isolation: diff_a={:.2e}, diff_b={:.2e}", diff_a, diff_b);
+
+        const TOL: f64 = 1e-5;
+        assert!(diff_a < TOL, "decode_batch logits differ for request A: {}", diff_a);
+        assert!(diff_b < TOL, "decode_batch logits differ for request B: {}", diff_b);
+
+        // ====== Multi-step decode: ensure no cross-contamination over 4 steps ======
+        const NUM_DECODE_STEPS: usize = 4;
+        const LOGITS_TOL: f64 = 1e-3;
+
+        let mut next_token_a = token_a;
+        let mut next_token_b = token_b;
+
+        for step in 0..NUM_DECODE_STEPS {
+            // Reference: individual decode requests
+            let ref_la = backend_ref.decode_request(1, next_token_a).unwrap();
+            let ref_lb = backend_ref.decode_request(2, next_token_b).unwrap();
+
+            // Batch decode
+            let batch_res = backend_batch
+                .decode_batch(&[(1, next_token_a), (2, next_token_b)])
+                .unwrap();
+            let batch_la = batch_res.iter().find(|(id, _)| *id == 1).unwrap().1.clone();
+            let batch_lb = batch_res.iter().find(|(id, _)| *id == 2).unwrap().1.clone();
+
+            let step_diff_a = Tensor::from_slice(&batch_la)
+                .f_sub(&Tensor::from_slice(&ref_la)).unwrap()
+                .abs().mean(Kind::Float).double_value(&[]);
+            let step_diff_b = Tensor::from_slice(&batch_lb)
+                .f_sub(&Tensor::from_slice(&ref_lb)).unwrap()
+                .abs().mean(Kind::Float).double_value(&[]);
+
+            let token_batch_a = Tensor::from_slice(&batch_la).argmax(-1, false).int64_value(&[]);
+            let token_batch_b = Tensor::from_slice(&batch_lb).argmax(-1, false).int64_value(&[]);
+            let token_ref_a = Tensor::from_slice(&ref_la).argmax(-1, false).int64_value(&[]);
+            let token_ref_b = Tensor::from_slice(&ref_lb).argmax(-1, false).int64_value(&[]);
+
+            println!(
+                "Multi-step decode step {}: diff_a={:.2e}, diff_b={:.2e}, tokens=[{},{}] vs ref=[{},{}]",
+                step, step_diff_a, step_diff_b, token_batch_a, token_batch_b, token_ref_a, token_ref_b
+            );
+
+            assert!(step_diff_a < LOGITS_TOL, "step {} request A logits diff too large: {}", step, step_diff_a);
+            assert!(step_diff_b < LOGITS_TOL, "step {} request B logits diff too large: {}", step, step_diff_b);
+            assert_eq!(token_batch_a, token_ref_a, "step {} request A token mismatch", step);
+            assert_eq!(token_batch_b, token_ref_b, "step {} request B token mismatch", step);
+
+            next_token_a = token_ref_a as i64;
+            next_token_b = token_ref_b as i64;
+        }
+    }
+}

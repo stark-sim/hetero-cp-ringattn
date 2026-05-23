@@ -262,12 +262,7 @@ impl LlamaModel {
 
 #[cfg(test)]
 #[cfg(feature = "tch-backend")]
-mod tests {
-    use super::*;
-    use crate::model::weights::{ModelWeights, WeightNames};
-    use tch::{Device, Kind, Tensor};
-
-    fn create_synthetic_weights(config: &ModelConfig, device: Device) -> ModelWeights {
+pub(crate) fn create_synthetic_weights(config: &ModelConfig, device: Device) -> ModelWeights {
         let mut tensors = std::collections::HashMap::new();
         let hidden = config.hidden_size as i64;
         let vocab = config.vocab_size as i64;
@@ -296,6 +291,13 @@ mod tests {
 
         ModelWeights { tensors }
     }
+
+#[cfg(test)]
+#[cfg(feature = "tch-backend")]
+mod tests {
+    use super::*;
+    use crate::model::weights::{ModelWeights, WeightNames};
+    use tch::{Device, Kind, Tensor};
 
     /// 【分布式 LlamaModel prefill 端到端测试】
     /// 
