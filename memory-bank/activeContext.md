@@ -2,6 +2,17 @@
 
 ## 当前焦点
 
+[2026-05-23] **M13 Phase 1-2: Continuous Batching Scheduler + Per-Request KV Cache 完成**：
+- Coordinator `BatchScheduler`：pending/active/completed 请求池，固定 `max_batch_size` 调度
+- `DecodeBatch` / `DecodeBatchDone` 协议扩展，为 Phase 3 批量 decode 做准备
+- Worker `RequestContext`：per-request KV cache 隔离，支持多请求同时存在不互相污染
+- HTTP mode 从 spawn_blocking 并发模式改为 iteration-based 调度循环
+- **本地 Batch E2E 验证**（`scripts/test_http_api_batch_local.sh`）：2 请求先后到达
+  - Request 1: `jumps over the` ✅
+  - Request 2: `, there was` ✅
+- 单请求 regression：`scripts/test_http_api_local.sh` → `jumps over the lazy dog` ✅
+- 48/48 cargo tests passed。Commit `ea111c9`
+
 [2026-05-22] **M10.3 Request-Level Parallelism 完成**：
 - Coordinator 并发请求处理：`worker_streams` 用 `Arc<std::sync::Mutex>` 保护，`rt.spawn_blocking()` 并发处理 HTTP 请求
 - `max_concurrent=4` 信号量限制并发数，防止 worker 过载
@@ -176,9 +187,21 @@ Python 层冻结。Rust 层为主干。
   - Request queue (`tokio::sync::mpsc`) + oneshot result channel
   - 双模式：batch mode（`--prompts-file`）vs HTTP API mode（默认）
   - Commit `e3eafe9`，45/45 tests passed ✅
+- [x] [2026-05-23] **M13 Phase 1-2: Continuous Batching Scheduler + Per-Request KV Cache**：
+  - `BatchScheduler`：pending/active/completed 请求池，固定 `max_batch_size` 迭代调度
+  - `DecodeBatch` / `DecodeBatchDone` 协议扩展
+  - Worker `RequestContext`：per-request KV cache 隔离（`HashMap<u64, RequestContext>`）
+  - HTTP mode 改为 iteration-based 调度循环
+  - 48/48 tests passed，batch E2E 通过（2 请求先后到达输出正确）。Commit `ea111c9` ✅
+- [ ] **M12: PagedAttention Block Table**（待启动）：
+  - 替换 `KvCache` 为 block 化分配，支持 ragged batching
+  - 不等长请求的 true continuous batching 基础设施
+- [ ] **M13 Phase 3-5: Full Continuous Batching with PagedAttention**（待启动）：
+  - Worker runtime 填充 `DecodeBatch` stub + coordinator 构造 batch token 列表
+  - Dynamic join/leave（新请求在 decode iteration 间插入，已完成的请求离开 batch）
+  - Kernel-level batch decode（依赖 PagedAttention block table）
 - [ ] **Phase 4.3: Rust 层性能优化与生产化**（长期）：
   - 量化支持（FP8/INT8 KV cache）— **暂不实施**，correctness 流程尚未完全走完
-  - 连续 batching / 动态 request 调度
   - 更高效的 transport（RDMA / GPUDirect）
 - [ ] **Phase 5: vLLM Block-Aware Ring**（远景）：
   - 让 ring 在 vLLM PagedAttention block 层面运作

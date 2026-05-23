@@ -362,3 +362,6 @@
 | M10.3.1: Worker 多请求状态隔离修复 | **已完成** | [2026-05-23] Harness Reviewer 独立验证发现并发请求下 worker panic。Bug A: `HcpRingAttentionBackend::is_prefill_done` / `prefill_kv_len` 未在请求间重置 → `set_distributed()` 中重置。Bug B: prompt tokens < num_domains 时空 chunk → `process_single_request` 中检查 size==0 并返回错误。Reviewer 验证 5/5 通过（编译、单元测试、并发 E2E、顺序请求、panic 检查），confidence=high。Commit `eb71401` |
 | M10.4: Rust 性能优化与生产化 | **待启动** | 量化（暂不实施，correctness 优先）、RDMA transport |
 | M11: vLLM Block-Aware Ring | **远景** | [2026-05-09] 核心洞察：ring 在 vLLM block 层面运作。详见 `docs/BLOCK_RING_FUSION.md` |
+| M13 Phase 1-2: Continuous Batching Scheduler + Per-Request KV Cache | **已完成** | [2026-05-23] Coordinator `BatchScheduler` 迭代调度 + `DecodeBatch` 协议 + Worker `RequestContext` per-request KV cache 隔离。本地 E2E：单请求 regression ✅ (`jumps over the`)，2 请求 batch ✅ (`jumps over the` + `, there was`)。48/48 tests passed。Commit `ea111c9` |
+| M12: PagedAttention Block Table | **待启动** | 替换 `KvCache` 为 block 化分配，支持 ragged batching |
+| M13 Phase 3-5: Full Continuous Batching with PagedAttention | **待启动** | 在 PagedAttention 基础上实现 kernel-level batch decode + dynamic join/leave |
