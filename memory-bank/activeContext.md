@@ -183,3 +183,15 @@ Python 层冻结。Rust 层为主干。
 - [ ] **Phase 5: vLLM Block-Aware Ring**（远景）：
   - 让 ring 在 vLLM PagedAttention block 层面运作
   - 详见 `docs/BLOCK_RING_FUSION.md`
+
+[2026-05-23] **M10.3 Worker 侧 Bug 修复**（commit `eb71401`）：
+- **Bug A: HcpRingAttentionBackend 状态未重置** — Reviewer 独立验证发现并发请求下 worker panic
+  - Root cause: `TchWorkerBackend::prefill()` 重置了 `LlamaModel::is_prefill_done` 但未重置 `HcpRingAttentionBackend::is_prefill_done` / `prefill_kv_len`
+  - Fix: `HcpRingAttentionBackend::set_distributed()` 中重置 `is_prefill_done=false` + `prefill_kv_len=0`
+  - Reviewer 验证: 2 并发 + 1 顺序请求全部通过，无 panic ✅
+- **Bug B: 空 chunk 分配** — prompt tokens < num_domains 时 domain 得到 0-token chunk
+  - Root cause: `process_single_request` chunk 分配在 seq_len=1, num_domains=2 时给 domain1 分配 0
+  - Fix: chunk_sizes 计算后检查 size==0，返回友好错误
+  - Reviewer 验证: 1-token prompt 正确返回错误（不再 panic）✅
+- **Harness Reviewer 独立验证通过**: APPROVE (guard=APPROVE, examiner=APPROVE, validator=APPROVE)
+  - 5/5 测试通过，confidence=high
