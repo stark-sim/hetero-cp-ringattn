@@ -14,6 +14,7 @@ use crate::api::{build_router, ApiState};
 use crate::distributed::protocol::{
     recv_response_quic, send_command_quic, WorkerCommand, WorkerResponse,
 };
+use crate::distributed::scheduler::{BatchScheduler, ActiveRequest};
 use crate::model::config::ModelConfig;
 use crate::model::sampling::sample_token;
 use std::net::SocketAddr;
@@ -294,6 +295,299 @@ fn process_single_request(
     })
 }
 
+/// Prefill a single request and return an `ActiveRequest` ready for decode batch.
+///
+/// On prefill failure, sends an error result via `job.tx` and returns `Err`.
+fn prefill_single_request(
+    job: InferenceJob,
+    tokenizer: &tokenizers::Tokenizer,
+    config: &ModelConfig,
+    worker_streams: &mut [(quinn::SendStream, quinn::RecvStream)],
+    chunk_sizes_override: &Option<Vec<usize>>,
+    capacity_aware: bool,
+    worker_capacities: &[u64],
+    rt: &tokio::runtime::Runtime,
+) -> Result<ActiveRequest, String> {
+    let eos_token = config.eos_token_id();
+    let vocab_size = config.vocab_size as usize;
+    let num_domains = worker_streams.len();
+
+    // Tokenize
+    let encoding = tokenizer
+        .encode(job.prompt.as_str(), true)
+        .map_err(|e| format!("encode failed: {e}"))?;
+    let prompt_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
+    let prompt_tokens = prompt_ids.len();
+    let seq_len = prompt_ids.len() as i64;
+
+    // Chunk allocation (same three-tier logic as process_single_request)
+    let chunk_sizes: Vec<usize> = if let Some(ref sizes) = chunk_sizes_override {
+        if sizes.len() != num_domains {
+            let _ = job.tx.send(InferenceResult {
+                text: format!("[error: --chunk-sizes length ({}) must match num_domains ({})]", sizes.len(), num_domains),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                finish_reason: Some("error".to_string()),
+            });
+            return Err(format!("--chunk-sizes length must match num_domains"));
+        }
+        let sum: usize = sizes.iter().sum();
+        if sum != seq_len as usize {
+            let _ = job.tx.send(InferenceResult {
+                text: format!("[error: --chunk-sizes sum ({}) must equal prompt length ({})]", sum, seq_len),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                finish_reason: Some("error".to_string()),
+            });
+            return Err(format!("--chunk-sizes sum must equal prompt length"));
+        }
+        sizes.clone()
+    } else if capacity_aware {
+        crate::capacity::allocate_by_capacity(seq_len as usize, worker_capacities)
+    } else {
+        let chunk_size = (seq_len as usize).div_ceil(num_domains).max(1);
+        let mut chunks = Vec::with_capacity(num_domains);
+        let mut offset = 0usize;
+        for i in 0..num_domains {
+            let end = if i == num_domains - 1 {
+                seq_len as usize
+            } else {
+                (offset + chunk_size).min(seq_len as usize)
+            };
+            chunks.push(end - offset);
+            offset = end;
+        }
+        chunks
+    };
+
+    for (i, size) in chunk_sizes.iter().enumerate() {
+        if *size == 0 {
+            let _ = job.tx.send(InferenceResult {
+                text: format!(
+                    "[error: prompt too short: domain {} received 0 tokens (total {} tokens, {} domains). Each domain needs at least 1 token.]",
+                    i, prompt_ids.len(), num_domains
+                ),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                finish_reason: Some("error".to_string()),
+            });
+            return Err(format!("prompt too short for {} domains", num_domains));
+        }
+    }
+
+    let mut chunk_boundaries = vec![0usize];
+    for size in &chunk_sizes {
+        chunk_boundaries.push(chunk_boundaries.last().unwrap() + size);
+    }
+
+    // Prefill
+    for (domain_id, (send, _recv)) in worker_streams.iter_mut().enumerate() {
+        let start = chunk_boundaries[domain_id];
+        let end = chunk_boundaries[domain_id + 1];
+        let chunk = &prompt_ids[start..end];
+        let cmd = WorkerCommand::Prefill {
+            request_id: job.request_id,
+            chunk: chunk.to_vec(),
+            seq_offset: start as i64,
+        };
+        if let Err(e) = send_command_quic(send, &cmd, rt.handle()) {
+            let _ = job.tx.send(InferenceResult {
+                text: format!("[error: send Prefill failed: {e}]"),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                finish_reason: Some("error".to_string()),
+            });
+            return Err(format!("send Prefill failed: {e}"));
+        }
+    }
+
+    let mut max_global_seq_len = 0usize;
+    let mut last_logits_bytes: Vec<u8> = Vec::new();
+    for (domain_id, (_send, recv)) in worker_streams.iter_mut().enumerate() {
+        let resp = match recv_response_quic(recv, rt.handle()) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = job.tx.send(InferenceResult {
+                    text: format!("[error: recv PrefillDone failed: {e}]"),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    finish_reason: Some("error".to_string()),
+                });
+                return Err(format!("recv PrefillDone failed: {e}"));
+            }
+        };
+        match resp {
+            WorkerResponse::PrefillDone { last_logits_bytes: bytes, global_seq_len, .. } => {
+                max_global_seq_len = max_global_seq_len.max(global_seq_len);
+                if domain_id == num_domains - 1 {
+                    last_logits_bytes = bytes;
+                }
+            }
+            WorkerResponse::Error { message, .. } => {
+                let _ = job.tx.send(InferenceResult {
+                    text: format!("[error: worker {domain_id} prefill error: {message}]"),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    finish_reason: Some("error".to_string()),
+                });
+                return Err(format!("worker {domain_id} prefill error: {message}"));
+            }
+            _ => {
+                let _ = job.tx.send(InferenceResult {
+                    text: format!("[error: unexpected response from worker {domain_id}: {resp:?}]"),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    finish_reason: Some("error".to_string()),
+                });
+                return Err(format!("unexpected response from worker {domain_id}: {resp:?}"));
+            }
+        }
+    }
+
+    // Sync global_seq_len
+    for (send, _recv) in worker_streams.iter_mut() {
+        let cmd = WorkerCommand::SyncGlobalSeqLen { request_id: job.request_id, len: max_global_seq_len };
+        let _ = send_command_quic(send, &cmd, rt.handle());
+    }
+
+    // Sample first token from last worker's logits
+    let logits_vec: Vec<f32> = last_logits_bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    if logits_vec.len() != vocab_size {
+        let _ = job.tx.send(InferenceResult {
+            text: format!("[error: logits size mismatch: expected {}, got {}]", vocab_size, logits_vec.len()),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            finish_reason: Some("error".to_string()),
+        });
+        return Err(format!("logits size mismatch: expected {}, got {}", vocab_size, logits_vec.len()));
+    }
+    let logits_tensor = Tensor::from_slice(&logits_vec);
+    let first_token = match sample_token(&logits_tensor, job.temperature, job.top_p) {
+        Ok(t) => t as i64,
+        Err(e) => {
+            let _ = job.tx.send(InferenceResult {
+                text: format!("[error: sample_token failed: {e}]"),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                finish_reason: Some("error".to_string()),
+            });
+            return Err(format!("sample_token failed: {e}"));
+        }
+    };
+
+    let mut generated_ids: Vec<u32> = Vec::new();
+    let mut finish_reason = None;
+
+    let token = first_token as u32;
+    generated_ids.push(token);
+    if Some(token) == eos_token {
+        finish_reason = Some("stop".to_string());
+    }
+
+    Ok(ActiveRequest {
+        request_id: job.request_id,
+        prompt: job.prompt,
+        max_tokens: job.max_tokens,
+        temperature: job.temperature,
+        top_p: job.top_p,
+        prompt_ids,
+        prompt_tokens,
+        chunk_boundaries,
+        generated_ids,
+        next_token: first_token,
+        finish_reason,
+        result_tx: job.tx,
+    })
+}
+
+/// Execute one decode iteration for all active requests in the scheduler.
+///
+/// Returns the list of request IDs that have completed (EOS or max_tokens).
+fn decode_iteration(
+    scheduler: &mut BatchScheduler,
+    worker_streams: &mut [(quinn::SendStream, quinn::RecvStream)],
+    eos_token: Option<u32>,
+    vocab_size: usize,
+    rt: &tokio::runtime::Runtime,
+) -> Result<Vec<u64>, String> {
+    let num_domains = worker_streams.len();
+
+    // Collect next tokens from all active requests
+    let request_tokens: Vec<(u64, i64)> = scheduler.active_requests()
+        .values()
+        .map(|req| (req.request_id, req.next_token))
+        .collect();
+
+    if request_tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Send DecodeBatch to all workers
+    for (send, _recv) in worker_streams.iter_mut() {
+        let cmd = WorkerCommand::DecodeBatch { request_tokens: request_tokens.clone() };
+        send_command_quic(send, &cmd, rt.handle())
+            .map_err(|e| format!("send DecodeBatch failed: {e}"))?;
+    }
+
+    // Receive DecodeBatchDone from worker 0 (it has the logits)
+    let resp = recv_response_quic(&mut worker_streams[0].1, rt.handle())
+        .map_err(|e| format!("recv DecodeBatchDone failed: {e}"))?;
+    let request_logits = match resp {
+        WorkerResponse::DecodeBatchDone { request_logits } => request_logits,
+        WorkerResponse::Error { message, .. } => {
+            return Err(format!("worker 0 decode batch error: {message}"));
+        }
+        _ => return Err(format!("unexpected response from worker 0: {resp:?}")),
+    };
+
+    // Drain responses from other workers (they participate in KV ring but logits come from worker 0)
+    for (_send, recv) in worker_streams.iter_mut().skip(1) {
+        let _ = recv_response_quic(recv, rt.handle());
+    }
+
+    // Sample next tokens and update states
+    let mut completed = Vec::new();
+    for (request_id, logits_bytes) in request_logits {
+        let req = match scheduler.get_active_mut(request_id) {
+            Some(r) => r,
+            None => continue, // request may have already been removed
+        };
+
+        let logits_vec: Vec<f32> = logits_bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        if logits_vec.len() != vocab_size {
+            eprintln!("[coordinator] request {request_id} logits size mismatch: expected {vocab_size}, got {}", logits_vec.len());
+            continue;
+        }
+        let logits_tensor = Tensor::from_slice(&logits_vec);
+        let next_token = match sample_token(&logits_tensor, req.temperature, req.top_p) {
+            Ok(t) => t as u32,
+            Err(e) => {
+                eprintln!("[coordinator] request {request_id} sample_token failed: {e}");
+                continue;
+            }
+        };
+
+        req.generated_ids.push(next_token);
+        req.next_token = next_token as i64;
+
+        if Some(next_token) == eos_token {
+            req.finish_reason = Some("stop".to_string());
+            completed.push(request_id);
+        } else if req.generated_ids.len() >= req.max_tokens {
+            req.finish_reason = Some("length".to_string());
+            completed.push(request_id);
+        }
+    }
+
+    Ok(completed)
+}
+
 /// Coordinator 主入口。
 pub fn run() {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -451,109 +745,116 @@ pub fn run() {
         });
     });
 
-    let max_concurrent = 4usize;
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
-    println!("[coordinator] entering HTTP service mode (max_concurrent={max_concurrent}). Press Ctrl+C to exit.");
+    let max_batch_size = 4usize;
+    let mut scheduler = BatchScheduler::new(max_batch_size);
+    println!("[coordinator] entering HTTP iterative scheduling mode (max_batch_size={max_batch_size}). Press Ctrl+C to exit.");
 
-    // Service loop: pull jobs from the queue and process them concurrently.
-    // Each request runs in a spawn_blocking task; Mutex ensures only one request
-    // uses the worker_streams at a time, preventing command interleaving.
+    // Iterative scheduling loop: each iteration may prefill new requests and/or
+    // decode all active requests.  This replaces the request-level spawn_blocking
+    // model with an iteration-level scheduler.
+    let eos_token = config.eos_token_id();
+    let vocab_size = config.vocab_size as usize;
+
     loop {
-        let job = match rt.block_on(job_rx.recv()) {
-            Some(j) => j,
-            None => {
-                println!("[coordinator] job channel closed, exiting");
-                break;
-            }
-        };
-
-        queued_counter.fetch_sub(1, Ordering::SeqCst);
-        active_counter.fetch_add(1, Ordering::SeqCst);
-
-        let streams = worker_streams.clone();
-        let permit = rt.block_on(semaphore.clone().acquire_owned()).expect("semaphore closed");
-        let tokenizer = tokenizer.clone();
-        let config = config.clone();
-        let worker_capacities = worker_capacities.clone();
-        let chunk_sizes = args.chunk_sizes.clone();
-        let capacity_aware = args.capacity_aware;
-        let request_id = job.request_id;
-        let prompt = job.prompt;
-        let max_tokens = job.max_tokens;
-        let temperature = job.temperature;
-        let top_p = job.top_p;
-        let job_result_tx = job.tx;
-
-        let active_counter_clone = active_counter.clone();
-        let _ = rt.spawn_blocking(move || {
-            let _permit = permit; // hold until done
-            let _active_decrement = ActiveRequestGuard(active_counter_clone);
-            let mut guard = match streams.lock() {
-                Ok(g) => g,
-                Err(e) => {
-                    eprintln!("[coordinator] mutex poisoned: {e}");
-                    let _ = job_result_tx.send(InferenceResult {
-                        text: "[error: internal mutex poisoned]".to_string(),
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        finish_reason: Some("error".to_string()),
-                    });
-                    return;
+        // Phase 1: Receive new jobs (non-blocking)
+        let mut channel_closed = false;
+        loop {
+            match job_rx.try_recv() {
+                Ok(job) => {
+                    queued_counter.fetch_sub(1, Ordering::SeqCst);
+                    scheduler.enqueue(job);
                 }
-            };
-            let local_rt = match tokio::runtime::Runtime::new() {
-                Ok(rt) => rt,
-                Err(e) => {
-                    eprintln!("[coordinator] failed to create local runtime: {e}");
-                    let _ = job_result_tx.send(InferenceResult {
-                        text: format!("[error: failed to create local runtime: {e}]"),
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        finish_reason: Some("error".to_string()),
-                    });
-                    return;
-                }
-            };
-            let result = process_single_request(
-                request_id,
-                &prompt,
-                max_tokens,
-                temperature,
-                top_p,
-                &tokenizer,
-                &config,
-                &mut *guard,
-                &chunk_sizes,
-                capacity_aware,
-                &worker_capacities,
-                &local_rt,
-            );
-            match result {
-                Ok(inference_result) => {
-                    let _ = job_result_tx.send(inference_result);
-                }
-                Err(e) => {
-                    eprintln!("[coordinator] request {request_id} failed: {e}");
-                    let _ = job_result_tx.send(InferenceResult {
-                        text: format!("[error: {e}]"),
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        finish_reason: Some("error".to_string()),
-                    });
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    channel_closed = true;
+                    break;
                 }
             }
-        });
+        }
+
+        // Phase 2: Execute one scheduling iteration
+        {
+            let mut guard = worker_streams.lock().unwrap_or_else(|e| e.into_inner());
+
+            // 2a: Prefill a pending request if batch has room
+            if scheduler.can_admit() && !scheduler.pending_is_empty() {
+                if let Some(job) = scheduler.try_dequeue_pending() {
+                    match prefill_single_request(job, &tokenizer, &config, &mut *guard, &args.chunk_sizes, args.capacity_aware, &worker_capacities, &rt) {
+                        Ok(active_req) => {
+                            active_counter.fetch_add(1, Ordering::SeqCst);
+                            scheduler.add_active(active_req);
+                        }
+                        Err(e) => {
+                            eprintln!("[coordinator] prefill failed: {e}");
+                            // Error result already sent via job.tx in prefill_single_request
+                        }
+                    }
+                }
+            }
+
+            // 2b: Decode all active requests
+            if !scheduler.active_is_empty() {
+                match decode_iteration(&mut scheduler, &mut *guard, eos_token, vocab_size, &rt) {
+                    Ok(completed) => {
+                        for request_id in completed {
+                            if let Some(req) = scheduler.remove_active(request_id) {
+                                active_counter.fetch_sub(1, Ordering::SeqCst);
+                                let text = tokenizer.decode(&req.generated_ids, true)
+                                    .unwrap_or_else(|e| {
+                                        eprintln!("[coordinator] decode failed for request {request_id}: {e}");
+                                        String::new()
+                                    });
+                                let result = InferenceResult {
+                                    text,
+                                    prompt_tokens: req.prompt_tokens,
+                                    completion_tokens: req.generated_ids.len(),
+                                    finish_reason: req.finish_reason,
+                                };
+                                let _ = req.result_tx.send(result);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[coordinator] decode iteration failed: {e}");
+                        // All active requests fail
+                        for request_id in scheduler.active_request_ids() {
+                            if let Some(req) = scheduler.remove_active(request_id) {
+                                active_counter.fetch_sub(1, Ordering::SeqCst);
+                                let _ = req.result_tx.send(InferenceResult {
+                                    text: format!("[error: decode batch failed: {e}]"),
+                                    prompt_tokens: req.prompt_tokens,
+                                    completion_tokens: req.generated_ids.len(),
+                                    finish_reason: Some("error".to_string()),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        } // drop guard
+
+        // Phase 3: If channel closed and no work remains, exit
+        if channel_closed && !scheduler.has_work() {
+            println!("[coordinator] job channel closed and all requests done, exiting");
+            break;
+        }
+
+        // Phase 4: If no active or pending work, block until new job arrives
+        if !scheduler.has_work() {
+            match rt.block_on(job_rx.recv()) {
+                Some(job) => {
+                    queued_counter.fetch_sub(1, Ordering::SeqCst);
+                    scheduler.enqueue(job);
+                }
+                None => {
+                    println!("[coordinator] job channel closed, exiting");
+                    break;
+                }
+            }
+        }
     }
 
-    // Wait for all spawned tasks to finish before shutdown.
-    println!("[coordinator] waiting for all requests to finish...");
-    let shutdown_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while Arc::strong_count(&worker_streams) > 1 && std::time::Instant::now() < shutdown_deadline {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    if Arc::strong_count(&worker_streams) > 1 {
-        eprintln!("[coordinator] warning: some requests still active after 30s, forcing shutdown");
-    }
+    println!("[coordinator] scheduler exited, shutting down workers");
 
     let mut worker_streams = match Arc::try_unwrap(worker_streams) {
         Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| e.into_inner()),

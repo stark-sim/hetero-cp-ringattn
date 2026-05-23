@@ -18,4 +18,6 @@ pub mod protocol;
 pub mod coordinator;
 #[cfg(feature = "tch-backend")]
 pub mod worker;
+#[cfg(feature = "tch-backend")]
+pub mod scheduler;
 pub mod transport;

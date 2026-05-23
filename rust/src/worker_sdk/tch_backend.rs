@@ -6,9 +6,10 @@
 //! 【生命周期】
 //! 1. `TchWorkerBackend::load()` / `from_model()`: 加载权重，创建 KV cache
 //! 2. `setup_kv_transports()`: 把 per-layer QUIC transports 绑定到 attention layers
-//! 3. `prefill()`: 处理 prompt chunk，计算 logits，更新 KV cache
-//! 4. `decode()`: 单 token forward，复用 KV cache
-//! 5. `sync_global_seq_len()`: coordinator 广播后同步全局序列长度
+//! 3. `prefill()`: 处理 prompt chunk，计算 logits，更新 KV cache（单请求 backward-compatible）
+//! 4. `decode()`: 单 token forward，复用 KV cache（单请求 backward-compatible）
+//! 5. `prefill_request() / decode_request()`: 多请求隔离版本，每个 request_id 有独立 KV cache
+//! 6. `sync_global_seq_len()`: coordinator 广播后同步全局序列长度
 //!
 //! 【与真实分布式的关系】
 //! `prefill` 和 `decode` 内部调用 `LlamaModel::forward()`，
@@ -21,8 +22,20 @@ use crate::model::transport::KvTransport;
 use crate::model::model::LlamaModel;
 use crate::model::{ModelConfig, ModelWeights};
 use crate::worker_sdk::backend::WorkerBackend;
+use std::collections::HashMap;
 use std::path::Path;
 use tch::{Device, Tensor};
+
+/// Per-request context holding the KV cache and model state.
+///
+/// When a request arrives, `prefill_request()` creates a new `RequestContext`.
+/// Each subsequent `decode_request()` uses this context's KV cache and restores
+/// the model state (`global_seq_len`, `is_prefill_done`) before forward.
+pub struct RequestContext {
+    pub kv_caches: KvCaches,
+    pub global_seq_len: usize,
+    pub is_prefill_done: bool,
+}
 
 /// 默认的 tch-rs Worker 后端。
 ///
@@ -31,6 +44,10 @@ use tch::{Device, Tensor};
 /// - 执行 prefill / decode forward
 /// - 在 forward 过程中通过 per-layer `KvTransport` 完成 KV ring 交换
 ///
+/// **多请求支持（M13）**：
+/// `request_contexts` 为每个 `request_id` 维护独立的 KV cache 和模型状态。
+/// 单请求接口（`prefill()` / `decode()`）继续使用 `self.kv_caches`，保持 backward compatible。
+///
 /// 使用方式：
 /// ```rust,ignore
 /// let backend = TchWorkerBackend::load("/path/to/model", Device::Mps, domain_id, num_domains)?;
@@ -38,8 +55,11 @@ use tch::{Device, Tensor};
 pub struct TchWorkerBackend {
     model: LlamaModel,
     device: Device,
+    /// Backward-compatible single-request KV cache.
     kv_caches: KvCaches,
     domain_id: usize,
+    /// Per-request KV cache and model state (M13 continuous batching).
+    request_contexts: HashMap<u64, RequestContext>,
 }
 
 impl TchWorkerBackend {
@@ -76,6 +96,7 @@ impl TchWorkerBackend {
             device,
             kv_caches,
             domain_id,
+            request_contexts: HashMap::new(),
         })
     }
 
@@ -87,34 +108,22 @@ impl TchWorkerBackend {
             device,
             kv_caches,
             domain_id,
-        }
-    }
-}
-
-impl WorkerBackend for TchWorkerBackend {
-    fn setup_kv_transports(&mut self, transports: Vec<Box<dyn KvTransport>>) {
-        let domain_id = self.domain_id;
-        for (layer_idx, transport) in transports.into_iter().enumerate() {
-            if let Some(layer) = self.model.layers.get_mut(layer_idx) {
-                layer.attention.set_distributed(domain_id, 0, Some(transport));
-            }
+            request_contexts: HashMap::new(),
         }
     }
 
-    fn prefill(
-        &mut self,
-        chunk: &[i64],
-        seq_offset: usize,
-    ) -> Result<(Vec<f32>, usize), String> {
-        // Reset KV cache for a new request. Each Prefill command starts a
-        // fresh autoregressive sequence; reusing old KV cache would pollute
-        // the attention computation with stale history.
+    /// Shared prefill logic used by both `prefill()` and `prefill_request()`.
+    ///
+    /// Operates on `self.kv_caches` and updates `self.model` state.
+    /// The caller is responsible for saving/restoring state if needed.
+    fn do_prefill(&mut self, chunk: &[i64], seq_offset: usize) -> Result<(Vec<f32>, usize), String> {
+        // Reset KV cache for a new request.
         self.kv_caches = self.model.create_kv_caches();
         self.model.is_prefill_done = false;
         self.model.global_seq_len = 0;
 
         self.model.seq_offset = seq_offset as i64;
-        // 更新每层的 seq_offset（用于 causal mask 的全局位置计算）
+        // Update per-layer seq_offset for causal mask global position computation
         for layer in self.model.layers.iter_mut() {
             layer
                 .attention
@@ -136,6 +145,28 @@ impl WorkerBackend for TchWorkerBackend {
         Ok((logits_vec, self.model.global_seq_len))
     }
 
+    // Note: do_decode removed to avoid borrow checker issues.
+    // decode() and decode_request() inline the small forward logic directly.
+}
+
+impl WorkerBackend for TchWorkerBackend {
+    fn setup_kv_transports(&mut self, transports: Vec<Box<dyn KvTransport>>) {
+        let domain_id = self.domain_id;
+        for (layer_idx, transport) in transports.into_iter().enumerate() {
+            if let Some(layer) = self.model.layers.get_mut(layer_idx) {
+                layer.attention.set_distributed(domain_id, 0, Some(transport));
+            }
+        }
+    }
+
+    fn prefill(
+        &mut self,
+        chunk: &[i64],
+        seq_offset: usize,
+    ) -> Result<(Vec<f32>, usize), String> {
+        self.do_prefill(chunk, seq_offset)
+    }
+
     fn decode(&mut self, token: i64) -> Result<Vec<f32>, String> {
         let input = Tensor::from_slice(&[token])
             .unsqueeze(0)
@@ -151,8 +182,61 @@ impl WorkerBackend for TchWorkerBackend {
         Ok(logits_vec)
     }
 
+    /// Request-aware prefill: creates an isolated `RequestContext` for the given request_id.
+    fn prefill_request(
+        &mut self,
+        request_id: u64,
+        chunk: &[i64],
+        seq_offset: usize,
+    ) -> Result<(Vec<f32>, usize), String> {
+        let (logits_vec, global_seq_len) = self.do_prefill(chunk, seq_offset)?;
+
+        // Save the freshly computed KV cache and model state into per-request context.
+        self.request_contexts.insert(request_id, RequestContext {
+            kv_caches: std::mem::replace(&mut self.kv_caches, self.model.create_kv_caches()),
+            global_seq_len: self.model.global_seq_len,
+            is_prefill_done: self.model.is_prefill_done,
+        });
+
+        Ok((logits_vec, global_seq_len))
+    }
+
+    /// Request-aware decode: uses the request's isolated KV cache.
+    fn decode_request(&mut self, request_id: u64, token: i64) -> Result<Vec<f32>, String> {
+        let ctx = self.request_contexts.get_mut(&request_id)
+            .ok_or_else(|| format!("request {request_id} not found"))?;
+
+        // Restore model state from the request's context before forward.
+        self.model.global_seq_len = ctx.global_seq_len;
+        self.model.is_prefill_done = ctx.is_prefill_done;
+
+        let input = Tensor::from_slice(&[token])
+            .unsqueeze(0)
+            .to_device(self.device);
+        let logits = self
+            .model
+            .forward(&input, &mut ctx.kv_caches)
+            .map_err(|e| format!("decode forward failed: {e}"))?;
+
+        // Save model state back to the request's context after forward.
+        ctx.global_seq_len = self.model.global_seq_len;
+        ctx.is_prefill_done = self.model.is_prefill_done;
+
+        let logits_vec: Vec<f32> = Vec::try_from(&logits.squeeze())
+            .map_err(|e| format!("logits to vec failed: {e}"))?;
+
+        Ok(logits_vec)
+    }
+
     fn sync_global_seq_len(&mut self, len: usize) {
         self.model.global_seq_len = len;
+    }
+
+    /// Request-aware sync: updates the per-request context.
+    fn sync_global_seq_len_for_request(&mut self, request_id: u64, len: usize) {
+        if let Some(ctx) = self.request_contexts.get_mut(&request_id) {
+            ctx.global_seq_len = len;
+        }
     }
 
     fn capacity_mb(&self) -> u64 {

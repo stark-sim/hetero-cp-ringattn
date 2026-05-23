@@ -24,6 +24,11 @@ pub enum WorkerCommand {
         request_id: u64,
         token: i64,
     },
+    /// Run batch decode for multiple requests in a single forward pass.
+    /// Each tuple is (request_id, token_to_decode).
+    DecodeBatch {
+        request_tokens: Vec<(u64, i64)>,
+    },
     /// Synchronize global sequence length before decode.
     SyncGlobalSeqLen {
         request_id: u64,
@@ -47,6 +52,11 @@ pub enum WorkerResponse {
     DecodeDone {
         request_id: u64,
         logits_bytes: Vec<u8>,
+    },
+    /// Batch decode completed; includes logits for each request.
+    /// Each tuple is (request_id, logits_bytes).
+    DecodeBatchDone {
+        request_logits: Vec<(u64, Vec<u8>)>,
     },
     /// Worker encountered an error.
     Error {

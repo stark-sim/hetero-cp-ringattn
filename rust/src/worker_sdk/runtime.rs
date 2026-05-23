@@ -134,7 +134,7 @@ impl<B: WorkerBackend> WorkerRuntime<B> {
                     let seq_offset = seq_offset as usize;
                     let (logits_vec, global_seq_len) = self
                         .backend
-                        .prefill(&chunk, seq_offset)
+                        .prefill_request(request_id, &chunk, seq_offset)
                         .map_err(|e| format!("prefill failed: {e}"))?;
 
                     let logits_bytes: Vec<u8> =
@@ -151,7 +151,7 @@ impl<B: WorkerBackend> WorkerRuntime<B> {
                 WorkerCommand::Decode { request_id, token } => {
                     let logits_vec = self
                         .backend
-                        .decode(token)
+                        .decode_request(request_id, token)
                         .map_err(|e| format!("decode failed: {e}"))?;
 
                     let logits_bytes: Vec<u8> =
@@ -164,8 +164,29 @@ impl<B: WorkerBackend> WorkerRuntime<B> {
                     send_response_quic(&mut self.coord_send, &resp, &rt_handle)
                         .map_err(|e| format!("send DecodeDone failed: {e}"))?;
                 }
+                WorkerCommand::DecodeBatch { request_tokens } => {
+                    let request_logits = self
+                        .backend
+                        .decode_batch(&request_tokens)
+                        .map_err(|e| format!("decode_batch failed: {e}"))?;
+
+                    let request_logits_bytes: Vec<(u64, Vec<u8>)> = request_logits
+                        .into_iter()
+                        .map(|(id, logits_vec)| {
+                            let bytes: Vec<u8> =
+                                logits_vec.iter().flat_map(|&v| v.to_le_bytes()).collect();
+                            (id, bytes)
+                        })
+                        .collect();
+
+                    let resp = WorkerResponse::DecodeBatchDone {
+                        request_logits: request_logits_bytes,
+                    };
+                    send_response_quic(&mut self.coord_send, &resp, &rt_handle)
+                        .map_err(|e| format!("send DecodeBatchDone failed: {e}"))?;
+                }
                 WorkerCommand::SyncGlobalSeqLen { request_id, len } => {
-                    self.backend.sync_global_seq_len(len);
+                    self.backend.sync_global_seq_len_for_request(request_id, len);
                     println!("[worker {domain_id}] request {request_id} synced global_seq_len = {len}");
                 }
                 WorkerCommand::Shutdown => {

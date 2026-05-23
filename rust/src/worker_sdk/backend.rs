@@ -66,6 +66,52 @@ pub trait WorkerBackend: Send {
     /// - `logits`: `Vec<f32>`，长度 = vocab_size
     fn decode(&mut self, token: i64) -> Result<Vec<f32>, String>;
 
+    /// 【请求感知的 prefill】支持多请求隔离的 prefill。
+    ///
+    /// 默认实现调用 `prefill()`（向后兼容单请求后端）。
+    /// 多请求后端应 override 此方法来为每个 request_id 创建独立的 KV cache。
+    fn prefill_request(
+        &mut self,
+        _request_id: u64,
+        chunk: &[i64],
+        seq_offset: usize,
+    ) -> Result<(Vec<f32>, usize), String> {
+        self.prefill(chunk, seq_offset)
+    }
+
+    /// 【请求感知的 decode】支持多请求隔离的 decode。
+    ///
+    /// 默认实现调用 `decode()`（向后兼容单请求后端）。
+    fn decode_request(&mut self, _request_id: u64, token: i64) -> Result<Vec<f32>, String> {
+        self.decode(token)
+    }
+
+    /// 执行 batch decode forward（多个请求同时解码）。
+    ///
+    /// 默认实现是逐个调用 `decode_request()`。后端可以 override 此方法来提供
+    /// 真正的 kernel-level batching（如 PagedAttention）。
+    ///
+    /// # Arguments
+    /// - `request_tokens`: (request_id, token) 列表
+    ///
+    /// # Returns
+    /// - `request_logits`: (request_id, logits) 列表
+    fn decode_batch(&mut self, request_tokens: &[(u64, i64)]) -> Result<Vec<(u64, Vec<f32>)>, String> {
+        let mut results = Vec::with_capacity(request_tokens.len());
+        for &(request_id, token) in request_tokens {
+            let logits = self.decode_request(request_id, token)?;
+            results.push((request_id, logits));
+        }
+        Ok(results)
+    }
+
+    /// 【请求感知的 global_seq_len 同步】
+    ///
+    /// 默认实现调用 `sync_global_seq_len()`。
+    fn sync_global_seq_len_for_request(&mut self, _request_id: u64, len: usize) {
+        self.sync_global_seq_len(len);
+    }
+
     /// 同步全局序列长度（coordinator 广播）。
     ///
     /// 在 prefill 完成后，coordinator 会取所有 worker 的 `global_seq_len` 最大值，
