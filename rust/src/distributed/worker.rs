@@ -231,7 +231,7 @@ pub fn run() {
                 .expect("invalid coordinator_addr");
 
             let mut runtime = WorkerRuntime::new(
-                backend,
+                Box::new(backend),
                 domain_config.domain_id,
                 num_domains,
                 listen_addr,

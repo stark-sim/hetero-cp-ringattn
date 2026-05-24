@@ -21,17 +21,17 @@ use tokio::runtime::Runtime;
 
 /// HCP Worker 协议运行时。
 ///
-/// 泛型参数 `B` 是后端实现（如 `TchWorkerBackend`）。
 /// 运行时负责所有网络协议，后端只负责模型计算。
-pub struct WorkerRuntime<B: WorkerBackend> {
-    backend: B,
+/// 通过 `Box<dyn WorkerBackend>` 支持运行时后端切换（tch / vllm / 其他）。
+pub struct WorkerRuntime {
+    backend: Box<dyn WorkerBackend>,
     domain_id: usize,
     coord_send: SendStream,
     coord_recv: RecvStream,
     rt: Runtime,
 }
 
-impl<B: WorkerBackend> WorkerRuntime<B> {
+impl WorkerRuntime {
     /// 创建并初始化 WorkerRuntime。
     ///
     /// 此函数会：
@@ -51,7 +51,7 @@ impl<B: WorkerBackend> WorkerRuntime<B> {
     /// - `next_peer_addr`: 下一个 peer 的地址（ring 中的下游）
     /// - `coordinator_addr`: coordinator 的地址
     pub fn new(
-        mut backend: B,
+        mut backend: Box<dyn WorkerBackend>,
         domain_id: usize,
         num_domains: usize,
         listen_addr: SocketAddr,
