@@ -11,10 +11,21 @@ Protocol: line-delimited JSON over stdin/stdout.
 """
 
 import argparse
+import inspect
 import json
+import os
 import sys
 import traceback
 from typing import List, Tuple, Optional
+
+
+def _vllm_generate(llm, token_ids, sampling_params):
+    """兼容 vLLM 0.6.x 和 0.20.x 的 generate() API。"""
+    sig = inspect.signature(llm.generate)
+    if "prompt_token_ids" in sig.parameters:
+        return llm.generate(prompt_token_ids=token_ids, sampling_params=sampling_params)
+    else:
+        return llm.generate(prompts=[token_ids], sampling_params=sampling_params)
 
 
 class Backend:
@@ -50,11 +61,11 @@ class MockBackend(Backend):
 
     def __init__(self, model_dir: str):
         super().__init__(model_dir)
-        import random
+        import random, os
         random.seed(42)
-        self.vocab_size = 100
-        self.num_layers = 2
-        self.capacity_mb = 4096
+        self.vocab_size = int(os.environ.get("HCP_MOCK_VOCAB_SIZE", "100"))
+        self.num_layers = int(os.environ.get("HCP_MOCK_NUM_LAYERS", "2"))
+        self.capacity_mb = int(os.environ.get("HCP_MOCK_CAPACITY_MB", "4096"))
 
     def handshake(self) -> dict:
         return {"num_layers": self.num_layers, "capacity_mb": self.capacity_mb, "vocab_size": self.vocab_size}
@@ -199,21 +210,19 @@ class VllmBackend(Backend):
         # vLLM generate returns sampled tokens, not raw logits.
         # For prototype, we use logprobs to approximate logits.
         from vllm import SamplingParams
-        outputs = self.llm.generate(
-            prompt_token_ids=tokens,
-            sampling_params=SamplingParams(max_tokens=1, temperature=0.0, prompt_logprobs=0),
+        outputs = _vllm_generate(
+            self.llm, tokens,
+            SamplingParams(max_tokens=1, temperature=0.0, prompt_logprobs=0),
         )
-        completion = outputs[0].outputs[0]
-        # Extract logprobs from the last prompt token
         logprobs_dict = outputs[0].prompt_logprobs[-1] if outputs[0].prompt_logprobs else {}
         logits = self._logprobs_to_logits(logprobs_dict)
         return logits, len(tokens) + seq_offset
 
     def decode(self, token: int) -> List[float]:
         from vllm import SamplingParams
-        outputs = self.llm.generate(
-            prompt_token_ids=[token],
-            sampling_params=SamplingParams(max_tokens=1, temperature=0.0, prompt_logprobs=0),
+        outputs = _vllm_generate(
+            self.llm, [token],
+            SamplingParams(max_tokens=1, temperature=0.0, prompt_logprobs=0),
         )
         logprobs_dict = outputs[0].prompt_logprobs[-1] if outputs[0].prompt_logprobs else {}
         return self._logprobs_to_logits(logprobs_dict)
@@ -234,9 +243,9 @@ class VllmBackend(Backend):
     def prefill_request(self, request_id: int, tokens: List[int], seq_offset: int) -> Tuple[List[float], int]:
         from vllm import SamplingParams
         self._request_states[request_id] = list(tokens)
-        outputs = self.llm.generate(
-            prompt_token_ids=tokens,
-            sampling_params=SamplingParams(max_tokens=1, temperature=0.0, prompt_logprobs=0),
+        outputs = _vllm_generate(
+            self.llm, tokens,
+            SamplingParams(max_tokens=1, temperature=0.0, prompt_logprobs=0),
         )
         logprobs_dict = outputs[0].prompt_logprobs[-1] if outputs[0].prompt_logprobs else {}
         logits = self._logprobs_to_logits(logprobs_dict)
@@ -248,9 +257,9 @@ class VllmBackend(Backend):
         if state is None:
             raise ValueError(f"request {request_id} not found")
         state.append(token)
-        outputs = self.llm.generate(
-            prompt_token_ids=state,
-            sampling_params=SamplingParams(max_tokens=1, temperature=0.0, prompt_logprobs=0),
+        outputs = _vllm_generate(
+            self.llm, state,
+            SamplingParams(max_tokens=1, temperature=0.0, prompt_logprobs=0),
         )
         logprobs_dict = outputs[0].prompt_logprobs[-1] if outputs[0].prompt_logprobs else {}
         return self._logprobs_to_logits(logprobs_dict)
@@ -279,7 +288,7 @@ def create_backend(backend_type: str, model_dir: str) -> Backend:
 
 
 def run_worker_process(backend: Backend):
-    print("[worker process] ready, waiting for commands...")
+    print("[worker process] ready, waiting for commands...", file=sys.stderr)
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -298,6 +307,8 @@ def run_worker_process(backend: Backend):
             continue
 
         _respond(resp)
+        if resp.get("exit"):
+            break
 
 
 def _handle_cmd(backend: Backend, cmd: dict) -> dict:
@@ -341,7 +352,7 @@ def _handle_cmd(backend: Backend, cmd: dict) -> dict:
 
     elif action == "shutdown":
         backend.shutdown()
-        return {"status": "ok"}
+        return {"status": "ok", "exit": True}
 
     else:
         return {"status": "error", "message": f"unknown cmd: {action}"}

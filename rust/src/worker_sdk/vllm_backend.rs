@@ -72,14 +72,17 @@ impl VllmWorkerBackend {
         domain_id: usize,
         python_path: &str,
     ) -> Result<Self, String> {
-        println!("[VllmWorkerBackend {domain_id}] spawning Python worker: {python_path}");
+        let python_exe = std::env::var("HCP_PYTHON_PATH").unwrap_or_else(|_| "python3".to_string());
+        println!("[VllmWorkerBackend {domain_id}] spawning Python worker: {python_path} (interpreter: {python_exe})");
 
-        let mut child = std::process::Command::new("python3")
+        let python_backend = std::env::var("HCP_PYTHON_BACKEND_TYPE")
+            .unwrap_or_else(|_| "vllm".to_string());
+        let mut child = std::process::Command::new(&python_exe)
             .arg(python_path)
             .arg("--model-dir")
             .arg(model_dir)
             .arg("--backend")
-            .arg("vllm")
+            .arg(&python_backend)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
@@ -271,5 +274,62 @@ impl Drop for VllmWorkerBackend {
             len: None,
         });
         let _ = self.child.wait();
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_vllm_backend_mock_handshake_prefill_decode() {
+        // Use mock Python backend so no actual model or GPU is needed.
+        std::env::set_var("HCP_PYTHON_BACKEND_TYPE", "mock");
+        let repo_root = std::env::var("CARGO_MANIFEST_DIR")
+            .map(|d| std::path::Path::new(&d).parent().unwrap().to_path_buf())
+            .unwrap_or_else(|_| std::env::current_dir().unwrap());
+        let python_path = repo_root.join("python/hcp_worker_process.py");
+        let model_dir = repo_root.join("models/Qwen2-0.5B");
+
+        let mut backend = VllmWorkerBackend::new(
+            model_dir.to_str().unwrap(),
+            0,
+            python_path.to_str().unwrap(),
+        )
+        .expect("create vllm backend failed");
+
+        // Handshake already happened in new(); verify metadata.
+        assert_eq!(backend.num_layers(), 2);
+        assert_eq!(backend.capacity_mb(), 4096);
+        assert!(backend.device() == Device::Cuda(0));
+
+        // Test prefill.
+        let (logits, global_seq_len) = backend.prefill(&[1, 2, 3], 0).unwrap();
+        assert_eq!(logits.len(), 100); // mock vocab_size = 100
+        assert_eq!(global_seq_len, 3);
+
+        // Test decode.
+        let logits = backend.decode(4).unwrap();
+        assert_eq!(logits.len(), 100);
+
+        // Test decode_batch.
+        let results = backend.decode_batch(&[(42, 5), (43, 6)]).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, 42);
+        assert_eq!(results[0].1.len(), 100);
+        assert_eq!(results[1].0, 43);
+        assert_eq!(results[1].1.len(), 100);
+
+        // Test request-aware methods.
+        let (logits, global_seq_len) = backend.prefill_request(99, &[10, 11], 0).unwrap();
+        assert_eq!(logits.len(), 100);
+        assert_eq!(global_seq_len, 2);
+
+        let logits = backend.decode_request(99, 12).unwrap();
+        assert_eq!(logits.len(), 100);
+
+        // Shutdown happens via Drop.
+        println!("test_vllm_backend_mock_handshake_prefill_decode passed");
     }
 }
