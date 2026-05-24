@@ -189,7 +189,13 @@ pub fn run() {
     let args = parse_args();
     let device = select_device();
 
-    let is_vllm = args.backend_type == "vllm";
+    let backend_type = args.backend_type.to_lowercase();
+    let is_vllm = backend_type == "vllm";
+
+    if backend_type != "tch" && backend_type != "vllm" {
+        eprintln!("[worker] ERROR: unknown --backend-type '{}', expected 'tch' or 'vllm'", backend_type);
+        std::process::exit(1);
+    }
 
     // Only load tch model weights for tch backend.
     let (config, weights) = if is_vllm {
@@ -210,7 +216,6 @@ pub fn run() {
     let num_domains = args.num_domains;
     let coordinator_addr = args.coordinator_addr;
     let model_dir = args.model_dir;
-    let backend_type = args.backend_type;
     let vllm_worker_path = std::env::var("HCP_VLLM_WORKER_PATH")
         .unwrap_or_else(|_| "python/hcp_worker_process.py".to_string());
 

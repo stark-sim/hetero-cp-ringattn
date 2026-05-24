@@ -140,7 +140,10 @@ impl VllmWorkerBackend {
 
     /// Send a command and wait for response.
     /// Skips any non-JSON lines on stdout (e.g., spurious child process logs).
+    /// Guards against infinite loops with a max skip limit (safety bound).
     fn send_cmd(&mut self, cmd: &VllmCommand) -> Result<VllmResponse, String> {
+        const MAX_SKIP_LINES: usize = 1024;
+
         let line = serde_json::to_string(cmd)
             .map_err(|e| format!("serialize command failed: {e}"))?;
 
@@ -150,7 +153,7 @@ impl VllmWorkerBackend {
             .and_then(|_| self.stdin.flush())
             .map_err(|e| format!("write to child stdin failed: {e}"))?;
 
-        loop {
+        for _ in 0..MAX_SKIP_LINES {
             let mut response_line = String::new();
             let n = self.stdout
                 .read_line(&mut response_line)
@@ -181,6 +184,10 @@ impl VllmWorkerBackend {
                 }
             }
         }
+
+        Err(format!(
+            "exceeded max {MAX_SKIP_LINES} non-JSON lines on stdout; child process may be misbehaving"
+        ))
     }
 }
 
@@ -277,9 +284,27 @@ impl WorkerBackend for VllmWorkerBackend {
 
     fn device(&self) -> Device {
         // Trait requires returning a tch::Device, but vLLM manages its own device.
-        // We return Cuda(0) as the canonical GPU device; the actual device is
-        // controlled by the Python subprocess.
-        Device::Cuda(0)
+        // Allow override via HCP_VLLM_DEVICE env var for accurate reporting.
+        if let Ok(name) = std::env::var("HCP_VLLM_DEVICE") {
+            match name.as_str() {
+                "cpu" => Device::Cpu,
+                "mps" => Device::Mps,
+                "cuda" => Device::Cuda(0),
+                _ => {
+                    if let Some(idx) = name.strip_prefix("cuda:") {
+                        if let Ok(i) = idx.parse::<usize>() {
+                            Device::Cuda(i)
+                        } else {
+                            Device::Cuda(0)
+                        }
+                    } else {
+                        Device::Cuda(0)
+                    }
+                }
+            }
+        } else {
+            Device::Cuda(0)
+        }
     }
 }
 

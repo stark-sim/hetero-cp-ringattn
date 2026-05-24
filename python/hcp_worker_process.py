@@ -20,9 +20,17 @@ from typing import List, Tuple, Optional
 
 
 def _vllm_generate(llm, token_ids, sampling_params):
-    """兼容 vLLM 0.6.x 和 0.20.x 的 generate() API。"""
-    sig = inspect.signature(llm.generate)
-    if "prompt_token_ids" in sig.parameters:
+    """兼容 vLLM 0.6.x 和 0.20.x 的 generate() API。
+    
+    使用 lru_cache 风格的单例检测避免每次调用都反射 inspect。
+    """
+    cache_key = id(llm)
+    if not hasattr(_vllm_generate, "_cache"):
+        _vllm_generate._cache = {}
+    if cache_key not in _vllm_generate._cache:
+        sig = inspect.signature(llm.generate)
+        _vllm_generate._cache[cache_key] = "prompt_token_ids" in sig.parameters
+    if _vllm_generate._cache[cache_key]:
         return llm.generate(prompt_token_ids=token_ids, sampling_params=sampling_params)
     else:
         return llm.generate(prompts=[token_ids], sampling_params=sampling_params)
@@ -128,14 +136,21 @@ class TransformersBackend(Backend):
         with torch.no_grad():
             outputs = self.model(input_ids, use_cache=True)
         logits = outputs.logits[0, -1, :].cpu().float().tolist()
+        # Save past_key_values for implicit-state decode() reuse.
+        self._last_past_key_values = outputs.past_key_values
         return logits, len(tokens) + seq_offset
 
     def decode(self, token: int) -> List[float]:
         import torch
         input_ids = torch.tensor([[token]], dtype=torch.long, device=self.device)
         with torch.no_grad():
-            outputs = self.model(input_ids, use_cache=True)
+            past_kv = getattr(self, '_last_past_key_values', None)
+            if past_kv is not None:
+                outputs = self.model(input_ids, past_key_values=past_kv, use_cache=True)
+            else:
+                outputs = self.model(input_ids, use_cache=True)
         logits = outputs.logits[0, -1, :].cpu().float().tolist()
+        self._last_past_key_values = outputs.past_key_values
         return logits
 
     def prefill_request(self, request_id: int, tokens: List[int], seq_offset: int) -> Tuple[List[float], int]:
@@ -240,9 +255,16 @@ class VllmBackend(Backend):
         reconstruct a one-hot logits vector where the sampled token has a
         high logit. This preserves greedy/temperature sampling correctness.
         """
-        sampled_token = outputs[0].outputs[0].token_ids[0]
+        if not outputs or not outputs[0].outputs:
+            raise RuntimeError("vLLM returned empty output")
+        token_ids = outputs[0].outputs[0].token_ids
+        if not token_ids:
+            raise RuntimeError("vLLM returned empty token_ids")
+        sampled_token = int(token_ids[0])
+        if sampled_token < 0 or sampled_token >= self.vocab_size:
+            raise RuntimeError(f"vLLM sampled out-of-bounds token {sampled_token} (vocab={self.vocab_size})")
         logits = [-1e9] * self.vocab_size
-        logits[int(sampled_token)] = 1e9
+        logits[sampled_token] = 1e9
         return logits
 
     def prefill_request(self, request_id: int, tokens: List[int], seq_offset: int) -> Tuple[List[float], int]:
@@ -324,29 +346,42 @@ def _handle_cmd(backend: Backend, cmd: dict) -> dict:
     elif action == "prefill":
         tokens = cmd.get("tokens", [])
         seq_offset = cmd.get("seq_offset", 0)
+        if not isinstance(tokens, list):
+            return {"status": "error", "message": "tokens must be a list"}
         logits, global_seq_len = backend.prefill(tokens, seq_offset)
         return {"status": "ok", "logits": logits, "global_seq_len": global_seq_len}
 
     elif action == "decode":
-        token = cmd.get("tokens", [0])[0]
-        logits = backend.decode(token)
+        tokens = cmd.get("tokens", [0])
+        if not isinstance(tokens, list) or len(tokens) == 0:
+            return {"status": "error", "message": "tokens must be a non-empty list"}
+        logits = backend.decode(tokens[0])
         return {"status": "ok", "logits": logits, "global_seq_len": 0}
 
     elif action == "prefill_request":
         request_id = cmd.get("request_id", 0)
         tokens = cmd.get("tokens", [])
         seq_offset = cmd.get("seq_offset", 0)
+        if not isinstance(tokens, list):
+            return {"status": "error", "message": "tokens must be a list"}
         logits, global_seq_len = backend.prefill_request(request_id, tokens, seq_offset)
         return {"status": "ok", "logits": logits, "global_seq_len": global_seq_len}
 
     elif action == "decode_request":
         request_id = cmd.get("request_id", 0)
-        token = cmd.get("tokens", [0])[0]
-        logits = backend.decode_request(request_id, token)
+        tokens = cmd.get("tokens", [0])
+        if not isinstance(tokens, list) or len(tokens) == 0:
+            return {"status": "error", "message": "tokens must be a non-empty list"}
+        logits = backend.decode_request(request_id, tokens[0])
         return {"status": "ok", "logits": logits, "global_seq_len": 0}
 
     elif action == "decode_batch":
         request_tokens = cmd.get("request_tokens", [])
+        if not isinstance(request_tokens, list):
+            return {"status": "error", "message": "request_tokens must be a list"}
+        for item in request_tokens:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                return {"status": "error", "message": "each request_tokens item must be [request_id, token]"}
         request_logits = backend.decode_batch(request_tokens)
         return {"status": "ok", "request_logits": request_logits}
 
