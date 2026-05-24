@@ -49,7 +49,7 @@ impl DecoderLayer {
         &mut self,
         hidden_states: &Tensor,
         position_ids: &Tensor,
-        kv_cache: Option<&mut crate::model::cache::KvCache>,
+        kv_cache: Option<&mut dyn crate::model::cache::KvCache>,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor, ModelError> {
         // ====== Attention 子层（带 Residual）======

@@ -201,7 +201,9 @@ impl LlamaModel {
 
         // Layer stack
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-            let kv_cache = kv_caches.get_mut(layer_idx).and_then(|c| c.as_mut());
+            let kv_cache: Option<&mut dyn crate::model::cache::KvCache> = kv_caches
+                .get_mut(layer_idx)
+                .and_then(|c| c.as_mut().map(|c| c as &mut dyn crate::model::cache::KvCache));
             hidden_states = layer.forward(&hidden_states, &position_ids, kv_cache, attention_mask.as_ref())?;
         }
 

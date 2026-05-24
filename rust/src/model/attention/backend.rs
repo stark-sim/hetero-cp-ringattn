@@ -30,7 +30,7 @@ pub trait AttentionBackend: Send {
         &mut self,
         hidden_states: &Tensor,
         position_ids: &Tensor,
-        kv_cache: Option<&mut crate::model::cache::KvCache>,
+        kv_cache: Option<&mut dyn crate::model::cache::KvCache>,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor, ModelError>;
 
@@ -55,7 +55,7 @@ impl AttentionBackend for LocalAttentionBackend {
         &mut self,
         hidden_states: &Tensor,
         position_ids: &Tensor,
-        kv_cache: Option<&mut crate::model::cache::KvCache>,
+        kv_cache: Option<&mut dyn crate::model::cache::KvCache>,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor, ModelError> {
         self.attention.forward(hidden_states, position_ids, kv_cache, attention_mask)

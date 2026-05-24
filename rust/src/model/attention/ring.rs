@@ -662,7 +662,7 @@ impl AttentionBackend for HcpRingAttentionBackend {
         &mut self,
         hidden_states: &Tensor,      // 【输入】上一层的输出，shape: [batch, seq_len, hidden_size]
         position_ids: &Tensor,       // 【位置编码】每个 token 在完整序列中的绝对位置，shape: [batch, seq_len]
-        kv_cache: Option<&mut crate::model::cache::KvCache>, // 【KV 缓存】用于自回归生成时复用之前的 K/V
+        kv_cache: Option<&mut dyn crate::model::cache::KvCache>, // 【KV 缓存】用于自回归生成时复用之前的 K/V
         attention_mask: Option<&Tensor>, // 【注意力掩码】因果掩码，防止当前 token 看到未来的 token
     ) -> Result<Tensor, ModelError> {
         // 获取输入的各个维度大小
@@ -785,6 +785,8 @@ impl AttentionBackend for HcpRingAttentionBackend {
 mod tests {
     use super::*;
     use crate::model::attention::backend::LocalAttentionBackend;
+    #[cfg(feature = "tch-backend")]
+    use crate::model::cache::KvCache;
 
     #[cfg(feature = "tch-backend")]
     fn create_test_attention(device: tch::Device) -> crate::model::layers::GqaAttention {
@@ -1265,10 +1267,10 @@ mod tests {
         let history_k = Tensor::randn([1, num_kv_heads as i64, cache_len - 1, head_dim as i64], (Kind::Float, device));
         let history_v = Tensor::randn([1, num_kv_heads as i64, cache_len - 1, head_dim as i64], (Kind::Float, device));
 
-        let mut gqa_cache = crate::model::cache::KvCache::new();
+        let mut gqa_cache = crate::model::cache::ContiguousKvCache::new();
         let _ = gqa_cache.update(&history_k, &history_v).unwrap();
 
-        let mut ring_cache = crate::model::cache::KvCache::new();
+        let mut ring_cache = crate::model::cache::ContiguousKvCache::new();
         let _ = ring_cache.update(&history_k, &history_v).unwrap();
 
         // Run both forwards

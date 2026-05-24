@@ -80,7 +80,7 @@ impl GqaAttention {
         &self,
         hidden_states: &Tensor,
         position_ids: &Tensor,
-        kv_cache: Option<&mut crate::model::cache::KvCache>,
+        kv_cache: Option<&mut dyn crate::model::cache::KvCache>,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor, ModelError> {
         let batch = hidden_states.size()[0];
