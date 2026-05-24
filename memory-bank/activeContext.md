@@ -2,6 +2,16 @@
 
 ## 当前焦点
 
+[2026-05-24] **M13 Step 2: VllmWorkerBackend 原型完成**（commit `cc9f5c0`）：
+- `VllmWorkerBackend`：通过子进程 + JSON-over-stdio pipe 与 Python vLLM worker 通信，实现 `WorkerBackend` trait
+  - Handshake 获取 num_layers / capacity_mb
+  - Prefill/Decode/DecodeBatch 全命令覆盖
+  - Graceful shutdown via Drop
+- `python/hcp_worker_process.py`：多后端 worker 进程（mock / transformers / vllm），统一 JSON 协议
+- `worker.rs` 新增 `--backend-type` CLI 参数：tch（默认）或 vllm。vllm 模式下跳过 tch 模型权重加载
+- `WorkerBackend` trait 从 `worker_sdk/mod.rs` 重新导出，支持 `Box<dyn WorkerBackend>` 在 worker entry 中使用
+- 53/53 cargo tests passed（1 flaky `test_batch_forward_correctness` 在并行运行时偶发 CPU BLAS 非确定性，单独运行通过）
+
 [2026-05-24] **M12 PagedAttention Block Table + vLLM Feasibility 完成**：
 - `KvCache` trait 抽象：`ContiguousKvCache`（现有行为）+ `BlockTableKvCache`（block 化存储）
 - `AttentionBackend::forward` 签名改为 `Option<&mut dyn KvCache>`，零行为变更
@@ -200,6 +210,19 @@ Python 层冻结。Rust 层为主干。
   - Worker `RequestContext`：per-request KV cache 隔离（`HashMap<u64, RequestContext>`）
   - HTTP mode 改为 iteration-based 调度循环
   - 48/48 tests passed，batch E2E 通过（2 请求先后到达输出正确）。Commit `ea111c9` ✅
+- [ ] **M13 Step 3/5: vLLM Backend 集成测试**：
+  - 在 white RTX 4090 上运行 `cargo run --bin distributed_worker -- --backend-type vllm`
+  - 验证单节点 vLLM backend 与 Rust coordinator 控制面互通
+  - 使用 mock backend 做本地协议回归测试（无需 vLLM 安装）
+- [ ] **M13 Step 4/5: vLLM Logits 精确提取**：
+  - 当前 `VllmBackend` 用 `prompt_logprobs` 近似 logits，精度不足
+  - 方案 A：vLLM `model_executor.execute_model(output_logits=True)` 直接提取
+  - 方案 B：vLLM `logits_processors` 或自定义 sampler 捕获
+  - 与 tch backend 做逐 token logits diff 对比
+- [ ] **M13 Step 5/5: vLLM Backend 端到端验证**：
+  - 跨节点异构：`--backend-type vllm` on white + `--backend-type tch` on Mac
+  - 单节点吞吐：vLLM 单 worker vs tch backend 单 worker 性能对比
+  - Correctness 验证：相同 prompt 输出 token 一致，logits diff < 1e-4
 - [ ] **M12: PagedAttention Block Table**（待启动）：
   - 替换 `KvCache` 为 block 化分配，支持 ragged batching
   - 不等长请求的 true continuous batching 基础设施
