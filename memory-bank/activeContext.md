@@ -2,16 +2,23 @@
 
 ## 当前焦点
 
-[2026-05-23] **M13 Phase 1-2: Continuous Batching Scheduler + Per-Request KV Cache 完成**：
+[2026-05-24] **M12 PagedAttention Block Table + vLLM Feasibility 完成**：
+- `KvCache` trait 抽象：`ContiguousKvCache`（现有行为）+ `BlockTableKvCache`（block 化存储）
+- `AttentionBackend::forward` 签名改为 `Option<&mut dyn KvCache>`，零行为变更
+- `BlockTableKvCache`：可配置 `block_size`（默认 16），逻辑 block 边界，供未来 custom kernel 消费
+- 可行性研究结论：vLLM 作为单节点 backend = HIGH feasibility；vLLM 参与 HCP KV ring = LOW feasibility（需深度修改 vLLM 内部）
+- 推荐架构：混合路径（`TchWorkerBackend` 处理分布式 ring attention + `VllmWorkerBackend` 处理单节点高吞吐）
+- 53/53 cargo tests passed。Commits: `cfe4cde` (trait), `fc5c15d` (feasibility), `c98e45f` (BlockTable)
+
+[2026-05-23] **M13 Phase 1-3: Continuous Batching Scheduler + Per-Request KV Cache + Batch Decode 完成**：
 - Coordinator `BatchScheduler`：pending/active/completed 请求池，固定 `max_batch_size` 调度
-- `DecodeBatch` / `DecodeBatchDone` 协议扩展，为 Phase 3 批量 decode 做准备
-- Worker `RequestContext`：per-request KV cache 隔离，支持多请求同时存在不互相污染
-- HTTP mode 从 spawn_blocking 并发模式改为 iteration-based 调度循环
-- **本地 Batch E2E 验证**（`scripts/test_http_api_batch_local.sh`）：2 请求先后到达
-  - Request 1: `jumps over the` ✅
-  - Request 2: `, there was` ✅
-- 单请求 regression：`scripts/test_http_api_local.sh` → `jumps over the lazy dog` ✅
-- 48/48 cargo tests passed。Commit `ea111c9`
+- `DecodeBatch` / `DecodeBatchDone` 协议扩展并已在 worker runtime 实现
+- Worker `RequestContext`：per-request KV cache 隔离
+- HTTP mode iteration-based 调度循环
+- `test_decode_batch_isolation`：验证 batch decode logits 与独立 decode 一致，4 步无交叉污染
+- Scheduler edge-case tests：batch 动态大小变化 + 状态修改
+- **本地 Batch E2E 验证**：2 请求先后到达，输出正确，metrics 准确
+- 53/53 cargo tests passed。Commits: `ea111c9` (Phase 1-2), `4f3d3dc` (Phase 3 tests)
 
 [2026-05-22] **M10.3 Request-Level Parallelism 完成**：
 - Coordinator 并发请求处理：`worker_streams` 用 `Arc<std::sync::Mutex>` 保护，`rt.spawn_blocking()` 并发处理 HTTP 请求
