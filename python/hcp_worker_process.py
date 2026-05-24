@@ -88,7 +88,7 @@ class TransformersBackend(Backend):
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
-        print(f"[transformers backend] loading model from {model_dir} ...")
+        print(f"[transformers backend] loading model from {model_dir} ...", file=sys.stderr)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.config = AutoConfig.from_pretrained(model_dir)
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -101,7 +101,7 @@ class TransformersBackend(Backend):
         self.num_layers = getattr(self.config, "num_hidden_layers", 24)
         self.capacity_mb = self._query_capacity_mb()
         self._request_states = {}  # request_id -> {input_ids, past_key_values}
-        print(f"[transformers backend] loaded, vocab_size={self.vocab_size}, device={self.device}")
+        print(f"[transformers backend] loaded, vocab_size={self.vocab_size}, device={self.device}", file=sys.stderr)
 
     def _query_capacity_mb(self) -> int:
         import torch
@@ -178,7 +178,7 @@ class VllmBackend(Backend):
         from vllm import LLM, SamplingParams
         import torch
 
-        print(f"[vllm backend] loading model from {model_dir} ...")
+        print(f"[vllm backend] loading model from {model_dir} ...", file=sys.stderr)
         self.llm = LLM(
             model=model_dir,
             dtype="float32",
@@ -194,7 +194,7 @@ class VllmBackend(Backend):
         )
         self.capacity_mb = self._query_capacity_mb()
         self._request_states = {}  # request_id -> {token_ids}
-        print(f"[vllm backend] loaded, vocab_size={self.vocab_size}")
+        print(f"[vllm backend] loaded, vocab_size={self.vocab_size}", file=sys.stderr)
 
     def _query_capacity_mb(self) -> int:
         import torch

@@ -83,6 +83,8 @@ impl VllmWorkerBackend {
             .arg(model_dir)
             .arg("--backend")
             .arg(&python_backend)
+            .env_remove("DYLD_LIBRARY_PATH")
+            .env_remove("LD_LIBRARY_PATH")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
