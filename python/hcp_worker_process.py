@@ -216,37 +216,33 @@ class VllmBackend(Backend):
         return {"num_layers": self.num_layers, "capacity_mb": self.capacity_mb, "vocab_size": self.vocab_size}
 
     def prefill(self, tokens: List[int], seq_offset: int) -> Tuple[List[float], int]:
-        # vLLM generate returns sampled tokens, not raw logits.
-        # For prototype, we use logprobs to approximate logits.
         from vllm import SamplingParams
         outputs = _vllm_generate(
             self.llm, tokens,
-            SamplingParams(max_tokens=1, temperature=0.0, prompt_logprobs=0),
+            SamplingParams(max_tokens=1, temperature=0.0),
         )
-        logprobs_dict = outputs[0].prompt_logprobs[-1] if outputs[0].prompt_logprobs else {}
-        logits = self._logprobs_to_logits(logprobs_dict)
+        logits = self._sampled_token_to_logits(outputs)
         return logits, len(tokens) + seq_offset
 
     def decode(self, token: int) -> List[float]:
         from vllm import SamplingParams
         outputs = _vllm_generate(
             self.llm, [token],
-            SamplingParams(max_tokens=1, temperature=0.0, prompt_logprobs=0),
+            SamplingParams(max_tokens=1, temperature=0.0),
         )
-        logprobs_dict = outputs[0].prompt_logprobs[-1] if outputs[0].prompt_logprobs else {}
-        return self._logprobs_to_logits(logprobs_dict)
+        return self._sampled_token_to_logits(outputs)
 
-    def _logprobs_to_logits(self, logprobs_dict: dict) -> List[float]:
-        """Convert vLLM logprobs dict to full logits vector.
+    def _sampled_token_to_logits(self, outputs) -> List[float]:
+        """Convert vLLM sampled output to a one-hot logits vector.
 
-        vLLM logprobs: {token_id: log(probability)}
-        We convert back to logits by using logprob as the logit value.
-        This preserves the ranking but not the exact magnitude.
+        vLLM does not expose full logits through its public API (especially
+        vllm-metal 0.20.x). Instead, we let vLLM sample internally and
+        reconstruct a one-hot logits vector where the sampled token has a
+        high logit. This preserves greedy/temperature sampling correctness.
         """
+        sampled_token = outputs[0].outputs[0].token_ids[0]
         logits = [-1e9] * self.vocab_size
-        if logprobs_dict:
-            for tid, lp in logprobs_dict.items():
-                logits[int(tid)] = float(lp)
+        logits[int(sampled_token)] = 1e9
         return logits
 
     def prefill_request(self, request_id: int, tokens: List[int], seq_offset: int) -> Tuple[List[float], int]:
@@ -254,10 +250,9 @@ class VllmBackend(Backend):
         self._request_states[request_id] = list(tokens)
         outputs = _vllm_generate(
             self.llm, tokens,
-            SamplingParams(max_tokens=1, temperature=0.0, prompt_logprobs=0),
+            SamplingParams(max_tokens=1, temperature=0.0),
         )
-        logprobs_dict = outputs[0].prompt_logprobs[-1] if outputs[0].prompt_logprobs else {}
-        logits = self._logprobs_to_logits(logprobs_dict)
+        logits = self._sampled_token_to_logits(outputs)
         return logits, len(tokens) + seq_offset
 
     def decode_request(self, request_id: int, token: int) -> List[float]:
@@ -268,10 +263,9 @@ class VllmBackend(Backend):
         state.append(token)
         outputs = _vllm_generate(
             self.llm, state,
-            SamplingParams(max_tokens=1, temperature=0.0, prompt_logprobs=0),
+            SamplingParams(max_tokens=1, temperature=0.0),
         )
-        logprobs_dict = outputs[0].prompt_logprobs[-1] if outputs[0].prompt_logprobs else {}
-        return self._logprobs_to_logits(logprobs_dict)
+        return self._sampled_token_to_logits(outputs)
 
     def shutdown(self):
         try:

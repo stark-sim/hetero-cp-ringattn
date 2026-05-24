@@ -139,6 +139,7 @@ impl VllmWorkerBackend {
     }
 
     /// Send a command and wait for response.
+    /// Skips any non-JSON lines on stdout (e.g., spurious child process logs).
     fn send_cmd(&mut self, cmd: &VllmCommand) -> Result<VllmResponse, String> {
         let line = serde_json::to_string(cmd)
             .map_err(|e| format!("serialize command failed: {e}"))?;
@@ -149,19 +150,37 @@ impl VllmWorkerBackend {
             .and_then(|_| self.stdin.flush())
             .map_err(|e| format!("write to child stdin failed: {e}"))?;
 
-        let mut response_line = String::new();
-        self.stdout
-            .read_line(&mut response_line)
-            .map_err(|e| format!("read from child stdout failed: {e}"))?;
+        loop {
+            let mut response_line = String::new();
+            let n = self.stdout
+                .read_line(&mut response_line)
+                .map_err(|e| format!("read from child stdout failed: {e}"))?;
 
-        let resp: VllmResponse = serde_json::from_str(&response_line)
-            .map_err(|e| format!("parse response failed: {e} (raw: {response_line})"))?;
+            if n == 0 {
+                return Err("child stdout closed without valid JSON response".to_string());
+            }
 
-        if resp.status != "ok" {
-            return Err(format!("Python worker error: {}", resp.message));
+            let trimmed = response_line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            match serde_json::from_str::<VllmResponse>(trimmed) {
+                Ok(resp) => {
+                    if resp.status != "ok" {
+                        return Err(format!("Python worker error: {}", resp.message));
+                    }
+                    return Ok(resp);
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[VllmWorkerBackend {}] skipping non-JSON stdout: {}",
+                        self.domain_id, trimmed
+                    );
+                    continue;
+                }
+            }
         }
-
-        Ok(resp)
     }
 }
 
