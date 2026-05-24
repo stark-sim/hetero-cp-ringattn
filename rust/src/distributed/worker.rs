@@ -12,7 +12,7 @@
 
 use crate::model::model::LlamaModel;
 use crate::model::{ModelConfig, ModelWeights};
-use crate::worker_sdk::{TchWorkerBackend, WorkerRuntime};
+use crate::worker_sdk::{TchWorkerBackend, VllmWorkerBackend, WorkerRuntime};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -71,6 +71,7 @@ struct WorkerArgs {
     model_dir: String,
     coordinator_addr: String,
     num_domains: usize,
+    backend_type: String,
 }
 
 fn parse_args() -> WorkerArgs {
@@ -85,6 +86,7 @@ fn parse_args() -> WorkerArgs {
     let mut local_domain_ids: Option<Vec<usize>> = None;
     let mut listen_addrs: Option<Vec<String>> = None;
     let mut next_peer_addrs: Option<Vec<String>> = None;
+    let mut backend_type = String::from("tch");
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -105,6 +107,9 @@ fn parse_args() -> WorkerArgs {
             }
             "--next-peer-addrs" => {
                 next_peer_addrs = Some(args.next().unwrap().split(',').map(|s| s.to_string()).collect());
+            }
+            "--backend-type" => {
+                backend_type = args.next().unwrap();
             }
             _ => eprintln!("[worker] unknown arg: {arg}"),
         }
@@ -133,6 +138,7 @@ fn parse_args() -> WorkerArgs {
         model_dir,
         coordinator_addr,
         num_domains,
+        backend_type,
     }
 }
 
@@ -183,12 +189,18 @@ pub fn run() {
     let args = parse_args();
     let device = select_device();
 
-    // Load model config and weights once per process.
-    // All domains share the weights via shallow_clone.
-    let config_path = Path::new(&args.model_dir).join("config.json");
-    let config = ModelConfig::from_file(&config_path).expect("load config failed");
-    let weights = ModelWeights::from_dir(&args.model_dir, device).expect("load weights failed");
-    println!("[multi-worker] loaded model weights once for {} domain(s)", args.domain_configs.len());
+    let is_vllm = args.backend_type == "vllm";
+
+    // Only load tch model weights for tch backend.
+    let (config, weights) = if is_vllm {
+        (None, None)
+    } else {
+        let config_path = Path::new(&args.model_dir).join("config.json");
+        let cfg = ModelConfig::from_file(&config_path).expect("load config failed");
+        let w = ModelWeights::from_dir(&args.model_dir, device).expect("load weights failed");
+        println!("[multi-worker] loaded model weights once for {} domain(s)", args.domain_configs.len());
+        (Some(cfg), Some(w))
+    };
 
     // Barrier to synchronize all domains before command loop.
     // 所有 domain 必须在 runtime.run() 之前到达 barrier，
@@ -198,30 +210,40 @@ pub fn run() {
     let num_domains = args.num_domains;
     let coordinator_addr = args.coordinator_addr;
     let model_dir = args.model_dir;
+    let backend_type = args.backend_type;
+    let vllm_worker_path = std::env::var("HCP_VLLM_WORKER_PATH")
+        .unwrap_or_else(|_| "python/hcp_worker_process.py".to_string());
 
     let mut handles = Vec::new();
     for domain_config in args.domain_configs {
         let b = barrier.clone();
-        let cfg = config.clone();
         let coord = coordinator_addr.clone();
-        let _dir = model_dir.clone();
-        // shallow_clone 权重：复制 Tensor 的 metadata 指针，不复制底层数据。
-        // 这样多个 domain 共享同一份模型参数，显著降低显存占用。
-        let w = ModelWeights {
+        let mdir = model_dir.clone();
+        let btype = backend_type.clone();
+        let vllm_path = vllm_worker_path.clone();
+        let cfg = config.clone();
+        let w = weights.as_ref().map(|weights| ModelWeights {
             #[cfg(feature = "tch-backend")]
             tensors: weights.tensors.iter().map(|(k, v)| (k.clone(), v.shallow_clone())).collect(),
             #[cfg(not(feature = "tch-backend"))]
             tensors: weights.tensors.clone(),
-        };
+        });
         let handle = std::thread::spawn(move || {
-            // 每个 domain 需要独立的 LlamaModel（因为 KV cache 是 domain-specific 的），
-            // 但权重共享（shallow_clone）。
-            let backend = TchWorkerBackend::from_model(
-                LlamaModel::from_weights(cfg, &w, device, num_domains)
-                    .expect("build model failed"),
-                device,
-                domain_config.domain_id,
-            );
+            let backend: Box<dyn crate::worker_sdk::WorkerBackend> = if btype == "vllm" {
+                Box::new(
+                    VllmWorkerBackend::new(&mdir, domain_config.domain_id, &vllm_path)
+                        .expect("create vllm backend failed"),
+                )
+            } else {
+                let cfg = cfg.expect("model config required for tch backend");
+                let w = w.expect("model weights required for tch backend");
+                Box::new(TchWorkerBackend::from_model(
+                    LlamaModel::from_weights(cfg, &w, device, num_domains)
+                        .expect("build model failed"),
+                    device,
+                    domain_config.domain_id,
+                ))
+            };
 
             let listen_addr: SocketAddr = domain_config.listen_addr.parse()
                 .expect("invalid listen_addr");
@@ -231,7 +253,7 @@ pub fn run() {
                 .expect("invalid coordinator_addr");
 
             let mut runtime = WorkerRuntime::new(
-                Box::new(backend),
+                backend,
                 domain_config.domain_id,
                 num_domains,
                 listen_addr,

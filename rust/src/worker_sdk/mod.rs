@@ -22,8 +22,14 @@ pub mod backend;
 pub mod runtime;
 #[cfg(feature = "tch-backend")]
 pub mod tch_backend;
+#[cfg(feature = "tch-backend")]
+pub mod vllm_backend;
 
+#[cfg(feature = "tch-backend")]
+pub use backend::WorkerBackend;
 #[cfg(feature = "tch-backend")]
 pub use runtime::WorkerRuntime;
 #[cfg(feature = "tch-backend")]
 pub use tch_backend::TchWorkerBackend;
+#[cfg(feature = "tch-backend")]
+pub use vllm_backend::VllmWorkerBackend;
