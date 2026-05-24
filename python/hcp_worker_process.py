@@ -89,7 +89,12 @@ class TransformersBackend(Backend):
         from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
         print(f"[transformers backend] loading model from {model_dir} ...", file=sys.stderr)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
         self.config = AutoConfig.from_pretrained(model_dir)
         self.model = AutoModelForCausalLM.from_pretrained(
             model_dir,
@@ -108,6 +113,10 @@ class TransformersBackend(Backend):
         if torch.cuda.is_available():
             free, _ = torch.cuda.mem_get_info()
             return int(free // (1024 * 1024))
+        if torch.backends.mps.is_available():
+            # MPS doesn't have a direct mem_get_info API; return a conservative estimate
+            import os
+            return int(os.environ.get("HCP_MPS_CAPACITY_MB", "4096"))
         return 4096
 
     def handshake(self) -> dict:
