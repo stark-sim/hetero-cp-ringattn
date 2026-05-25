@@ -2,6 +2,16 @@
 
 ## 当前焦点
 
+[2026-05-09] **Request memory leak 修复完成**（commit `ee6bd0e`）：
+- 根因：coordinator 检测请求完成（EOS/max_tokens）后仅从 scheduler 移除，从未通知 workers 释放 per-request 状态
+- `WorkerCommand::ReleaseRequest { request_id }` 新增到控制协议
+- `WorkerBackend::release_request()` trait 方法，默认 no-op（向后兼容）
+- `TchWorkerBackend`: `request_contexts.remove(request_id)` 释放 KV cache tensors
+- `VllmWorkerBackend`: 发送 release_request JSON 命令到 Python 子进程
+- Python `TransformersBackend` / `VllmBackend`: `del _request_states[request_id]`
+- Coordinator batch mode + HTTP mode 均在请求完成后发送 ReleaseRequest 给所有 workers
+- 验证：54/54 tests pass，HTTP API E2E `jumps over the lazy dog` ✅，worker 日志确认 `[TchWorkerBackend] released request 1`
+
 [2026-05-09] **M12 BlockTable 运行时切换 + 集成测试 + E2E 验证完成**（commits `3efbdf0`, `c8ec740`）：
 - `KvCacheImpl` enum（Contiguous | BlockTable）替代硬编码 `ContiguousKvCache`，避免 `Box<dyn>` 生命周期问题
 - `create_kv_caches()` 运行时切换：环境变量 `HCP_KV_CACHE_BLOCK_TABLE=1` 启用 BlockTable，`HCP_KV_CACHE_BLOCK_SIZE=N` 调整 block 大小（默认 16）
