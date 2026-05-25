@@ -14,8 +14,34 @@
 use crate::model::transport::KvTransport;
 use crate::worker_sdk::backend::WorkerBackend;
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
+use std::time::{Duration, Instant};
 use tch::Device;
+
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+
+/// Poll a file descriptor for readability with a timeout (Unix only).
+#[cfg(unix)]
+fn poll_readable(fd: i32, timeout: Duration) -> io::Result<bool> {
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+    let ret = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(ret > 0)
+}
+
+/// Stub for non-Unix platforms (always returns true, falls back to blocking read).
+#[cfg(not(unix))]
+fn poll_readable(_fd: i32, _timeout: Duration) -> io::Result<bool> {
+    Ok(true)
+}
 
 /// JSON command sent to Python vLLM worker process.
 #[derive(Serialize)]
@@ -138,11 +164,17 @@ impl VllmWorkerBackend {
         Ok(backend)
     }
 
+    /// Default timeout for waiting on Python worker response.
+    /// Covers model load + inference; vllm-metal first init can take 60-90s.
+    const DEFAULT_CMD_TIMEOUT: Duration = Duration::from_secs(120);
+
     /// Send a command and wait for response.
     /// Skips any non-JSON lines on stdout (e.g., spurious child process logs).
     /// Guards against infinite loops with a max skip limit (safety bound).
+    /// Uses `poll` with timeout to avoid blocking forever on a hung child.
     fn send_cmd(&mut self, cmd: &VllmCommand) -> Result<VllmResponse, String> {
         const MAX_SKIP_LINES: usize = 1024;
+        let deadline = Instant::now() + Self::DEFAULT_CMD_TIMEOUT;
 
         let line = serde_json::to_string(cmd)
             .map_err(|e| format!("serialize command failed: {e}"))?;
@@ -153,7 +185,53 @@ impl VllmWorkerBackend {
             .and_then(|_| self.stdin.flush())
             .map_err(|e| format!("write to child stdin failed: {e}"))?;
 
-        for _ in 0..MAX_SKIP_LINES {
+        for skip_count in 0..MAX_SKIP_LINES {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                // Timeout — check if child exited
+                match self.child.try_wait() {
+                    Ok(Some(status)) => {
+                        return Err(format!(
+                            "cmd timeout: child exited with status {status} after {} skips",
+                            skip_count
+                        ));
+                    }
+                    Ok(None) => {
+                        return Err(format!(
+                            "cmd timeout: child still alive but unresponsive after {} skips (timeout={:?})",
+                            skip_count, Self::DEFAULT_CMD_TIMEOUT
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "cmd timeout: cannot check child status: {e}"
+                        ));
+                    }
+                }
+            }
+
+            // Wait for data on stdout with remaining timeout.
+            // IMPORTANT: Check BufReader's internal buffer first — if it already
+            // has data from a previous read, we must NOT poll (which would wait
+            // for new FD data and ignore the buffered content).
+            #[cfg(unix)]
+            {
+                let has_buffered = self.stdout.buffer().len() > 0;
+                if !has_buffered {
+                    let fd = self.stdout.get_ref().as_raw_fd();
+                    match poll_readable(fd, remaining) {
+                        Ok(true) => {} // new data available on FD
+                        Ok(false) => {
+                            // poll timed out — loop back to check deadline / child status
+                            continue;
+                        }
+                        Err(e) => {
+                            return Err(format!("poll on child stdout failed: {e}"));
+                        }
+                    }
+                }
+            }
+
             let mut response_line = String::new();
             let n = self.stdout
                 .read_line(&mut response_line)
