@@ -2,6 +2,13 @@
 
 ## 当前焦点
 
+[2026-05-09] **M12 BlockTable 运行时切换 + 集成测试完成**（commit `3efbdf0`）：
+- `KvCacheImpl` enum（Contiguous | BlockTable）替代硬编码 `ContiguousKvCache`，避免 `Box<dyn>` 生命周期问题
+- `create_kv_caches()` 运行时切换：环境变量 `HCP_KV_CACHE_BLOCK_TABLE=1` 启用 BlockTable，`HCP_KV_CACHE_BLOCK_SIZE=N` 调整 block 大小（默认 16）
+- `test_block_table_through_model_forward`：BlockTableKvCache 通过完整 `LlamaModel::forward` prefill + 3-step decode 路径验证，block_size=4 跨越 block 边界，diff < 1e-6
+- 所有 53 非 flaky tests 通过，零 regression
+- **Trade-off**: BlockTable.update() 仍调用 Tensor::cat()，无即时内存/性能收益；此为未来 custom kernel 消费 `k_blocks()`/`v_blocks()` 的结构基础
+
 [2026-05-24] **M13 Step 2: VllmWorkerBackend 原型完成 + Review 修复**（commits `cc9f5c0` → `abed260`）：
 - `VllmWorkerBackend`：通过子进程 + JSON-over-stdio pipe 与 Python vLLM worker 通信，实现 `WorkerBackend` trait
   - Handshake 获取 num_layers / capacity_mb
