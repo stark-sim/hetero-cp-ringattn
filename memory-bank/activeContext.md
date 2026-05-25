@@ -2,15 +2,20 @@
 
 ## 当前焦点
 
-[2026-05-24] **M13 Step 2: VllmWorkerBackend 原型完成**（commit `cc9f5c0`）：
+[2026-05-24] **M13 Step 2: VllmWorkerBackend 原型完成 + Review 修复**（commits `cc9f5c0` → `abed260`）：
 - `VllmWorkerBackend`：通过子进程 + JSON-over-stdio pipe 与 Python vLLM worker 通信，实现 `WorkerBackend` trait
   - Handshake 获取 num_layers / capacity_mb
   - Prefill/Decode/DecodeBatch 全命令覆盖
-  - Graceful shutdown via Drop
+  - Graceful shutdown via Drop，stdout 隔离（非 JSON 行自动跳过）
 - `python/hcp_worker_process.py`：多后端 worker 进程（mock / transformers / vllm），统一 JSON 协议
+  - TransformersBackend：MPS/CPU 自动检测，prefill→decode KV cache 复用（Reviewer blocker #2 修复）
+  - VllmBackend：vLLM 0.6.x / 0.20.x 双版本兼容，one-hot logits 重建
 - `worker.rs` 新增 `--backend-type` CLI 参数：tch（默认）或 vllm。vllm 模式下跳过 tch 模型权重加载
+  - backend_type shadowing 修复（Reviewer blocker #1）：移除冗余变量和错误 casing 的 assert
 - `WorkerBackend` trait 从 `worker_sdk/mod.rs` 重新导出，支持 `Box<dyn WorkerBackend>` 在 worker entry 中使用
+- Harness Review：Guard=APPROVE，Examiner=CONDITIONAL → 2 blockers 修复后通过
 - 53/53 cargo tests passed（1 flaky `test_batch_forward_correctness` 在并行运行时偶发 CPU BLAS 非确定性，单独运行通过）
+- 本地 E2E 全部通过：mock ✅、transformers ✅、vllm-metal ✅、cross-backend (tch vs transformers) ✅
 
 [2026-05-24] **M12 PagedAttention Block Table + vLLM Feasibility 完成**：
 - `KvCache` trait 抽象：`ContiguousKvCache`（现有行为）+ `BlockTableKvCache`（block 化存储）
@@ -210,12 +215,14 @@ Python 层冻结。Rust 层为主干。
   - Worker `RequestContext`：per-request KV cache 隔离（`HashMap<u64, RequestContext>`）
   - HTTP mode 改为 iteration-based 调度循环
   - 48/48 tests passed，batch E2E 通过（2 请求先后到达输出正确）。Commit `ea111c9` ✅
-- [ ] **M13 Step 3/5: vLLM Backend 集成测试**：
+- [ ] **M13 Step 3/5: vLLM Backend 集成测试（white RTX 4090 CUDA）**：
   - 在 white RTX 4090 上运行 `cargo run --bin distributed_worker -- --backend-type vllm`
   - 验证单节点 vLLM backend 与 Rust coordinator 控制面互通
-  - 使用 mock backend 做本地协议回归测试（无需 vLLM 安装）
+  - 使用 mock backend 做本地协议回归测试（无需 vLLM 安装）✅ 已完成
+  - **Blocked**: white RTX 4090 当前不可达（Tailscale down），等待恢复后验证
 - [ ] **M13 Step 4/5: vLLM Logits 精确提取**：
-  - 当前 `VllmBackend` 用 `prompt_logprobs` 近似 logits，精度不足
+  - 当前 `VllmBackend` 使用 one-hot logits（sampled token=1e9，其余=-1e9），因 vLLM 公共 API 不暴露完整 logits
+  - vllm-metal token drift 已知：vLLM 内部采样器即使 temperature=0.0 也使用独立随机状态，sampled token 可能与 true argmax 不同
   - 方案 A：vLLM `model_executor.execute_model(output_logits=True)` 直接提取
   - 方案 B：vLLM `logits_processors` 或自定义 sampler 捕获
   - 与 tch backend 做逐 token logits diff 对比
