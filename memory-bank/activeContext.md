@@ -2,6 +2,11 @@
 
 ## 当前焦点
 
+[2026-05-09] **Flaky test 修复完成**（commit `f84f441`）：
+- `test_batch_forward_correctness` 因 CPU BLAS 非确定性频繁失败（batched vs single matmul 累加顺序不同）
+- BATCH_TOL 从 1e-5 放宽到 1e-4，添加 single-step decode token 一致性断言（argmax 必须匹配）
+- 5/5 连续运行通过，全套件 55/55 tests pass
+
 [2026-05-09] **DEPLOYMENT_GUIDE.md vLLM backend 部署文档更新完成**（commit `a9cbefc`）：
 - 新增 §6.5 "vLLM Backend 部署（单节点高吞吐）"
 - 覆盖 Mac vllm-metal 和 GPU vLLM 0.6.4 CUDA 的环境准备、启动命令、关键环境变量表
