@@ -319,6 +319,107 @@ cargo run --features tch-backend --bin hcp-ringattn-rust -- \
 
 如遇隧道崩溃，减小 prompt 长度或等待网络恢复后重试。
 
+### 6.5 vLLM Backend 部署（单节点高吞吐）
+
+> **重要限制**：当前 `VllmWorkerBackend` 是**单节点后端**，`setup_kv_transports()` 为 no-op，**不参与分布式 KV Ring 交换**。因此：
+> - 可与 tch backend 混合部署，但 vLLM worker 只处理本地 prompt 分片，不参与跨域 attention
+> - 若要全集群使用 vLLM，需所有 worker 均为 `--backend-type vllm`（同构 vLLM 集群）
+> - vLLM backend 不支持 logits 全向量提取（见 `docs/VLLM_INTEGRATION.md` §9）
+
+#### 环境准备
+
+**Mac（vllm-metal）**：
+```bash
+# 创建 uv 虚拟环境并安装 vllm-metal
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv venv ~/.venv-vllm-metal --python 3.11
+source ~/.venv-vllm-metal/bin/activate
+# 按 vllm-metal 官方 install.sh 安装（vLLM 0.20.1+cpu + vllm-metal 0.2.0）
+```
+
+**GPU（vLLM 0.6.4 CUDA）**：
+```bash
+uv venv ~/venv-vllm --python 3.11
+source ~/venv-vllm/bin/activate
+uv pip install torch==2.5.1+cu124 --index-url https://download.pytorch.org/whl/cu124
+uv pip install vllm==0.6.4 --no-deps
+# 手动补全核心依赖（见 python/hcp_worker_process.py 的 import）
+```
+
+#### 启动 vLLM Worker
+
+```bash
+# Mac vllm-metal
+cd hetero-cp-ringattn/rust
+cargo build --features tch-backend --release
+
+export HCP_PYTHON_BACKEND_TYPE=vllm
+export HCP_PYTHON_PATH=/Users/<you>/.venv-vllm-metal/bin/python3
+export HCP_VLLM_WORKER_PATH=/Users/<you>/hetero-cp-ringattn/python/hcp_worker_process.py
+export DYLD_LIBRARY_PATH="/Users/<you>/libtorch/lib:$DYLD_LIBRARY_PATH"
+
+./target/release/hcp-ringattn-rust \
+  --distributed-role worker \
+  --domain-id 0 \
+  --model-dir /path/to/models/Qwen2-0.5B \
+  --backend-type vllm \
+  --listen-addr 0.0.0.0:29451 \
+  --next-peer-addr 127.0.0.1:29451 \
+  --coordinator-addr 127.0.0.1:29450 \
+  --num-domains 1
+```
+
+```bash
+# GPU vLLM 0.6.4 CUDA
+export HCP_PYTHON_BACKEND_TYPE=vllm
+export HCP_PYTHON_PATH=/home/<you>/venv-vllm/bin/python3
+export HCP_VLLM_WORKER_PATH=/home/<you>/hetero-cp-ringattn/python/hcp_worker_process.py
+export LD_LIBRARY_PATH="/home/<you>/libtorch/lib:$LD_LIBRARY_PATH"
+
+./target/release/hcp-ringattn-rust \
+  --distributed-role worker \
+  --domain-id 0 \
+  --model-dir /path/to/models/Qwen2-0.5B \
+  --backend-type vllm \
+  --listen-addr 0.0.0.0:29451 \
+  --next-peer-addr 127.0.0.1:29451 \
+  --coordinator-addr <COORD_IP>:29450 \
+  --num-domains 1
+```
+
+**关键环境变量**：
+
+| 变量 | 说明 | 示例值 |
+|------|------|--------|
+| `HCP_PYTHON_BACKEND_TYPE` | Python 后端类型 | `vllm` 或 `transformers` |
+| `HCP_PYTHON_PATH` | Python 解释器路径 | `~/.venv-vllm-metal/bin/python3` |
+| `HCP_VLLM_WORKER_PATH` | Python worker 脚本路径 | `python/hcp_worker_process.py` |
+| `HCP_VLLM_CMD_TIMEOUT_MS` | vLLM 命令超时（毫秒） | `30000`（默认 30s） |
+
+#### HTTP API 模式验证
+
+```bash
+# 启动 coordinator（HTTP mode）
+./target/release/hcp-ringattn-rust \
+  --distributed-role coordinator \
+  --model-dir /path/to/models/Qwen2-0.5B \
+  --num-domains 1 \
+  --listen-addr 0.0.0.0:29450 \
+  --http-addr 0.0.0.0:8080
+
+# 测试
+curl -s http://localhost:8080/health
+curl -s -X POST http://localhost:8080/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "The quick brown fox", "max_tokens": 5, "temperature": 0.0}'
+```
+
+#### 已知问题
+
+- **vllm-metal 初始化慢**：首次 gloo init ~60s + Metal kernel warmup ~10-20s。预热后约 8-10s。
+- **EngineCore 子进程残留**：macOS spawn 模式下，父进程异常退出时 EngineCore 可能残留。E2E 脚本已包含 `pkill -9 -f EngineCore` 清理。
+- **token drift**：即使 `temperature=0.0`，vLLM 内部采样器使用独立随机状态，sampled token 可能与 true argmax 不同。`logprobs=20` 可部分缓解。
+
 ---
 
 ## 7. 故障排查
