@@ -3,7 +3,7 @@
 use axum::{
     extract::State,
     http::StatusCode,
-    response::Json,
+    response::{IntoResponse, Json, Sse},
     routing::{get, post},
     Router,
 };
@@ -12,11 +12,14 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tower_http::cors::CorsLayer;
 
 use crate::api::types::{
-    CompletionChoice, CompletionRequest, CompletionResponse, HealthResponse,
-    InferenceJob, InferenceResult, MetricsResponse, Usage,
+    CompletionChoice, CompletionRequest, CompletionResponse, CompletionStreamChoice,
+    CompletionStreamResponse, HealthResponse, InferenceJob, InferenceResult,
+    MetricsResponse, StreamChunk, Usage,
 };
 
 /// Shared state between HTTP handlers and the coordinator.
@@ -47,16 +50,63 @@ pub fn build_router(state: ApiState) -> Router {
 async fn completions_handler(
     State(state): State<ApiState>,
     Json(req): Json<CompletionRequest>,
-) -> Result<Json<CompletionResponse>, (StatusCode, String)> {
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let request_id = state.request_counter.fetch_add(1, Ordering::SeqCst) + 1;
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let model_name = req.model.unwrap_or_else(|| state.model_name.clone());
+
     if req.stream {
-        return Err((
-            StatusCode::NOT_IMPLEMENTED,
-            "Streaming is not yet supported".to_string(),
-        ));
+        // Streaming mode: use mpsc channel for per-token chunks.
+        let (chunk_tx, chunk_rx) = tokio::sync::mpsc::unbounded_channel::<StreamChunk>();
+        let job = InferenceJob {
+            request_id,
+            prompt: req.prompt.clone(),
+            max_tokens: req.max_tokens,
+            temperature: req.temperature,
+            top_p: req.top_p,
+            tx: oneshot::channel().0, // dummy oneshot for type compatibility
+            stream_tx: Some(chunk_tx),
+        };
+
+        if state.job_tx.send(job).is_err() {
+            state.failed_counter.fetch_add(1, Ordering::SeqCst);
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Coordinator queue is closed".to_string(),
+            ));
+        }
+        state.queued_counter.fetch_add(1, Ordering::SeqCst);
+
+        let stream = UnboundedReceiverStream::new(chunk_rx)
+            .map(move |chunk| {
+                let resp = CompletionStreamResponse {
+                    id: format!("hcp-completion-{request_id}"),
+                    object: "text_completion".to_string(),
+                    created,
+                    model: model_name.clone(),
+                    choices: vec![CompletionStreamChoice {
+                        text: chunk.delta,
+                        index: 0,
+                        finish_reason: chunk.finish_reason.clone(),
+                    }],
+                };
+                let data = serde_json::to_string(&resp).unwrap_or_default();
+                Ok::<_, std::convert::Infallible>(
+                    axum::response::sse::Event::default().data(data),
+                )
+            })
+            .chain(tokio_stream::once(Ok::<_, std::convert::Infallible>(
+                axum::response::sse::Event::default().data("[DONE]"),
+            )));
+
+        let sse = Sse::new(stream);
+        return Ok(axum::response::IntoResponse::into_response(sse));
     }
 
-    let request_id = state.request_counter.fetch_add(1, Ordering::SeqCst) + 1;
-
+    // Non-streaming mode: use oneshot channel for final result.
     let (tx, rx) = oneshot::channel();
     let job = InferenceJob {
         request_id,
@@ -65,6 +115,7 @@ async fn completions_handler(
         temperature: req.temperature,
         top_p: req.top_p,
         tx,
+        stream_tx: None,
     };
 
     if state.job_tx.send(job).is_err() {
@@ -89,16 +140,11 @@ async fn completions_handler(
 
     state.completed_counter.fetch_add(1, Ordering::SeqCst);
 
-    let created = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
     let response = CompletionResponse {
         id: format!("hcp-completion-{request_id}"),
         object: "text_completion".to_string(),
         created,
-        model: req.model.unwrap_or_else(|| state.model_name.clone()),
+        model: model_name,
         choices: vec![CompletionChoice {
             text: result.text,
             index: 0,
@@ -112,7 +158,7 @@ async fn completions_handler(
         },
     };
 
-    Ok(Json(response))
+    Ok(Json(response).into_response())
 }
 
 /// `GET /health`

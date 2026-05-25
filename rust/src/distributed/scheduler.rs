@@ -38,8 +38,10 @@ pub struct ActiveRequest {
     /// 完成原因（None = 还在生成）。
     pub finish_reason: Option<String>,
 
-    /// 结果回传通道。
+    /// 结果回传通道（非 streaming）。
     pub result_tx: tokio::sync::oneshot::Sender<InferenceResult>,
+    /// Streaming chunk 回传通道（streaming 模式下）。
+    pub stream_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::api::types::StreamChunk>>,
 }
 
 /// Batch 调度器。
@@ -155,6 +157,7 @@ mod tests {
             temperature: 0.0,
             top_p: 1.0,
             tx,
+            stream_tx: None,
         }
     }
 
@@ -198,6 +201,7 @@ mod tests {
             next_token: 42,
             finish_reason: None,
             result_tx: tx1,
+            stream_tx: None,
         });
 
         let j2 = scheduler.try_dequeue_pending().unwrap();
@@ -216,6 +220,7 @@ mod tests {
             next_token: 99,
             finish_reason: None,
             result_tx: tx2,
+            stream_tx: None,
         });
 
         assert_eq!(scheduler.active_len(), 2);
@@ -255,6 +260,7 @@ mod tests {
             next_token: 10,
             finish_reason: None,
             result_tx: tx,
+            stream_tx: None,
         });
         assert!(scheduler.has_work());
 
@@ -287,6 +293,7 @@ mod tests {
             next_token: 100,
             finish_reason: None,
             result_tx: tx1,
+            stream_tx: None,
         });
 
         let j2 = scheduler.try_dequeue_pending().unwrap();
@@ -304,6 +311,7 @@ mod tests {
             next_token: 200,
             finish_reason: None,
             result_tx: tx2,
+            stream_tx: None,
         });
 
         assert_eq!(scheduler.active_len(), 2);
@@ -341,6 +349,7 @@ mod tests {
             next_token: 300,
             finish_reason: None,
             result_tx: tx3,
+            stream_tx: None,
         });
 
         assert_eq!(scheduler.active_len(), 2);
@@ -373,6 +382,7 @@ mod tests {
             next_token: 100,
             finish_reason: None,
             result_tx: tx,
+            stream_tx: None,
         });
 
         // Modify next_token via mutable access

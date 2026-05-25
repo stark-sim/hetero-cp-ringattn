@@ -68,6 +68,16 @@ pub struct MetricsResponse {
     pub active_requests: u64,
 }
 
+/// A chunk of streaming inference output.
+pub struct StreamChunk {
+    /// Text delta for this chunk (only newly generated text).
+    pub delta: String,
+    /// The token ID.
+    pub token_id: u32,
+    /// Finish reason if this is the final chunk.
+    pub finish_reason: Option<String>,
+}
+
 /// Internal job submitted from HTTP handler to the coordinator loop.
 pub struct InferenceJob {
     pub request_id: u64,
@@ -75,8 +85,10 @@ pub struct InferenceJob {
     pub max_tokens: usize,
     pub temperature: f64,
     pub top_p: f64,
-    /// Channel to send back the result.
+    /// For non-streaming: channel to send back the final result.
     pub tx: tokio::sync::oneshot::Sender<InferenceResult>,
+    /// For streaming: channel to send per-token chunks.
+    pub stream_tx: Option<tokio::sync::mpsc::UnboundedSender<StreamChunk>>,
 }
 
 /// Result of an inference job.
@@ -84,5 +96,22 @@ pub struct InferenceResult {
     pub text: String,
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
+    pub finish_reason: Option<String>,
+}
+
+/// SSE response for streaming completions (OpenAI-compatible).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CompletionStreamResponse {
+    pub id: String,
+    pub object: String,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<CompletionStreamChoice>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CompletionStreamChoice {
+    pub text: String,
+    pub index: usize,
     pub finish_reason: Option<String>,
 }

@@ -9,7 +9,7 @@
 //!    Starts an OpenAI-compatible HTTP server on `--http-addr` (default 0.0.0.0:8080)
 //!    and serves `/v1/completions`, `/health`, `/metrics`.
 
-use crate::api::types::{InferenceJob, InferenceResult};
+use crate::api::types::{InferenceJob, InferenceResult, StreamChunk};
 use crate::api::{build_router, ApiState};
 use crate::distributed::protocol::{
     recv_response_quic, send_command_quic, WorkerCommand, WorkerResponse,
@@ -506,6 +506,7 @@ fn prefill_single_request(
         next_token: first_token,
         finish_reason,
         result_tx: job.tx,
+        stream_tx: job.stream_tx,
     })
 }
 
@@ -802,6 +803,24 @@ pub fn run() {
             if !scheduler.active_is_empty() {
                 match decode_iteration(&mut scheduler, &mut *guard, eos_token, vocab_size, &rt) {
                     Ok(completed) => {
+                        // Emit streaming chunks for all active requests.
+                        for (_, req) in scheduler.active_requests_mut() {
+                            if let Some(ref chunk_tx) = req.stream_tx {
+                                if let Some(&token_id) = req.generated_ids.last() {
+                                    let delta = tokenizer.decode(&[token_id], false)
+                                        .unwrap_or_else(|e| {
+                                            eprintln!("[coordinator] token decode failed for request {}: {e}", req.request_id);
+                                            String::new()
+                                        });
+                                    let _ = chunk_tx.send(StreamChunk {
+                                        delta,
+                                        token_id,
+                                        finish_reason: None,
+                                    });
+                                }
+                            }
+                        }
+
                         // Release per-request state on workers for completed requests.
                         for request_id in &completed {
                             for (send, _recv) in guard.iter_mut() {
@@ -812,18 +831,29 @@ pub fn run() {
                         for request_id in completed {
                             if let Some(req) = scheduler.remove_active(request_id) {
                                 active_counter.fetch_sub(1, Ordering::SeqCst);
-                                let text = tokenizer.decode(&req.generated_ids, true)
-                                    .unwrap_or_else(|e| {
-                                        eprintln!("[coordinator] decode failed for request {request_id}: {e}");
-                                        String::new()
+
+                                if let Some(ref chunk_tx) = req.stream_tx {
+                                    // Streaming: send final chunk with finish_reason.
+                                    let _ = chunk_tx.send(StreamChunk {
+                                        delta: "".to_string(),
+                                        token_id: 0,
+                                        finish_reason: req.finish_reason.clone(),
                                     });
-                                let result = InferenceResult {
-                                    text,
-                                    prompt_tokens: req.prompt_tokens,
-                                    completion_tokens: req.generated_ids.len(),
-                                    finish_reason: req.finish_reason,
-                                };
-                                let _ = req.result_tx.send(result);
+                                } else {
+                                    // Non-streaming: send full result via oneshot.
+                                    let text = tokenizer.decode(&req.generated_ids, true)
+                                        .unwrap_or_else(|e| {
+                                            eprintln!("[coordinator] decode failed for request {request_id}: {e}");
+                                            String::new()
+                                        });
+                                    let result = InferenceResult {
+                                        text,
+                                        prompt_tokens: req.prompt_tokens,
+                                        completion_tokens: req.generated_ids.len(),
+                                        finish_reason: req.finish_reason,
+                                    };
+                                    let _ = req.result_tx.send(result);
+                                }
                             }
                         }
                     }
