@@ -2,6 +2,13 @@
 
 ## 当前焦点
 
+[2026-05-09] **DEPLOYMENT_GUIDE.md vLLM backend 部署文档更新完成**（commit `a9cbefc`）：
+- 新增 §6.5 "vLLM Backend 部署（单节点高吞吐）"
+- 覆盖 Mac vllm-metal 和 GPU vLLM 0.6.4 CUDA 的环境准备、启动命令、关键环境变量表
+- HTTP API 验证步骤
+- 已知问题文档化：初始化慢、EngineCore 残留、token drift
+- 明确标注 vLLM backend 的当前限制：单节点 only，不参与 KV ring
+
 [2026-05-09] **Request memory leak 修复完成**（commit `ee6bd0e`）：
 - 根因：coordinator 检测请求完成（EOS/max_tokens）后仅从 scheduler 移除，从未通知 workers 释放 per-request 状态
 - `WorkerCommand::ReleaseRequest { request_id }` 新增到控制协议
