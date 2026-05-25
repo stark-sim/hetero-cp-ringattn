@@ -838,4 +838,91 @@ mod tests {
             next_token_b = token_ref_b as i64;
         }
     }
+
+    /// 【BlockTableKvCache 集成测试】验证 BlockTable 缓存通过 LlamaModel::forward 的
+    /// 完整 prefill + decode 路径时，输出与 ContiguousKvCache 完全一致。
+    ///
+    /// 使用 block_size=4 确保测试跨越 block 边界（prefill 8 tokens 跨越 2 个 block）。
+    #[test]
+    fn test_block_table_through_model_forward() {
+        use crate::model::cache::{BlockTableKvCache, KvCacheImpl};
+
+        let device = Device::Cpu;
+        let config = ModelConfig {
+            architectures: Some(vec!["LlamaForCausalLM".to_string()]),
+            hidden_size: 32,
+            num_layers: 2,
+            num_heads: 4,
+            num_kv_heads: Some(1),
+            intermediate_size: 64,
+            vocab_size: 100,
+            rope_theta: 10000.0,
+            rms_norm_eps: 1e-6,
+            tie_word_embeddings: false,
+            torch_dtype: Some("float32".to_string()),
+            hidden_act: "silu".to_string(),
+            max_position_embeddings: Some(128),
+            attention_dropout: 0.0,
+            bos_token_id: None,
+            eos_token_id: None,
+            use_cache: true,
+            sliding_window: None,
+            use_sliding_window: None,
+            partial_rotary_factor: 1.0,
+        };
+
+        let weights = create_synthetic_weights(&config, device);
+        let mut model_contiguous = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+        let mut model_block = LlamaModel::from_weights(config, &weights, device, 1).unwrap();
+
+        // Prefill with 8 tokens (crosses block boundary when block_size=4)
+        let prompt: Vec<i64> = (0..8).collect();
+        let input_ids = Tensor::from_slice(&prompt).unsqueeze(0).to_device(device);
+
+        let mut caches_contiguous = model_contiguous.create_kv_caches();
+        let mut caches_block: KvCaches = (0..model_block.layers.len())
+            .map(|_| Some(KvCacheImpl::BlockTable(BlockTableKvCache::new(4))))
+            .collect();
+
+        let logits_contiguous = model_contiguous.forward(&input_ids, &mut caches_contiguous).unwrap();
+        let logits_block = model_block.forward(&input_ids, &mut caches_block).unwrap();
+
+        let prefill_diff = (&logits_contiguous - &logits_block).abs().mean(Kind::Float).double_value(&[]);
+        println!("Prefill diff (Contiguous vs BlockTable): {:.2e}", prefill_diff);
+        assert!(prefill_diff < 1e-6, "Prefill logits differ: {}", prefill_diff);
+
+        // Decode 3 steps
+        let mut next_token_contiguous = logits_contiguous
+            .narrow(1, 7, 1)
+            .squeeze()
+            .argmax(-1, false)
+            .int64_value(&[]) as i64;
+        let mut next_token_block = logits_block
+            .narrow(1, 7, 1)
+            .squeeze()
+            .argmax(-1, false)
+            .int64_value(&[]) as i64;
+
+        // argmax should agree on prefill
+        assert_eq!(next_token_contiguous, next_token_block);
+
+        for step in 0..3 {
+            let input_c = Tensor::from_slice(&[next_token_contiguous]).unsqueeze(0).to_device(device);
+            let input_b = Tensor::from_slice(&[next_token_block]).unsqueeze(0).to_device(device);
+
+            let logit_c = model_contiguous.forward(&input_c, &mut caches_contiguous).unwrap();
+            let logit_b = model_block.forward(&input_b, &mut caches_block).unwrap();
+
+            let step_diff = (&logit_c - &logit_b).abs().mean(Kind::Float).double_value(&[]);
+            println!("Decode step {} diff: {:.2e}", step, step_diff);
+            assert!(step_diff < 1e-6, "Decode step {} logits differ: {}", step, step_diff);
+
+            next_token_contiguous = logit_c.squeeze().argmax(-1, false).int64_value(&[]) as i64;
+            next_token_block = logit_b.squeeze().argmax(-1, false).int64_value(&[]) as i64;
+            assert_eq!(next_token_contiguous, next_token_block,
+                "Decode step {} sampled token mismatch", step);
+        }
+
+        println!("✅ BlockTableKvCache integration test passed");
+    }
 }

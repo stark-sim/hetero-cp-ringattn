@@ -204,15 +204,79 @@ impl KvCache for BlockTableKvCache {
     }
 }
 
-/// 【每层一个 KV 缓存】Vec<Option<ContiguousKvCache>> 表示 num_layers 个可选缓存。
+/// 【KV 缓存实现枚举】封装所有可用的 KV 缓存实现。
+///
+/// 使用 enum 而非 `Box<dyn KvCache>` 以避免 trait object 的生命周期问题
+/// 和堆分配开销，同时保持运行时切换能力。
+#[cfg(feature = "tch-backend")]
+#[derive(Debug)]
+pub enum KvCacheImpl {
+    Contiguous(ContiguousKvCache),
+    BlockTable(BlockTableKvCache),
+}
+
+#[cfg(feature = "tch-backend")]
+impl KvCache for KvCacheImpl {
+    fn update(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<(Tensor, Tensor), ModelError> {
+        match self {
+            KvCacheImpl::Contiguous(c) => c.update(new_k, new_v),
+            KvCacheImpl::BlockTable(c) => c.update(new_k, new_v),
+        }
+    }
+
+    fn seq_len(&self) -> usize {
+        match self {
+            KvCacheImpl::Contiguous(c) => c.seq_len(),
+            KvCacheImpl::BlockTable(c) => c.seq_len(),
+        }
+    }
+
+    fn clear(&mut self) {
+        match self {
+            KvCacheImpl::Contiguous(c) => c.clear(),
+            KvCacheImpl::BlockTable(c) => c.clear(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            KvCacheImpl::Contiguous(c) => c.is_empty(),
+            KvCacheImpl::BlockTable(c) => c.is_empty(),
+        }
+    }
+}
+
+/// 【每层一个 KV 缓存】Vec<Option<KvCacheImpl>> 表示 num_layers 个可选缓存。
 /// Option 是为了某些 layer 可能不需要缓存（虽然通常所有 layer 都有）。
 #[cfg(feature = "tch-backend")]
-pub type KvCaches = Vec<Option<ContiguousKvCache>>;
+pub type KvCaches = Vec<Option<KvCacheImpl>>;
 
-/// 【创建多层 KV 缓存】为每个 layer 初始化一个空的 ContiguousKvCache。
+/// 【创建多层 KV 缓存】为每个 layer 初始化一个缓存实例。
+///
+/// 缓存类型由环境变量控制：
+/// - `HCP_KV_CACHE_BLOCK_TABLE=1`（或 `true`）：使用 `BlockTableKvCache`
+/// - 默认（未设置或其他值）：使用 `ContiguousKvCache`
+///
+/// BlockTable 的 block 大小可通过 `HCP_KV_CACHE_BLOCK_SIZE` 调整（默认 16）。
 #[cfg(feature = "tch-backend")]
 pub fn create_kv_caches(num_layers: usize) -> KvCaches {
-    (0..num_layers).map(|_| Some(ContiguousKvCache::new())).collect()
+    let use_block_table = std::env::var("HCP_KV_CACHE_BLOCK_TABLE")
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let block_size = std::env::var("HCP_KV_CACHE_BLOCK_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
+
+    (0..num_layers)
+        .map(|_| {
+            if use_block_table {
+                Some(KvCacheImpl::BlockTable(BlockTableKvCache::new(block_size)))
+            } else {
+                Some(KvCacheImpl::Contiguous(ContiguousKvCache::new()))
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
