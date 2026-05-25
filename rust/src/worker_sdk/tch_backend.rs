@@ -239,6 +239,13 @@ impl WorkerBackend for TchWorkerBackend {
         }
     }
 
+    /// Release per-request state to prevent memory leak.
+    fn release_request(&mut self, request_id: u64) {
+        if self.request_contexts.remove(&request_id).is_some() {
+            println!("[TchWorkerBackend] released request {request_id}");
+        }
+    }
+
     fn capacity_mb(&self) -> u64 {
         crate::capacity::query_device_capacity_mb(self.device)
     }

@@ -352,6 +352,18 @@ impl WorkerBackend for VllmWorkerBackend {
         // No-op for vLLM backend.
     }
 
+    fn release_request(&mut self, request_id: u64) {
+        // Best-effort release; ignore errors since the request may already be gone.
+        let _ = self.send_cmd(&VllmCommand {
+            cmd: "release_request".to_string(),
+            request_id: Some(request_id),
+            tokens: None,
+            seq_offset: None,
+            request_tokens: None,
+            len: None,
+        });
+    }
+
     fn capacity_mb(&self) -> u64 {
         self.capacity_mb
     }

@@ -112,6 +112,14 @@ pub trait WorkerBackend: Send {
         self.sync_global_seq_len(len);
     }
 
+    /// 释放已完成请求的 per-request 状态（KV cache、past_key_values 等）。
+    ///
+    /// Coordinator 在请求完成（EOS 或 max_tokens）后调用此方法，
+    /// 防止长时间运行服务时内存无限增长。
+    ///
+    /// 默认实现为空（向后兼容单请求后端）。
+    fn release_request(&mut self, _request_id: u64) {}
+
     /// 同步全局序列长度（coordinator 广播）。
     ///
     /// 在 prefill 完成后，coordinator 会取所有 worker 的 `global_seq_len` 最大值，

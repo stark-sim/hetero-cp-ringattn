@@ -34,6 +34,10 @@ pub enum WorkerCommand {
         request_id: u64,
         len: usize,
     },
+    /// Release per-request state (KV cache, past_key_values, etc.) for a completed request.
+    ReleaseRequest {
+        request_id: u64,
+    },
     /// Shutdown the worker.
     Shutdown,
 }

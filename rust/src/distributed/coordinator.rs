@@ -283,6 +283,12 @@ fn process_single_request(
         finish_reason = Some("length".to_string());
     }
 
+    // Release per-request state on workers to prevent memory leak.
+    for (send, _recv) in worker_streams.iter_mut() {
+        let cmd = WorkerCommand::ReleaseRequest { request_id };
+        let _ = send_command_quic(send, &cmd, rt.handle());
+    }
+
     let text = tokenizer
         .decode(&generated_ids, true)
         .map_err(|e| format!("decode failed: {e}"))?;
@@ -796,6 +802,13 @@ pub fn run() {
             if !scheduler.active_is_empty() {
                 match decode_iteration(&mut scheduler, &mut *guard, eos_token, vocab_size, &rt) {
                     Ok(completed) => {
+                        // Release per-request state on workers for completed requests.
+                        for request_id in &completed {
+                            for (send, _recv) in guard.iter_mut() {
+                                let cmd = WorkerCommand::ReleaseRequest { request_id: *request_id };
+                                let _ = send_command_quic(send, &cmd, rt.handle());
+                            }
+                        }
                         for request_id in completed {
                             if let Some(req) = scheduler.remove_active(request_id) {
                                 active_counter.fetch_sub(1, Ordering::SeqCst);

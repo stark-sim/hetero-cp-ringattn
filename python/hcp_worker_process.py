@@ -60,6 +60,10 @@ class Backend:
     def decode_batch(self, request_tokens: List[Tuple[int, int]]) -> List[Tuple[int, List[float]]]:
         return [(rid, self.decode_request(rid, tok)) for rid, tok in request_tokens]
 
+    def release_request(self, request_id: int):
+        """Release per-request state. Default: no-op."""
+        pass
+
     def shutdown(self):
         pass
 
@@ -181,6 +185,11 @@ class TransformersBackend(Backend):
     def decode_batch(self, request_tokens: List[Tuple[int, int]]) -> List[Tuple[int, List[float]]]:
         # transformers 不支持 true batch decode with different KV states，逐个处理
         return [(rid, self.decode_request(rid, tok)) for rid, tok in request_tokens]
+
+    def release_request(self, request_id: int):
+        if request_id in self._request_states:
+            del self._request_states[request_id]
+            print(f"[transformers backend] released request {request_id}", file=sys.stderr)
 
     def shutdown(self):
         import gc
@@ -421,6 +430,11 @@ def _handle_cmd(backend: Backend, cmd: dict) -> dict:
                 return {"status": "error", "message": "each request_tokens item must be [request_id, token]"}
         request_logits = backend.decode_batch(request_tokens)
         return {"status": "ok", "request_logits": request_logits}
+
+    elif action == "release_request":
+        request_id = cmd.get("request_id", 0)
+        backend.release_request(request_id)
+        return {"status": "ok"}
 
     elif action == "sync_global_seq_len":
         return {"status": "ok"}

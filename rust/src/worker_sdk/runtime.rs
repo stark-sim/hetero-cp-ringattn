@@ -189,6 +189,10 @@ impl WorkerRuntime {
                     self.backend.sync_global_seq_len_for_request(request_id, len);
                     println!("[worker {domain_id}] request {request_id} synced global_seq_len = {len}");
                 }
+                WorkerCommand::ReleaseRequest { request_id } => {
+                    self.backend.release_request(request_id);
+                    println!("[worker {domain_id}] released request {request_id}");
+                }
                 WorkerCommand::Shutdown => {
                     println!("[worker {domain_id}] shutting down");
                     break;
