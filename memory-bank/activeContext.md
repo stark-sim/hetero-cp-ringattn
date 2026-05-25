@@ -2,6 +2,17 @@
 
 ## 当前焦点
 
+[2026-05-09] **HTTP API SSE Streaming 支持完成**（commit `89efef1`）：
+- `/v1/completions` 新增 `stream: true` 支持，返回 Server-Sent Events (SSE)
+- `InferenceJob` 双通道设计：`tx` (oneshot) 非 streaming + `stream_tx` (mpsc) streaming
+- `ActiveRequest` 携带 `stream_tx` 通过 scheduler
+- Coordinator decode 循环每 iteration 为每个 streaming 请求发送 `StreamChunk`
+- SSE 格式：每 token 一个 `data: {json}` event，`[DONE]` 标记结束
+- 非 streaming 回归：`jumps over the lazy dog` ✅
+- Streaming E2E：` over`→` the`→` lazy`→` dog`→`finish_reason:length`→`[DONE]` ✅
+- 55/55 tests pass
+- **Phase 2 TODO**: 增量解码优化（当前单 token decode 对 subword token 可能产生不干净的 delta）
+
 [2026-05-09] **Flaky test 修复完成**（commit `f84f441`）：
 - `test_batch_forward_correctness` 因 CPU BLAS 非确定性频繁失败（batched vs single matmul 累加顺序不同）
 - BATCH_TOL 从 1e-5 放宽到 1e-4，添加 single-step decode token 一致性断言（argmax 必须匹配）
