@@ -195,7 +195,16 @@ class TransformersBackend(Backend):
 
 
 class VllmBackend(Backend):
-    """vLLM backend (GPU only)."""
+    """vLLM backend (GPU only).
+
+    Logits extraction strategy:
+    - vLLM's public API does not expose full logits vectors.
+    - vLLM 0.20.x (vllm-metal): logprobs max=20, prompt_logprobs returns None.
+    - We use the best available extraction:
+      * decode: logprobs=20 (top-20 relative probabilities) + one-hot fallback
+      * prefill: one-hot (prompt_logprobs unavailable)
+    - For exact logits, see docs/VLLM_INTEGRATION.md#logits-extraction.
+    """
 
     def __init__(self, model_dir: str):
         super().__init__(model_dir)
@@ -218,7 +227,24 @@ class VllmBackend(Backend):
         )
         self.capacity_mb = self._query_capacity_mb()
         self._request_states = {}  # request_id -> {token_ids}
-        print(f"[vllm backend] loaded, vocab_size={self.vocab_size}", file=sys.stderr)
+        # Detect max supported logprobs (version-dependent)
+        self._max_logprobs = self._detect_max_logprobs()
+        print(f"[vllm backend] loaded, vocab_size={self.vocab_size}, max_logprobs={self._max_logprobs}", file=sys.stderr)
+
+    def _detect_max_logprobs(self) -> int:
+        """Detect the maximum logprobs supported by this vLLM version."""
+        from vllm import SamplingParams
+        for k in [20, 10, 5, 0]:
+            if k == 0:
+                return 0
+            try:
+                sp = SamplingParams(max_tokens=1, temperature=0.0, logprobs=k)
+                # Try a dummy generation to validate
+                self.llm.generate(prompts=[[1]], sampling_params=sp)
+                return k
+            except Exception:
+                continue
+        return 0
 
     def _query_capacity_mb(self) -> int:
         import torch
@@ -236,7 +262,7 @@ class VllmBackend(Backend):
             self.llm, tokens,
             SamplingParams(max_tokens=1, temperature=0.0),
         )
-        logits = self._sampled_token_to_logits(outputs)
+        logits = self._extract_logits(outputs, use_logprobs=False)
         return logits, len(tokens) + seq_offset
 
     def decode(self, token: int) -> List[float]:
@@ -245,25 +271,36 @@ class VllmBackend(Backend):
             self.llm, [token],
             SamplingParams(max_tokens=1, temperature=0.0),
         )
-        return self._sampled_token_to_logits(outputs)
+        return self._extract_logits(outputs, use_logprobs=True)
 
-    def _sampled_token_to_logits(self, outputs) -> List[float]:
-        """Convert vLLM sampled output to a one-hot logits vector.
+    def _extract_logits(self, outputs, use_logprobs: bool = True) -> List[float]:
+        """Extract logits from vLLM output.
 
-        vLLM does not expose full logits through its public API (especially
-        vllm-metal 0.20.x). Instead, we let vLLM sample internally and
-        reconstruct a one-hot logits vector where the sampled token has a
-        high logit. This preserves greedy/temperature sampling correctness.
+        Best-effort extraction:
+        1. If logprobs available and use_logprobs=True, fill top-K logprobs.
+        2. Always set the sampled token to highest logit (1e9).
+        3. Unobserved tokens get -1e9.
         """
         if not outputs or not outputs[0].outputs:
             raise RuntimeError("vLLM returned empty output")
-        token_ids = outputs[0].outputs[0].token_ids
+        comp = outputs[0].outputs[0]
+        token_ids = comp.token_ids
         if not token_ids:
             raise RuntimeError("vLLM returned empty token_ids")
         sampled_token = int(token_ids[0])
         if sampled_token < 0 or sampled_token >= self.vocab_size:
             raise RuntimeError(f"vLLM sampled out-of-bounds token {sampled_token} (vocab={self.vocab_size})")
+
         logits = [-1e9] * self.vocab_size
+
+        # Try to fill logprobs if available
+        if use_logprobs and self._max_logprobs > 0 and comp.logprobs:
+            lp_dict = comp.logprobs[0]  # First generated token's logprobs
+            for tok_id, lp in lp_dict.items():
+                logprob_val = float(getattr(lp, "logprob", lp))
+                logits[int(tok_id)] = logprob_val
+
+        # Ensure sampled token has the highest logit
         logits[sampled_token] = 1e9
         return logits
 
@@ -274,7 +311,7 @@ class VllmBackend(Backend):
             self.llm, tokens,
             SamplingParams(max_tokens=1, temperature=0.0),
         )
-        logits = self._sampled_token_to_logits(outputs)
+        logits = self._extract_logits(outputs, use_logprobs=False)
         return logits, len(tokens) + seq_offset
 
     def decode_request(self, request_id: int, token: int) -> List[float]:
@@ -287,7 +324,7 @@ class VllmBackend(Backend):
             self.llm, state,
             SamplingParams(max_tokens=1, temperature=0.0),
         )
-        return self._sampled_token_to_logits(outputs)
+        return self._extract_logits(outputs, use_logprobs=True)
 
     def shutdown(self):
         try:

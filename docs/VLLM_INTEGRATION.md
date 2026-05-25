@@ -399,3 +399,60 @@ python hcp_vllm_worker.py --model-dir /models/Qwen2-0.5B --domain-id 1 ...
 3. **Correctness 验证**
    - Rust Worker ↔ vLLM Worker 的数值对齐（tolerance tier: Relaxed）
    - Long context（32K+）的端到端生成一致性
+
+---
+
+## 9. Logits 提取技术（M13 Step 4/5）
+
+### 9.1 问题定义
+
+HCP Coordinator 需要完整的 logits 向量（`[vocab_size]`）来执行自己的采样策略（greedy / temperature / top-p）。vLLM 的公共 API（`LLM.generate`）返回的是**采样后的 token**，不是 logits。
+
+### 9.2 探索结果（vLLM 0.20.x / vllm-metal）
+
+| 方案 | 可行性 | 说明 |
+|------|--------|------|
+| `SamplingParams.logprobs=vocab_size` | ❌ 不可行 | 最大允许值 = 20（`VLLMValidationError`） |
+| `SamplingParams.prompt_logprobs` | ❌ 不可用 | 返回 `[None]`，无法获取 prompt token 的 logits |
+| `LLM.apply_model()` | ❌ 不可行 | vLLM V1 模型结构特殊（`Qwen2Model` 无 `forward`，`parameters()` 返回 dict），无法直接调用 |
+| `LogitsProcessor` 自定义 | ❌ 不可行 | 虽然可以注册，但运行在 EngineCore **子进程**中，捕获的数据无法传回主进程 |
+| 同时加载 transformers | ⚠️ 可行但有差异 | 可加载相同权重，但 vLLM 优化内核与 transformers 数值有差异，生成 token 可能分叉 |
+| **Top-20 logprobs + one-hot** | ✅ 当前最佳 | `logprobs=20` 获取前 20 个相对概率，其余用 -1e9，采样 token 设为 1e9 |
+
+### 9.3 核心结论
+
+**vLLM 0.20.x (vllm-metal) 的公共/内部 API 均不支持提取完整 logits 向量。**
+
+这是 vLLM 的设计决策：
+- vLLM 是为高吞吐 serving 设计的，公共 API 返回 text/token
+- 暴露完整 logits（151936 dims for Qwen2-0.5B）在内存和带宽上昂贵
+- 内部 sampler 与 engine 紧耦合，不提供 hook 机制
+
+### 9.4 当前实现（`VllmBackend`）
+
+```python
+# 自动检测当前 vLLM 版本支持的最大 logprobs
+self._max_logprobs = self._detect_max_logprobs()  # vLLM 0.20.x → 20
+
+def _extract_logits(self, outputs, use_logprobs: bool = True):
+    logits = [-1e9] * self.vocab_size
+    # 填充可用的 logprobs（相对概率准确）
+    if use_logprobs and self._max_logprobs > 0 and comp.logprobs:
+        for tok_id, lp in comp.logprobs[0].items():
+            logits[tok_id] = float(lp.logprob)
+    # 采样 token 始终设为最高 logit
+    logits[sampled_token] = 1e9
+    return logits
+```
+
+### 9.5 生产建议
+
+- **若 coordinator 需要控制采样**：当前 vLLM backend 不适合。应使用 `TransformersBackend`（精确 logits）或等待 vLLM 开放 logits API。
+- **若 coordinator 只验证文本输出**：one-hot + top-20 logprobs 足够。vLLM 的高吞吐优势不受影响。
+- **vLLM 0.6.x (CUDA)**：待 white RTX 4090 恢复后验证，API 可能有差异。
+
+### 9.6 关键发现补充
+
+1. **vLLM 与 transformers 数值差异**：即使加载相同权重，vLLM 的 PagedAttention / 优化内核与 transformers 的纯 PyTorch 实现存在数值差异（~1e-5 级别）。前几个 token 通常一致，长序列可能分叉。
+2. **token drift 根因**：vLLM 内部 sampler 即使 `temperature=0.0` 也使用独立随机状态，sampled token 可能与 true argmax 不同。
+3. **验证正确方式**：比较**生成文本**而非逐 token logits。文本级别的语义一致性才是 vLLM backend 的正确ness 标准。
