@@ -364,7 +364,7 @@ project-root/
 |------|------|--------|--------|-----------|-------|------|
 | **Mac** (local) | MPS (M1 Pro) | 3.12.7 | uv | `~/.venv-vllm-metal` | 2.11.0 (CPU, vllm-metal 绑定) | vllm-metal 0.2.0 |
 | **white** (remote) | RTX 4090 (CUDA 13.0) | 3.12.13 | uv | `~/hetero-cp-ringattn/.venv` | 2.11.0+cu130 | 0.22.0 |
-| **pearl** (remote) | RX 9060 XT (ROCm 7.2, gfx1200) | 3.12.3 | uv | `~/hetero-cp-ringattn/.venv` | 2.12.0+rocm7.2 | 未安装 (gfx1200 不在支持列表) |
+| **pearl** (remote) | RX 9060 XT (ROCm 7.2, gfx1200) | 3.12.3 | uv | `~/hetero-cp-ringattn/.venv` | 2.11.0+rocm7.2 | 未安装 (gfx1200 不在 vLLM 官方支持列表) |
 
 **统一规范**：Python 3.12 + uv + repo 内 `.venv`（Mac 除外，使用 `~/.venv-vllm-metal` 因 vllm-metal 硬性要求隔离）。
 

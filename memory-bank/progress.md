@@ -12,7 +12,10 @@
 - [x] [2026-04-24] 已创建 Basic memory bank 和 Codex `AGENTS.md` 协议文件。
 - [x] [2026-04-24] 已建立 NumPy Ring Attention correctness model，包含 ring source order、per-source block traversal、online softmax state update、full attention reference 对照。
 - [x] [2026-04-24] correctness model 默认 3 个 case 全部通过：2-domain uneven chunks、3-domain uneven blocks、4-domain tail blocks。
-- [x] [2026-05-31] **white (RTX 4090) Python 3.12 + uv + repo 内 `.venv` 规范化完成**：torch 2.11.0+cu130、vllm 0.22.0、transformers 5.9.0、aioquic 1.3.0、triton 3.6.0、torchvision 0.26.0、torchaudio 2.11.0 全部安装验证通过，`torch.cuda.is_available()=True`，CUDA 13.0，device count=1。
+- [x] [2026-05-31] **三平台 torch 2.11.0 版本统一完成**：
+  - white (RTX 4090): torch 2.11.0+cu130、vllm 0.22.0、CUDA 13.0 ✅
+  - pearl (RX 9060 XT): torch 2.11.0+rocm7.2、ROCm 7.2、HIP 计算正常 ✅
+  - Mac (M1 Pro): torch 2.11.0 (CPU, vllm-metal 绑定) ✅
 - [x] [2026-04-24] 本地 C++ smoke 在 `SKIP_PYTHON_SMOKE=1` 下通过；Python correctness 已降为显式 opt-in。
 - [x] [2026-04-24] 已新增 Rust crate，实现纯 Rust Ring Attention correctness model。
 - [x] [2026-04-24] 已新增 Rust -> C ABI -> C++ runtime bridge，并成功调用 C++ `NoOpRingAttnRuntime`。
