@@ -3,7 +3,7 @@
 ## 当前焦点
 
 [2026-05-31] **Infra 环境同步与三平台状态评估**（已完成规范化）：
-- **white (RTX 4090, CUDA) 恢复 + Python 3.12 升级完成**：Tailscale 修复后 SSH 连通，代码从 `b9a0bd3` fast-forward 到 `d9a1eb2`（+43 commits）。cargo check 13.98s ✅，cargo test 55/55 ✅。**`.venv` 规范化完成**：repo 内 `uv venv --python 3.12`，通过清华镜像安装 torch 2.5.1+cu124 + vllm 0.6.4 + transformers 5.9.0 + aioquic 1.3.0 等全部依赖，CUDA RTX 4090 识别正常（`torch.cuda.is_available()=True`, `device_count=1`）。standalone libtorch (`~/libtorch`, 2.11.0) 保持用于 Rust 编译（环境变量已持久化到 `~/.bashrc`）。
+- **white (RTX 4090, CUDA) 恢复 + Python 3.12 升级完成**：Tailscale 修复后 SSH 连通，代码从 `b9a0bd3` fast-forward 到 `d9a1eb2`（+43 commits）。cargo check 13.98s ✅，cargo test 55/55 ✅。**`.venv` 规范化完成**：repo 内 `uv venv --python 3.12`，通过清华镜像安装 torch 2.11.0+cu130 + vllm 0.22.0 + transformers 5.9.0 + aioquic 1.3.0 等全部依赖，CUDA RTX 4090 识别正常（`torch.cuda.is_available()=True`, `CUDA 13.0`, `device_count=1`）。standalone libtorch (`~/libtorch`, 2.11.0) 保持用于 Rust 编译（环境变量已持久化到 `~/.bashrc`）。
 - **pearl (RX 9060 XT, ROCm/HIP) 首次接入 + 规范化**：AMD Radeon RX 9060 XT (gfx1200)，ROCm 7.2，torch 2.12.0+rocm7.2。代码同步到 `d9a1eb2` ✅。`.venv` 确认已是 uv 管理 ✅。Rust CPU 测试 55/55 pass ✅。Python HIP 计算正常 ✅。**模型已下载**：hf-mirror.com 绕过防火墙，Qwen2-0.5B 完整下载（942MB）✅。
 - **关键发现：pip torch 不能用于 Rust tch-rs 编译！** white 上测试将 `LIBTORCH` 指向 pip torch 路径后，`torch-sys` build script 编译失败：`torch::_assert_tensor_metadata` 参数数量不匹配（pip torch C++ API 与 standalone libtorch 不同）。这说明 pearl 的 GPU panic 也是同一根因——**tch-rs 0.24.0 的 C++ 绑定与 pip torch 2.12.0 的 C++ ABI 不兼容**。
 - **关键发现：tch-rs 0.25.0 支持 libtorch 2.12.0**。GitHub 主分支 `build.rs` 显示 `TORCH_VERSION = "2.12.0"`。升级路径：tch-rs 0.24.0 → 0.25.0，同时 white standalone libtorch 2.11.0 → 2.12.0，即可实现两平台 libtorch 版本完全对齐。
