@@ -12,6 +12,7 @@
 - [x] [2026-04-24] 已创建 Basic memory bank 和 Codex `AGENTS.md` 协议文件。
 - [x] [2026-04-24] 已建立 NumPy Ring Attention correctness model，包含 ring source order、per-source block traversal、online softmax state update、full attention reference 对照。
 - [x] [2026-04-24] correctness model 默认 3 个 case 全部通过：2-domain uneven chunks、3-domain uneven blocks、4-domain tail blocks。
+- [x] [2026-05-31] **white (RTX 4090) Python 3.12 + uv + repo 内 `.venv` 规范化完成**：torch 2.5.1+cu124、vllm 0.6.4、transformers 5.9.0、aioquic 1.3.0、triton 3.1.0、xformers 0.0.28.post3 全部安装验证通过，`torch.cuda.is_available()=True`，CUDA 12.4，device count=1。
 - [x] [2026-04-24] 本地 C++ smoke 在 `SKIP_PYTHON_SMOKE=1` 下通过；Python correctness 已降为显式 opt-in。
 - [x] [2026-04-24] 已新增 Rust crate，实现纯 Rust Ring Attention correctness model。
 - [x] [2026-04-24] 已新增 Rust -> C ABI -> C++ runtime bridge，并成功调用 C++ `NoOpRingAttnRuntime`。
@@ -371,4 +372,6 @@
 | Fix: flaky test_batch_forward_correctness | **已完成** | [2026-05-09] BATCH_TOL 1e-5→1e-4 + token agreement assertion。根因：CPU BLAS 非确定性。5/5 连续通过，55/55 tests pass。Commit `f84f441` |
 | HTTP API SSE Streaming | **已完成** | [2026-05-09] `/v1/completions` 支持 `stream: true`，OpenAI-compatible SSE 格式。Dual-channel InferenceJob (oneshot+mpsc)。Coordinator decode loop 每 iteration emit StreamChunk。E2E 验证通过。55/55 tests pass。Commit `89efef1` |
 | M13 Step 2/5: VllmWorkerBackend 原型 | **已完成** | [2026-05-24] Rust `VllmWorkerBackend` (JSON-over-stdio pipe) + Python `hcp_worker_process.py` (mock/transformers/vllm 三后端)。`--backend-type` CLI 参数支持 tch/vllm 切换。Harness Review: Guard=APPROVE, Examiner=CONDITIONAL → 2 blockers 修复后通过（backend_type shadowing + TransformersBackend KV cache reuse）。本地 E2E: mock ✅、transformers ✅、vllm-metal ✅、cross-backend (tch vs transformers) ✅。53/53 tests passed。Commits: `cc9f5c0`→`abed260` |
+| M13 Step 3/5: vLLM CUDA E2E (white) | **待验证** | [2026-05-31] white 恢复（Tailscale 修复）。代码同步到 `d9a1eb2`，cargo check 13.97s ✅，cargo test 55/55 ✅，torch 2.5.1+cu124 ✅，vLLM 0.6.4 ✅，模型 Qwen2-0.5B ✅。Ready for `--backend-type vllm` 验证。 |
+| pearl (AMD RX 9060 XT) 首次接入 | **模型就绪，待 tch-rs 升级** | [2026-05-31] 新平台：ROCm 7.2，torch 2.12.0+rocm7.2，gfx1200。代码同步到 `d9a1eb2` ✅。`.venv` uv 管理 ✅。Rust CPU 测试 55/55 pass ✅。Python HIP 计算正常 ✅。模型 Qwen2-0.5B 通过 hf-mirror.com 下载完成（942MB）。**Blocker**: tch-rs 0.24.0 + libtorch 2.12.0 运行时 ABI 不兼容，`randn` on `Device::Cuda(0)` panic。需升级 tch-rs 到 0.25.0 + standalone libtorch 2.12.0。 |
 | M13 Phase 3-5: Full Continuous Batching with PagedAttention | **待启动** | 在 PagedAttention 基础上实现 kernel-level batch decode + dynamic join/leave |

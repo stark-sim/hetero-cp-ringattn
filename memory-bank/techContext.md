@@ -357,3 +357,26 @@ project-root/
 - Rust 构建通过 Cargo 完成；`tch-backend` 为默认 feature，需要 `LIBTORCH` 环境变量。
 - 当前没有 CI/CD 或 Docker 配置。
 - `build/` 和 `reports/*` 被 `.gitignore` 忽略，`reports/.gitkeep` 保留目录。
+
+### 三平台环境配置（2026-05-31）
+
+| 平台 | 设备 | Python | 包管理 | venv 位置 | torch | vLLM |
+|------|------|--------|--------|-----------|-------|------|
+| **Mac** (local) | MPS (M1 Pro) | 3.12.7 | uv | `~/.venv-vllm-metal` | 2.11.0 (CPU, vllm-metal 绑定) | vllm-metal 0.2.0 |
+| **white** (remote) | RTX 4090 (CUDA 12.4) | 3.12.13 | uv | `~/hetero-cp-ringattn/.venv` | 2.5.1+cu124 | 0.6.4 |
+| **pearl** (remote) | RX 9060 XT (ROCm 7.2, gfx1200) | 3.12.3 | uv | `~/hetero-cp-ringattn/.venv` | 2.12.0+rocm7.2 | 未安装 (gfx1200 不在支持列表) |
+
+**统一规范**：Python 3.12 + uv + repo 内 `.venv`（Mac 除外，使用 `~/.venv-vllm-metal` 因 vllm-metal 硬性要求隔离）。
+
+**white 关键环境变量**（已持久化到 `~/.bashrc`）：
+```bash
+export LIBTORCH=/home/stark/libtorch
+export LIBTORCH_INCLUDE=/home/stark/libtorch/include
+export LIBTORCH_LIB=/home/stark/libtorch/lib
+export LD_LIBRARY_PATH=/home/stark/libtorch/lib:$LD_LIBRARY_PATH
+```
+
+**pearl 已知限制**：
+- tch-rs 0.24.0 + pip torch 2.12.0 ABI 不兼容，GPU 计算 panic。需升级 tch-rs 0.25.0 + standalone libtorch 2.12.0。
+- vLLM ROCm 不支持 gfx1200，需源码编译 `PYTORCH_ROCM_ARCH="gfx1200"`。
+- HTTPS 对 huggingface.co 阻断，使用 `HF_ENDPOINT=https://hf-mirror.com`。
