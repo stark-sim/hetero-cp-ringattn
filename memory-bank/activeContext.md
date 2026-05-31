@@ -2,6 +2,12 @@
 
 ## 当前焦点
 
+[2026-05-31] **三平台 torch 2.11.0 统一后首次端到端验证完成**：
+- **white (RTX 4090, CUDA) Rust 编译/测试全绿**：`cargo check --features tch-backend` 13.98s ✅，`cargo test --lib --features tch-backend` 55/55 pass ✅。libtorch 2.11.0+cu130 与 tch-rs 0.24.0 兼容。
+- **white 本地 2-node loopback smoke 完全成功**：CPU 模式，2 worker + coordinator 同机运行，24 层 ring attention 全通，生成 `"The answer to life is not a destination,"` ✅，workers 优雅退出，exit=0。
+- **跨节点 Mac MPS + white CUDA 异构验证成功**：coordinator + worker0 (Mac MPS) + worker1 (white CUDA) 通过 Tailscale VPN 完成 prefill + decode ring attention。QUIC KV ring 交换正常（229KB/micro_block），prefill 64 tokens 通过 24 层，decode 进入多步生成。**Tailscale VPN 高延迟 (~380ms RTT) 导致 decode 极慢**（每 layer recv 0ms–13s 波动），但 correctness 无 regression。跨节点逻辑已验证，速度非当前 blocker。
+- **pearl (RX 9060 XT) 保持待 tch-rs 升级**：Rust CPU 测试 55/55 pass，pip torch 2.11.0+rocm7.2 编译通过，但 GPU runtime 需 tch-rs 0.25.0 + libtorch 2.12.0 升级。
+
 [2026-05-31] **Infra 环境同步与三平台状态评估**（已完成规范化）：
 - **white (RTX 4090, CUDA) 恢复 + Python 3.12 升级完成**：Tailscale 修复后 SSH 连通，代码从 `b9a0bd3` fast-forward 到 `d9a1eb2`（+43 commits）。cargo check 13.98s ✅，cargo test 55/55 ✅。**`.venv` 规范化完成**：repo 内 `uv venv --python 3.12`，通过清华镜像安装 torch 2.11.0+cu130 + vllm 0.22.0 + transformers 5.9.0 + aioquic 1.3.0 等全部依赖，CUDA RTX 4090 识别正常（`torch.cuda.is_available()=True`, `CUDA 13.0`, `device_count=1`）。standalone libtorch (`~/libtorch`, 2.11.0) 保持用于 Rust 编译（环境变量已持久化到 `~/.bashrc`）。
 - **pearl (RX 9060 XT, ROCm/HIP) 首次接入 + 规范化**：AMD Radeon RX 9060 XT (gfx1200)，ROCm 7.2，torch 2.11.0+rocm7.2（已从 2.12.0 降级以统一三平台版本）。代码同步到 `d9a1eb2` ✅。`.venv` 确认已是 uv 管理 ✅。Rust CPU 测试 55/55 pass ✅。Python HIP 计算正常 ✅（`torch.cuda.is_available()=True`，设备 AMD Radeon RX 9060 XT）。**模型已下载**：hf-mirror.com 绕过防火墙，Qwen2-0.5B 完整下载（942MB）✅。
