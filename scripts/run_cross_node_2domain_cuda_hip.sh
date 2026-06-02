@@ -77,18 +77,14 @@ if ! run_remote_pearl "test -x ${PEARL_REPO_DIR}/rust/target/release/hcp-ringatt
     exit 1
 fi
 
-# === Generate prompt (on white) ===
+# === Generate prompt (locally, then scp to both nodes) ===
 echo "=== Generating prompt (${SEQ_LEN} tokens) ==="
 PROMPT_FILE="/tmp/hcp_prompt_${RUN_ID}.txt"
-run_remote_white "cd ${WHITE_REPO_DIR} && source .venv/bin/activate && python3 -c \"from transformers import AutoTokenizer; tok=AutoTokenizer.from_pretrained('${WHITE_MODEL_DIR}'); prompt=' '.join(['the']*${SEQ_LEN}); ids=tok.encode(prompt, add_special_tokens=False); print(tok.decode(ids[:${SEQ_LEN}]))\" > ${PROMPT_FILE}" 2>/dev/null || true
+python3 -c "import sys; tok=sys.argv[1] if len(sys.argv)>1 else 'the'; n=int(sys.argv[2]); print(' '.join([tok]*n))" "the" "${SEQ_LEN}" > "${PROMPT_FILE}"
 
-if [ ! -s "${PROMPT_FILE}" ]; then
-    # Fallback: simple repetition
-    python3 -c "print(' '.join(['the']*${SEQ_LEN}))" > "${PROMPT_FILE}"
-fi
-
-# Copy prompt to pearl
-scp "${PROMPT_FILE}" "${PEARL_SSH}:~/hcp_prompt_${RUN_ID}.txt" >/dev/null 2>&1 || true
+# Copy prompt to white and pearl
+scp -o ConnectTimeout=30 "${PROMPT_FILE}" "${WHITE_SSH}:~/hcp_prompt_${RUN_ID}.txt" >/dev/null 2>&1 || true
+scp -o ConnectTimeout=30 "${PROMPT_FILE}" "${PEARL_SSH}:~/hcp_prompt_${RUN_ID}.txt" >/dev/null 2>&1 || true
 
 # === Launch Coordinator (white) ===
 echo "=== Launching Coordinator (white) ==="
