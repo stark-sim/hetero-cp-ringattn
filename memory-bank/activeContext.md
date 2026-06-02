@@ -2,6 +2,23 @@
 
 ## 当前焦点
 
+[2026-06-02] **Harness Subagent Review 完成 + Review Fixes 已提交**（commits `e546dba`, `fc0eac3`）：
+- **Review 结论**: 👍 Thumbs Up with Reservations。可行性证明确实展示了所声称的内容，但有代码质量缺口、架构债务和完整性漏洞。
+- **P0 修复 — 多 GPU capacity 查询 bug**: `query_device_capacity_mb(Device::Cuda(idx))` 现在将 `idx` 传递给 `nvidia-smi --id={idx}` 和 `rocm-smi -d {idx}`，修复了多 GPU 系统上使用 GPU 0 容量做分片决策的 bug。
+- **P1 修复 — ISSUE-001 关闭**: 填写 root_cause / impact / resolution / prevention，移动到 `harness/issues/resolved/`。
+- **P1 修复 — DESIGN.md 历史标记**: 添加 deprecation banner，指向 `systemPatterns.md` 和 `DEPLOYMENT_GUIDE.md`。
+- **P1 修复 — Smoke 脚本 cleanup trap**: `run_cross_node_2domain_mps_hip.sh` 和 `run_cross_node_2domain_cuda_hip.sh` 新增 `trap cleanup EXIT INT TERM`。
+- **P0 待做 — logits 比较脚本**: 为 2-domain 规模矩阵添加单节点 vs 分布式 logits diff 验证（`< 1e-4` Relaxed tier）。Blocked by pearl 模型下载。
+- **P0 待做 — `tch-backend` 真正可选**: `cargo check --no-default-features` 仍失败（25 errors），需将 `infer.rs` 等模块移到 `#[cfg(feature = "tch-backend")]` 后。
+- **剩余 P1/P2**: 端口冲突检测、parse_worker_perf.py argparse、CI smoke、vLLM backend E2E on white。
+
+[2026-06-02] **平台切换：white CUDA + pearl HIP 组合准备中**：
+- Mac MPS 暂时退出验证（~8GB unified memory 对大模型是瓶颈）。
+- white RTX 4090 (24GB) + pearl RX 9060 XT (16GB) 更适合 3B/7B 模型。
+- **white 模型已就位**: Qwen2.5-3B-Instruct 完整下载（3.7GB + 2.1GB = ~5.8GB）。
+- **pearl 模型传输中**: 从 white 通过 scp 传输 `model-00001-of-00002.safetensors`（3.7GB），当前 ~808MB（22%），预计 15-20 分钟完成。model-00002（2.1GB）已在 pearl 上。
+- **目标**: Qwen2.5-3B-Instruct（bf16, 6GB）首次 white CUDA + pearl HIP 异构验证。
+
 [2026-05-31] **三平台 torch 2.11.0 统一后首次端到端验证完成**：
 - **white (RTX 4090, CUDA) Rust 编译/测试全绿**：`cargo check --features tch-backend` 13.98s ✅，`cargo test --lib --features tch-backend` 55/55 pass ✅。libtorch 2.11.0+cu130 与 tch-rs 0.24.0 兼容。
 - **white 本地 2-node loopback smoke 完全成功**：CPU 模式，2 worker + coordinator 同机运行，24 层 ring attention 全通，生成 `"The answer to life is not a destination,"` ✅，workers 优雅退出，exit=0。
