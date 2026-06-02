@@ -268,11 +268,10 @@ macOS MPS 后端在 tch-rs/libtorch 中存在以下已知问题，已在 `rust/s
 
 ### 部署策略
 
-- **生产默认 1 worker / 1 GPU**：最稳定，显存最可控，无 inter-domain 资源竞争。
-- **开发环境可尝试 2 worker / 1 GPU**：验证权重共享逻辑，小 seq（<=8K）可行。
+- **🚫 铁律：1 GPU = 1 worker，禁止单卡多 worker**。每个 worker 加载**完整模型权重**。3B bf16 (~6GB) × 2 workers = ~12GB，RTX 4090 (24GB) 本地 loopback 实测 OOM。即使 0.5B 模型可行，也不推广到 3B+ 场景。`--local-domain-ids` 仅限 <1GB 小模型的本地协议验证。生产/大规模验证必须每平台一 worker。
 - **大 seq 必须多卡分布**：
-  - 32K -> 4-domain（2 workers x 2 GPUs 或 4 workers x 1 GPU 如果显存够）
-  - 64K -> 8-domain（4 workers x 2 GPUs 或 8 workers x 4 GPUs）
+  - 32K -> 4-domain（2 workers x 2 GPUs，每卡一 worker）
+  - 64K -> 8-domain（4 workers x 2 GPUs 或 8 workers x 4 GPUs，每卡一 worker）
 
 ## 项目结构
 

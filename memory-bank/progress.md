@@ -204,7 +204,7 @@
 ## 已知问题
 
 - [2026-05-03] 远程 4090 已恢复并通过验证（统一 QUIC 控制面 + 单进程多 domain worker，8K seq）。
-- [2026-05-02] 单卡多 worker 虽共享权重，但 LM head + KV cache 仍按 domain 数倍增，不能突破单卡显存上限。生产默认 1 worker/GPU，开发环境可尝试 2 worker/GPU。
+- **[2026-05-02] → [2026-06-02] 强化为铁律：1 GPU = 1 worker，禁止单卡多 worker**。每个 worker 加载完整模型权重，3B bf16 (~6GB) × 2 workers 在 RTX 4090 (24GB) 上实测 OOM。`--local-domain-ids` 仅限 <1GB 小模型的本地协议验证。详见 `systemPatterns.md` 架构决策表。
 - [2026-04-24] 完整 Python smoke 在当前沙箱下无法绑定本地端口。
 - [2026-04-24] `ringattn_controller.py` 存在 `bytes` JSON 序列化问题。
 - [x] [2026-05-01] `ringattn_kernel_stub.py` 的 correctness JSON 已进一步整理为正式 M2 report 文档：`docs/CORRECTNESS_REPORT.md`。

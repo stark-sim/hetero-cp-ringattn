@@ -25,7 +25,8 @@
 - **根因**: 每个 worker 加载完整的模型权重。3B bf16 (~6GB) × 2 workers = ~12GB VRAM，white RTX 4090 (24GB) 本地 loopback 测试 OOM。
 - **即使 0.5B 模型（~1GB）可以双 worker，也不推广到 3B+ 场景**。
 - **脚本已更新**: `scripts/run_multiworker_2node_smoke.sh` 添加显式警告，仅用于 <1GB 小模型验证。
-- **正确架构**: 每平台一个 worker，跨节点分布式。 Coordinator 可与 worker 同机，但 worker 之间必须分 GPU。
+- **正确架构**: 每平台一个 worker，跨节点分布式。Coordinator 可与 worker 同机，但 worker 之间必须分 GPU。
+- **规则出处**: `memory-bank/systemPatterns.md` 架构决策表 → 「🚫 铁律：1 GPU = 1 worker，禁止单卡多 worker」
 
 [2026-06-02] **平台切换完成**：
 - Mac MPS 暂时退出验证（~8GB unified memory 对大模型是瓶颈）。
