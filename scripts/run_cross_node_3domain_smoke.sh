@@ -18,7 +18,7 @@ REPORT_DIR="${REPO_ROOT}/reports/${RUN_ID}"
 mkdir -p "${REPORT_DIR}"
 
 # === Configuration ===
-WHITE_HOST="${WHITE_HOST:-100.64.0.2}"
+WHITE_HOST="${WHITE_HOST:-100.118.253.68}"
 WHITE_USER="${WHITE_USER:-stark}"
 WHITE_SSH="${WHITE_USER}@${WHITE_HOST}"
 WHITE_REPO_DIR="${WHITE_REPO_DIR:-hetero-cp-ringattn}"

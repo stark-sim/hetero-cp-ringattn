@@ -10,7 +10,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BINARY="${REPO_ROOT}/rust/target/release/hcp-ringattn-rust"
 
 # === Configuration ===
-WHITE_HOST="${WHITE_HOST:-100.64.0.2}"
+WHITE_HOST="${WHITE_HOST:-100.118.253.68}"
 WHITE_USER="${WHITE_USER:-stark}"
 WHITE_SSH="${WHITE_USER}@${WHITE_HOST}"
 WHITE_REPO_DIR="${WHITE_REPO_DIR:-hetero-cp-ringattn}"
