@@ -37,7 +37,9 @@ use tch::Device;
 ///   deliberately under-weight RAM to avoid overloading CPU domains.
 pub fn query_device_capacity_mb(device: Device) -> u64 {
     match device {
-        Device::Cuda(_) => query_cuda_free_memory_mb().unwrap_or(u64::MAX),
+        Device::Cuda(_) => query_cuda_free_memory_mb()
+            .or_else(query_rocm_free_memory_mb)
+            .unwrap_or(u64::MAX),
         Device::Mps => query_total_ram_mb() / 2,
         Device::Cpu => query_available_ram_mb() / 4,
         _ => query_available_ram_mb() / 4,
@@ -164,6 +166,37 @@ fn query_cuda_free_memory_mb() -> Option<u64> {
     }
     let s = String::from_utf8(output.stdout).ok()?;
     s.trim().parse::<u64>().ok()
+}
+
+/// Query AMD ROCm GPU free memory via `rocm-smi` subprocess.
+///
+/// `rocm-smi --showmeminfo VRAM -d 0` outputs lines like:
+///   GPU[0] : VRAM Total Memory (B): 17095983104
+///   GPU[0] : VRAM Total Used Memory (B): 93093888
+/// We compute free = total - used.
+fn query_rocm_free_memory_mb() -> Option<u64> {
+    let output = std::process::Command::new("rocm-smi")
+        .args(["--showmeminfo", "VRAM", "-d", "0"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(output.stdout).ok()?;
+    let mut total: Option<u64> = None;
+    let mut used: Option<u64> = None;
+    for line in s.lines() {
+        if line.contains("Total Memory") && !line.contains("Used") {
+            total = line.split_whitespace().last().and_then(|v| v.parse().ok());
+        } else if line.contains("Total Used Memory") {
+            used = line.split_whitespace().last().and_then(|v| v.parse().ok());
+        }
+    }
+    match (total, used) {
+        (Some(t), Some(u)) => Some((t.saturating_sub(u)) / 1024 / 1024),
+        (Some(t), None) => Some(t / 1024 / 1024),
+        _ => None,
+    }
 }
 
 /// Query available system RAM in megabytes.
@@ -337,5 +370,17 @@ mod tests {
         // fractional remainders: d2=0.538, d0=0.385, d1=0.077
         // remainder → d2 gets +1
         assert_eq!(chunks, vec![3, 5, 3]);
+    }
+
+    #[test]
+    fn test_allocate_with_rocm_capacity() {
+        // Simulate pearl-like capacity: MPS (8GB) + CUDA (20GB) + ROCm (16GB)
+        let chunks = allocate_by_capacity(16, &[8192, 20480, 16384]);
+        assert_eq!(chunks.iter().sum::<usize>(), 16);
+        // Proportional: 8192:20480:16384 = 2:5:4
+        // Exact: [2.909, 7.273, 5.818] → floor [2, 7, 5], sum=14, remainder=2
+        // fractional remainders: d0=0.909, d2=0.818, d1=0.273
+        // remainder → d0 gets +1, d2 gets +1 → [3, 7, 6]
+        assert_eq!(chunks, vec![3, 7, 6]);
     }
 }
