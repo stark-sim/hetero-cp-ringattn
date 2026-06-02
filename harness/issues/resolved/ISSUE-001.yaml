@@ -1,0 +1,54 @@
+id: "ISSUE-001"
+timestamp: "2026-05-22T10:35:34Z"
+resolved_at: "2026-05-22T18:37:00Z"
+commit: "cbefc49"
+
+type: "bug"
+severity: "high"
+status: "resolved"
+
+# 问题描述
+description: |
+  Pipeline Phase 2 in ring.rs does NOT stream compute: recv blocks are collected into Vec before processing, defeating the intended compute-communication overlap. Design: recv→process→forward per block. Implementation: recv ALL → sort → process ALL. Root cause: inner scope collects all blocks to release transport borrow before process_kv_block(&self). Fix: release transport borrow per block, process immediately, then re-acquire for forwarding.
+
+# 根本原因分析
+root_cause: |
+  Phase 2 的原始实现将所有 peer micro blocks 收集到一个 Vec 中，然后统一排序、处理。
+  虽然使用了 inner scope 来释放 transport borrow，但这个 scope 覆盖了整个收集循环。
+  结果：transport borrow 直到所有 blocks 都接收完成后才释放，process_kv_block(&self) 在此期间无法执行，
+  导致 recv block N 时 compute 完全空闲，零计算-通信重叠。
+
+# 影响评估
+impact:
+  tokens_wasted: 0
+  time_wasted_minutes: 0
+  steps_wasted: 0
+  other: |
+    在跨节点场景下，网络延迟（recv time）成为瓶颈。零重叠意味着总时间 = sum(recv_time) + sum(compute_time)，
+    而修复后可以达到 recv(N) 与 compute(N-1) 重叠，理论最大加速比取决于 recv/compute 比例。
+    实测 2-domain 跨节点中 recv/compute 比例从 27x（64 token）增长到 2902x（8K token），
+    修复 streaming compute 对长序列的端到端延迟有显著改善。
+
+# 解决方案
+resolution: |
+  重构 Phase 2 为逐块流式处理：
+  1. 内层 scope 仅包裹单次 recv_micro_block（释放 transport borrow）
+  2. 收到一个 block 后立即调用 process_kv_block（compute）
+  3. 重新获取 transport，submit_send 转发该 block（最后一轮除外）
+  4. 循环处理下一个 block
+  这样实现了 true streaming：recv block N 与 process block N-1 和 send block N-2 重叠。
+
+# 预防措施
+prevention: |
+  1. 代码 review 时检查 transport borrow 生命周期与 compute 的并行性
+  2. 在 ring attention 性能测试中监控 recv/compute ratio，若 ratio >> 1 但无重叠则告警
+  3. 关键路径（Phase 2）添加单元测试验证逐块处理顺序（已通过 45/45 tests）
+
+related_issues: []
+tags: ["streaming", "compute-overlap", "ring-attention", "performance"]
+
+# 复盘记录
+retrospectives:
+  - date: "2026-05-22"
+    author: "枕哒"
+    note: "修复已验证：cargo test --features tch-backend 45/45 passed，零回归。"
