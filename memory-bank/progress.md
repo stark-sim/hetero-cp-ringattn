@@ -21,6 +21,9 @@
   - 三平台容量：Mac 8192 MB / white 20805 MB / pearl uint64_max
   - **证明 HCP Ring Attention 协议完全不依赖同构假设**，MPS/CUDA/HIP 任意组合均可协同推理
   - 这是项目历史上首次三异构平台联合验证
+- [x] [2026-06-02] **pearl capacity uint64_max 修复**（commit `1025838`）：根因是 `LD_PRELOAD` 导致 `rocm-smi` 子进程崩溃（exit=134），修复为 `.env_remove("LD_PRELOAD")`。验证：pearl capacity 从 `uint64_max` → `13992 MB`。
+- [x] [2026-06-02] **2-domain Mac MPS + pearl HIP 跨节点验证**：64-token smoke pass，exit=0，`generated: jumps over the lazy dog. The quick brown fox`。capacity 正确：Mac 8192 MB / pearl 13992 MB。white CUDA 暂时下线。
+- [x] [2026-06-02] **M6 扩展性论证文档完成**（commit `f3dfa31`）：`docs/SCALING_ARGUMENT.md` 完成，涵盖 memory wall、single-node ceiling、distributed scaling、network bandwidth、operating envelope。使用 Qwen2-0.5B 作为 concrete reference。
 - [x] [2026-05-31] **三平台 torch 2.11.0 版本统一完成**：
   - white (RTX 4090): torch 2.11.0+cu130、vllm 0.22.0、CUDA 13.0 ✅
   - pearl (RX 9060 XT): torch 2.11.0+rocm7.2、ROCm 7.2、HIP 计算正常 ✅

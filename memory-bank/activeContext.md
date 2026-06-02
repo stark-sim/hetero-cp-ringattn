@@ -15,6 +15,24 @@
   - **三平台容量**：Mac 8192 MB / white 20805 MB / pearl uint64_max（capacity 查询待优化）。
   - 这是项目首次 MPS + CUDA + HIP 三异构平台联合验证，证明 HCP Ring Attention 协议完全不依赖同构假设。
 
+[2026-06-02] **pearl capacity uint64_max 根因定位与修复**（commits `61aaea3` → `1025838`）：
+- **根因**：`LD_PRELOAD=/home/stark/libtorch/lib/libtorch_hip.so` 导致 `rocm-smi` 子进程崩溃（SIGABRT, exit=134）。`query_rocm_free_memory_mb()` 检查 `output.status.success()`，崩溃时返回 `None`，最终 `unwrap_or(u64::MAX)`。
+- **修复**：`query_cuda_free_memory_mb()` 和 `query_rocm_free_memory_mb()` 在 `Command::new()` 后添加 `.env_remove("LD_PRELOAD")`，确保 GPU 查询子进程不受 libtorch preload 影响。
+- **验证**：pearl worker capacity 从 `uint64_max` → `13992 MB`（2-domain MPS+HIP 验证）/ `16215 MB`（独立测试）。
+- **2-domain Mac MPS + pearl HIP 验证**：64-token smoke pass，exit=0，`generated: jumps over the lazy dog. The quick brown fox`。capacity 正确：Mac 8192 MB / pearl 13992 MB。
+- **white CUDA 暂时下线**，后续 3-domain 验证待恢复。
+
+[2026-06-02] **M6 扩展性论证文档完成**（commit `f3dfa31`）：
+- `docs/SCALING_ARGUMENT.md` 已撰写，涵盖：
+  1. Memory Wall（KV cache 线性增长，1M tokens = 24GB）
+  2. Single-Node Ceiling（RTX 4090 实测 131K tokens，~10.6GB peak）
+  3. Distributed Scaling（N-domain 内存 reduction，capacity-aware sharding）
+  4. Network Bandwidth Requirements（per-round transfer 量化）
+  5. Why HCP Wins（vs single-node / vs PyTorch CP，heterogeneity advantage）
+  6. Operating Envelope（memory feasibility matrix, network feasibility matrix, practical recommendations）
+- 使用 Qwen2-0.5B 作为 concrete reference model，基于已验证的性能数据。
+- 证明单节点 inference 在 ~131K tokens 处撞墙，HCP 是唯一可行的异构扩展路径。
+
 - **pearl (RX 9060 XT) Rust + libtorch GPU 路径已跑通**：
   - libtorch 降级到 2.11.0+rocm7.2（用户完成）✅
   - `torch-sys` 0.24.0 添加 HIP patch：`device_of_int` 中 `hasHIP() → at::kHIP` ✅
