@@ -32,6 +32,15 @@ echo "Report dir: ${REPORT_DIR}"
 
 BINARY="${REPO_ROOT}/rust/target/release/hcp-ringattn-rust"
 
+# --- Cleanup trap ---
+cleanup() {
+    echo "=== Cleanup ==="
+    [ -n "${COORD_PID:-}" ] && kill "${COORD_PID}" 2>/dev/null || true
+    [ -n "${W0_PID:-}" ] && kill "${W0_PID}" 2>/dev/null || true
+    [ -n "${W1_SSH_PID:-}" ] && kill "${W1_SSH_PID}" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
 # --- Preflight: verify pearl binary exists ---
 echo "=== Verifying pearl binary ==="
 if ! ssh -o ConnectTimeout=10 "${PEARL_SSH}" "test -x ${PEARL_REPO_DIR}/rust/target/release/hcp-ringattn-rust"; then

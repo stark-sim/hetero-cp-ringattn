@@ -1,5 +1,11 @@
 # HCP 设计目标
 
+> **⚠️ 历史文档（Historical）**
+>
+> 本文档描述的是项目早期的骨架设计（protocol skeleton），其中列出的"下一阶段"任务（如 Python `ringattn_kernel_stub.py` 的 correctness 报告、`RingAttnMessage` 的序列化与 P2P 传输实现）已完成。
+>
+> 当前实际架构已演进为：Rust Worker SDK、HTTP API、Batch Scheduler、BlockTable、vLLM/tch 多后端。请参阅 [`systemPatterns.md`](../memory-bank/systemPatterns.md) 和 [`DEPLOYMENT_GUIDE.md`](DEPLOYMENT_GUIDE.md) 了解当前架构。
+
 这个仓库只研究一件事：
 
 - **低边界异构跨域 CP / Ring Attention**

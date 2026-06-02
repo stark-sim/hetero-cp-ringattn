@@ -37,8 +37,8 @@ use tch::Device;
 ///   deliberately under-weight RAM to avoid overloading CPU domains.
 pub fn query_device_capacity_mb(device: Device) -> u64 {
     match device {
-        Device::Cuda(_) => query_cuda_free_memory_mb()
-            .or_else(query_rocm_free_memory_mb)
+        Device::Cuda(idx) => query_cuda_free_memory_mb(idx)
+            .or_else(|| query_rocm_free_memory_mb(idx))
             .unwrap_or(u64::MAX),
         Device::Mps => query_total_ram_mb() / 2,
         Device::Cpu => query_available_ram_mb() / 4,
@@ -153,11 +153,12 @@ pub fn allocate_by_capacity(prompt_len: usize, capacities: &[u64]) -> Vec<usize>
 // ---------------------------------------------------------------------------
 
 /// Query CUDA free memory via `nvidia-smi` subprocess.
-fn query_cuda_free_memory_mb() -> Option<u64> {
+fn query_cuda_free_memory_mb(device_idx: usize) -> Option<u64> {
     let output = std::process::Command::new("nvidia-smi")
         .args([
             "--query-gpu=memory.free",
             "--format=csv,noheader,nounits",
+            &format!("--id={}", device_idx),
         ])
         .env_remove("LD_PRELOAD")
         .output()
@@ -175,9 +176,9 @@ fn query_cuda_free_memory_mb() -> Option<u64> {
 ///   GPU[0] : VRAM Total Memory (B): 17095983104
 ///   GPU[0] : VRAM Total Used Memory (B): 93093888
 /// We compute free = total - used.
-fn query_rocm_free_memory_mb() -> Option<u64> {
+fn query_rocm_free_memory_mb(device_idx: usize) -> Option<u64> {
     let output = std::process::Command::new("rocm-smi")
-        .args(["--showmeminfo", "VRAM", "-d", "0"])
+        .args(["--showmeminfo", "VRAM", "-d", &device_idx.to_string()])
         .env_remove("LD_PRELOAD")
         .output()
         .ok()?;
