@@ -6,6 +6,15 @@
 - **white (RTX 4090, CUDA) Rust 编译/测试全绿**：`cargo check --features tch-backend` 13.98s ✅，`cargo test --lib --features tch-backend` 55/55 pass ✅。libtorch 2.11.0+cu130 与 tch-rs 0.24.0 兼容。
 - **white 本地 2-node loopback smoke 完全成功**：CPU 模式，2 worker + coordinator 同机运行，24 层 ring attention 全通，生成 `"The answer to life is not a destination,"` ✅，workers 优雅退出，exit=0。
 - **跨节点 Mac MPS + white CUDA 异构验证成功**：coordinator + worker0 (Mac MPS) + worker1 (white CUDA) 通过 Tailscale VPN 完成 prefill + decode ring attention。QUIC KV ring 交换正常（229KB/micro_block），prefill 64 tokens 通过 24 层，decode 进入多步生成。**Tailscale VPN 高延迟 (~380ms RTT) 导致 decode 极慢**（每 layer recv 0ms–13s 波动），但 correctness 无 regression。跨节点逻辑已验证，速度非当前 blocker。
+- **[2026-06-02] 历史性里程碑：三平台异构分布式推理首次成功！**
+  - **Mac MPS (domain 0) + white RTX 4090 CUDA (domain 1) + pearl RX 9060 XT HIP (domain 2)** 三平台通过 Tailscale VPN 完成 3-domain ring attention 分布式推理。
+  - Coordinator 生成 `"The quick brown"`，3 个 decode token，exit=0。
+  - 24 层 × 2 rounds（prefill + decode）KV ring 交换全通，workers 优雅退出。
+  - 11-token prompt，每个 domain 约 3-4 tokens，3 步 decode。
+  - **关键挑战**：pearl SSH host key 导致 worker 2 初始启动失败，手动补启动后 ring 拓扑自动闭合。
+  - **三平台容量**：Mac 8192 MB / white 20805 MB / pearl uint64_max（capacity 查询待优化）。
+  - 这是项目首次 MPS + CUDA + HIP 三异构平台联合验证，证明 HCP Ring Attention 协议完全不依赖同构假设。
+
 - **pearl (RX 9060 XT) Rust + libtorch GPU 路径已跑通**：
   - libtorch 降级到 2.11.0+rocm7.2（用户完成）✅
   - `torch-sys` 0.24.0 添加 HIP patch：`device_of_int` 中 `hasHIP() → at::kHIP` ✅
