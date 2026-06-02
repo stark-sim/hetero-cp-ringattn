@@ -24,6 +24,8 @@
 - [x] [2026-06-02] **pearl capacity uint64_max 修复**（commit `1025838`）：根因是 `LD_PRELOAD` 导致 `rocm-smi` 子进程崩溃（exit=134），修复为 `.env_remove("LD_PRELOAD")`。验证：pearl capacity 从 `uint64_max` → `13992 MB`。
 - [x] [2026-06-02] **2-domain Mac MPS + pearl HIP 跨节点验证**：64-token smoke pass，exit=0，`generated: jumps over the lazy dog. The quick brown fox`。capacity 正确：Mac 8192 MB / pearl 13992 MB。white CUDA 暂时下线。
 - [x] [2026-06-02] **M6 扩展性论证文档完成**（commit `f3dfa31`）：`docs/SCALING_ARGUMENT.md` 完成，涵盖 memory wall、single-node ceiling、distributed scaling、network bandwidth、operating envelope。使用 Qwen2-0.5B 作为 concrete reference。
+- [x] [2026-06-02] **2-domain HTTP API 跨节点 E2E 验证**（commit `613c443`）：Mac MPS + pearl HIP，`/health` workers_connected=2，`/metrics` 正常，`/v1/completions` non-streaming 生成 `1. The`，SSE streaming OK（data: events + [DONE]）。
+- [x] [2026-06-02] **2-domain 并发 HTTP API 验证**（commit `a5da680`）：同时提交 2 个 `/v1/completions` 请求，req1=`1. The`，req2=`The lazy dog`，两者同时完成无错误。验证 coordinator 并发调度能力。
 - [x] [2026-05-31] **三平台 torch 2.11.0 版本统一完成**：
   - white (RTX 4090): torch 2.11.0+cu130、vllm 0.22.0、CUDA 13.0 ✅
   - pearl (RX 9060 XT): torch 2.11.0+rocm7.2、ROCm 7.2、HIP 计算正常 ✅

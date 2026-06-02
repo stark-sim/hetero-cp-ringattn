@@ -33,6 +33,16 @@
 - 使用 Qwen2-0.5B 作为 concrete reference model，基于已验证的性能数据。
 - 证明单节点 inference 在 ~131K tokens 处撞墙，HCP 是唯一可行的异构扩展路径。
 
+[2026-06-02] **2-domain HTTP API 跨节点 E2E 验证完成**（commits `613c443`, `a5da680`）：
+- Mac MPS + pearl HIP 2-domain HTTP API 测试通过。
+- `/health`：workers_connected=2，status=ok
+- `/metrics`：total_requests=0，正常返回
+- `/v1/completions` non-streaming：64-token prompt → `1. The`（3 tokens）
+- SSE streaming：`data:` events + `[DONE]` 结束标记，格式正确
+- 并发测试：2 个同时提交的请求均完成，req1=`1. The`，req2=`The lazy dog`，无错误
+- Coordinator 并发调度能力在跨节点 2-domain 场景下验证通过
+- **white CUDA 暂时下线**，3-domain HTTP API 验证待恢复
+
 - **pearl (RX 9060 XT) Rust + libtorch GPU 路径已跑通**：
   - libtorch 降级到 2.11.0+rocm7.2（用户完成）✅
   - `torch-sys` 0.24.0 添加 HIP patch：`device_of_int` 中 `hasHIP() → at::kHIP` ✅
