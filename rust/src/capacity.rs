@@ -159,6 +159,7 @@ fn query_cuda_free_memory_mb() -> Option<u64> {
             "--query-gpu=memory.free",
             "--format=csv,noheader,nounits",
         ])
+        .env_remove("LD_PRELOAD")
         .output()
         .ok()?;
     if !output.status.success() {
@@ -177,6 +178,7 @@ fn query_cuda_free_memory_mb() -> Option<u64> {
 fn query_rocm_free_memory_mb() -> Option<u64> {
     let output = std::process::Command::new("rocm-smi")
         .args(["--showmeminfo", "VRAM", "-d", "0"])
+        .env_remove("LD_PRELOAD")
         .output()
         .ok()?;
     if !output.status.success() {
