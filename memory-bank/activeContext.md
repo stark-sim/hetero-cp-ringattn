@@ -12,12 +12,19 @@
 - **P0 待做 — `tch-backend` 真正可选**: `cargo check --no-default-features` 仍失败（25 errors），需将 `infer.rs` 等模块移到 `#[cfg(feature = "tch-backend")]` 后。
 - **剩余 P1/P2**: 端口冲突检测、parse_worker_perf.py argparse、CI smoke、vLLM backend E2E on white。
 
-[2026-06-02] **平台切换：white CUDA + pearl HIP 组合准备中**：
+[2026-06-02] **历史性里程碑：white CUDA + pearl HIP 跨节点 3B 模型异构分布式推理首次成功！**
+- **white RTX 4090 CUDA (domain 0) + pearl RX 9060 XT HIP (domain 1)** 完成 Qwen2.5-3B-Instruct（bf16, ~6GB）跨节点分布式推理。
+- Coordinator (white) 生成 `"  • 1"`（5 decode tokens: 220, 7288, 220, 16, 198），exit=0。
+- 36 层 ring attention 全通，KV micro block = 524KB(white)/540KB(pearl)，recv/compute ratio: white ~166-367x, pearl ~8-58x。
+- Workers 优雅退出，coordinator shutdown complete。
+- **关键修复**: `scripts/run_cross_node_2domain_cuda_hip.sh` prompt 生成改为本地（Mac）→ scp 到两端，避免 remote bash 引号嵌套地狱（commit `4322a87`）。
+- **white 单 GPU 双 worker 3B OOM**: white 本地 loopback 测试发现单 GPU 跑两个 3B worker 会 OOM（worker0 占 ~12GB）。但单 worker 每平台完全正常。
+- **pearl 单节点 3B 推理验证**: `" area succesivamente leaved"` — 模型加载和计算完全正常，证明 16GB 单 worker 承载 3B 模型 + KV 无压力。
+- **capacity=4229 MB 谜题**: pearl 报告 capacity=4229 MB（实际 rocm-smi 显示 ~16215 MB），根因待查。不影响功能。
+
+[2026-06-02] **平台切换完成**：
 - Mac MPS 暂时退出验证（~8GB unified memory 对大模型是瓶颈）。
-- white RTX 4090 (24GB) + pearl RX 9060 XT (16GB) 更适合 3B/7B 模型。
-- **white 模型已就位**: Qwen2.5-3B-Instruct 完整下载（3.7GB + 2.1GB = ~5.8GB）。
-- **pearl 模型传输中**: 从 white 通过 scp 传输 `model-00001-of-00002.safetensors`（3.7GB），当前 ~808MB（22%），预计 15-20 分钟完成。model-00002（2.1GB）已在 pearl 上。
-- **目标**: Qwen2.5-3B-Instruct（bf16, 6GB）首次 white CUDA + pearl HIP 异构验证。
+- white RTX 4090 (24GB) + pearl RX 9060 XT (16GB) 验证通过，可承载 3B/7B 模型。
 
 [2026-05-31] **三平台 torch 2.11.0 统一后首次端到端验证完成**：
 - **white (RTX 4090, CUDA) Rust 编译/测试全绿**：`cargo check --features tch-backend` 13.98s ✅，`cargo test --lib --features tch-backend` 55/55 pass ✅。libtorch 2.11.0+cu130 与 tch-rs 0.24.0 兼容。

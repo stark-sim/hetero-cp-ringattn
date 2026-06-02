@@ -34,6 +34,13 @@
   - P1 修复：DESIGN.md 添加历史文档 deprecation banner
   - P1 修复：smoke 脚本添加 cleanup trap（EXIT/INT/TERM）
   - Review 报告详见 subagent 输出日志
+- [x] [2026-06-02] **white CUDA + pearl HIP 跨节点 3B 模型异构分布式推理首次成功**（commit `4322a87`）：
+  - white RTX 4090 CUDA (domain 0) + pearl RX 9060 XT HIP (domain 1)
+  - Qwen2.5-3B-Instruct（bf16, ~6GB），64-token prompt，5 decode tokens
+  - 36 层 ring attention 全通，KV micro block ~524KB(white)/540KB(pearl)
+  - recv/compute ratio: white ~166-367x, pearl ~8-58x
+  - Coordinator exit=0，workers 优雅退出
+  - 脚本修复：prompt 本地生成 + scp 到两端，避免 remote bash 引号嵌套
 - [x] [2026-05-31] **三平台 torch 2.11.0 版本统一完成**：
   - white (RTX 4090): torch 2.11.0+cu130、vllm 0.22.0、CUDA 13.0 ✅
   - pearl (RX 9060 XT): torch 2.11.0+rocm7.2、ROCm 7.2、HIP 计算正常 ✅
