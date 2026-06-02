@@ -26,6 +26,7 @@
 - [x] [2026-06-02] **M6 扩展性论证文档完成**（commit `f3dfa31`）：`docs/SCALING_ARGUMENT.md` 完成，涵盖 memory wall、single-node ceiling、distributed scaling、network bandwidth、operating envelope。使用 Qwen2-0.5B 作为 concrete reference。
 - [x] [2026-06-02] **2-domain HTTP API 跨节点 E2E 验证**（commit `613c443`）：Mac MPS + pearl HIP，`/health` workers_connected=2，`/metrics` 正常，`/v1/completions` non-streaming 生成 `1. The`，SSE streaming OK（data: events + [DONE]）。
 - [x] [2026-06-02] **2-domain 并发 HTTP API 验证**（commit `a5da680`）：同时提交 2 个 `/v1/completions` 请求，req1=`1. The`，req2=`The lazy dog`，两者同时完成无错误。验证 coordinator 并发调度能力。
+- [x] [2026-06-02] **2-domain MPS+HIP 规模矩阵验证**（commit `5a239cf` → `9ab4659`）：64→512→1024→2048→4096→8192 tokens 全部通过，exit=0，生成连贯文本。有效带宽 ~7–9 MB/s（Tailscale VPN），compute 稳定（pearl ~1.2ms/layer, Mac ~0.6ms/layer），recv 与 KV block 大小线性增长。8K 时 KV cache 自动拆分为 2×14MB micro blocks，compute 上升到 ~34ms/micro_block（O(n²) attention）。文档：`docs/2domain_mps_hip_scale_matrix.md`。
 - [x] [2026-05-31] **三平台 torch 2.11.0 版本统一完成**：
   - white (RTX 4090): torch 2.11.0+cu130、vllm 0.22.0、CUDA 13.0 ✅
   - pearl (RX 9060 XT): torch 2.11.0+rocm7.2、ROCm 7.2、HIP 计算正常 ✅

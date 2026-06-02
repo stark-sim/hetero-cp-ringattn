@@ -41,7 +41,17 @@
 - SSE streaming：`data:` events + `[DONE]` 结束标记，格式正确
 - 并发测试：2 个同时提交的请求均完成，req1=`1. The`，req2=`The lazy dog`，无错误
 - Coordinator 并发调度能力在跨节点 2-domain 场景下验证通过
-- **white CUDA 暂时下线**，3-domain HTTP API 验证待恢复
+
+[2026-06-02] **2-domain MPS+HIP 规模矩阵验证完成**（commit `5a239cf`）：
+- 64→512→1024→2048→4096 tokens 全部通过，exit=0
+- Generated text coherent at all scales
+- KV block size strictly linear with sequence length: 0.22MB (64) → 14MB (4096)
+- Effective bandwidth ~7–9 MB/s over Tailscale VPN
+- Compute time stable: pearl ~1.2ms/layer, Mac ~0.6ms/layer
+- recv/compute ratio grows linearly: 27x (64) → 2902x (4096)
+- **Network-bound, not compute-bound** characteristic confirmed
+- 8192-token validation in progress
+- **white CUDA 暂时下线**，3-domain 验证待恢复
 
 - **pearl (RX 9060 XT) Rust + libtorch GPU 路径已跑通**：
   - libtorch 降级到 2.11.0+rocm7.2（用户完成）✅
