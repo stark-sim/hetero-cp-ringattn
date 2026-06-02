@@ -18,9 +18,14 @@
 - 36 层 ring attention 全通，KV micro block = 524KB(white)/540KB(pearl)，recv/compute ratio: white ~166-367x, pearl ~8-58x。
 - Workers 优雅退出，coordinator shutdown complete。
 - **关键修复**: `scripts/run_cross_node_2domain_cuda_hip.sh` prompt 生成改为本地（Mac）→ scp 到两端，避免 remote bash 引号嵌套地狱（commit `4322a87`）。
-- **white 单 GPU 双 worker 3B OOM**: white 本地 loopback 测试发现单 GPU 跑两个 3B worker 会 OOM（worker0 占 ~12GB）。但单 worker 每平台完全正常。
 - **pearl 单节点 3B 推理验证**: `" area succesivamente leaved"` — 模型加载和计算完全正常，证明 16GB 单 worker 承载 3B 模型 + KV 无压力。
 - **capacity=4229 MB 谜题**: pearl 报告 capacity=4229 MB（实际 rocm-smi 显示 ~16215 MB），根因待查。不影响功能。
+
+**🚫 铁律确立：永远不在单 GPU 上运行多个 worker**
+- **根因**: 每个 worker 加载完整的模型权重。3B bf16 (~6GB) × 2 workers = ~12GB VRAM，white RTX 4090 (24GB) 本地 loopback 测试 OOM。
+- **即使 0.5B 模型（~1GB）可以双 worker，也不推广到 3B+ 场景**。
+- **脚本已更新**: `scripts/run_multiworker_2node_smoke.sh` 添加显式警告，仅用于 <1GB 小模型验证。
+- **正确架构**: 每平台一个 worker，跨节点分布式。 Coordinator 可与 worker 同机，但 worker 之间必须分 GPU。
 
 [2026-06-02] **平台切换完成**：
 - Mac MPS 暂时退出验证（~8GB unified memory 对大模型是瓶颈）。

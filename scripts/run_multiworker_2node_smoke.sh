@@ -1,7 +1,13 @@
 #!/bin/bash
-# Launcher for single-GPU multi-domain worker smoke test.
-# Topology: GPU node runs 2 workers (2 domains) on one 4090.
+# ⚠️ WARNING: Single-GPU multi-domain worker — ONLY for tiny models (<1GB).
+# Topology: GPU node runs 2 workers (2 domains) on ONE GPU.
 # Mac node runs coordinator + optionally a 3rd domain.
+#
+# 🚫 NEVER use this for 3B+ models. Each worker loads the FULL model weights,
+# so 2 workers on one GPU = 2× model VRAM. A 3B bf16 model (~6GB) × 2 = ~12GB,
+# which exceeds most consumer GPUs and causes OOM.
+#
+# This script is hardcoded for Qwen2-0.5B (~1GB) only.
 #
 # Environment:
 #   GPU: 100.118.253.68, RTX 4090 24GB, CUDA
