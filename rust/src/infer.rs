@@ -66,6 +66,6 @@ pub fn run_inference(model_dir: &str, prompt: &str, max_tokens: usize, temperatu
 }
 
 #[cfg(not(feature = "tch-backend"))]
-pub fn run_inference(_model_dir: &str, _prompt: &str, _max_tokens: usize, _temperature: f64) -> Result<String, String> {
+pub fn run_inference(_model_dir: &str, _prompt: &str, _max_tokens: usize, _temperature: f64, _top_p: f64, _num_domains: usize) -> Result<String, String> {
     Err("tch-backend feature required".to_string())
 }

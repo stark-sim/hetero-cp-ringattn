@@ -14,6 +14,7 @@
 //! - `remote`: 远程 smoke test 入口
 //! - `smoke`: correctness 验证基础设施
 
+#[cfg(feature = "tch-backend")]
 mod api;
 mod cli;
 mod compute_runtime;
@@ -21,6 +22,7 @@ mod compute_runtime;
 mod capacity;
 mod distributed;
 mod error;
+#[cfg(feature = "tch-backend")]
 mod infer;
 mod model;
 mod protocol;
@@ -182,6 +184,7 @@ pub fn run_cli() -> Result<(), RingError> {
     let args = parse_cli_args()?;
 
     // Inference mode: load real model and generate text
+    #[cfg(feature = "tch-backend")]
     if let Some(ref model_dir) = args.infer_model_dir {
         let prompt = if let Some(ref path) = args.infer_prompt_file {
             std::fs::read_to_string(path)
@@ -195,6 +198,10 @@ pub fn run_cli() -> Result<(), RingError> {
             Err(e) => eprintln!("Inference failed: {}", e),
         }
         return Ok(());
+    }
+    #[cfg(not(feature = "tch-backend"))]
+    if args.infer_model_dir.is_some() {
+        return Err(RingError::InvalidCli("tch-backend feature required for inference".to_string()));
     }
 
     #[cfg(feature = "tch-backend")]

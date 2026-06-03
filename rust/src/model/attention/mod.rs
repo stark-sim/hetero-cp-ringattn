@@ -7,8 +7,12 @@
 //! 所有单节点和分布式推理都使用 HcpRingAttentionBackend，
 //! 它通过固定 chunk-size 上限避免 O(seq²) 的 scores 显存爆炸。
 
+#[cfg(feature = "tch-backend")]
 pub mod backend;
+#[cfg(feature = "tch-backend")]
 pub mod ring;
 
+#[cfg(feature = "tch-backend")]
 pub use backend::AttentionBackend;
+#[cfg(feature = "tch-backend")]
 pub use ring::HcpRingAttentionBackend;

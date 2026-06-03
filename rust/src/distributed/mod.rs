@@ -20,4 +20,5 @@ pub mod coordinator;
 pub mod worker;
 #[cfg(feature = "tch-backend")]
 pub mod scheduler;
+#[cfg(feature = "tch-backend")]
 pub mod transport;

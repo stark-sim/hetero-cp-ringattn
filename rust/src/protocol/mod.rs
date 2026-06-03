@@ -15,8 +15,10 @@ pub mod framing;
 pub mod node;
 
 pub use message::ProtocolError;
+pub(crate) use message::RingAttnMessage;
+#[cfg(feature = "tch-backend")]
 pub(crate) use message::{
-    RingAttnMessage, RingAttnMessageKind, PayloadKind,
+    RingAttnMessageKind, PayloadKind,
     BlockMetadata, TensorMetadata, FLOAT32_BYTES, SCHEMA_VERSION,
 };
 pub use node::{
@@ -26,5 +28,7 @@ pub use node::{
     run_remote_p2p_server,
 };
 pub(crate) use node::{
-    DomainModelState, LayerActivationState, OnlineSoftmaxAccumulator,
+    DomainModelState, OnlineSoftmaxAccumulator,
 };
+#[cfg(feature = "tch-backend")]
+pub(crate) use node::LayerActivationState;

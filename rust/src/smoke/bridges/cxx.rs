@@ -68,7 +68,10 @@ extern "C" {
     ) -> i32;
     pub fn hcp_ringattn_torch_query_chunk_output_smoke_message() -> *const std::os::raw::c_char;
 }
-pub fn c_string_from_ptr(ptr: *const std::os::raw::c_char) -> String {
+/// # Safety
+/// `ptr` must be a valid, non-null C string pointer or null.
+/// If non-null, it must point to a null-terminated sequence of bytes.
+pub unsafe fn c_string_from_ptr(ptr: *const std::os::raw::c_char) -> String {
     if ptr.is_null() {
         String::new()
     } else {
@@ -77,7 +80,7 @@ pub fn c_string_from_ptr(ptr: *const std::os::raw::c_char) -> String {
 }
 pub fn torch_bridge_report() -> TorchBridgeReport {
     let code = unsafe { hcp_ringattn_torch_smoke() };
-    let message = c_string_from_ptr(unsafe { hcp_ringattn_torch_smoke_message() });
+    let message = unsafe { c_string_from_ptr(hcp_ringattn_torch_smoke_message()) };
     torch_report_from_code(
         code,
         message,
@@ -90,7 +93,7 @@ pub fn torch_bridge_report() -> TorchBridgeReport {
 }
 pub fn torch_attention_bridge_report() -> TorchBridgeReport {
     let code = unsafe { hcp_ringattn_torch_attention_smoke() };
-    let message = c_string_from_ptr(unsafe { hcp_ringattn_torch_attention_smoke_message() });
+    let message = unsafe { c_string_from_ptr(hcp_ringattn_torch_attention_smoke_message()) };
     torch_report_from_code(
         code,
         message,
@@ -104,7 +107,7 @@ pub fn torch_attention_bridge_report() -> TorchBridgeReport {
 pub fn torch_block_update_bridge_report(requested_updates: usize) -> TorchBlockUpdateReport {
     let block_updates = i32::try_from(requested_updates).unwrap_or(i32::MAX);
     let code = unsafe { hcp_ringattn_torch_block_update_smoke(block_updates) };
-    let message = c_string_from_ptr(unsafe { hcp_ringattn_torch_block_update_smoke_message() });
+    let message = unsafe { c_string_from_ptr(hcp_ringattn_torch_block_update_smoke_message()) };
     let report = torch_report_from_code(
         code,
         message,
@@ -170,7 +173,7 @@ pub fn torch_payload_block_bridge_report(
                 head_dim,
             )
         };
-        message = c_string_from_ptr(unsafe { hcp_ringattn_torch_payload_block_smoke_message() });
+        message = unsafe { c_string_from_ptr(hcp_ringattn_torch_payload_block_smoke_message()) };
         let block_report = torch_report_from_code(
             code,
             message.clone(),
@@ -278,7 +281,7 @@ pub fn torch_payload_online_bridge_report(
             i32::try_from(head_dim).unwrap_or(i32::MAX),
         )
     };
-    let message = c_string_from_ptr(unsafe { hcp_ringattn_torch_payload_online_smoke_message() });
+    let message = unsafe { c_string_from_ptr(hcp_ringattn_torch_payload_online_smoke_message()) };
     let report = torch_report_from_code(
         code,
         message,
@@ -376,7 +379,7 @@ pub fn torch_payload_chunk_bridge_report(
             i32::try_from(head_dim).unwrap_or(i32::MAX),
         )
     };
-    let message = c_string_from_ptr(unsafe { hcp_ringattn_torch_payload_chunk_smoke_message() });
+    let message = unsafe { c_string_from_ptr(hcp_ringattn_torch_payload_chunk_smoke_message()) };
     let report = torch_report_from_code(
         code,
         message,
@@ -520,7 +523,7 @@ pub fn torch_query_chunk_bridge_report(blocks: &[protocol::CpPayloadBlock]) -> T
                 i32::try_from(head_dim).unwrap_or(i32::MAX),
             )
         };
-        message = c_string_from_ptr(unsafe { hcp_ringattn_torch_query_chunk_smoke_message() });
+        message = unsafe { c_string_from_ptr(hcp_ringattn_torch_query_chunk_smoke_message()) };
         let group_report = torch_report_from_code(
             code,
             message.clone(),
@@ -668,7 +671,7 @@ pub fn torch_query_output_bridge_report(blocks: &[protocol::CpPayloadBlock]) -> 
             )
         };
         message =
-            c_string_from_ptr(unsafe { hcp_ringattn_torch_query_chunk_output_smoke_message() });
+            unsafe { c_string_from_ptr(hcp_ringattn_torch_query_chunk_output_smoke_message()) };
         let group_report = torch_report_from_code(
             code,
             message.clone(),

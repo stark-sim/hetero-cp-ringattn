@@ -1,13 +1,22 @@
+#[cfg(feature = "tch-backend")]
 pub mod norm;
+#[cfg(feature = "tch-backend")]
 pub mod rotary;
+#[cfg(feature = "tch-backend")]
 pub mod mlp;
+#[cfg(feature = "tch-backend")]
 pub mod attention;
 
+#[cfg(feature = "tch-backend")]
 pub use norm::RmsNorm;
+#[cfg(feature = "tch-backend")]
 pub use rotary::RotaryEmbedding;
+#[cfg(feature = "tch-backend")]
 pub use mlp::Mlp;
+#[cfg(feature = "tch-backend")]
 pub use attention::GqaAttention;
 
+#[cfg(feature = "tch-backend")]
 use crate::model::{ModelConfig, ModelError, ModelWeights, WeightNames};
 
 #[cfg(feature = "tch-backend")]

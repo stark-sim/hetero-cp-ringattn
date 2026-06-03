@@ -185,6 +185,7 @@ pub(crate) fn checksum(payload: &[u8]) -> u64 {
     })
 }
 
+#[allow(dead_code)]
 pub(crate) fn read_f32(bytes: &[u8], value_index: usize) -> f32 {
     let start = value_index * FLOAT32_BYTES;
     f32::from_le_bytes([
@@ -196,6 +197,7 @@ pub(crate) fn read_f32(bytes: &[u8], value_index: usize) -> f32 {
 }
 
 /// 构造一个完整的 RingAttnMessage（KV block 类型），用于序列化测试。
+#[allow(dead_code)]
 pub(crate) fn sample_kv_message() -> RingAttnMessage {
     RingAttnMessage {
         schema_version: SCHEMA_VERSION,

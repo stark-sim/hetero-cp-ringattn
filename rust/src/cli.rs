@@ -71,7 +71,7 @@ pub fn parse_cli_args() -> Result<CliArgs, RingError> {
             }
             "--tolerance-tier" => {
                 let value = next_cli_value(&mut args, "--tolerance-tier")?;
-                tolerance_tier = ToleranceTier::from_str(&value).ok_or_else(|| {
+                tolerance_tier = value.parse().map_err(|_| {
                     RingError::InvalidCli(format!(
                         "invalid --tolerance-tier: {value}; expected strict|relaxed|end-to-end"
                     ))

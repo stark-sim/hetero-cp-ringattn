@@ -125,14 +125,17 @@ pub struct ModelConfig {
 /// 先尝试解析成 Single(u32)，如果失败再尝试 Multiple(Vec<u32>)。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
+#[allow(dead_code)]
 pub enum EosTokenId {
     Single(u32),
     Multiple(Vec<u32>),
 }
 
+#[allow(dead_code)]
 impl EosTokenId {
     /// 【获取主 EOS ID】
     /// 如果是 Single 就直接返回；如果是 Multiple 就返回数组中的第一个。
+    #[allow(dead_code)]
     pub fn primary(&self) -> u32 {
         match self {
             EosTokenId::Single(id) => *id,
@@ -141,6 +144,7 @@ impl EosTokenId {
     }
 }
 
+#[allow(dead_code)]
 impl ModelConfig {
     /// 【从文件加载配置】读取 HuggingFace 风格的 `config.json`。
     /// P: AsRef<Path> 是 Rust 的泛型约束，表示 P 可以转换成文件路径（支持 String、&str、PathBuf 等）。

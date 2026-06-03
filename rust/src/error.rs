@@ -41,15 +41,19 @@ pub enum ToleranceTier {
     EndToEnd,
 }
 
-impl ToleranceTier {
-    pub fn from_str(s: &str) -> Option<Self> {
+impl std::str::FromStr for ToleranceTier {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "strict" | "s" => Some(Self::Strict),
-            "relaxed" | "r" => Some(Self::Relaxed),
-            "end-to-end" | "e2e" | "e" => Some(Self::EndToEnd),
-            _ => None,
+            "strict" | "s" => Ok(Self::Strict),
+            "relaxed" | "r" => Ok(Self::Relaxed),
+            "end-to-end" | "e2e" | "e" => Ok(Self::EndToEnd),
+            _ => Err(format!("unknown tolerance tier: {s}")),
         }
     }
+}
+
+impl ToleranceTier {
 
     pub fn default_tolerance(self) -> Tolerance {
         match self {

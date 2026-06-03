@@ -9,9 +9,13 @@
 
 #![allow(dead_code)]
 
+#[cfg(feature = "tch-backend")]
 pub mod block;
+#[cfg(feature = "tch-backend")]
 pub mod r#trait;
+#[cfg(feature = "tch-backend")]
 pub mod tcp;
+#[cfg(feature = "tch-backend")]
 pub mod mock;
 
 #[cfg(feature = "tch-backend")]

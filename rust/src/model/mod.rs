@@ -12,24 +12,35 @@
 //! - `transport`: KV Block 传输层（Trait + TCP + Mock + QUIC）
 //! - `sampling`: Token 采样策略（greedy / temperature / top-p）
 
-pub mod attention;
-pub mod cache;
 pub mod config;
-pub mod sampling;
-pub mod generator;
-pub mod distributed_generator;
-pub mod transport;
-pub mod layers;
-#[allow(clippy::module_inception)]
-pub mod model;
-pub mod weights;
 pub mod error;
 pub use error::ModelError;
+#[cfg(feature = "tch-backend")]
+pub use config::ModelConfig;
+
+#[cfg(feature = "tch-backend")]
+pub mod attention;
+#[cfg(feature = "tch-backend")]
+pub mod cache;
+#[cfg(feature = "tch-backend")]
+pub mod sampling;
+#[cfg(feature = "tch-backend")]
+pub mod generator;
+#[cfg(feature = "tch-backend")]
+pub mod distributed_generator;
+#[cfg(feature = "tch-backend")]
+pub mod transport;
+#[cfg(feature = "tch-backend")]
+pub mod layers;
+#[cfg(feature = "tch-backend")]
+#[allow(clippy::module_inception)]
+pub mod model;
+#[cfg(feature = "tch-backend")]
+pub mod weights;
 
 #[cfg(feature = "tch-backend")]
 pub use transport::KvTransport;
-
+#[cfg(feature = "tch-backend")]
 pub use model::LlamaModel;
+#[cfg(feature = "tch-backend")]
 pub use weights::{ModelWeights, WeightNames};
-
-pub use config::ModelConfig;
