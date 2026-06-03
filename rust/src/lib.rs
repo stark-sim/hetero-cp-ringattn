@@ -193,7 +193,21 @@ pub fn run_cli() -> Result<(), RingError> {
             args.infer_prompt.unwrap_or_else(|| "Hello, how are you?".to_string())
         };
         println!("[infer] prompt length: {} chars", prompt.len());
-        match infer::run_inference(model_dir, &prompt, args.infer_max_tokens, args.infer_temperature, args.infer_top_p, args.infer_num_domains) {
+
+        let result = if let Some(ref export_dir) = args.export_logits_dir {
+            infer::run_inference_and_export_logits(
+                model_dir, &prompt, args.infer_max_tokens,
+                args.infer_temperature, args.infer_top_p,
+                args.infer_num_domains, export_dir,
+            )
+        } else {
+            infer::run_inference(
+                model_dir, &prompt, args.infer_max_tokens,
+                args.infer_temperature, args.infer_top_p,
+                args.infer_num_domains,
+            )
+        };
+        match result {
             Ok(text) => println!("{}", text),
             Err(e) => eprintln!("Inference failed: {}", e),
         }

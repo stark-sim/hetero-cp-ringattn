@@ -26,6 +26,7 @@ pub struct CliArgs {
     pub infer_temperature: f64,
     pub infer_top_p: f64,
     pub infer_num_domains: usize,
+    pub export_logits_dir: Option<String>,
     pub distributed_role: Option<String>,
 }
 
@@ -45,6 +46,7 @@ pub fn parse_cli_args() -> Result<CliArgs, RingError> {
     let mut infer_temperature = 0.7;
     let mut infer_top_p = 0.9;
     let mut infer_num_domains = 1usize;
+    let mut export_logits_dir = None;
     let mut distributed_role = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -110,6 +112,9 @@ pub fn parse_cli_args() -> Result<CliArgs, RingError> {
                     RingError::InvalidCli(format!("invalid --infer-num-domains: {e}"))
                 })?;
             }
+            "--export-logits" => {
+                export_logits_dir = Some(next_cli_value(&mut args, "--export-logits")?);
+            }
             "--distributed-role" => {
                 distributed_role = Some(next_cli_value(&mut args, "--distributed-role")?);
                 // Worker / coordinator parse remaining args themselves;
@@ -136,6 +141,7 @@ pub fn parse_cli_args() -> Result<CliArgs, RingError> {
         infer_temperature,
         infer_top_p,
         infer_num_domains,
+        export_logits_dir,
         distributed_role,
     })
 }

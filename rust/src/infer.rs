@@ -1,7 +1,9 @@
 use crate::model::{ModelConfig, ModelWeights};
 use crate::model::model::LlamaModel;
 use crate::model::generator::Generator;
+use crate::model::sampling::sample_token;
 use std::path::Path;
+use std::io::Write;
 
 /// 【单节点推理入口】加载模型并执行完整的文本生成。
 ///
@@ -65,7 +67,159 @@ pub fn run_inference(model_dir: &str, prompt: &str, max_tokens: usize, temperatu
     generator.generate(prompt, max_tokens, temperature, top_p).map_err(|e: crate::model::ModelError| e.to_string())
 }
 
+/// Single-node inference with logits export for correctness validation.
+///
+/// Exports raw little-endian f32 logits to a binary file for later comparison
+/// with distributed outputs. File format:
+///   - Header: [vocab_size: u64 LE][num_steps: u64 LE]
+///   - Body: prefill last-token logits (vocab_size f32 LE) +
+///     each decode step's logits (vocab_size f32 LE each)
+#[cfg(feature = "tch-backend")]
+pub fn run_inference_and_export_logits(
+    model_dir: &str,
+    prompt: &str,
+    max_tokens: usize,
+    temperature: f64,
+    top_p: f64,
+    num_domains: usize,
+    export_dir: &str,
+) -> Result<String, String> {
+    use tch::Device;
+
+    let device = if let Ok(name) = std::env::var("HCP_TORCH_DEVICE").or_else(|_| std::env::var("HCP_TCH_DEVICE")) {
+        match name.as_str() {
+            "cpu" => Device::Cpu,
+            "mps" => Device::Mps,
+            "cuda" => Device::Cuda(0),
+            _ => {
+                if let Some(idx) = name.strip_prefix("cuda:") {
+                    if let Ok(i) = idx.parse::<usize>() {
+                        Device::Cuda(i)
+                    } else {
+                        Device::Cpu
+                    }
+                } else {
+                    Device::Cpu
+                }
+            }
+        }
+    } else if cfg!(target_os = "macos") && tch::utils::has_mps() {
+        Device::Mps
+    } else if tch::Cuda::is_available() {
+        Device::Cuda(0)
+    } else {
+        Device::Cpu
+    };
+    println!("[infer-export] device: {:?}", device);
+
+    let config_path = Path::new(model_dir).join("config.json");
+    println!("[infer-export] loading config from {:?}", config_path);
+    let config = ModelConfig::from_file(&config_path).map_err(|e: crate::model::ModelError| e.to_string())?;
+
+    println!("[infer-export] loading weights from {}", model_dir);
+    let weights = ModelWeights::from_dir(model_dir, device).map_err(|e: crate::model::ModelError| e.to_string())?;
+
+    println!("[infer-export] building model ({} layers, {} heads)", config.num_layers, config.num_heads);
+    let mut model = LlamaModel::from_weights(config, &weights, device, num_domains).map_err(|e: crate::model::ModelError| e.to_string())?;
+
+    // Load tokenizer
+    let tokenizer_path = Path::new(model_dir).join("tokenizer.json");
+    println!("[infer-export] loading tokenizer from {:?}", tokenizer_path);
+    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+        .map_err(|e| format!("tokenizer load failed: {}", e))?;
+
+    // Tokenize prompt
+    let prompt_ids = tokenizer.encode(prompt, true)
+        .map_err(|e| format!("tokenizer encode failed: {}", e))?
+        .get_ids().iter().map(|&id| id as i64).collect::<Vec<_>>();
+    println!("[infer-export] prompt tokens: {}", prompt_ids.len());
+
+    let mut kv_caches = model.create_kv_caches();
+
+    // Prefill
+    let input_tensor = tch::Tensor::from_slice(&prompt_ids)
+        .unsqueeze(0)
+        .to_device(device);
+    let mut logits = model.forward(&input_tensor, &mut kv_caches)
+        .map_err(|e| e.to_string())?;
+
+    let mut all_logits: Vec<Vec<f32>> = Vec::new();
+
+    // Extract last-token logits from prefill
+    let seq_len = logits.size()[1];
+    let mut last_logits = logits.narrow(1, seq_len - 1, 1).squeeze();
+
+    // Decode loop
+    let mut generated_ids: Vec<u32> = Vec::new();
+    let eos_token = model.config.eos_token_id();
+
+    for step in 0..max_tokens {
+        // Save logits that produced this step's token
+        let logits_vec: Vec<f32> = Vec::try_from(&last_logits)
+            .map_err(|e| format!("failed to convert step {} logits: {}", step, e))?;
+        all_logits.push(logits_vec);
+
+        let next_token_id = sample_token(&last_logits, temperature, top_p)
+            .map_err(|e| e.to_string())?;
+        generated_ids.push(next_token_id);
+
+        if Some(next_token_id) == eos_token {
+            break;
+        }
+
+        let next_input = tch::Tensor::from_slice(&[next_token_id as i64])
+            .unsqueeze(0)
+            .to_device(device);
+        logits = model.forward(&next_input, &mut kv_caches)
+            .map_err(|e| e.to_string())?;
+        // After first decode step, logits shape is [batch=1, vocab_size]
+        last_logits = logits.squeeze();
+    }
+
+    println!("[infer-export] generated {} tokens, total logits chunks: {}", generated_ids.len(), all_logits.len());
+
+    // Write logits to file
+    std::fs::create_dir_all(export_dir)
+        .map_err(|e| format!("failed to create export dir: {}", e))?;
+
+    let vocab_size = model.config.vocab_size;
+    let num_chunks = all_logits.len() as u64;
+    let out_path = Path::new(export_dir).join("logits.bin");
+    let mut file = std::fs::File::create(&out_path)
+        .map_err(|e| format!("failed to create logits file: {}", e))?;
+
+    // Header: vocab_size (u64 LE), num_chunks (u64 LE)
+    file.write_all(&vocab_size.to_le_bytes())
+        .map_err(|e| format!("failed to write header: {}", e))?;
+    file.write_all(&num_chunks.to_le_bytes())
+        .map_err(|e| format!("failed to write header: {}", e))?;
+
+    // Body: raw f32 LE
+    for (i, chunk) in all_logits.iter().enumerate() {
+        if chunk.len() != vocab_size {
+            return Err(format!("logits chunk {} size mismatch: expected {}, got {}", i, vocab_size, chunk.len()));
+        }
+        for &f in chunk {
+            file.write_all(&f.to_le_bytes())
+                .map_err(|e| format!("failed to write logits: {}", e))?;
+        }
+    }
+    println!("[infer-export] saved logits to {:?}", out_path);
+
+    // Decode generated IDs to text
+    let text = tokenizer.decode(&generated_ids, true)
+        .map_err(|e| format!("tokenizer decode failed: {}", e))?;
+    Ok(text)
+}
+
 #[cfg(not(feature = "tch-backend"))]
 pub fn run_inference(_model_dir: &str, _prompt: &str, _max_tokens: usize, _temperature: f64, _top_p: f64, _num_domains: usize) -> Result<String, String> {
+    Err("tch-backend feature required".to_string())
+}
+
+#[cfg(not(feature = "tch-backend"))]
+pub fn run_inference_and_export_logits(
+    _model_dir: &str, _prompt: &str, _max_tokens: usize, _temperature: f64, _top_p: f64, _num_domains: usize, _export_dir: &str,
+) -> Result<String, String> {
     Err("tch-backend feature required".to_string())
 }
