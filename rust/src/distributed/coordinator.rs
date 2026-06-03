@@ -17,6 +17,7 @@ use crate::distributed::protocol::{
 use crate::distributed::scheduler::{BatchScheduler, ActiveRequest};
 use crate::model::config::ModelConfig;
 use crate::model::sampling::sample_token;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,6 +44,8 @@ struct CoordinatorArgs {
     prompt_file: Option<String>,
     /// Read multiple prompts from file (one per line) for batch serving.
     prompts_file: Option<String>,
+    /// Export raw logits to directory for correctness validation.
+    export_logits_dir: Option<String>,
 }
 
 fn parse_args() -> CoordinatorArgs {
@@ -59,6 +62,7 @@ fn parse_args() -> CoordinatorArgs {
     let mut capacity_aware = false;
     let mut prompt_file = None;
     let mut prompts_file = None;
+    let mut export_logits_dir = None;
 
     let mut args = std::env::args().skip(1); // skip binary name
     while let Some(arg) = args.next() {
@@ -82,6 +86,7 @@ fn parse_args() -> CoordinatorArgs {
             "--capacity-aware" => capacity_aware = true,
             "--prompt-file" => prompt_file = Some(args.next().unwrap()),
             "--prompts-file" => prompts_file = Some(args.next().unwrap()),
+            "--export-logits" => export_logits_dir = Some(args.next().unwrap()),
             _ => eprintln!("[coordinator] unknown arg: {arg}"),
         }
     }
@@ -100,7 +105,33 @@ fn parse_args() -> CoordinatorArgs {
         capacity_aware,
         prompt_file,
         prompts_file,
+        export_logits_dir,
     }
+}
+
+/// Write collected logits chunks to a binary file for correctness comparison.
+///
+/// Format matches single-node export:
+///   - Header: [vocab_size: u64 LE][num_chunks: u64 LE]
+///   - Body:  contiguous vocab_size f32 LE per chunk
+fn write_logits_file(path: &std::path::Path, vocab_size: usize, chunks: &[Vec<f32>]) -> Result<(), String> {
+    let mut file = std::fs::File::create(path)
+        .map_err(|e| format!("failed to create logits file: {e}"))?;
+    let num_chunks = chunks.len() as u64;
+    file.write_all(&vocab_size.to_le_bytes())
+        .map_err(|e| format!("failed to write header: {e}"))?;
+    file.write_all(&num_chunks.to_le_bytes())
+        .map_err(|e| format!("failed to write header: {e}"))?;
+    for (i, chunk) in chunks.iter().enumerate() {
+        if chunk.len() != vocab_size {
+            return Err(format!("logits chunk {} size mismatch: expected {}, got {}", i, vocab_size, chunk.len()));
+        }
+        for &f in chunk {
+            file.write_all(&f.to_le_bytes())
+                .map_err(|e| format!("failed to write logits: {e}"))?;
+        }
+    }
+    Ok(())
 }
 
 /// Process a single inference request against the connected workers.
@@ -120,6 +151,7 @@ fn process_single_request(
     capacity_aware: bool,
     worker_capacities: &[u64],
     rt: &tokio::runtime::Runtime,
+    export_logits_dir: Option<&str>,
 ) -> Result<InferenceResult, String> {
     let eos_token = config.eos_token_id();
     let vocab_size = config.vocab_size;
@@ -238,6 +270,8 @@ fn process_single_request(
     };
 
     let mut generated_ids: Vec<u32> = Vec::new();
+    let mut all_logits: Vec<Vec<f32>> = Vec::new();
+    all_logits.push(logits_vec);
 
     // Decode loop
     let mut finish_reason = None;
@@ -273,6 +307,7 @@ fn process_single_request(
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect();
+        all_logits.push(decode_logits.clone());
         let decode_tensor = Tensor::from_slice(&decode_logits);
         next_token = match sample_token(&decode_tensor, temperature, top_p) {
             Ok(t) => t as i64,
@@ -288,6 +323,16 @@ fn process_single_request(
     for (send, _recv) in worker_streams.iter_mut() {
         let cmd = WorkerCommand::ReleaseRequest { request_id };
         let _ = send_command_quic(send, &cmd, rt.handle());
+    }
+
+    // Export logits if requested
+    if let Some(dir) = export_logits_dir {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("failed to create export dir: {e}"))?;
+        let out_path = Path::new(dir).join(format!("logits_{}.bin", request_id));
+        write_logits_file(&out_path, vocab_size, &all_logits)
+            .map_err(|e| format!("logits export failed: {e}"))?;
+        println!("[coordinator] exported logits to {:?}", out_path);
     }
 
     let text = tokenizer
@@ -694,6 +739,7 @@ pub fn run() {
                 args.capacity_aware,
                 &worker_capacities,
                 &rt,
+                args.export_logits_dir.as_deref(),
             ) {
                 Ok(result) => {
                     println!("[coordinator] generated: {}", result.text);
