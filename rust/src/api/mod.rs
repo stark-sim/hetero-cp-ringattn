@@ -7,4 +7,3 @@ pub mod server;
 pub mod types;
 
 pub use server::{build_router, ApiState};
-pub use types::{CompletionRequest, CompletionResponse, HealthResponse, InferenceJob, InferenceResult, MetricsResponse};

@@ -2,7 +2,7 @@ use crate::model::{ModelConfig, ModelError, ModelWeights, WeightNames};
 use super::rotary::RotaryEmbedding;
 
 #[cfg(feature = "tch-backend")]
-use tch::{Device, Kind, Tensor};
+use tch::{Kind, Tensor};
 
 
 // ==================== GQA Attention ====================
@@ -24,6 +24,7 @@ use tch::{Device, Kind, Tensor};
 /// - 14 个 query head 分成 2 组，每组 7 个 query head 共享 1 个 key head 和 1 个 value head。
 #[cfg(feature = "tch-backend")]
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct GqaAttention {
     pub q_proj: Tensor,       // Q 投影权重 [num_heads * head_dim, hidden_size]
     pub k_proj: Tensor,       // K 投影权重 [num_kv_heads * head_dim, hidden_size]
@@ -40,6 +41,7 @@ pub struct GqaAttention {
 }
 
 #[cfg(feature = "tch-backend")]
+#[allow(dead_code)]
 impl GqaAttention {
     pub fn from_weights(
         weights: &ModelWeights,

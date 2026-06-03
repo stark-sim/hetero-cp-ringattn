@@ -8,6 +8,7 @@ use tch::Tensor;
 /// This trait enables future block-aware implementations (e.g. PagedAttention)
 /// without modifying `LlamaModel` or `HcpRingAttentionBackend`.
 #[cfg(feature = "tch-backend")]
+#[allow(dead_code)]
 pub trait KvCache: Send {
     /// Append new K/V tokens and return the full K/V tensors for attention compute.
     ///
@@ -126,10 +127,12 @@ impl BlockTableKvCache {
     ///
     /// 每个 block 的 shape: [batch, num_kv_heads, block_len, head_dim]
     /// 其中最后一个 block 的 `block_len` 可能小于 `block_size`。
+    #[allow(dead_code)]
     pub fn k_blocks(&self) -> &[Tensor] {
         &self.k_blocks
     }
 
+    #[allow(dead_code)]
     pub fn v_blocks(&self) -> &[Tensor] {
         &self.v_blocks
     }
@@ -164,8 +167,8 @@ impl KvCache for BlockTableKvCache {
         // Allocate new blocks for any remaining tokens.
         while remaining > 0 {
             let take = remaining.min(self.block_size);
-            let mut k_slice = new_k.narrow(2, offset, take as i64);
-            let mut v_slice = new_v.narrow(2, offset, take as i64);
+            let k_slice = new_k.narrow(2, offset, take as i64);
+            let v_slice = new_v.narrow(2, offset, take as i64);
             self.k_blocks.push(k_slice);
             self.v_blocks.push(v_slice);
             self.last_block_used = take;

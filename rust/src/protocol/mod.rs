@@ -18,8 +18,7 @@ pub use message::ProtocolError;
 pub(crate) use message::RingAttnMessage;
 #[cfg(feature = "tch-backend")]
 pub(crate) use message::{
-    RingAttnMessageKind, PayloadKind,
-    BlockMetadata, TensorMetadata, FLOAT32_BYTES, SCHEMA_VERSION,
+    RingAttnMessageKind, FLOAT32_BYTES,
 };
 pub use node::{
     CpPayloadBlock, CpRingNodeSmokeReport, ProtocolSmokeReport,
@@ -30,5 +29,3 @@ pub use node::{
 pub(crate) use node::{
     DomainModelState, OnlineSoftmaxAccumulator,
 };
-#[cfg(feature = "tch-backend")]
-pub(crate) use node::LayerActivationState;

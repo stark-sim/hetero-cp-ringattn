@@ -106,6 +106,7 @@ fn parse_args() -> CoordinatorArgs {
 /// Process a single inference request against the connected workers.
 ///
 /// Returns `InferenceResult` on success, `String` error message on failure.
+#[allow(clippy::too_many_arguments)]
 fn process_single_request(
     request_id: u64,
     prompt_text: &str,
@@ -121,7 +122,7 @@ fn process_single_request(
     rt: &tokio::runtime::Runtime,
 ) -> Result<InferenceResult, String> {
     let eos_token = config.eos_token_id();
-    let vocab_size = config.vocab_size as usize;
+    let vocab_size = config.vocab_size;
     let num_domains = worker_streams.len();
 
     let encoding = tokenizer
@@ -304,6 +305,7 @@ fn process_single_request(
 /// Prefill a single request and return an `ActiveRequest` ready for decode batch.
 ///
 /// On prefill failure, sends an error result via `job.tx` and returns `Err`.
+#[allow(clippy::too_many_arguments)]
 fn prefill_single_request(
     job: InferenceJob,
     tokenizer: &tokenizers::Tokenizer,
@@ -315,7 +317,7 @@ fn prefill_single_request(
     rt: &tokio::runtime::Runtime,
 ) -> Result<ActiveRequest, String> {
     let eos_token = config.eos_token_id();
-    let vocab_size = config.vocab_size as usize;
+    let vocab_size = config.vocab_size;
     let num_domains = worker_streams.len();
 
     // Tokenize
@@ -335,7 +337,7 @@ fn prefill_single_request(
                 completion_tokens: 0,
                 finish_reason: Some("error".to_string()),
             });
-            return Err(format!("--chunk-sizes length must match num_domains"));
+            return Err("--chunk-sizes length must match num_domains".to_string());
         }
         let sum: usize = sizes.iter().sum();
         if sum != seq_len as usize {
@@ -345,7 +347,7 @@ fn prefill_single_request(
                 completion_tokens: 0,
                 finish_reason: Some("error".to_string()),
             });
-            return Err(format!("--chunk-sizes sum must equal prompt length"));
+            return Err("--chunk-sizes sum must equal prompt length".to_string());
         }
         sizes.clone()
     } else if capacity_aware {
@@ -520,7 +522,7 @@ fn decode_iteration(
     vocab_size: usize,
     rt: &tokio::runtime::Runtime,
 ) -> Result<Vec<u64>, String> {
-    let num_domains = worker_streams.len();
+    let _num_domains = worker_streams.len();
 
     // Collect next tokens from all active requests
     let request_tokens: Vec<(u64, i64)> = scheduler.active_requests()
@@ -573,7 +575,7 @@ fn decode_iteration(
         }
         let logits_tensor = Tensor::from_slice(&logits_vec);
         let next_token = match sample_token(&logits_tensor, req.temperature, req.top_p) {
-            Ok(t) => t as u32,
+            Ok(t) => t,
             Err(e) => {
                 eprintln!("[coordinator] request {request_id} sample_token failed: {e}");
                 continue;
@@ -636,15 +638,13 @@ pub fn run() {
         Vec::with_capacity(args.num_domains);
     for i in 0..args.num_domains {
         let (send, mut recv) = rt.block_on(async {
-            let incoming = loop {
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(600),
-                    endpoint.accept()
-                ).await {
-                    Ok(Some(incoming)) => break incoming,
-                    Ok(None) => return Err("endpoint closed".to_string()),
-                    Err(_) => return Err("accept timeout after 600s".to_string()),
-                }
+            let incoming = match tokio::time::timeout(
+                std::time::Duration::from_secs(600),
+                endpoint.accept()
+            ).await {
+                Ok(Some(incoming)) => incoming,
+                Ok(None) => return Err("endpoint closed".to_string()),
+                Err(_) => return Err("accept timeout after 600s".to_string()),
             };
             let conn = incoming.await.map_err(|e| format!("connection failed: {e}"))?;
             println!("[coordinator] worker connection established (accept order {i})");
@@ -666,7 +666,7 @@ pub fn run() {
     }
     worker_handshakes.sort_by_key(|(domain_id, _, _, _)| *domain_id);
     let worker_capacities: Vec<u64> = worker_handshakes.iter().map(|(_, cap, _, _)| *cap).collect();
-    let mut worker_streams: Vec<(quinn::SendStream, quinn::RecvStream)> = worker_handshakes
+    let worker_streams: Vec<(quinn::SendStream, quinn::RecvStream)> = worker_handshakes
         .into_iter()
         .map(|(_, _, send, recv)| (send, recv))
         .collect();
@@ -689,7 +689,7 @@ pub fn run() {
                 args.top_p,
                 &tokenizer,
                 &config,
-                &mut *guard,
+                &mut guard,
                 &args.chunk_sizes,
                 args.capacity_aware,
                 &worker_capacities,
@@ -786,7 +786,7 @@ pub fn run() {
             // 2a: Prefill a pending request if batch has room
             if scheduler.can_admit() && !scheduler.pending_is_empty() {
                 if let Some(job) = scheduler.try_dequeue_pending() {
-                    match prefill_single_request(job, &tokenizer, &config, &mut *guard, &args.chunk_sizes, args.capacity_aware, &worker_capacities, &rt) {
+                    match prefill_single_request(job, &tokenizer, &config, &mut guard, &args.chunk_sizes, args.capacity_aware, &worker_capacities, &rt) {
                         Ok(active_req) => {
                             active_counter.fetch_add(1, Ordering::SeqCst);
                             scheduler.add_active(active_req);
@@ -801,10 +801,10 @@ pub fn run() {
 
             // 2b: Decode all active requests
             if !scheduler.active_is_empty() {
-                match decode_iteration(&mut scheduler, &mut *guard, eos_token, vocab_size, &rt) {
+                match decode_iteration(&mut scheduler, &mut guard, eos_token, vocab_size, &rt) {
                     Ok(completed) => {
                         // Emit streaming chunks for all active requests.
-                        for (_, req) in scheduler.active_requests_mut() {
+                        for req in scheduler.active_requests_mut().values_mut() {
                             if let Some(ref chunk_tx) = req.stream_tx {
                                 if let Some(&token_id) = req.generated_ids.last() {
                                     let delta = tokenizer.decode(&[token_id], false)

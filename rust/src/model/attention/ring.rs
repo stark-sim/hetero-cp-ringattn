@@ -189,7 +189,7 @@ impl HcpRingAttentionBackend {
                 .to_device(q_chunk.device());
             let zero = Tensor::zeros(1, (Kind::Float, q_chunk.device()));
             let neg_inf_mask = neg_inf.where_self(&causal.logical_not(), &zero);
-            scores = scores + neg_inf_mask;
+            scores += neg_inf_mask;
         }
 
         // ====== 第三步：Online Softmax 更新 ======
@@ -304,8 +304,7 @@ impl HcpRingAttentionBackend {
         // ====== 确定 chunk 大小 ======
         let q_chunk_size = (seq_len as usize)
             .div_ceil(self.num_domains)
-            .max(1)
-            .min(2048);
+            .clamp(1, 2048);
         let kv_chunk_size = if seq_len == 1 { 2048 } else { q_chunk_size };
 
         // micro KV block 大小：默认使用 kv_chunk_size，可通过 HCP_MICRO_KV_BLOCK_SIZE 覆盖
@@ -358,7 +357,7 @@ impl HcpRingAttentionBackend {
         // ====== 准备本地 KV micro blocks ======
         let has_transport = self.kv_transport.is_some();
         let local_micro_blocks: Vec<KvBlock> = if has_transport {
-            let (k_to_send, v_to_send, send_seq_end) = if seq_len == 1 {
+            let (k_to_send, v_to_send, _send_seq_end) = if seq_len == 1 {
                 let history_len = self.prefill_kv_len as i64;
                 (
                     k.narrow(2, 0, history_len),
@@ -391,18 +390,14 @@ impl HcpRingAttentionBackend {
 
         // ====== 接收一个 micro block（poll_recv + recv_kv_block fallback）======
         let recv_micro_block = |transport: &mut dyn KvTransport| -> Result<Option<KvBlock>, String> {
-            loop {
-                match transport.poll_recv() {
-                    Ok(Some(block)) => return Ok(Some(block)),
-                    Ok(None) => {
-                        match transport.recv_kv_block() {
-                            Ok(Some(block)) => return Ok(Some(block)),
-                            Ok(None) => return Ok(None),
-                            Err(e) => return Err(e),
-                        }
-                    }
-                    Err(e) => return Err(e),
-                }
+            match transport.poll_recv() {
+                Ok(Some(block)) => Ok(Some(block)),
+                Ok(None) => match transport.recv_kv_block() {
+                    Ok(Some(block)) => Ok(Some(block)),
+                    Ok(None) => Ok(None),
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e),
             }
         };
 
@@ -424,15 +419,10 @@ impl HcpRingAttentionBackend {
                     let mut all_blocks: Vec<Vec<KvBlock>> = Vec::new();
                     for round in 0..num_rounds {
                         let mut round_blocks = Vec::new();
-                        loop {
-                            match recv_micro_block(transport.as_mut()).map_err(|e| ModelError::Backend(format!("recv_micro_block: {e}")))? {
-                                Some(block) => {
-                                    let is_last = block.micro_block_idx + 1 == block.total_micro_blocks;
-                                    round_blocks.push(block);
-                                    if is_last { break; }
-                                }
-                                None => break,
-                            }
+                        while let Some(block) = recv_micro_block(transport.as_mut()).map_err(|e| ModelError::Backend(format!("recv_micro_block: {e}")))? {
+                            let is_last = block.micro_block_idx + 1 == block.total_micro_blocks;
+                            round_blocks.push(block);
+                            if is_last { break; }
                         }
                         all_blocks.push(round_blocks);
 
@@ -623,6 +613,7 @@ impl HcpRingAttentionBackend {
     }
 
     /// Standard local attention for short sequences or single-token decode.
+    #[allow(dead_code)]
     fn local_attention_scores(
         &self,
         q: &Tensor,

@@ -206,7 +206,7 @@ impl WorkerRuntime {
     /// 网络初始化：创建 QUIC endpoint、peer 连接、coordinator 连接、per-layer streams。
     async fn setup_network(
         domain_id: usize,
-        num_domains: usize,
+        _num_domains: usize,
         num_layers: usize,
         device: tch::Device,
         listen_addr: SocketAddr,

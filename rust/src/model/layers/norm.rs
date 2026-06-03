@@ -1,4 +1,4 @@
-use crate::model::{ModelError, ModelWeights, WeightNames};
+use crate::model::{ModelError, ModelWeights};
 
 #[cfg(feature = "tch-backend")]
 use tch::{Kind, Tensor};

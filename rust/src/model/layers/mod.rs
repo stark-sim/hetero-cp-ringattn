@@ -17,10 +17,10 @@ pub use mlp::Mlp;
 pub use attention::GqaAttention;
 
 #[cfg(feature = "tch-backend")]
-use crate::model::{ModelConfig, ModelError, ModelWeights, WeightNames};
+use crate::model::ModelError;
 
 #[cfg(feature = "tch-backend")]
-use tch::{Device, Kind, Tensor};
+use tch::Tensor;
 
 /// 【Decoder Layer：解码器层】
 ///
@@ -78,6 +78,8 @@ impl DecoderLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "tch-backend")]
+    use tch::{Device, Kind, Tensor};
 
     #[test]
     #[cfg(feature = "tch-backend")]

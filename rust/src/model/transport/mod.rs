@@ -23,8 +23,10 @@ pub use block::KvBlock;
 #[cfg(feature = "tch-backend")]
 pub use r#trait::KvTransport;
 #[cfg(feature = "tch-backend")]
+#[allow(unused_imports)]
 pub use tcp::TcpKvTransport;
 #[cfg(feature = "tch-backend")]
+#[allow(unused_imports)]
 pub use mock::{MockKvTransport, LinkedMockKvTransport};
 
 #[cfg(test)]

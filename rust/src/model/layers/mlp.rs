@@ -1,7 +1,7 @@
-use crate::model::{ModelConfig, ModelError, ModelWeights, WeightNames};
+use crate::model::{ModelError, ModelWeights, WeightNames};
 
 #[cfg(feature = "tch-backend")]
-use tch::{Device, Kind, Tensor};
+use tch::Tensor;
 
 // ==================== MLP (SwiGLU) ====================
 

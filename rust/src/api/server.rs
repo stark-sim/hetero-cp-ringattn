@@ -18,7 +18,7 @@ use tower_http::cors::CorsLayer;
 
 use crate::api::types::{
     CompletionChoice, CompletionRequest, CompletionResponse, CompletionStreamChoice,
-    CompletionStreamResponse, HealthResponse, InferenceJob, InferenceResult,
+    CompletionStreamResponse, HealthResponse, InferenceJob,
     MetricsResponse, StreamChunk, Usage,
 };
 

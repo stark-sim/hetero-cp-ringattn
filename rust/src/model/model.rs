@@ -153,7 +153,7 @@ impl LlamaModel {
         // Guard: prevent position_ids from exceeding RoPE cache / model capacity.
         if let Some(max_pos) = self.config.max_position_embeddings {
             let max_pos = max_pos as i64;
-            if self.seq_offset as i64 + seq_len > max_pos {
+            if self.seq_offset + seq_len > max_pos {
                 return Err(ModelError::Generation(format!(
                     "sequence length {} + offset {} exceeds max_position_embeddings {}; prompt too long",
                     seq_len, self.seq_offset, max_pos
@@ -232,12 +232,10 @@ impl LlamaModel {
             } else {
                 last_hidden.matmul(&self.embedding.transpose(0, 1))
             }
+        } else if let Some(ref lm_head) = self.lm_head {
+            hidden_states.matmul(&lm_head.transpose(0, 1))
         } else {
-            if let Some(ref lm_head) = self.lm_head {
-                hidden_states.matmul(&lm_head.transpose(0, 1))
-            } else {
-                hidden_states.matmul(&self.embedding.transpose(0, 1))
-            }
+            hidden_states.matmul(&self.embedding.transpose(0, 1))
         };
 
         Ok(logits)

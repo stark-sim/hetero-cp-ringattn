@@ -17,6 +17,7 @@ pub struct CompletionRequest {
     #[serde(default)]
     pub stream: bool,
     #[serde(default)]
+    #[allow(dead_code)]
     pub stop: Option<Vec<String>>,
 }
 
@@ -73,6 +74,7 @@ pub struct StreamChunk {
     /// Text delta for this chunk (only newly generated text).
     pub delta: String,
     /// The token ID.
+    #[allow(dead_code)]
     pub token_id: u32,
     /// Finish reason if this is the final chunk.
     pub finish_reason: Option<String>,

@@ -45,6 +45,7 @@ pub trait AttentionBackend: Send {
 
 /// Local (non-distributed) attention backend using standard GQA.
 #[cfg(feature = "tch-backend")]
+#[allow(dead_code)]
 pub struct LocalAttentionBackend {
     pub attention: crate::model::layers::GqaAttention,
 }

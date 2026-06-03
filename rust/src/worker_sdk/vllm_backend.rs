@@ -216,7 +216,7 @@ impl VllmWorkerBackend {
             // for new FD data and ignore the buffered content).
             #[cfg(unix)]
             {
-                let has_buffered = self.stdout.buffer().len() > 0;
+                let has_buffered = !self.stdout.buffer().is_empty();
                 if !has_buffered {
                     let fd = self.stdout.get_ref().as_raw_fd();
                     match poll_readable(fd, remaining) {

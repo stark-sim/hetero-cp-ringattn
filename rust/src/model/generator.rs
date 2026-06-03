@@ -3,7 +3,7 @@ use crate::model::sampling::sample_token;
 use tokenizers::Tokenizer;
 
 #[cfg(feature = "tch-backend")]
-use tch::{Device, Kind, Tensor};
+use tch::{Device, Tensor};
 
 /// 【单节点自回归文本生成器】
 ///
@@ -119,6 +119,7 @@ impl Generator {
 /// throughput efficiency. Once the full correctness pipeline is
 /// complete, we can relax them incrementally.
 #[cfg(feature = "tch-backend")]
+#[allow(dead_code)]
 pub struct BatchGenerator {
     model: LlamaModel,
     tokenizer: Tokenizer,
@@ -126,6 +127,7 @@ pub struct BatchGenerator {
 }
 
 #[cfg(feature = "tch-backend")]
+#[allow(dead_code)]
 impl BatchGenerator {
     /// Create a batch generator from a loaded model and tokenizer file path.
     pub fn new(model: LlamaModel, tokenizer_path: &str, device: Device) -> Result<Self, ModelError> {
