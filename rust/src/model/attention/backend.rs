@@ -41,6 +41,10 @@ pub trait AttentionBackend: Send {
     fn set_distributed(&mut self, _domain_id: usize, _seq_offset: usize, _transport: Option<Box<dyn KvTransport>>) {
         // Local backend 不需要分布式配置，noop
     }
+
+    /// Return `&mut dyn Any` for downcasting to concrete backend types (debug only).
+    #[cfg(feature = "tch-backend")]
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 }
 
 /// Local (non-distributed) attention backend using standard GQA.
@@ -60,5 +64,9 @@ impl AttentionBackend for LocalAttentionBackend {
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor, ModelError> {
         self.attention.forward(hidden_states, position_ids, kv_cache, attention_mask)
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 }
