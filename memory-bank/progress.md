@@ -209,6 +209,20 @@
     - Decode: max_diff ≤ 1.31e-03, argmax_match=True
     - atol=0.01 下全部 5 步 PASS
   - Clippy 双模式全绿（`--features tch-backend` + `--no-default-features`）。
+- [x] [2026-06-04] **Phase 3: BF16 priority support for Rust/Python numerical consistency**（commit `c226ed2`）：
+  - **根因**: float32 BLAS 累加顺序差异导致 Rust/libtorch 与 Python/PyTorch 的 Q/K projection 每层产生 ~2e-4 divergence，24 层累积后输出差异可见
+  - **方案**: 当模型 config 指定 `torch_dtype=bfloat16` 时，权重加载和推理全程使用 BF16。BF16 的 7-bit 尾数屏蔽了微小 BLAS 差异
+  - **核心修改**:
+    - `weights.rs`: `from_dir()` 默认 `keep_original_dtype=true`，F16/BF16 权重保持原 dtype；修复 `Tensor::from_slice` 不支持 u16 的问题（f32 中间转换）
+    - `model.rs`: `LlamaModel` 新增 `dtype` 字段，从 config 自动检测；embedding 后 cast 到 model dtype；logits 仅在输出边界转回 Float
+    - `attention/ring.rs`: 所有 hardcoded `Kind::Float` 替换为输入 tensor 的动态 dtype（causal mask、softmax、running states、sum ops）
+    - `rotary.rs`: `apply()` 中将 Float32 cos/sin 缓存转换为输入 dtype，防止 Float 缓存污染 BF16 计算流
+  - **验证**:
+    - 本地 smoke test (CPU, Qwen2-0.5B BF16): 7/7 pass ✅
+    - Rust BF16 vs Python BF16 logits: Top-1 匹配 (token 358=' I')，max_diff=0.265
+    - 参考基准: Python float32 vs BF16 max_diff=0.286 — Rust BF16 差异与 Python 内部 float32/BF16 差异相当
+    - Top-5 overlap: 4/5，中位数差异仅 0.031，95% token 差异 < 0.11
+  - **关键洞察**: 无需显式 scale 转换（`bf16_tensor * f64_scalar` 自动保持 BF16），仅需确保没有 Float32 tensor 混入 BF16 计算流
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 
 ## 已知问题

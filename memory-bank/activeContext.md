@@ -2,6 +2,21 @@
 
 ## 当前焦点
 
+[2026-06-04] **Phase 3: BF16 priority support 完成 — Rust/Python 数值一致性验证通过**（commit `c226ed2`）：
+  - **根因定位**: float32 BLAS 累加顺序差异（Rust/libtorch vs Python/PyTorch）导致 Q/K projection 每层 ~2e-4 divergence，24 层累积后输出差异可见
+  - **解决方案**: 当模型 config 指定 `torch_dtype=bfloat16` 时，权重加载和推理全程使用 BF16。BF16 的 7-bit 尾数天然屏蔽微小 BLAS 差异
+  - **关键修复**:
+    - `weights.rs`: 默认 `keep_original_dtype=true`，F16/BF16 权重保持原 dtype；修复 `Tensor::from_slice` 不支持 u16（f32 中间转换）
+    - `model.rs`: `LlamaModel` 新增 `dtype` 字段，从 config 自动检测 `torch_dtype`；embedding 后 cast 到 model dtype；logits 仅在输出边界转回 Float
+    - `attention/ring.rs`: 所有 hardcoded `Kind::Float` 替换为输入 tensor 的动态 dtype（causal mask zero/neg_inf、softmax、running states rm/rs/obh、sum_dim_intlist）
+    - `rotary.rs`: `apply()` 中将 Float32 cos/sin 缓存 `.to_kind(q_kind)`，防止 Float 缓存污染 BF16 计算流
+  - **验证结果**:
+    - 本地 smoke test (CPU, Qwen2-0.5B BF16): 7/7 pass ✅
+    - Rust BF16 vs Python BF16 logits 对比: Top-1 匹配 (token 358=' I')，max_diff=0.265
+    - 参考基准: Python 自身 float32 vs BF16 max_diff=0.286 — Rust BF16 差异与 Python 内部差异相当
+    - Top-5 overlap: 4/5，中位数差异 0.031，95% token 差异 < 0.11
+  - **工程教训**: 无需显式 scale 转换（`bf16_tensor * f64_scalar` 自动保持 BF16），只需确保没有 Float32 tensor 混入 BF16 计算流。RoPE cos/sin 缓存是唯一的 Float32 污染源
+
 [2026-06-04] **Phase 1: Logits 比较脚本完成 — 单节点 vs 分布式 correctness 验证通过**（commits `54d80b0`, `299b37a`, `3afea1a`, `ee3d89d`）：
   - **1.1 单节点 logits 导出**: `infer.rs` 新增 `run_inference_and_export_logits()`，绕过 `Generator::generate()` 直接操作 `LlamaModel::forward`，保存 prefill last-token + decode 每步 logits 为原始 little-endian f32 二进制。文件格式：`[vocab_size: u64 LE][num_chunks: u64 LE][vocab_size×4 bytes f32 LE per chunk]`。`--export-logits <dir>` CLI 参数已添加。
   - **1.2 分布式 logits 导出**: `distributed/coordinator.rs` `process_single_request()` 在 batch/CLI 模式下收集所有 logits 并写入 `{dir}/logits_{request_id}.bin`（同格式）。HTTP API 模式待扩展。

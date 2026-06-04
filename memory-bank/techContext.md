@@ -199,6 +199,7 @@ RUN_ID=rust-remote-cp-3node-<timestamp> \
 - `run_rust_ringattn_smoke.sh` 在有 `LIBTORCH` 或 `HCP_ENABLE_TORCH=1` 时自动启用 `--features tch-backend`；无 `LIBTORCH` 时 `tch_attention=disabled`。
 - Linux CUDA 构建需注意：`torch-sys` 的 `libtorch_cuda.so` 可能被 `--as-needed` 丢弃，已通过 `build.rs` 的 `cargo:rustc-link-arg-bins` 强制保留。
 - `HCP_TORCH_DEVICE=cpu|mps|cuda|cuda:N`：选择 ATen smoke 设备；成功码分别为 CPU=1、MPS=2、CUDA=3。
+- BF16 推理：当模型 `config.json` 中 `torch_dtype="bfloat16"` 时，`LlamaModel` 自动检测并使用 BF16 计算。权重通过 `ModelWeights::from_dir()` 保持原始 BF16 dtype，无需手动转换。
 - `BIND_ADDR`：remote P2P server 监听地址，双机 smoke 使用 `0.0.0.0:29172` 或 GPU 子网地址。
 - `CONNECT_ADDR`：remote P2P client 连接地址，当前 GPU host 为 `192.168.8.172`。
 - `NODE_INDEX`：remote CP node index；当前 `0=mac-mps`，`1=gpu-cuda`。
@@ -232,8 +233,9 @@ macOS MPS 后端在 tch-rs/libtorch 中存在以下已知问题，已在 `rust/s
 | 原代码 | 问题 | Workaround |
 |--------|------|------------|
 | `Tensor::arange_start(..., (kind, device))` on MPS | `arange_start` 在 MPS 设备上产生错误结果 | 在 `Device::Cpu` 上创建后 `.to_device(q_chunk.device())` |
-| `scores.masked_fill(&mask, f64::NEG_INFINITY)` | MPS `masked_fill` 存在 bug，结果不正确 | `mask.logical_not().to_kind(Float) * NEG_INFINITY` 然后 `scores + neg_inf_mask`（add+mul 替代） |
+| `scores.masked_fill(&mask, f64::NEG_INFINITY)` | MPS `masked_fill` 存在 bug，结果不正确 | `where_self` 替代：`neg_inf.where_self(&causal.logical_not(), &zero)` |
 | `scores.max_dim(3, false)` | MPS `max_dim` 返回 argmax indices 时行为异常 | `scores.amax(&[3i64][..], false)` 替代，只取最大值不取索引 |
+| RoPE cos/sin cache (Float32) × Q/K (BF16) | tch-rs 中 `bf16_tensor * f32_tensor` 结果变为 Float32，污染整个计算流 | `rotary.rs apply()` 中将 cos/sin 缓存 `.to_kind(q.kind())` 转换为输入 dtype |
 
 以上修复在本地 MPS（M1 Pro）和远程 CUDA（RTX 4090）跨节点 2-domain smoke 中均已验证。CPU 路径不受影响（CPU 上 `masked_fill` 和 `max_dim` 均正常工作）。
 
