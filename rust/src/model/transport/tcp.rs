@@ -17,8 +17,8 @@ use super::r#trait::KvTransport;
 /// [meta_len: u32 BE] [meta_json] [k_raw_bytes] [v_raw_bytes]
 /// ```
 ///
-/// meta_json 包含：layer_idx, global_seq_start/end, k/v shape, k/v bytes 长度。
-/// raw bytes 是 f32 的小端序二进制表示。
+/// meta_json 包含：layer_idx, global_seq_start/end, k/v shape, k/v bytes 长度, k/v dtype。
+/// raw bytes 是 f32 的小端序二进制表示（支持 Float/Half/BFloat16/Double，传输时统一为 f32）。
 ///
 /// 【为什么不直接用 bincode 序列化整个 KvBlock？】
 /// - JSON meta 便于人工调试和抓包分析
@@ -50,14 +50,27 @@ impl TcpKvTransport {
         Ok(Self { stream, device, send_buffer: Vec::new() })
     }
 
-    fn tensor_to_bytes(t: &Tensor) -> Result<Vec<u8>, String> {
-        let flat = t.contiguous().view(-1);
+    fn tensor_to_bytes(t: &Tensor) -> Result<(Vec<u8>, String), String> {
+        let flat = t.contiguous().view(-1).to_kind(tch::Kind::Float);
         let values: Vec<f32> =
             Vec::try_from(&flat).map_err(|e| format!("tensor to vec failed: {e}"))?;
-        Ok(values.iter().flat_map(|&v| v.to_le_bytes()).collect())
+        let bytes = values.iter().flat_map(|&v| v.to_le_bytes()).collect();
+        let dtype = match t.kind() {
+            tch::Kind::Float => "float32",
+            tch::Kind::Half => "float16",
+            tch::Kind::BFloat16 => "bfloat16",
+            tch::Kind::Double => "float64",
+            _ => "float32",
+        };
+        Ok((bytes, dtype.to_string()))
     }
 
-    fn bytes_to_tensor(bytes: &[u8], shape: &[i64], device: Device) -> Result<Tensor, String> {
+    fn bytes_to_tensor(
+        bytes: &[u8],
+        shape: &[i64],
+        device: Device,
+        dtype_str: &str,
+    ) -> Result<Tensor, String> {
         let values: Vec<f32> = bytes
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -70,9 +83,16 @@ impl TcpKvTransport {
                 values.len()
             ));
         }
-        Ok(Tensor::from_slice(&values)
+        let t = Tensor::from_slice(&values)
             .reshape(shape)
-            .to_device(device))
+            .to_device(device);
+        let kind = match dtype_str {
+            "float16" => tch::Kind::Half,
+            "bfloat16" => tch::Kind::BFloat16,
+            "float64" => tch::Kind::Double,
+            _ => tch::Kind::Float,
+        };
+        Ok(t.to_kind(kind))
     }
 }
 
@@ -82,8 +102,8 @@ fn serialize_block_to_buffer(
     send_buffer: &mut Vec<u8>,
     block: &KvBlock,
 ) -> Result<(), String> {
-    let k_bytes = TcpKvTransport::tensor_to_bytes(&block.k)?;
-    let v_bytes = TcpKvTransport::tensor_to_bytes(&block.v)?;
+    let (k_bytes, k_dtype) = TcpKvTransport::tensor_to_bytes(&block.k)?;
+    let (v_bytes, v_dtype) = TcpKvTransport::tensor_to_bytes(&block.v)?;
     let k_shape: Vec<i64> = block.k.size();
     let v_shape: Vec<i64> = block.v.size();
 
@@ -95,6 +115,8 @@ fn serialize_block_to_buffer(
         "v_shape": v_shape,
         "k_bytes": k_bytes.len(),
         "v_bytes": v_bytes.len(),
+        "k_dtype": k_dtype,
+        "v_dtype": v_dtype,
     });
     let meta_bytes = meta.to_string().into_bytes();
     let meta_len = meta_bytes.len() as u32;
@@ -202,8 +224,10 @@ impl KvTransport for TcpKvTransport {
             .read_exact(&mut v_bytes)
             .map_err(|e| format!("recv_kv_block read v_bytes failed: {e}"))?;
 
-        let k = Self::bytes_to_tensor(&k_bytes, &k_shape, self.device)?;
-        let v = Self::bytes_to_tensor(&v_bytes, &v_shape, self.device)?;
+        let k_dtype = meta["k_dtype"].as_str().unwrap_or("float32");
+        let v_dtype = meta["v_dtype"].as_str().unwrap_or("float32");
+        let k = Self::bytes_to_tensor(&k_bytes, &k_shape, self.device, k_dtype)?;
+        let v = Self::bytes_to_tensor(&v_bytes, &v_shape, self.device, v_dtype)?;
 
         Ok(Some(KvBlock {
             layer_idx,

@@ -1,0 +1,3 @@
+config	mode	micro_block_size	status	elapsed_sec	generated_text
+baseline_serial	serial	0	PASS	203	 brown 
+overlap_default	pipeline	0	PASS	202	 brown 

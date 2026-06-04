@@ -1,0 +1,6 @@
+config	mode	micro_block_size	status	elapsed_sec	generated_text
+baseline_serial	serial	0	PASS	201	 brown 
+overlap_default	pipeline	0	PASS	214	 brown 
+overlap_micro_64	pipeline	64	PASS	732	 brown 
+overlap_micro_256	pipeline	256	PASS	190	 brown 
+overlap_micro_512	pipeline	512	PASS	207	 brown 

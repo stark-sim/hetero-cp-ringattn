@@ -1,0 +1,48 @@
+executor_verdict: EXECUTED
+pre_check:
+  memory_verified: true
+  risk_level: medium
+  target_registered: true
+execution:
+  steps:
+    - step: "Generate prompt on Mac"
+      status: ok
+      detail: "64-token prompt generated to /tmp/hcp_prompt_64.txt"
+    - step: "Sync code versions"
+      status: ok
+      detail: "All hosts reset to origin/main (c12d79c); prior version mismatch caused connection failures"
+    - step: "Build on sd-1"
+      status: ok
+      detail: "cargo build --features tch-backend --release succeeded"
+    - step: "Build on white"
+      status: ok
+      detail: "cargo build --features tch-backend --release succeeded"
+    - step: "Copy prompts to remote hosts"
+      status: ok
+    - step: "Launch coordinator + workers"
+      status: ok
+      detail: "Coordinator on Mac (0.0.0.0:29800), worker-1 on white (domain-1, 0.0.0.0:29802), worker-0 on sd-1 (domain-0, 0.0.0.0:29801)"
+    - step: "64-token smoke"
+      status: ok
+      generated: " jumps over the"
+      elapsed_sec: "~70"
+      detail: "Prefill split: domain-0 [0,32), domain-1 [32,64). All 24 layers ring-attention completed. Both workers exited gracefully."
+  logs:
+    coord: "/tmp/sd1_white_coord.log"
+    w0: "/tmp/hcp_worker0.log"
+    w1: "/tmp/hcp_worker1.log"
+notes: |
+  Cross-node heterogeneous smoke result: SUCCESS.
+  
+  Key finding: The initial attempts failed because sd-1 and white were on 
+  different Git commits (c103f6b and 3759811 vs Mac's c12d79c). After 
+  resetting all hosts to origin/main (c12d79c) and rebuilding, the QUIC 
+  connections between sd-1 and white established successfully.
+  
+  Topology validated:
+    - Coordinator: Mac (MPS, no compute) @ 100.64.0.95:29800
+    - Worker-0: sd-1 (4x RTX 4080 SUPER, CUDA) @ 100.64.0.93:29801, domain-0
+    - Worker-1: white (RTX 4090, CUDA) @ 100.64.0.2:29802, domain-1
+  
+  Observed transient dial retries on white worker before handshake completion 
+  (~2 timeouts); this is normal retry behavior on cross-VPN paths.

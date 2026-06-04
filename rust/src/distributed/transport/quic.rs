@@ -224,8 +224,8 @@ async fn recv_task_loop(mut recv: RecvStream, block_tx: mpsc::Sender<KvBlock>, d
 
 /// 【序列化 KV block 为 Vec<u8> frame】
 fn serialize_kv_block(block: &KvBlock) -> Result<Vec<u8>, String> {
-    let k_bytes = tensor_to_bytes(&block.k)?;
-    let v_bytes = tensor_to_bytes(&block.v)?;
+    let (k_bytes, k_dtype) = tensor_to_bytes(&block.k)?;
+    let (v_bytes, v_dtype) = tensor_to_bytes(&block.v)?;
     let k_shape: Vec<i64> = block.k.size();
     let v_shape: Vec<i64> = block.v.size();
 
@@ -239,6 +239,8 @@ fn serialize_kv_block(block: &KvBlock) -> Result<Vec<u8>, String> {
         "v_shape": v_shape,
         "k_bytes": k_bytes.len(),
         "v_bytes": v_bytes.len(),
+        "k_dtype": k_dtype,
+        "v_dtype": v_dtype,
     });
     let meta_bytes = meta.to_string().into_bytes();
     let meta_len = meta_bytes.len() as u32;
@@ -306,8 +308,10 @@ async fn recv_kv_block_from_stream(
     read_exact(recv, &mut v_bytes).await
         .map_err(|e| format!("quic recv v_bytes failed: {e}"))?;
 
-    let k = bytes_to_tensor(&k_bytes, &k_shape, device)?;
-    let v = bytes_to_tensor(&v_bytes, &v_shape, device)?;
+    let k_dtype = meta["k_dtype"].as_str().unwrap_or("float32");
+    let v_dtype = meta["v_dtype"].as_str().unwrap_or("float32");
+    let k = bytes_to_tensor(&k_bytes, &k_shape, device, k_dtype)?;
+    let v = bytes_to_tensor(&v_bytes, &v_shape, device, v_dtype)?;
 
     Ok(Some(KvBlock { layer_idx, global_seq_start, global_seq_end, k, v, micro_block_idx, total_micro_blocks }))
 }
@@ -398,13 +402,21 @@ pub async fn read_exact(stream: &mut RecvStream, buf: &mut [u8]) -> Result<(), R
     Ok(())
 }
 
-fn tensor_to_bytes(t: &Tensor) -> Result<Vec<u8>, String> {
-    let flat = t.contiguous().view(-1);
+fn tensor_to_bytes(t: &Tensor) -> Result<(Vec<u8>, String), String> {
+    let flat = t.contiguous().view(-1).to_kind(tch::Kind::Float);
     let values: Vec<f32> = Vec::try_from(&flat).map_err(|e| format!("tensor to vec failed: {e}"))?;
-    Ok(values.iter().flat_map(|&v| v.to_le_bytes()).collect())
+    let bytes = values.iter().flat_map(|&v| v.to_le_bytes()).collect();
+    let dtype = match t.kind() {
+        tch::Kind::Float => "float32",
+        tch::Kind::Half => "float16",
+        tch::Kind::BFloat16 => "bfloat16",
+        tch::Kind::Double => "float64",
+        _ => "float32",
+    };
+    Ok((bytes, dtype.to_string()))
 }
 
-fn bytes_to_tensor(bytes: &[u8], shape: &[i64], device: Device) -> Result<Tensor, String> {
+fn bytes_to_tensor(bytes: &[u8], shape: &[i64], device: Device, dtype_str: &str) -> Result<Tensor, String> {
     let values: Vec<f32> = bytes.chunks_exact(4)
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect();
@@ -412,5 +424,12 @@ fn bytes_to_tensor(bytes: &[u8], shape: &[i64], device: Device) -> Result<Tensor
     if values.len() != expected {
         return Err(format!("byte length mismatch: expected {} floats, got {}", expected, values.len()));
     }
-    Ok(Tensor::from_slice(&values).reshape(shape).to_device(device))
+    let t = Tensor::from_slice(&values).reshape(shape).to_device(device);
+    let kind = match dtype_str {
+        "float16" => tch::Kind::Half,
+        "bfloat16" => tch::Kind::BFloat16,
+        "float64" => tch::Kind::Double,
+        _ => tch::Kind::Float,
+    };
+    Ok(t.to_kind(kind))
 }

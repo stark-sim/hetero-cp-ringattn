@@ -1,0 +1,57 @@
+isolated_context: true
+verdict: CONDITIONAL
+dimensions:
+  guard:
+    verdict: APPROVE
+    notes: |
+      All security checks pass.
+      - Subprocess spawn: env_remove("DYLD_LIBRARY_PATH") / env_remove("LD_LIBRARY_PATH") present (vllm_backend.rs:86-87).
+      - stdin/stdout piped(), stderr inherit() (vllm_backend.rs:88-90).
+      - JSON deserialization via serde_json::from_str to VllmResponse struct; Python uses json.loads. No eval/exec.
+      - Python side has no network listeners; pure stdio pipe.
+      - Drop impl sends shutdown command + child.wait() (vllm_backend.rs:311-324); send_cmd errors swallowed safely.
+      - MAX_SKIP_LINES = 1024 bounds non-JSON line skipping (vllm_backend.rs:145).
+      - Python _handle_cmd validates tokens/list types and request_tokens structure (hcp_worker_process.py:334-391).
+      - _sampled_token_to_logits validates sampled_token bounds (hcp_worker_process.py:259-260).
+      - DoS protection: read_line EOF returns Ok(0) and errors out; no unbounded loops.
+  examiner:
+    verdict: CONDITIONAL
+    notes: |
+      Trait implementation is complete (all WorkerBackend methods implemented). Protocol coverage is full
+      (handshake / prefill / decode / prefill_request / decode_request / decode_batch / shutdown / sync_global_seq_len).
+      One-hot logits reconstruction uses ±1e9 which preserves greedy/temperature sampling correctness.
+      device() supports HCP_VLLM_DEVICE override with cpu/mps/cuda/cuda:N (vllm_backend.rs:285-308).
+      backend_type validation exists in both Rust (worker.rs:195-198) and Python argparse choices.
+      Test coverage in vllm_backend.rs tests mock handshake, prefill, decode, decode_batch, request-aware methods,
+      and Drop shutdown.
+
+      BLOCKERS (must fix before APPROVE):
+
+      1. rust/src/distributed/worker.rs:219 — backend_type shadowing breaks case-insensitive selection.
+         Line 192 creates a lowercase `backend_type` and validates it at lines 195-198. However, line 219 shadows
+         this with `let backend_type = args.backend_type;` (original case). The closure clones this into `btype`
+         and does case-sensitive comparison at line 229 (`assert!(btype == "tch" || btype == "vllm")`) and at
+         line 239 (`if btype == "vllm"`). A valid non-lowercase input like `--backend-type VLLM` or `Tch` will
+         either panic at the assert or incorrectly instantiate a TchWorkerBackend (since `VLLM != "vllm"`).
+         Fix: do not shadow; use the already-lowercased `backend_type` in the closure, or lowercase `btype`.
+
+      2. python/hcp_worker_process.py:141-149 — TransformersBackend.decode() writes `_last_past_key_values`
+         but never reads it on subsequent calls. The model is invoked without `past_key_values=`, so KV cache
+         is recomputed from scratch on every decode step. Similarly, prefill() (lines 133-139) does not save
+         `past_key_values`, so even if decode() were fixed, the prefill→decode transition would still miss KV reuse.
+         This contradicts the checklist claim that KV cache is reused in TransformersBackend decode.
+         Note: the request-aware path (prefill_request / decode_request) DOES correctly reuse KV cache.
+         Fix: pass `_last_past_key_values` to the model in decode(), and save `outputs.past_key_values` in prefill().
+
+      3. python/hcp_worker_process.py:228-236, 237-243 — VllmBackend.prefill() and decode() do not maintain
+         any implicit state between calls. Each generate() call is treated as an independent request by vLLM.
+         This means a Rust prefill() followed by decode() loses the prefill context. The request-aware path
+         (prefill_request / decode_request) correctly tracks state in `_request_states`. This is acceptable as
+         a known prototype limitation, but should be documented if the non-request path is exposed to runtime use.
+
+      Minor:
+      - rust/src/distributed/worker.rs:229 — The assert is redundant with the validation at lines 195-198
+        but uses wrong casing (see blocker #1). Recommend removing or aligning casing.
+      - VllmBackend._sampled_token_to_logits allocates `[-1e9] * vocab_size` on every call; fine for correctness
+        but worth monitoring for large vocab sizes.
+confidence: high

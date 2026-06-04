@@ -1,0 +1,14 @@
+size	mode	elapsed_sec	status	generated
+64	serial	60	SUCCESS	quick
+64	pipeline	57	SUCCESS	quick
+256	serial	211	SUCCESS	jumps
+256	pipeline	207	SUCCESS	jumps
+64	serial	69	SUCCESS	quick
+512	serial	383	SUCCESS	dog
+512	pipeline	390	SUCCESS	dog
+1024	serial	600	FAILED	N/A
+1024	pipeline	600	FAILED	N/A
+2048	serial	600	FAILED	N/A
+2048	pipeline	600	FAILED	N/A
+4096	serial	601	FAILED	N/A
+4096	pipeline	2404	FAILED_NETWORK	N/A
