@@ -271,11 +271,15 @@ fn process_single_request(
 
     let mut generated_ids: Vec<u32> = Vec::new();
     let mut all_logits: Vec<Vec<f32>> = Vec::new();
-    all_logits.push(logits_vec);
 
-    // Decode loop
+    // Decode loop: match single-node structure where logits are pushed at the
+    // START of each iteration (logits that produce THIS token), and decode
+    // is only sent when another token will be generated.
+    let mut logits_vec = logits_vec;
     let mut finish_reason = None;
     for step in 0..max_tokens {
+        all_logits.push(logits_vec);
+
         let token = next_token as u32;
         generated_ids.push(token);
 
@@ -303,12 +307,11 @@ fn process_single_request(
             let _ = recv_response_quic(recv, rt.handle());
         }
 
-        let decode_logits: Vec<f32> = logits_bytes
+        logits_vec = logits_bytes
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect();
-        all_logits.push(decode_logits.clone());
-        let decode_tensor = Tensor::from_slice(&decode_logits);
+        let decode_tensor = Tensor::from_slice(&logits_vec);
         next_token = match sample_token(&decode_tensor, temperature, top_p) {
             Ok(t) => t as i64,
             Err(e) => return Err(format!("sample_token failed at step {step}: {e}")),
