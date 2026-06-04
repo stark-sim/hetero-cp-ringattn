@@ -149,6 +149,12 @@ impl LlamaModel {
 
         // Embedding lookup
         let mut hidden_states = Tensor::embedding(&self.embedding, input_ids, -1, false, false);
+        eprintln!("[DEBUG] embedding: shape={:?}", hidden_states.size());
+        let emb_last: Vec<f32> = Vec::try_from(&hidden_states.narrow(1, seq_len - 1, 1).squeeze()).unwrap_or_default();
+        if !emb_last.is_empty() {
+            let (min_v, max_v, sum) = emb_last.iter().fold((f32::MAX, f32::MIN, 0.0f64), |(mn, mx, s), &v| (mn.min(v), mx.max(v), s + v as f64));
+            eprintln!("[DEBUG] embedding last: min={:.4} max={:.4} mean={:.4}", min_v, max_v, sum / emb_last.len() as f64);
+        }
 
         // Guard: prevent position_ids from exceeding RoPE cache / model capacity.
         if let Some(max_pos) = self.config.max_position_embeddings {
@@ -205,6 +211,11 @@ impl LlamaModel {
                 .get_mut(layer_idx)
                 .and_then(|c| c.as_mut().map(|c| c as &mut dyn crate::model::cache::KvCache));
             hidden_states = layer.forward(&hidden_states, &position_ids, kv_cache, attention_mask.as_ref())?;
+            let h_last: Vec<f32> = Vec::try_from(&hidden_states.narrow(1, seq_len - 1, 1).squeeze()).unwrap_or_default();
+            if !h_last.is_empty() {
+                let (min_v, max_v, sum) = h_last.iter().fold((f32::MAX, f32::MIN, 0.0f64), |(mn, mx, s), &v| (mn.min(v), mx.max(v), s + v as f64));
+                eprintln!("[DEBUG] layer {}: min={:.4} max={:.4} mean={:.4}", layer_idx, min_v, max_v, sum / h_last.len() as f64);
+            }
         }
 
         // Increment global_seq_len after decode step only
@@ -214,6 +225,11 @@ impl LlamaModel {
 
         // Final norm
         hidden_states = self.norm.forward(&hidden_states);
+        let norm_last: Vec<f32> = Vec::try_from(&hidden_states.narrow(1, seq_len - 1, 1).squeeze()).unwrap_or_default();
+        if !norm_last.is_empty() {
+            let (min_v, max_v, sum) = norm_last.iter().fold((f32::MAX, f32::MIN, 0.0f64), |(mn, mx, s), &v| (mn.min(v), mx.max(v), s + v as f64));
+            eprintln!("[DEBUG] final norm: min={:.4} max={:.4} mean={:.4}", min_v, max_v, sum / norm_last.len() as f64);
+        }
 
         // LM Head — chunked for long sequences to avoid OOM.
         // Avoid pre-allocating a full [batch, seq_len, vocab_size] buffer;
@@ -237,6 +253,12 @@ impl LlamaModel {
         } else {
             hidden_states.matmul(&self.embedding.transpose(0, 1))
         };
+
+        let logits_last: Vec<f32> = Vec::try_from(&logits.narrow(1, seq_len - 1, 1).squeeze()).unwrap_or_default();
+        if !logits_last.is_empty() {
+            let (min_v, max_v, sum) = logits_last.iter().fold((f32::MAX, f32::MIN, 0.0f64), |(mn, mx, s), &v| (mn.min(v), mx.max(v), s + v as f64));
+            eprintln!("[DEBUG] logits last: min={:.4} max={:.4} mean={:.4}", min_v, max_v, sum / logits_last.len() as f64);
+        }
 
         Ok(logits)
     }
