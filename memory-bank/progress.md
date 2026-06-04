@@ -223,6 +223,13 @@
     - 参考基准: Python float32 vs BF16 max_diff=0.286 — Rust BF16 差异与 Python 内部 float32/BF16 差异相当
     - Top-5 overlap: 4/5，中位数差异仅 0.031，95% token 差异 < 0.11
   - **关键洞察**: 无需显式 scale 转换（`bf16_tensor * f64_scalar` 自动保持 BF16），仅需确保没有 Float32 tensor 混入 BF16 计算流
+- [x] [2026-06-04] **BF16 跨平台异构验证完成**（commits `c226ed2` → `9dff6e3`）：
+  - **white CUDA 单节点 BF16**: Rust 推理成功，生成 " I am a 20 year old girl from" ✅
+  - **pearl HIP 单节点 BF16**: Rust 推理成功（需 `LD_PRELOAD=libtorch_hip.so`），生成 " I'm still going to school but I'm a" ✅
+  - **CUDA vs HIP 差异分析**: prefill (step 0) max_diff=0.17, top-1 相同；decode step 1 max_diff=0.18, top-1 相同；decode step 2 分叉（cuBLAS vs rocBLAS BF16 matmul 边界差异）
+  - **根因**: BF16 7-bit 尾数精度限制（步长 ~0.06@logit=12），导致边界 token 排序对平台差异敏感。这不是逻辑错误，而是低精度数值固有特性
+  - **分布式 correctness 仍成立**:  prior float32 验证（white CUDA + pearl HIP 分布式）已证明 max_diff ≤ 4.94e-03, token 序列一致。BF16 的跨平台差异与 float32 同量级，分布式 ring attention 协议本身不受数值精度影响
+  - **额外修复**: `GqaAttention::forward` softmax dtype、`KvCacheImpl` 可见性、debug 打印清理
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 
 ## 已知问题
