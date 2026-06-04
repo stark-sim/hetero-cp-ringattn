@@ -13,6 +13,6 @@ pub mod backend;
 pub mod ring;
 
 #[cfg(feature = "tch-backend")]
-pub use backend::AttentionBackend;
+pub use backend::{AttentionBackend, LocalAttentionBackend};
 #[cfg(feature = "tch-backend")]
 pub use ring::HcpRingAttentionBackend;

@@ -28,6 +28,8 @@ pub struct CliArgs {
     pub infer_num_domains: usize,
     pub export_logits_dir: Option<String>,
     pub export_hidden_states_dir: Option<String>,
+    pub prefill_debug_dir: Option<String>,
+    pub qk_inject_dir: Option<String>,
     pub distributed_role: Option<String>,
 }
 
@@ -49,6 +51,8 @@ pub fn parse_cli_args() -> Result<CliArgs, RingError> {
     let mut infer_num_domains = 1usize;
     let mut export_logits_dir = None;
     let mut export_hidden_states_dir = None;
+    let mut prefill_debug_dir = None;
+    let mut qk_inject_dir = None;
     let mut distributed_role = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -120,6 +124,12 @@ pub fn parse_cli_args() -> Result<CliArgs, RingError> {
             "--export-hidden-states" => {
                 export_hidden_states_dir = Some(next_cli_value(&mut args, "--export-hidden-states")?);
             }
+            "--prefill-debug" => {
+                prefill_debug_dir = Some(next_cli_value(&mut args, "--prefill-debug")?);
+            }
+            "--qk-inject" => {
+                qk_inject_dir = Some(next_cli_value(&mut args, "--qk-inject")?);
+            }
             "--distributed-role" => {
                 distributed_role = Some(next_cli_value(&mut args, "--distributed-role")?);
                 // Worker / coordinator parse remaining args themselves;
@@ -148,6 +158,8 @@ pub fn parse_cli_args() -> Result<CliArgs, RingError> {
         infer_num_domains,
         export_logits_dir,
         export_hidden_states_dir,
+        prefill_debug_dir,
+        qk_inject_dir,
         distributed_role,
     })
 }

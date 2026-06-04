@@ -30,8 +30,6 @@ impl RmsNorm {
     /// - 最后乘 weight（gamma）做缩放
     pub fn forward(&self, x: &Tensor) -> Tensor {
         let variance = x.pow_tensor_scalar(2i64).mean_dim(&[-1i64][..], true, x.kind());
-        let result = x * (variance + self.eps).rsqrt() * &self.weight;
-        eprintln!("[rmsnorm] input={:?} weight={:?} output={:?}", x.kind(), self.weight.kind(), result.kind());
-        result
+        x * (variance + self.eps).rsqrt() * &self.weight
     }
 }

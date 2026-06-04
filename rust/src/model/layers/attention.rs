@@ -157,7 +157,7 @@ impl GqaAttention {
 
         // ====== 第八步：Softmax ======
         // 把 scores 转换成概率分布（所有权重之和为 1）。
-        let attn_weights = scores.softmax(-1, Kind::Float);
+        let attn_weights = scores.softmax(-1, scores.kind());
 
         // ====== 第九步：加权求和 ======
         // output = attn_weights @ V

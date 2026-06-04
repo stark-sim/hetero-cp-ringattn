@@ -167,7 +167,6 @@ impl LlamaModel {
         if self.dtype != Kind::Float {
             hidden_states = hidden_states.to_kind(self.dtype);
         }
-        eprintln!("[model.forward] after cast: hidden_states kind={:?}", hidden_states.kind());
 
         // Guard: prevent position_ids from exceeding RoPE cache / model capacity.
         if let Some(max_pos) = self.config.max_position_embeddings {

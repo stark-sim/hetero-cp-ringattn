@@ -122,9 +122,7 @@ pub fn run_inference_and_export_logits(
     let weights = ModelWeights::from_dir(model_dir, device).map_err(|e: crate::model::ModelError| e.to_string())?;
 
     println!("[infer-export] building model ({} layers, {} heads)", config.num_layers, config.num_heads);
-    println!("[infer-export] config.torch_dtype={:?}", config.torch_dtype);
     let mut model = LlamaModel::from_weights(config, &weights, device, num_domains).map_err(|e: crate::model::ModelError| e.to_string())?;
-    println!("[infer-export] model.dtype={:?}", model.dtype);
 
     // Load tokenizer
     let tokenizer_path = Path::new(model_dir).join("tokenizer.json");
