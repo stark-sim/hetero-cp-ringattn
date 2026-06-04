@@ -27,6 +27,7 @@ pub struct CliArgs {
     pub infer_top_p: f64,
     pub infer_num_domains: usize,
     pub export_logits_dir: Option<String>,
+    pub export_hidden_states_dir: Option<String>,
     pub distributed_role: Option<String>,
 }
 
@@ -47,6 +48,7 @@ pub fn parse_cli_args() -> Result<CliArgs, RingError> {
     let mut infer_top_p = 0.9;
     let mut infer_num_domains = 1usize;
     let mut export_logits_dir = None;
+    let mut export_hidden_states_dir = None;
     let mut distributed_role = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -115,6 +117,9 @@ pub fn parse_cli_args() -> Result<CliArgs, RingError> {
             "--export-logits" => {
                 export_logits_dir = Some(next_cli_value(&mut args, "--export-logits")?);
             }
+            "--export-hidden-states" => {
+                export_hidden_states_dir = Some(next_cli_value(&mut args, "--export-hidden-states")?);
+            }
             "--distributed-role" => {
                 distributed_role = Some(next_cli_value(&mut args, "--distributed-role")?);
                 // Worker / coordinator parse remaining args themselves;
@@ -142,6 +147,7 @@ pub fn parse_cli_args() -> Result<CliArgs, RingError> {
         infer_top_p,
         infer_num_domains,
         export_logits_dir,
+        export_hidden_states_dir,
         distributed_role,
     })
 }

@@ -194,7 +194,13 @@ pub fn run_cli() -> Result<(), RingError> {
         };
         println!("[infer] prompt length: {} chars", prompt.len());
 
-        let result = if let Some(ref export_dir) = args.export_logits_dir {
+        let result = if let Some(ref export_dir) = args.export_hidden_states_dir {
+            infer::run_inference_and_export_hidden_states(
+                model_dir, &prompt, args.infer_max_tokens,
+                args.infer_temperature, args.infer_top_p,
+                args.infer_num_domains, export_dir,
+            )
+        } else if let Some(ref export_dir) = args.export_logits_dir {
             infer::run_inference_and_export_logits(
                 model_dir, &prompt, args.infer_max_tokens,
                 args.infer_temperature, args.infer_top_p,

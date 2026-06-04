@@ -258,6 +258,124 @@ impl LlamaModel {
     pub fn create_kv_caches(&self) -> KvCaches {
         create_kv_caches(self.config.num_layers)
     }
+
+    /// Forward pass that also exports per-layer hidden states.
+    ///
+    /// Runs the same computation as `forward`, but after each decoder layer
+    /// and after the final norm, saves the hidden states to `{export_dir}/layer_{i}.bin`.
+    /// Each file format: `[batch: u64 LE][seq_len: u64 LE][hidden_size: u64 LE][f32 data...]`
+    ///
+    /// This is intended for debug correctness validation only.
+    pub fn forward_with_hidden_state_export(
+        &mut self,
+        input_ids: &Tensor,
+        kv_caches: &mut KvCaches,
+        export_dir: &str,
+    ) -> Result<Tensor, ModelError> {
+        let _no_grad = tch::no_grad_guard();
+
+        let batch = input_ids.size()[0];
+        let seq_len = input_ids.size()[1];
+        let device = input_ids.device();
+
+        let mut hidden_states = Tensor::embedding(&self.embedding, input_ids, -1, false, false);
+
+        if let Some(max_pos) = self.config.max_position_embeddings {
+            let max_pos = max_pos as i64;
+            if self.seq_offset + seq_len > max_pos {
+                return Err(ModelError::Generation(format!(
+                    "sequence length {} + offset {} exceeds max_position_embeddings {}; prompt too long",
+                    seq_len, self.seq_offset, max_pos
+                )));
+            }
+        }
+
+        let is_prefill = !self.is_prefill_done;
+        let position_ids = if is_prefill {
+            self.global_seq_len = (self.seq_offset + seq_len) as usize;
+            self.is_prefill_done = true;
+            let base = Tensor::arange(seq_len, (Kind::Int64, device)) + self.seq_offset;
+            base.unsqueeze(0).repeat([batch, 1])
+        } else {
+            let pos = self.global_seq_len as i64;
+            Tensor::from_slice(&[pos])
+                .to_device(device)
+                .unsqueeze(0)
+                .repeat([batch, 1])
+        };
+
+        let attention_mask = if seq_len > 1 {
+            if self.num_domains > 1 || seq_len > 8192 {
+                Some(Tensor::zeros([1, 1, 1, 1], (Kind::Float, device)))
+            } else {
+                Some(Self::create_causal_mask(seq_len, device))
+            }
+        } else {
+            None
+        };
+
+        std::fs::create_dir_all(export_dir)
+            .map_err(|e| ModelError::Generation(format!("failed to create export dir: {}", e)))?;
+
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            let kv_cache: Option<&mut dyn crate::model::cache::KvCache> = kv_caches
+                .get_mut(layer_idx)
+                .and_then(|c| c.as_mut().map(|c| c as &mut dyn crate::model::cache::KvCache));
+            hidden_states = layer.forward(&hidden_states, &position_ids, kv_cache, attention_mask.as_ref())?;
+
+            // Export hidden state after this layer
+            let file_path = std::path::Path::new(export_dir).join(format!("layer_{}.bin", layer_idx));
+            Self::write_tensor_as_binary(&hidden_states, &file_path)
+                .map_err(|e| ModelError::Generation(format!("failed to write layer {} hidden state: {}", layer_idx, e)))?;
+        }
+
+        if !is_prefill {
+            self.global_seq_len += 1;
+        }
+
+        hidden_states = self.norm.forward(&hidden_states);
+
+        // Export final norm output
+        let file_path = std::path::Path::new(export_dir).join("final_norm.bin");
+        Self::write_tensor_as_binary(&hidden_states, &file_path)
+            .map_err(|e| ModelError::Generation(format!("failed to write final norm hidden state: {}", e)))?;
+
+        let seq_len = hidden_states.size()[1];
+        const LM_HEAD_CHUNK_SIZE: i64 = 8192;
+        let logits = if seq_len > LM_HEAD_CHUNK_SIZE {
+            let last_hidden = hidden_states.narrow(1, seq_len - 1, 1);
+            if let Some(ref lm_head) = self.lm_head {
+                last_hidden.matmul(&lm_head.transpose(0, 1))
+            } else {
+                last_hidden.matmul(&self.embedding.transpose(0, 1))
+            }
+        } else if let Some(ref lm_head) = self.lm_head {
+            hidden_states.matmul(&lm_head.transpose(0, 1))
+        } else {
+            hidden_states.matmul(&self.embedding.transpose(0, 1))
+        };
+
+        Ok(logits)
+    }
+
+    /// Write a tensor to a binary file: [ndims: u64 LE][dim0: u64 LE]...[dimN: u64 LE][f32 data...]
+    fn write_tensor_as_binary(tensor: &Tensor, path: &std::path::Path) -> Result<(), String> {
+        use std::io::Write;
+        let flat = tensor.view(-1);
+        let data: Vec<f32> = Vec::try_from(&flat).map_err(|e| format!("tensor to vec: {}", e))?;
+        let shape = tensor.size();
+        let mut file = std::fs::File::create(path)
+            .map_err(|e| format!("create file: {}", e))?;
+        let ndims = shape.len() as u64;
+        file.write_all(&ndims.to_le_bytes()).map_err(|e| e.to_string())?;
+        for &dim in &shape {
+            file.write_all(&(dim as u64).to_le_bytes()).map_err(|e| e.to_string())?;
+        }
+        for &val in &data {
+            file.write_all(&val.to_le_bytes()).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
