@@ -2,7 +2,7 @@
 
 ## 当前焦点
 
-[2026-06-04] **Phase 3: BF16 priority support 完成 — 跨平台数值一致性验证通过**（commits `c226ed2` → `9dff6e3`）：
+[2026-06-04] **Phase 3: BF16 priority support 完成 — 跨平台数值一致性验证通过**（commits `c226ed2` → `09cf374`）：
   - **根因定位**: float32 BLAS 累加顺序差异（Rust/libtorch vs Python/PyTorch）导致 Q/K projection 每层 ~2e-4 divergence，24 层累积后输出差异可见
   - **解决方案**: 当模型 config 指定 `torch_dtype=bfloat16` 时，权重加载和推理全程使用 BF16。BF16 的 7-bit 尾数天然屏蔽微小 BLAS 差异
   - **关键修复**:
@@ -19,9 +19,17 @@
     - **Rust BF16 vs Python BF16 (white CUDA)**: prefill top-1 相同 (358=' I')，max_diff=0.31，top-5 相同。但 decode step 2 分叉（不同 BLAS 实现: Rust online softmax vs PyTorch SDPA）
     - **Rust BF16 CUDA vs Rust BF16 HIP**: prefill top-1 相同，step 0 max_diff=0.17，step 1 max_diff=0.18。step 2 分叉（cuBLAS vs rocBLAS BF16 matmul 差异）
     - **关键洞察**: BF16 的 7-bit 尾数精度（步长 ~0.06@12）导致边界 token 的 logit 排序对微小平台差异敏感。这不是逻辑错误，而是低精度数值的固有特性
+  - **分布式 BF16 验证 — 历史性突破**（commit `09cf374`）：
+    - **根因**: TCP/QUIC transport 的 `tensor_to_bytes`/`bytes_to_tensor` 硬编码 `f32`，BF16 KV block 传输时被转 Float32，接收方重建为 Float32 tensor → `matmul` dtype 不匹配 panic
+    - **修复**: 序列化时记录 dtype（float32/float16/bfloat16/float64），反序列化后 `.to_kind(kind)` 还原原始 dtype。TCP + QUIC 双 transport 均修复
+    - **验证**: white RTX 4090 CUDA (domain 0) + pearl RX 9060 XT HIP (domain 1)，Qwen2-0.5B BF16，10-token greedy decode
+    - **结果**: `generated:  in the universe. The universe is a vast space` — 与 Rust 单节点 BF16 输出**完全一致**
+    - **dtype 日志确认**: `q_kind=BFloat16 k_kind=BFloat16 v_kind=BFloat16`（peer KV block 正确保持 BF16）
+    - **意义**: 首次验证 BF16 跨异构平台（CUDA+HIP）分布式推理端到端成功，transport dtype 保真
   - **工程教训**:
     - 无需显式 scale 转换（`bf16_tensor * f64_scalar` 自动保持 BF16），只需确保没有 Float32 tensor 混入 BF16 计算流
     - RoPE cos/sin 缓存是唯一的 Float32 污染源（已修复 `.to_kind(q_kind)`）
+    - **Transport 序列化必须携带 dtype 元数据**，不能假设所有 tensor 都是 f32
     - BF16 异构计算的 token 一致性需要放宽到 top-5 或语义等价，而非逐 token 精确匹配
 
 [2026-06-04] **Phase 1: Logits 比较脚本完成 — 单节点 vs 分布式 correctness 验证通过**（commits `54d80b0`, `299b37a`, `3afea1a`, `ee3d89d`）：

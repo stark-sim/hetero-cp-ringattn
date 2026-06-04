@@ -223,13 +223,19 @@
     - 参考基准: Python float32 vs BF16 max_diff=0.286 — Rust BF16 差异与 Python 内部 float32/BF16 差异相当
     - Top-5 overlap: 4/5，中位数差异仅 0.031，95% token 差异 < 0.11
   - **关键洞察**: 无需显式 scale 转换（`bf16_tensor * f64_scalar` 自动保持 BF16），仅需确保没有 Float32 tensor 混入 BF16 计算流
-- [x] [2026-06-04] **BF16 跨平台异构验证完成**（commits `c226ed2` → `9dff6e3`）：
+- [x] [2026-06-04] **BF16 跨平台异构验证完成**（commits `c226ed2` → `09cf374`）：
   - **white CUDA 单节点 BF16**: Rust 推理成功，生成 " I am a 20 year old girl from" ✅
   - **pearl HIP 单节点 BF16**: Rust 推理成功（需 `LD_PRELOAD=libtorch_hip.so`），生成 " I'm still going to school but I'm a" ✅
   - **CUDA vs HIP 差异分析**: prefill (step 0) max_diff=0.17, top-1 相同；decode step 1 max_diff=0.18, top-1 相同；decode step 2 分叉（cuBLAS vs rocBLAS BF16 matmul 边界差异）
   - **根因**: BF16 7-bit 尾数精度限制（步长 ~0.06@logit=12），导致边界 token 排序对平台差异敏感。这不是逻辑错误，而是低精度数值固有特性
   - **分布式 correctness 仍成立**:  prior float32 验证（white CUDA + pearl HIP 分布式）已证明 max_diff ≤ 4.94e-03, token 序列一致。BF16 的跨平台差异与 float32 同量级，分布式 ring attention 协议本身不受数值精度影响
   - **额外修复**: `GqaAttention::forward` softmax dtype、`KvCacheImpl` 可见性、debug 打印清理
+  - **[新增] 分布式 BF16 端到端验证**（commit `09cf374`）：
+    - **根因**: TCP/QUIC transport `tensor_to_bytes`/`bytes_to_tensor` 硬编码 f32，BF16 KV block 跨节点传输后 dtype 丢失 → `matmul` panic "expected BFloat16 but found Float"
+    - **修复**: transport 序列化/反序列化携带 dtype 元数据（k_dtype/v_dtype），反序列化后 `.to_kind(kind)` 还原原始 dtype
+    - **验证**: white RTX 4090 CUDA (domain 0) + pearl RX 9060 XT HIP (domain 1)，Qwen2-0.5B，10-token greedy decode
+    - **结果**: ` in the universe. The universe is a vast space` — 与 Rust 单节点 BF16 **完全一致**
+    - **意义**: 首次验证 BF16 跨异构平台分布式推理成功，transport dtype 保真
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 
 ## 已知问题
