@@ -2,6 +2,8 @@ use crate::model::{ModelConfig, ModelWeights};
 use crate::model::model::LlamaModel;
 use crate::model::generator::Generator;
 use crate::model::sampling::sample_token;
+#[cfg(feature = "tch-backend")]
+use crate::model::KvCacheImpl;
 use std::path::Path;
 use std::io::Write;
 

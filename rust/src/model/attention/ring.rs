@@ -924,6 +924,7 @@ impl AttentionBackend for HcpRingAttentionBackend {
         let batch = hidden_states.size()[0];
         let seq_len = hidden_states.size()[1];
         let hidden_size = hidden_states.size()[2];
+        eprintln!("[ring-attn] hidden_states kind={:?} q_proj kind={:?}", hidden_states.kind(), self.q_proj.kind());
 
         // ====== 第一步：线性投影（Linear Projection）======
         // Attention 的核心思想：用三个不同的权重矩阵把输入 hidden_states 映射成 Q、K、V。

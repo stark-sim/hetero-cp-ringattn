@@ -219,6 +219,34 @@ pub enum KvCacheImpl {
 }
 
 #[cfg(feature = "tch-backend")]
+impl KvCacheImpl {
+    /// Get the current K and V tensors from the cache.
+    pub fn get_kv(&self) -> Option<(Tensor, Tensor)> {
+        match self {
+            KvCacheImpl::Contiguous(c) => {
+                let k = c.k.as_ref()?.shallow_clone();
+                let v = c.v.as_ref()?.shallow_clone();
+                Some((k, v))
+            }
+            KvCacheImpl::BlockTable(c) => {
+                if c.k_blocks.is_empty() {
+                    return None;
+                }
+                let k = Tensor::cat(
+                    &c.k_blocks.iter().map(|t| t.shallow_clone()).collect::<Vec<_>>(),
+                    2,
+                );
+                let v = Tensor::cat(
+                    &c.v_blocks.iter().map(|t| t.shallow_clone()).collect::<Vec<_>>(),
+                    2,
+                );
+                Some((k, v))
+            }
+        }
+    }
+}
+
+#[cfg(feature = "tch-backend")]
 impl KvCache for KvCacheImpl {
     fn update(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<(Tensor, Tensor), ModelError> {
         match self {
