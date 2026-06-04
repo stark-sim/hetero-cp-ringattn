@@ -35,6 +35,11 @@ pub struct LlamaModel {
     /// Whether the first forward (prefill) has been completed.
     /// Distinguishes prefill from decode even when prefill chunk length is 1.
     pub is_prefill_done: bool,
+    /// Computation dtype for model forward pass.
+    /// Inferred from config.torch_dtype (e.g., "bfloat16" → Kind::BFloat16).
+    /// Input tensors are cast to this dtype at the start of forward,
+    /// and logits are cast back to Float at the end.
+    pub dtype: Kind,
 }
 
 #[cfg(feature = "tch-backend")]
@@ -96,7 +101,14 @@ impl LlamaModel {
             });
         }
 
-        Ok(Self { config, embedding, layers, norm, lm_head, seq_offset: 0, num_domains, global_seq_len: 0, is_prefill_done: false })
+        // Detect computation dtype from config.torch_dtype
+        let dtype = match config.torch_dtype.as_deref() {
+            Some("bfloat16") => Kind::BFloat16,
+            Some("float16") => Kind::Half,
+            _ => Kind::Float,
+        };
+
+        Ok(Self { config, embedding, layers, norm, lm_head, seq_offset: 0, num_domains, global_seq_len: 0, is_prefill_done: false, dtype })
     }
 
     /// 【为模型中所有 attention 后端配置分布式传输】
@@ -150,6 +162,12 @@ impl LlamaModel {
         // Embedding lookup
         let mut hidden_states = Tensor::embedding(&self.embedding, input_ids, -1, false, false);
 
+        // Cast to computation dtype (e.g., BFloat16) if needed.
+        // Weights are loaded in the original dtype; input embeddings may be Float.
+        if self.dtype != Kind::Float {
+            hidden_states = hidden_states.to_kind(self.dtype);
+        }
+
         // Guard: prevent position_ids from exceeding RoPE cache / model capacity.
         if let Some(max_pos) = self.config.max_position_embeddings {
             let max_pos = max_pos as i64;
@@ -191,9 +209,9 @@ impl LlamaModel {
             // HcpRingAttentionBackend implements causality via position comparison
             // and never reads the mask tensor data; it only checks is_some().
             if self.num_domains > 1 || seq_len > 8192 {
-                Some(Tensor::zeros([1, 1, 1, 1], (Kind::Float, device)))
+                Some(Tensor::zeros([1, 1, 1, 1], (self.dtype, device)))
             } else {
-                Some(Self::create_causal_mask(seq_len, device))
+                Some(Self::create_causal_mask(seq_len, device, self.dtype))
             }
         } else {
             None
@@ -238,17 +256,24 @@ impl LlamaModel {
             hidden_states.matmul(&self.embedding.transpose(0, 1))
         };
 
+        // Cast logits back to Float for sampling / output consistency.
+        let logits = if self.dtype != Kind::Float {
+            logits.to_kind(Kind::Float)
+        } else {
+            logits
+        };
+
         Ok(logits)
     }
 
     /// Create a causal attention mask for prefill.
     ///
     /// Shape: `[1, 1, seq_len, seq_len]` — broadcasts over batch and heads.
-    fn create_causal_mask(seq_len: i64, device: Device) -> Tensor {
-        let mask = Tensor::ones([seq_len, seq_len], (Kind::Float, device))
+    fn create_causal_mask(seq_len: i64, device: Device, dtype: Kind) -> Tensor {
+        let mask = Tensor::ones([seq_len, seq_len], (dtype, device))
             .triu(1)
             .to_kind(Kind::Bool);
-        Tensor::zeros([seq_len, seq_len], (Kind::Float, device))
+        Tensor::zeros([seq_len, seq_len], (dtype, device))
             .masked_fill(&mask, f64::NEG_INFINITY)
             .unsqueeze(0)
             .unsqueeze(0)
@@ -280,6 +305,11 @@ impl LlamaModel {
 
         let mut hidden_states = Tensor::embedding(&self.embedding, input_ids, -1, false, false);
 
+        // Cast to computation dtype (e.g., BFloat16) if needed.
+        if self.dtype != Kind::Float {
+            hidden_states = hidden_states.to_kind(self.dtype);
+        }
+
         if let Some(max_pos) = self.config.max_position_embeddings {
             let max_pos = max_pos as i64;
             if self.seq_offset + seq_len > max_pos {
@@ -306,9 +336,9 @@ impl LlamaModel {
 
         let attention_mask = if seq_len > 1 {
             if self.num_domains > 1 || seq_len > 8192 {
-                Some(Tensor::zeros([1, 1, 1, 1], (Kind::Float, device)))
+                Some(Tensor::zeros([1, 1, 1, 1], (self.dtype, device)))
             } else {
-                Some(Self::create_causal_mask(seq_len, device))
+                Some(Self::create_causal_mask(seq_len, device, self.dtype))
             }
         } else {
             None
@@ -358,10 +388,141 @@ impl LlamaModel {
         Ok(logits)
     }
 
+    /// 【Prefill debug export for layer 0】
+    ///
+    /// Runs prefill (full prompt) but uses `HcpRingAttentionBackend::forward_debug`
+    /// for layer 0 to export all attention intermediates. Other layers use normal forward.
+    /// Also exports the embedding output and the hidden state after layer 0's MLP.
+    ///
+    /// If `qk_inject_dir` is provided, layer 0 will load Q and K projections from
+    /// Python-exported files instead of computing them via matmul. This is used to
+    /// verify whether Q/K projection BLAS differences are the root cause of divergence.
+    ///
+    /// This is for systematic debugging of Rust vs Python numerical divergence.
+    pub fn forward_prefill_debug_layer_0(
+        &mut self,
+        input_ids: &Tensor,
+        kv_caches: &mut KvCaches,
+        export_dir: &str,
+        qk_inject_dir: Option<&str>,
+    ) -> Result<Tensor, ModelError> {
+        let _no_grad = tch::no_grad_guard();
+
+        let batch = input_ids.size()[0];
+        let seq_len = input_ids.size()[1];
+        let device = input_ids.device();
+
+        let mut hidden_states = Tensor::embedding(&self.embedding, input_ids, -1, false, false);
+
+        if let Some(max_pos) = self.config.max_position_embeddings {
+            let max_pos = max_pos as i64;
+            if self.seq_offset + seq_len > max_pos {
+                return Err(ModelError::Generation(format!(
+                    "sequence length {} + offset {} exceeds max_position_embeddings {}; prompt too long",
+                    seq_len, self.seq_offset, max_pos
+                )));
+            }
+        }
+
+        let is_prefill = !self.is_prefill_done;
+        let position_ids = if is_prefill {
+            self.global_seq_len = (self.seq_offset + seq_len) as usize;
+            self.is_prefill_done = true;
+            let base = Tensor::arange(seq_len, (Kind::Int64, device)) + self.seq_offset;
+            base.unsqueeze(0).repeat([batch, 1])
+        } else {
+            let pos = self.global_seq_len as i64;
+            Tensor::from_slice(&[pos])
+                .to_device(device)
+                .unsqueeze(0)
+                .repeat([batch, 1])
+        };
+
+        let attention_mask = if seq_len > 1 {
+            if self.num_domains > 1 || seq_len > 8192 {
+                Some(Tensor::zeros([1, 1, 1, 1], (self.dtype, device)))
+            } else {
+                Some(Self::create_causal_mask(seq_len, device, self.dtype))
+            }
+        } else {
+            None
+        };
+
+        std::fs::create_dir_all(export_dir)
+            .map_err(|e| ModelError::Generation(format!("failed to create export dir: {}", e)))?;
+
+        let export_path = std::path::Path::new(export_dir);
+
+        // Export embedding output
+        Self::write_tensor_as_binary(&hidden_states, &export_path.join("embedding_output.bin"))
+            .map_err(|e| ModelError::Generation(format!("failed to write embedding: {}", e)))?;
+
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            let kv_cache: Option<&mut dyn crate::model::cache::KvCache> = kv_caches
+                .get_mut(layer_idx)
+                .and_then(|c| c.as_mut().map(|c| c as &mut dyn crate::model::cache::KvCache));
+
+            if layer_idx == 0 {
+                // Layer 0: use debug forward to export all attention intermediates
+                let residual = hidden_states.shallow_clone();
+                let normed = layer.input_layernorm.forward(&hidden_states);
+                Self::write_tensor_as_binary(&normed, &export_path.join("layer_0_input_norm.bin"))
+                    .map_err(|e| ModelError::Generation(format!("failed to write layer 0 input norm: {}", e)))?;
+
+                // Cast to HcpRingAttentionBackend to call forward_debug or forward_debug_with_injected_qk
+                let attn_out = if let Some(ring) = layer.attention.as_any_mut().downcast_mut::<crate::model::attention::HcpRingAttentionBackend>() {
+                    if let Some(qk_dir) = qk_inject_dir {
+                        let qk_path = std::path::Path::new(qk_dir);
+                        ring.forward_debug_with_injected_qk(&normed, &position_ids, kv_cache, attention_mask.as_ref(), export_path, qk_path)?
+                    } else {
+                        ring.forward_debug(&normed, &position_ids, kv_cache, attention_mask.as_ref(), export_path)?
+                    }
+                } else {
+                    layer.attention.forward(&normed, &position_ids, kv_cache, attention_mask.as_ref())?
+                };
+                hidden_states = &attn_out + &residual;
+                Self::write_tensor_as_binary(&hidden_states, &export_path.join("layer_0_post_attn.bin"))
+                    .map_err(|e| ModelError::Generation(format!("failed to write layer 0 post attn: {}", e)))?;
+
+                let residual = hidden_states.shallow_clone();
+                let normed = layer.post_attention_layernorm.forward(&hidden_states);
+                let mlp_out = layer.mlp.forward(&normed);
+                hidden_states = &mlp_out + &residual;
+                Self::write_tensor_as_binary(&hidden_states, &export_path.join("layer_0_post_mlp.bin"))
+                    .map_err(|e| ModelError::Generation(format!("failed to write layer 0 post mlp: {}", e)))?;
+            } else {
+                hidden_states = layer.forward(&hidden_states, &position_ids, kv_cache, attention_mask.as_ref())?;
+            }
+        }
+
+        if !is_prefill {
+            self.global_seq_len += 1;
+        }
+
+        hidden_states = self.norm.forward(&hidden_states);
+
+        let seq_len = hidden_states.size()[1];
+        const LM_HEAD_CHUNK_SIZE: i64 = 8192;
+        let logits = if seq_len > LM_HEAD_CHUNK_SIZE {
+            let last_hidden = hidden_states.narrow(1, seq_len - 1, 1);
+            if let Some(ref lm_head) = self.lm_head {
+                last_hidden.matmul(&lm_head.transpose(0, 1))
+            } else {
+                last_hidden.matmul(&self.embedding.transpose(0, 1))
+            }
+        } else if let Some(ref lm_head) = self.lm_head {
+            hidden_states.matmul(&lm_head.transpose(0, 1))
+        } else {
+            hidden_states.matmul(&self.embedding.transpose(0, 1))
+        };
+
+        Ok(logits)
+    }
+
     /// Write a tensor to a binary file: [ndims: u64 LE][dim0: u64 LE]...[dimN: u64 LE][f32 data...]
-    fn write_tensor_as_binary(tensor: &Tensor, path: &std::path::Path) -> Result<(), String> {
+    pub fn write_tensor_as_binary(tensor: &Tensor, path: &std::path::Path) -> Result<(), String> {
         use std::io::Write;
-        let flat = tensor.view(-1);
+        let flat = tensor.contiguous().view(-1);
         let data: Vec<f32> = Vec::try_from(&flat).map_err(|e| format!("tensor to vec: {}", e))?;
         let shape = tensor.size();
         let mut file = std::fs::File::create(path)

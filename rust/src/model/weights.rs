@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 #[cfg(feature = "tch-backend")]
-use tch::{Device, Tensor};
+use tch::{Device, Kind, Tensor};
 
 /// 【模型权重集合】从 safetensors 文件加载的全部权重。
 ///
@@ -127,11 +127,25 @@ impl ModelWeights {
     /// 大模型（如 70B）的权重通常被拆分成多个文件（如 model-00001-of-00004.safetensors），
     /// 所以需要遍历所有文件并合并它们的权重。
     ///
+    /// 默认行为：如果检测到 BF16 权重，保持原始 BF16 dtype（不转换为 F32）。
+    /// 这是为了与 Python transformers 的 BF16 推理行为完全一致。
+    ///
     /// 参数：
     /// - dir: 模型目录路径（例如 ~/models/qwen2-0.5b/）
     /// - device: 目标设备（CPU / MPS / CUDA），加载后的 tensor 会被移到该设备上
     #[cfg(feature = "tch-backend")]
     pub fn from_dir<P: AsRef<Path>>(dir: P, device: Device) -> Result<Self, ModelError> {
+        Self::from_dir_with_dtype(dir, device, true)
+    }
+
+    /// 【从目录加载，可指定是否保持原始 dtype】
+    ///
+    /// 参数：
+    /// - dir: 模型目录路径
+    /// - device: 目标设备
+    /// - keep_original_dtype: true 时，BF16/F16 权重保持原 dtype；false 时统一转 F32
+    #[cfg(feature = "tch-backend")]
+    pub fn from_dir_with_dtype<P: AsRef<Path>>(dir: P, device: Device, keep_original_dtype: bool) -> Result<Self, ModelError> {
         let dir = dir.as_ref();
 
         // 读取目录中的所有文件，筛选出扩展名为 .safetensors 的文件。
@@ -167,7 +181,7 @@ impl ModelWeights {
                 let view = st.tensor(name)
                     .map_err(|e| ModelError::Safetensors(e.to_string()))?;
                 // 把 safetensors 的 view 转换为 tch::Tensor。
-                let tensor = tensor_from_view(&view, device)?;
+                let tensor = tensor_from_view(&view, device, keep_original_dtype)?;
                 tensors.insert(name.to_string(), tensor);
             }
         }
@@ -201,15 +215,15 @@ impl ModelWeights {
 
 /// 【将 safetensors view 转换为 tch::Tensor】
 ///
-/// safetensors 支持多种数据类型（F32、F16、BF16），但 tch-rs 通常需要 F32 tensor。
+/// safetensors 支持多种数据类型（F32、F16、BF16）。
 /// 这个函数负责类型转换：
 /// - F32: 直接读取，无需转换
-/// - F16: 每个元素 2 字节，需要手动解码为 f32
-/// - BF16: 每个元素 2 字节，也需要手动解码为 f32
+/// - F16: 如果 keep_original_dtype=true，加载为 Kind::Half；否则解码为 F32
+/// - BF16: 如果 keep_original_dtype=true，加载为 Kind::BFloat16；否则解码为 F32
 ///
 /// 注意：目前不支持 INT8/INT4 量化格式，遇到会报错。
 #[cfg(feature = "tch-backend")]
-fn tensor_from_view(view: &safetensors::tensor::TensorView, device: Device) -> Result<Tensor, ModelError> {
+fn tensor_from_view(view: &safetensors::tensor::TensorView, device: Device, keep_original_dtype: bool) -> Result<Tensor, ModelError> {
     use safetensors::tensor::Dtype;
 
     // safetensors 的 shape 是 &[usize]，tch-rs 需要 Vec<i64>。
@@ -224,37 +238,71 @@ fn tensor_from_view(view: &safetensors::tensor::TensorView, device: Device) -> R
             Tensor::from_slice(data).to_device(device).view(shape.as_slice())
         }
 
-        // ====== F16 (Half Precision): 需要手动解码 ======
+        // ====== F16 (Half Precision) ======
         // F16 每个数占 2 字节（16 bit），格式：1 位符号 + 5 位指数 + 10 位尾数。
         // 大多数 GPU（NVIDIA A100/H100、Apple M 系列）原生支持 F16 计算，可以节省显存和带宽。
         Dtype::F16 => {
-            let bytes: &[u8] = view.data();
-            let f32_vec: Vec<f32> = bytes
-                .chunks_exact(2)  // 每 2 字节一个 F16 数
-                .map(|chunk| {
-                    // 小端序解码：先读 2 字节成 u16，再转成 f16，最后转成 f32。
-                    let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-                    half::f16::from_bits(bits).to_f32()
-                })
-                .collect();
-            Tensor::from_slice(&f32_vec).to_device(device).view(shape.as_slice())
+            if keep_original_dtype {
+                // 直接以 Half (F16) 加载，保持原始 dtype。
+                // tch::Tensor::from_slice 不支持 u16，所以先以 f32 加载再转换。
+                let bytes: &[u8] = view.data();
+                let f32_vec: Vec<f32> = bytes
+                    .chunks_exact(2)
+                    .map(|chunk| {
+                        let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                        half::f16::from_bits(bits).to_f32()
+                    })
+                    .collect();
+                Tensor::from_slice(&f32_vec)
+                    .to_device(device)
+                    .view(shape.as_slice())
+                    .to_kind(Kind::Half)
+            } else {
+                let bytes: &[u8] = view.data();
+                let f32_vec: Vec<f32> = bytes
+                    .chunks_exact(2)  // 每 2 字节一个 F16 数
+                    .map(|chunk| {
+                        // 小端序解码：先读 2 字节成 u16，再转成 f16，最后转成 f32。
+                        let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                        half::f16::from_bits(bits).to_f32()
+                    })
+                    .collect();
+                Tensor::from_slice(&f32_vec).to_device(device).view(shape.as_slice())
+            }
         }
 
-        // ====== BF16 (Brain Float 16): 也需要手动解码 ======
+        // ====== BF16 (Brain Float 16) ======
         // BF16 也是 2 字节，但格式不同：1 位符号 + 8 位指数 + 7 位尾数。
         // 相比 F16，BF16 的指数范围和 F32 相同（都是 8 位），所以数值稳定性更好，
         // 但精度略低（尾数只有 7 位 vs F16 的 10 位）。
         // Google TPU 和 NVIDIA Ampere+ GPU 广泛支持 BF16。
         Dtype::BF16 => {
-            let bytes: &[u8] = view.data();
-            let f32_vec: Vec<f32> = bytes
-                .chunks_exact(2)
-                .map(|chunk| {
-                    let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-                    half::bf16::from_bits(bits).to_f32()
-                })
-                .collect();
-            Tensor::from_slice(&f32_vec).to_device(device).view(shape.as_slice())
+            if keep_original_dtype {
+                // 直接以 BFloat16 加载，保持原始 dtype。
+                // tch::Tensor::from_slice 不支持 u16，所以先以 f32 加载再转换。
+                let bytes: &[u8] = view.data();
+                let f32_vec: Vec<f32> = bytes
+                    .chunks_exact(2)
+                    .map(|chunk| {
+                        let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                        half::bf16::from_bits(bits).to_f32()
+                    })
+                    .collect();
+                Tensor::from_slice(&f32_vec)
+                    .to_device(device)
+                    .view(shape.as_slice())
+                    .to_kind(Kind::BFloat16)
+            } else {
+                let bytes: &[u8] = view.data();
+                let f32_vec: Vec<f32> = bytes
+                    .chunks_exact(2)
+                    .map(|chunk| {
+                        let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                        half::bf16::from_bits(bits).to_f32()
+                    })
+                    .collect();
+                Tensor::from_slice(&f32_vec).to_device(device).view(shape.as_slice())
+            }
         }
 
         // 其他类型（如 INT8、INT4）暂不支持。

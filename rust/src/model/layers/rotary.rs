@@ -107,6 +107,7 @@ impl RotaryEmbedding {
         let seq_len = q.size()[2] as usize;
         let num_heads_q = q.size()[1];
         let num_heads_k = k.size()[1];
+        let q_kind = q.kind();
 
         // 根据 position_ids 从缓存中取出对应的 cos/sin。
         let (cos, sin) = if let Some(pos_ids) = position_ids {
@@ -120,15 +121,17 @@ impl RotaryEmbedding {
             // unsqueeze(1): 在 head 维度插入一维，变成 [batch, 1, seq, dim/2]，方便广播到 num_heads
             let cos = self.cos_cache.index_select(0, &pos_flat)
                 .view([batch, seq, (self.dim / 2) as i64])
-                .unsqueeze(1);
+                .unsqueeze(1)
+                .to_kind(q_kind);
             let sin = self.sin_cache.index_select(0, &pos_flat)
                 .view([batch, seq, (self.dim / 2) as i64])
-                .unsqueeze(1);
+                .unsqueeze(1)
+                .to_kind(q_kind);
             (cos, sin)
         } else {
             // 没有 position_ids 时，默认使用位置 0..seq_len
-            let cos = self.cos_cache.narrow(0, 0, seq_len as i64).unsqueeze(0).unsqueeze(1);
-            let sin = self.sin_cache.narrow(0, 0, seq_len as i64).unsqueeze(0).unsqueeze(1);
+            let cos = self.cos_cache.narrow(0, 0, seq_len as i64).unsqueeze(0).unsqueeze(1).to_kind(q_kind);
+            let sin = self.sin_cache.narrow(0, 0, seq_len as i64).unsqueeze(0).unsqueeze(1).to_kind(q_kind);
             (cos, sin)
         };
 

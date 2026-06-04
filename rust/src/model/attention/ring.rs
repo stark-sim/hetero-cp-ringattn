@@ -184,10 +184,11 @@ impl HcpRingAttentionBackend {
             // MPS masked_fill bug workaround: use where_self instead of add+mul.
             // add+mul (logical_not().to_kind(Float) * NEG_INFINITY) produces NaN
             // because 0.0 * NEG_INFINITY = NaN in IEEE 754.
+            let q_kind = q_chunk.kind();
             let neg_inf = Tensor::from(f64::NEG_INFINITY)
-                .to_kind(Kind::Float)
+                .to_kind(q_kind)
                 .to_device(q_chunk.device());
-            let zero = Tensor::zeros(1, (Kind::Float, q_chunk.device()));
+            let zero = Tensor::zeros(1, (q_kind, q_chunk.device()));
             let neg_inf_mask = neg_inf.where_self(&causal.logical_not(), &zero);
             scores += neg_inf_mask;
         }
@@ -238,9 +239,9 @@ impl HcpRingAttentionBackend {
         let weights = (&scores - local_max.unsqueeze(3)).exp();
 
         // local_sum: 当前 block 的权重之和（softmax 的分母的一部分）。
-        // sum_dim_intlist(&[3i64][..], false, Kind::Float): 在第 3 维求和。
+        // sum_dim_intlist(&[3i64][..], false, q_chunk.kind()): 在第 3 维求和。
         // shape: [batch, num_heads, q_chunk_len]
-        let local_sum = weights.sum_dim_intlist(&[3i64][..], false, Kind::Float);
+        let local_sum = weights.sum_dim_intlist(&[3i64][..], false, q_chunk.kind());
 
         // local_pv: 当前 block 的加权 Value 之和（softmax 的分子的一部分）。
         // weights [batch, num_heads, q_chunk_len, kv_chunk_len] @ V [batch, num_heads, kv_chunk_len, head_dim]
@@ -344,13 +345,14 @@ impl HcpRingAttentionBackend {
             } else {
                 (0, seq_len as usize)
             };
+            let q_kind = q.kind();
             q_states.push(QChunkState {
                 q_chunk,
                 q_global_start: q_gs,
                 q_global_end: q_ge,
-                rm: Tensor::full([batch, num_heads, q_chunk_len], f64::NEG_INFINITY, (Kind::Float, q.device())),
-                rs: Tensor::zeros([batch, num_heads, q_chunk_len], (Kind::Float, q.device())),
-                obh: Tensor::zeros([batch, num_heads, q_chunk_len, head_dim], (Kind::Float, q.device())),
+                rm: Tensor::full([batch, num_heads, q_chunk_len], f64::NEG_INFINITY, (q_kind, q.device())),
+                rs: Tensor::zeros([batch, num_heads, q_chunk_len], (q_kind, q.device())),
+                obh: Tensor::zeros([batch, num_heads, q_chunk_len, head_dim], (q_kind, q.device())),
             });
         }
 
@@ -629,8 +631,267 @@ impl HcpRingAttentionBackend {
             scores
         };
 
-        let attn_weights = scores.softmax(-1, Kind::Float);
+        let attn_weights = scores.softmax(-1, scores.kind());
         attn_weights.matmul(v)
+    }
+}
+
+#[cfg(feature = "tch-backend")]
+impl HcpRingAttentionBackend {
+    /// 【Debug forward】逐层导出 attention 内部中间结果，用于定位数值 divergence。
+    ///
+    /// 与 `forward` 计算完全一致，但在每个关键步骤后导出 tensor 到 `export_dir`：
+    /// - `q_proj_layer_{i}.bin` / `k_proj_layer_{i}.bin` / `v_proj_layer_{i}.bin`
+    ///   —— linear projection 后、RoPE 前的 Q/K/V
+    /// - `q_rope_layer_{i}.bin` / `k_rope_layer_{i}.bin`
+    ///   —— RoPE 后的 Q/K
+    /// - `k_cache_layer_{i}.bin` / `v_cache_layer_{i}.bin`
+    ///   —— KV cache update 后的 K/V（即写入 cache 前的值）
+    /// - `attn_out_layer_{i}.bin`
+    ///   —— ring_attention 输出（O-projection 前）
+    /// - `attn_final_layer_{i}.bin`
+    ///   —— O-projection 后的最终 attention 输出
+    ///
+    /// 所有 tensor 使用与 `LlamaModel::write_tensor_as_binary` 相同的二进制格式。
+    pub fn forward_debug(
+        &mut self,
+        hidden_states: &Tensor,
+        position_ids: &Tensor,
+        kv_cache: Option<&mut dyn crate::model::cache::KvCache>,
+        attention_mask: Option<&Tensor>,
+        export_dir: &std::path::Path,
+    ) -> Result<Tensor, ModelError> {
+        let batch = hidden_states.size()[0];
+        let seq_len = hidden_states.size()[1];
+        let hidden_size = hidden_states.size()[2];
+
+        // Step 1: Linear projection
+        let mut q = hidden_states.matmul(&self.q_proj.transpose(0, 1));
+        if let Some(ref bias) = self.q_bias { q += bias; }
+        let mut k = hidden_states.matmul(&self.k_proj.transpose(0, 1));
+        if let Some(ref bias) = self.k_bias { k += bias; }
+        let mut v = hidden_states.matmul(&self.v_proj.transpose(0, 1));
+        if let Some(ref bias) = self.v_bias { v += bias; }
+
+        crate::model::model::LlamaModel::write_tensor_as_binary(&q, &export_dir.join(format!("q_proj_layer_{}.bin", self.layer_idx)))
+            .map_err(|e| ModelError::Generation(format!("debug export q_proj: {}", e)))?;
+        crate::model::model::LlamaModel::write_tensor_as_binary(&k, &export_dir.join(format!("k_proj_layer_{}.bin", self.layer_idx)))
+            .map_err(|e| ModelError::Generation(format!("debug export k_proj: {}", e)))?;
+        crate::model::model::LlamaModel::write_tensor_as_binary(&v, &export_dir.join(format!("v_proj_layer_{}.bin", self.layer_idx)))
+            .map_err(|e| ModelError::Generation(format!("debug export v_proj: {}", e)))?;
+
+        // Step 2: Reshape
+        let q = q.view([batch, seq_len, self.num_heads as i64, self.head_dim as i64])
+            .transpose(1, 2);
+        let k = k.view([batch, seq_len, self.num_kv_heads as i64, self.head_dim as i64])
+            .transpose(1, 2);
+        let v = v.view([batch, seq_len, self.num_kv_heads as i64, self.head_dim as i64])
+            .transpose(1, 2);
+
+        // Step 3: RoPE
+        let (q, k) = self.rope.apply(&q, &k, Some(position_ids));
+
+        crate::model::model::LlamaModel::write_tensor_as_binary(&q, &export_dir.join(format!("q_rope_layer_{}.bin", self.layer_idx)))
+            .map_err(|e| ModelError::Generation(format!("debug export q_rope: {}", e)))?;
+        crate::model::model::LlamaModel::write_tensor_as_binary(&k, &export_dir.join(format!("k_rope_layer_{}.bin", self.layer_idx)))
+            .map_err(|e| ModelError::Generation(format!("debug export k_rope: {}", e)))?;
+
+        // Step 4: KV Cache update
+        let (k_cached, v_cached) = if let Some(cache) = kv_cache {
+            cache.update(&k, &v)?
+        } else {
+            (k.shallow_clone(), v.shallow_clone())
+        };
+
+        if !self.is_prefill_done {
+            self.prefill_kv_len = k_cached.size()[2] as usize;
+            self.is_prefill_done = true;
+        }
+
+        crate::model::model::LlamaModel::write_tensor_as_binary(&k_cached, &export_dir.join(format!("k_cache_layer_{}.bin", self.layer_idx)))
+            .map_err(|e| ModelError::Generation(format!("debug export k_cache: {}", e)))?;
+        crate::model::model::LlamaModel::write_tensor_as_binary(&v_cached, &export_dir.join(format!("v_cache_layer_{}.bin", self.layer_idx)))
+            .map_err(|e| ModelError::Generation(format!("debug export v_cache: {}", e)))?;
+
+        // Step 5: GQA head repeat
+        let num_rep = self.num_heads / self.num_kv_heads;
+        let k_cached = if num_rep > 1 {
+            let shape = k_cached.size();
+            k_cached.unsqueeze(2)
+                .expand([shape[0], shape[1], num_rep as i64, shape[2], shape[3]], false)
+                .reshape([shape[0], shape[1] * num_rep as i64, shape[2], shape[3]])
+        } else {
+            k_cached
+        };
+        let v_cached = if num_rep > 1 {
+            let shape = v_cached.size();
+            v_cached.unsqueeze(2)
+                .expand([shape[0], shape[1], num_rep as i64, shape[2], shape[3]], false)
+                .reshape([shape[0], shape[1] * num_rep as i64, shape[2], shape[3]])
+        } else {
+            v_cached
+        };
+
+        // Step 6: Ring Attention
+        let global_seq_start = self.seq_offset;
+        let attn_output = self.ring_attention(&q, &k_cached, &v_cached, attention_mask, global_seq_start)?;
+
+        crate::model::model::LlamaModel::write_tensor_as_binary(&attn_output, &export_dir.join(format!("attn_out_layer_{}.bin", self.layer_idx)))
+            .map_err(|e| ModelError::Generation(format!("debug export attn_out: {}", e)))?;
+
+        // Step 7: O-projection
+        let attn_output = attn_output.transpose(1, 2).contiguous().view([batch, seq_len, hidden_size]);
+        let result = attn_output.matmul(&self.o_proj.transpose(0, 1));
+
+        crate::model::model::LlamaModel::write_tensor_as_binary(&result, &export_dir.join(format!("attn_final_layer_{}.bin", self.layer_idx)))
+            .map_err(|e| ModelError::Generation(format!("debug export attn_final: {}", e)))?;
+
+        Ok(result)
+    }
+
+    /// 【Debug forward with injected Q/K】
+    ///
+    /// Same as `forward_debug`, but loads Q and K projections from Python-exported files
+    /// instead of computing them via matmul. V projection is still computed normally.
+    ///
+    /// This is to verify whether the Q/K projection BLAS difference is the root cause
+    /// of downstream divergence.
+    ///
+    /// `qk_dir`: directory containing `q_proj_layer_{i}.bin` and `k_proj_layer_{i}.bin`
+    ///           in the standard binary format [ndims][dims...][f32 data...]
+    pub fn forward_debug_with_injected_qk(
+        &mut self,
+        hidden_states: &Tensor,
+        position_ids: &Tensor,
+        kv_cache: Option<&mut dyn crate::model::cache::KvCache>,
+        attention_mask: Option<&Tensor>,
+        export_dir: &std::path::Path,
+        qk_dir: &std::path::Path,
+    ) -> Result<Tensor, ModelError> {
+        let batch = hidden_states.size()[0];
+        let seq_len = hidden_states.size()[1];
+        let hidden_size = hidden_states.size()[2];
+
+        // Step 1: Load Q and K from Python export, compute V normally
+        let q_path = qk_dir.join(format!("q_proj_layer_{}.bin", self.layer_idx));
+        let k_path = qk_dir.join(format!("k_proj_layer_{}.bin", self.layer_idx));
+
+        let q = Self::read_tensor_as_binary(&q_path, hidden_states.device())
+            .map_err(|e| ModelError::Generation(format!("failed to read injected q_proj: {}", e)))?;
+        let k = Self::read_tensor_as_binary(&k_path, hidden_states.device())
+            .map_err(|e| ModelError::Generation(format!("failed to read injected k_proj: {}", e)))?;
+
+        // Compute V normally
+        let mut v = hidden_states.matmul(&self.v_proj.transpose(0, 1));
+        if let Some(ref bias) = self.v_bias { v += bias; }
+
+        crate::model::model::LlamaModel::write_tensor_as_binary(&q, &export_dir.join(format!("q_proj_layer_{}.bin", self.layer_idx)))
+            .map_err(|e| ModelError::Generation(format!("debug export q_proj: {}", e)))?;
+        crate::model::model::LlamaModel::write_tensor_as_binary(&k, &export_dir.join(format!("k_proj_layer_{}.bin", self.layer_idx)))
+            .map_err(|e| ModelError::Generation(format!("debug export k_proj: {}", e)))?;
+        crate::model::model::LlamaModel::write_tensor_as_binary(&v, &export_dir.join(format!("v_proj_layer_{}.bin", self.layer_idx)))
+            .map_err(|e| ModelError::Generation(format!("debug export v_proj: {}", e)))?;
+
+        // Step 2: Reshape (if needed)
+        // Python exports q/k as [batch, num_heads, seq_len, head_dim] (already transposed)
+        // Rust computes them as [batch, seq_len, num_heads * head_dim] then reshapes
+        let q = if q.size().len() == 4 {
+            q  // Already [batch, num_heads, seq_len, head_dim]
+        } else {
+            q.view([batch, seq_len, self.num_heads as i64, self.head_dim as i64])
+                .transpose(1, 2)
+        };
+        let k = if k.size().len() == 4 {
+            k
+        } else {
+            k.view([batch, seq_len, self.num_kv_heads as i64, self.head_dim as i64])
+                .transpose(1, 2)
+        };
+        let v = v.view([batch, seq_len, self.num_kv_heads as i64, self.head_dim as i64])
+            .transpose(1, 2);
+
+        // Step 3: RoPE
+        let (q, k) = self.rope.apply(&q, &k, Some(position_ids));
+
+        crate::model::model::LlamaModel::write_tensor_as_binary(&q, &export_dir.join(format!("q_rope_layer_{}.bin", self.layer_idx)))
+            .map_err(|e| ModelError::Generation(format!("debug export q_rope: {}", e)))?;
+        crate::model::model::LlamaModel::write_tensor_as_binary(&k, &export_dir.join(format!("k_rope_layer_{}.bin", self.layer_idx)))
+            .map_err(|e| ModelError::Generation(format!("debug export k_rope: {}", e)))?;
+
+        // Step 4: KV Cache update
+        let (k_cached, v_cached) = if let Some(cache) = kv_cache {
+            cache.update(&k, &v)?
+        } else {
+            (k.shallow_clone(), v.shallow_clone())
+        };
+
+        if !self.is_prefill_done {
+            self.prefill_kv_len = k_cached.size()[2] as usize;
+            self.is_prefill_done = true;
+        }
+
+        crate::model::model::LlamaModel::write_tensor_as_binary(&k_cached, &export_dir.join(format!("k_cache_layer_{}.bin", self.layer_idx)))
+            .map_err(|e| ModelError::Generation(format!("debug export k_cache: {}", e)))?;
+        crate::model::model::LlamaModel::write_tensor_as_binary(&v_cached, &export_dir.join(format!("v_cache_layer_{}.bin", self.layer_idx)))
+            .map_err(|e| ModelError::Generation(format!("debug export v_cache: {}", e)))?;
+
+        // Step 5: GQA head repeat
+        let num_rep = self.num_heads / self.num_kv_heads;
+        let k_cached = if num_rep > 1 {
+            let shape = k_cached.size();
+            k_cached.unsqueeze(2)
+                .expand([shape[0], shape[1], num_rep as i64, shape[2], shape[3]], false)
+                .reshape([shape[0], shape[1] * num_rep as i64, shape[2], shape[3]])
+        } else {
+            k_cached
+        };
+        let v_cached = if num_rep > 1 {
+            let shape = v_cached.size();
+            v_cached.unsqueeze(2)
+                .expand([shape[0], shape[1], num_rep as i64, shape[2], shape[3]], false)
+                .reshape([shape[0], shape[1] * num_rep as i64, shape[2], shape[3]])
+        } else {
+            v_cached
+        };
+
+        // Step 6: Ring Attention
+        let global_seq_start = self.seq_offset;
+        let attn_output = self.ring_attention(&q, &k_cached, &v_cached, attention_mask, global_seq_start)?;
+
+        crate::model::model::LlamaModel::write_tensor_as_binary(&attn_output, &export_dir.join(format!("attn_out_layer_{}.bin", self.layer_idx)))
+            .map_err(|e| ModelError::Generation(format!("debug export attn_out: {}", e)))?;
+
+        // Step 7: O-projection
+        let attn_output = attn_output.transpose(1, 2).contiguous().view([batch, seq_len, hidden_size]);
+        let result = attn_output.matmul(&self.o_proj.transpose(0, 1));
+
+        crate::model::model::LlamaModel::write_tensor_as_binary(&result, &export_dir.join(format!("attn_final_layer_{}.bin", self.layer_idx)))
+            .map_err(|e| ModelError::Generation(format!("debug export attn_final: {}", e)))?;
+
+        Ok(result)
+    }
+
+    /// Read a tensor from a binary file: [ndims: u64 LE][dim0: u64 LE]...[dimN: u64 LE][f32 data...]
+    fn read_tensor_as_binary(path: &std::path::Path, device: Device) -> Result<Tensor, String> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path)
+            .map_err(|e| format!("open file: {}", e))?;
+        let mut ndims_buf = [0u8; 8];
+        file.read_exact(&mut ndims_buf).map_err(|e| e.to_string())?;
+        let ndims = u64::from_le_bytes(ndims_buf) as i64;
+        let mut shape = Vec::new();
+        for _ in 0..ndims {
+            let mut dim_buf = [0u8; 8];
+            file.read_exact(&mut dim_buf).map_err(|e| e.to_string())?;
+            shape.push(i64::from_le_bytes(dim_buf));
+        }
+        let numel: i64 = shape.iter().product();
+        let mut data_buf = vec![0u8; (numel * 4) as usize];
+        file.read_exact(&mut data_buf).map_err(|e| e.to_string())?;
+        let data: Vec<f32> = data_buf.chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect();
+        Ok(Tensor::from_slice(&data).to_device(device).reshape(&shape))
     }
 }
 
@@ -769,6 +1030,11 @@ impl AttentionBackend for HcpRingAttentionBackend {
         // 最后再乘一个 o_proj 权重矩阵，映射回 hidden_size 维度
         let attn_output = attn_output.transpose(1, 2).contiguous().view([batch, seq_len, hidden_size]);
         Ok(attn_output.matmul(&self.o_proj.transpose(0, 1)))
+    }
+
+    #[cfg(feature = "tch-backend")]
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 }
 
