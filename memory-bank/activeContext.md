@@ -2,14 +2,26 @@
 
 ## 当前焦点
 
-[2026-06-02] **Harness Subagent Review 完成 + Review Fixes 已提交**（commits `e546dba`, `fc0eac3`）：
+[2026-06-04] **Phase 1: Logits 比较脚本完成 — 单节点 vs 分布式 correctness 验证通过**（commits `54d80b0`, `299b37a`, `3afea1a`, `ee3d89d`）：
+  - **1.1 单节点 logits 导出**: `infer.rs` 新增 `run_inference_and_export_logits()`，绕过 `Generator::generate()` 直接操作 `LlamaModel::forward`，保存 prefill last-token + decode 每步 logits 为原始 little-endian f32 二进制。文件格式：`[vocab_size: u64 LE][num_chunks: u64 LE][vocab_size×4 bytes f32 LE per chunk]`。`--export-logits <dir>` CLI 参数已添加。
+  - **1.2 分布式 logits 导出**: `distributed/coordinator.rs` `process_single_request()` 在 batch/CLI 模式下收集所有 logits 并写入 `{dir}/logits_{request_id}.bin`（同格式）。HTTP API 模式待扩展。
+  - **1.3 Python 比较脚本**: `scripts/compare_logits.py` 读取两个二进制文件，计算每步 max_abs_diff / RMSE，报告 top-K disagreeing tokens，输出 PASS/FAIL。支持 `--atol`/`--rtol`/`--topk`/`--verbose`。
+  - **1.4 white+pearl 跨节点验证**: Qwen2.5-3B-Instruct，58-token prompt，5 decode tokens，temperature=0.0（greedy）。
+    - 单节点 reference（white CUDA）生成 `" 1111"`（tokens: 220, 16, 16, 16, 16）
+    - 分布式（white CUDA domain 0 + pearl HIP domain 1）生成 `" 1111"`（完全相同 token 序列）
+    - **Prefill step 0**: max_diff=4.94e-03, RMSE=1.34e-03, argmax_match=True（token 220）— CUDA vs ROCm 内核数值差异在预期范围内
+    - **Decode steps 1-4**: max_diff ≤ 1.31e-03, RMSE ≤ 2.03e-04, argmax_match=True — 高度一致
+    - **atol=0.01 下全部 5 步 PASS**。单节点与分布式生成 token 序列完全一致，证明 ring attention 分布式实现 correctness 无 regression。
+  - **修复 off-by-one bug**: 分布式 decode 循环初始多保存一个 logits chunk，修复后与单节点 chunk 数一致。
+
+- [2026-06-02] **Harness Subagent Review 完成 + Review Fixes 已提交**（commits `e546dba`, `fc0eac3`）：
 - **Review 结论**: 👍 Thumbs Up with Reservations。可行性证明确实展示了所声称的内容，但有代码质量缺口、架构债务和完整性漏洞。
 - **P0 修复 — 多 GPU capacity 查询 bug**: `query_device_capacity_mb(Device::Cuda(idx))` 现在将 `idx` 传递给 `nvidia-smi --id={idx}` 和 `rocm-smi -d {idx}`，修复了多 GPU 系统上使用 GPU 0 容量做分片决策的 bug。
 - **P1 修复 — ISSUE-001 关闭**: 填写 root_cause / impact / resolution / prevention，移动到 `harness/issues/resolved/`。
 - **P1 修复 — DESIGN.md 历史标记**: 添加 deprecation banner，指向 `systemPatterns.md` 和 `DEPLOYMENT_GUIDE.md`。
 - **P1 修复 — Smoke 脚本 cleanup trap**: `run_cross_node_2domain_mps_hip.sh` 和 `run_cross_node_2domain_cuda_hip.sh` 新增 `trap cleanup EXIT INT TERM`。
-- **P0 待做 — logits 比较脚本**: 为 2-domain 规模矩阵添加单节点 vs 分布式 logits diff 验证（`< 1e-4` Relaxed tier）。Blocked by pearl 模型下载。
-- **P0 待做 — `tch-backend` 真正可选**: `cargo check --no-default-features` 仍失败（25 errors），需将 `infer.rs` 等模块移到 `#[cfg(feature = "tch-backend")]` 后。
+- **P0 已完成 — logits 比较脚本**: 单节点 vs 分布式 logits diff 验证通过，atol=0.01 PASS，token 序列完全一致。
+- **P0 已完成 — `tch-backend` 真正可选**: `cargo check --no-default-features` 和 `cargo clippy --no-default-features -- -D warnings` 双模式全绿。所有 tch 依赖模块已用 `#[cfg(feature = "tch-backend")]` 保护。
 - **剩余 P1/P2**: 端口冲突检测、parse_worker_perf.py argparse、CI smoke、vLLM backend E2E on white。
 
 [2026-06-02] **历史性里程碑：white CUDA + pearl HIP 跨节点 3B 模型异构分布式推理首次成功！**

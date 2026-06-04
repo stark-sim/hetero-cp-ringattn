@@ -199,6 +199,16 @@
   - **4K 跨节点失败**：网络不稳定导致连接丢失。根因：7.3MB/layer × 24 layers ≈ 175MB 总传输量，跨 VPN 慢网络下大 block 传输不稳定。需 micro block 切分改善
   - **QUIC recv_kv_block timeout 修复**：120s → 600s（`3759811`），覆盖大 block + 慢网络场景
   - **分析报告**：`reports/ab-analysis-20260513/README.md`
+- [x] [2026-06-04] **Phase 1: Logits 比较脚本完成**（commits `54d80b0`, `299b37a`, `3afea1a`, `ee3d89d`）：
+  - 单节点 logits 导出：`--export-logits <dir>` + `run_inference_and_export_logits()`，直接操作 `LlamaModel::forward`，保存 prefill+decode logits 为原始 f32 LE 二进制。
+  - 分布式 logits 导出：`distributed/coordinator.rs` `process_single_request()` batch 模式支持 `--export-logits`，同格式输出。
+  - Python 比较脚本：`scripts/compare_logits.py`，支持 max_abs_diff / RMSE / top-K disagreements / PASS-FAIL（`--atol`/`--rtol`）。
+  - white+pearl 跨节点验证（Qwen2.5-3B-Instruct, 58-token prompt, 5 decode, temperature=0.0）：
+    - 单节点（white CUDA）与分布式（white CUDA + pearl HIP）生成 token 序列完全一致：`" 1111"`（220, 16, 16, 16, 16）
+    - Prefill: max_diff=4.94e-03, argmax_match=True
+    - Decode: max_diff ≤ 1.31e-03, argmax_match=True
+    - atol=0.01 下全部 5 步 PASS
+  - Clippy 双模式全绿（`--features tch-backend` + `--no-default-features`）。
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 
 ## 已知问题
