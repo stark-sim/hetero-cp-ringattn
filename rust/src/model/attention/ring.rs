@@ -148,6 +148,7 @@ impl HcpRingAttentionBackend {
         // k_chunk.transpose(2, 3) → [batch, num_heads, head_dim, kv_chunk_len]
         // matmul 结果 shape: [batch, num_heads, q_chunk_len, kv_chunk_len]
         // 最后乘 self.scale（即 1/sqrt(head_dim)）做缩放，防止数值过大导致 softmax 梯度消失。
+        eprintln!("[process_kv_block] q_kind={:?} k_kind={:?} v_kind={:?}", q_chunk.kind(), k_chunk.kind(), v_chunk.kind());
         let mut scores = q_chunk.matmul(&k_chunk.transpose(2, 3)) * self.scale;
 
         // 用全局位置构造因果掩码，确保当前 token 看不到未来的 token。
