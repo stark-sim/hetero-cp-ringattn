@@ -120,7 +120,9 @@ pub fn run_inference_and_export_logits(
     let weights = ModelWeights::from_dir(model_dir, device).map_err(|e: crate::model::ModelError| e.to_string())?;
 
     println!("[infer-export] building model ({} layers, {} heads)", config.num_layers, config.num_heads);
+    println!("[infer-export] config.torch_dtype={:?}", config.torch_dtype);
     let mut model = LlamaModel::from_weights(config, &weights, device, num_domains).map_err(|e: crate::model::ModelError| e.to_string())?;
+    println!("[infer-export] model.dtype={:?}", model.dtype);
 
     // Load tokenizer
     let tokenizer_path = Path::new(model_dir).join("tokenizer.json");
@@ -293,6 +295,22 @@ pub fn run_inference_and_export_hidden_states(
     let logits = model.forward(&input_tensor, &mut kv_caches)
         .map_err(|e| e.to_string())?;
 
+    // Export KV cache after prefill
+    std::fs::create_dir_all(export_dir)
+        .map_err(|e| format!("failed to create export dir: {}", e))?;
+    for (layer_idx, cache_opt) in kv_caches.iter().enumerate() {
+        if let Some(ref cache_impl) = cache_opt {
+            if let Some((k, v)) = cache_impl.get_kv() {
+                let k_path = std::path::Path::new(export_dir).join(format!("prefill_k_layer_{}.bin", layer_idx));
+                let v_path = std::path::Path::new(export_dir).join(format!("prefill_v_layer_{}.bin", layer_idx));
+                crate::model::model::LlamaModel::write_tensor_as_binary(&k, &k_path)
+                    .map_err(|e| format!("failed to write k cache: {}", e))?;
+                crate::model::model::LlamaModel::write_tensor_as_binary(&v, &v_path)
+                    .map_err(|e| format!("failed to write v cache: {}", e))?;
+            }
+        }
+    }
+
     let seq_len = logits.size()[1];
     let last_logits = logits.narrow(1, seq_len - 1, 1).squeeze();
 
@@ -360,5 +378,109 @@ pub fn run_inference_and_export_logits(
 pub fn run_inference_and_export_hidden_states(
     _model_dir: &str, _prompt: &str, _max_tokens: usize, _temperature: f64, _top_p: f64, _num_domains: usize, _export_dir: &str,
 ) -> Result<String, String> {
+    Err("tch-backend feature required".to_string())
+}
+
+/// 【Prefill layer-0 debug export】
+///
+/// Runs prefill on the full prompt, but for layer 0 exports ALL attention intermediates:
+/// - embedding_output.bin
+/// - layer_0_input_norm.bin
+/// - q_proj_layer_0.bin, k_proj_layer_0.bin, v_proj_layer_0.bin
+/// - q_rope_layer_0.bin, k_rope_layer_0.bin
+/// - k_cache_layer_0.bin, v_cache_layer_0.bin
+/// - attn_out_layer_0.bin, attn_final_layer_0.bin
+/// - layer_0_post_attn.bin, layer_0_post_mlp.bin
+///
+/// Also exports KV cache for ALL layers after prefill.
+///
+/// This is for systematic debugging of Rust vs Python transformers numerical divergence.
+#[cfg(feature = "tch-backend")]
+pub fn run_prefill_debug_layer_0(
+    model_dir: &str,
+    prompt: &str,
+    export_dir: &str,
+    qk_inject_dir: Option<&str>,
+) -> Result<(), String> {
+    use tch::Device;
+
+    let device = if let Ok(name) = std::env::var("HCP_TORCH_DEVICE").or_else(|_| std::env::var("HCP_TCH_DEVICE")) {
+        match name.as_str() {
+            "cpu" => Device::Cpu,
+            "mps" => Device::Mps,
+            "cuda" => Device::Cuda(0),
+            _ => {
+                if let Some(idx) = name.strip_prefix("cuda:") {
+                    if let Ok(i) = idx.parse::<usize>() {
+                        Device::Cuda(i)
+                    } else {
+                        Device::Cpu
+                    }
+                } else {
+                    Device::Cpu
+                }
+            }
+        }
+    } else if cfg!(target_os = "macos") && tch::utils::has_mps() {
+        Device::Mps
+    } else if tch::Cuda::is_available() {
+        Device::Cuda(0)
+    } else {
+        Device::Cpu
+    };
+    println!("[prefill-debug] device: {:?}", device);
+
+    let config_path = Path::new(model_dir).join("config.json");
+    println!("[prefill-debug] loading config from {:?}", config_path);
+    let config = ModelConfig::from_file(&config_path).map_err(|e: crate::model::ModelError| e.to_string())?;
+
+    println!("[prefill-debug] loading weights from {}", model_dir);
+    let weights = ModelWeights::from_dir(model_dir, device).map_err(|e: crate::model::ModelError| e.to_string())?;
+
+    println!("[prefill-debug] building model ({} layers, {} heads)", config.num_layers, config.num_heads);
+    let mut model = LlamaModel::from_weights(config, &weights, device, 1)
+        .map_err(|e: crate::model::ModelError| e.to_string())?;
+
+    let tokenizer_path = Path::new(model_dir).join("tokenizer.json");
+    println!("[prefill-debug] loading tokenizer from {:?}", tokenizer_path);
+    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+        .map_err(|e| format!("tokenizer load failed: {}", e))?;
+
+    let prompt_ids = tokenizer.encode(prompt, true)
+        .map_err(|e| format!("tokenizer encode failed: {}", e))?
+        .get_ids().iter().map(|&id| id as i64).collect::<Vec<_>>();
+    println!("[prefill-debug] prompt tokens: {}", prompt_ids.len());
+
+    let mut kv_caches = model.create_kv_caches();
+
+    let input_tensor = tch::Tensor::from_slice(&prompt_ids)
+        .unsqueeze(0)
+        .to_device(device);
+
+    let _logits = model.forward_prefill_debug_layer_0(&input_tensor, &mut kv_caches, export_dir, qk_inject_dir)
+        .map_err(|e| e.to_string())?;
+
+    // Export KV cache for all layers
+    for (layer_idx, cache_opt) in kv_caches.iter().enumerate() {
+        if let Some(ref cache_impl) = cache_opt {
+            if let Some((k, v)) = cache_impl.get_kv() {
+                let k_path = std::path::Path::new(export_dir).join(format!("prefill_k_layer_{}.bin", layer_idx));
+                let v_path = std::path::Path::new(export_dir).join(format!("prefill_v_layer_{}.bin", layer_idx));
+                crate::model::model::LlamaModel::write_tensor_as_binary(&k, &k_path)
+                    .map_err(|e| format!("failed to write k cache: {}", e))?;
+                crate::model::model::LlamaModel::write_tensor_as_binary(&v, &v_path)
+                    .map_err(|e| format!("failed to write v cache: {}", e))?;
+            }
+        }
+    }
+
+    println!("[prefill-debug] exported all intermediates to {}", export_dir);
+    Ok(())
+}
+
+#[cfg(not(feature = "tch-backend"))]
+pub fn run_prefill_debug_layer_0(
+    _model_dir: &str, _prompt: &str, _export_dir: &str, _qk_inject_dir: Option<&str>,
+) -> Result<(), String> {
     Err("tch-backend feature required".to_string())
 }

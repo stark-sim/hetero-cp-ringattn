@@ -23,6 +23,8 @@ pub mod attention;
 #[cfg(feature = "tch-backend")]
 pub mod cache;
 #[cfg(feature = "tch-backend")]
+pub use cache::KvCacheImpl;
+#[cfg(feature = "tch-backend")]
 pub mod sampling;
 #[cfg(feature = "tch-backend")]
 pub mod generator;
