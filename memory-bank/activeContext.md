@@ -19,6 +19,22 @@
     - **Rust BF16 vs Python BF16 (white CUDA)**: prefill top-1 相同 (358=' I')，max_diff=0.31，top-5 相同。但 decode step 2 分叉（不同 BLAS 实现: Rust online softmax vs PyTorch SDPA）
     - **Rust BF16 CUDA vs Rust BF16 HIP**: prefill top-1 相同，step 0 max_diff=0.17，step 1 max_diff=0.18。step 2 分叉（cuBLAS vs rocBLAS BF16 matmul 差异）
     - **关键洞察**: BF16 的 7-bit 尾数精度（步长 ~0.06@12）导致边界 token 的 logit 排序对微小平台差异敏感。这不是逻辑错误，而是低精度数值的固有特性
+  - **[新增] 系统性三向 logits 量化对比验证**（2026-06-04 现场执行）：
+    - **方法**: Qwen2-0.5B BF16，prompt `"The answer to life, the universe, and everything is"`，greedy decode 10 tokens，导出三组 logits 二进制文件
+    - **Run 1 — White CUDA 单节点**: `generated:  in the universe. The universe is a vast space`
+    - **Run 2 — Pearl HIP 单节点**: `generated:  in the universe. The universe is a vast space`（与 White 文本完全一致）
+    - **Run 3 — White+Pearl 分布式**: `generated:  in the universe. The universe is a vast space`（与单节点文本完全一致）
+    - **Logits 对比结果**:
+      | 对比 | max_diff | RMSE | atol=0.5 | argmax |
+      |------|----------|------|----------|--------|
+      | White CUDA vs Pearl HIP | 0.438 | 0.062 | ✅ PASS | ✅ 10/10 一致 |
+      | White CUDA vs 分布式 | 0.484 | 0.062 | ✅ PASS | ✅ 10/10 一致 |
+      | Pearl HIP vs 分布式 | 0.414 | 0.062 | ✅ PASS | ✅ 10/10 一致 |
+    - **核心结论**:
+      1. **float32 的 ~2e-4 divergence 在 BF16 下已消除**：BF16 精度 ~0.06，e-4 差异被截断归零
+      2. **BF16 异构偏差不在 e-4 级别**：实际在 ~0.1-0.5 级别（BF16 固有精度限制），不是 e-4
+      3. **不影响模型计算正确性**：所有 10 个 decode step 的 argmax 在三组配置中完全一致，token 序列完全相同
+      4. **分布式不引入额外数值误差**：单节点 vs 分布式 logits diff 与跨平台 diff 同量级，ring attention 协议本身无 regression
   - **分布式 BF16 验证 — 历史性突破**（commit `09cf374`）：
     - **根因**: TCP/QUIC transport 的 `tensor_to_bytes`/`bytes_to_tensor` 硬编码 `f32`，BF16 KV block 传输时被转 Float32，接收方重建为 Float32 tensor → `matmul` dtype 不匹配 panic
     - **修复**: 序列化时记录 dtype（float32/float16/bfloat16/float64），反序列化后 `.to_kind(kind)` 还原原始 dtype。TCP + QUIC 双 transport 均修复

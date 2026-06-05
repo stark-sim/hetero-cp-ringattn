@@ -236,6 +236,19 @@
     - **验证**: white RTX 4090 CUDA (domain 0) + pearl RX 9060 XT HIP (domain 1)，Qwen2-0.5B，10-token greedy decode
     - **结果**: ` in the universe. The universe is a vast space` — 与 Rust 单节点 BF16 **完全一致**
     - **意义**: 首次验证 BF16 跨异构平台分布式推理成功，transport dtype 保真
+  - **[新增] 系统性三向 logits 量化对比**（2026-06-04 现场执行）：
+    - **方法**: `--export-logits` 导出 White CUDA 单节点 / Pearl HIP 单节点 / White+Pearl 分布式三组 logits，用 `compare_logits.py` 做三向量化对比
+    - **文本输出**: 三组配置生成完全相同的 10 tokens：` in the universe. The universe is a vast space`
+    - **Logits 对比结果**:
+      | 对比 | max_diff | RMSE | atol=0.5 | argmax 一致性 |
+      |------|----------|------|----------|---------------|
+      | White CUDA vs Pearl HIP | 0.438 | 0.062 | ✅ PASS | ✅ 10/10 |
+      | White CUDA vs 分布式 | 0.484 | 0.062 | ✅ PASS | ✅ 10/10 |
+      | Pearl HIP vs 分布式 | 0.414 | 0.062 | ✅ PASS | ✅ 10/10 |
+    - **回答三个核心问题**:
+      1. **float32 的 ~2e-4 divergence 在 BF16 下已消除** ✅：BF16 精度 ~0.06，e-4 差异被截断归零
+      2. **BF16 异构偏差不在 e-4 级别** ✅：实际在 ~0.1-0.5 级别（BF16 固有精度限制）
+      3. **不影响模型计算正确性** ✅：所有 10 step 的 argmax 在三组配置中完全一致，token 序列完全相同
 - [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
 
 ## 已知问题
