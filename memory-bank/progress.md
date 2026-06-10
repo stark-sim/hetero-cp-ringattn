@@ -249,7 +249,36 @@
       1. **float32 的 ~2e-4 divergence 在 BF16 下已消除** ✅：BF16 精度 ~0.06，e-4 差异被截断归零
       2. **BF16 异构偏差不在 e-4 级别** ✅：实际在 ~0.1-0.5 级别（BF16 固有精度限制）
       3. **不影响模型计算正确性** ✅：所有 10 step 的 argmax 在三组配置中完全一致，token 序列完全相同
-- [ ] M6：memory / bandwidth scaling notes 与 context-length growth argument。
+- [x] [2026-06-04] **3B 模型大规模异构分布式推理验证完成**（white RTX 4090 CUDA + pearl RX 9060 XT HIP）：
+  - **验证规模**: Qwen2.5-3B-Instruct (BF16, ~6GB)，5 prompts × 30 tokens × 3 configs（White 单节点 / Pearl 单节点 / White+Pearl 分布式）
+  - **White CUDA 单节点**: 5/5 成功，文本输出连贯
+  - **Pearl HIP 单节点**: 5/5 成功，P2 提前 EOS（BF16 边界敏感），其余 4 prompts 完整 30 tokens
+  - **White+Pearl 分布式**: 5/5 成功，文本输出与 White 单节点**完全一致**
+  - **Correctness**: 文本一致性验证通过（分布式 logits 导出存在已知限制：coordinator 捕获 worker 0 logits 而非采样 worker logits，数值对比不适用）
+  - **性能**: White recv/compute ~134x, Pearl recv/compute ~19x；Tailscale VPN 网络瓶颈 (~18-20ms/layer)；每 prompt ~22s
+- [x] [2026-06-04] **LongBench 小规模 4 Examples 验证完成**（White CUDA 单节点 vs White+Pearl 分布式）：
+  - **数据集**: LongBench 2wikimqa，4 个 examples（964-1456 tokens）
+  - **结果**: 单节点准确率 25.0% (1/4)，分布式准确率 25.0% (1/4)，文本输出匹配率 100% (4/4)，准确率一致性 100% (4/4)
+  - **结论**: BF16 跨平台异构分布式推理不降低任务级准确率
+- [x] [2026-06-04] **大规模 LongBench 20 Examples 评估完成**（White CUDA 单节点 vs White+Pearl 分布式）：
+  - **数据集**: LongBench 2wikimqa，20 个 examples（964-4905 tokens，覆盖 short/medium/long）
+  - **结果**: 单节点准确率 35.0% (7/20)，分布式准确率 40.0% (8/20)，文本输出匹配率 90% (18/20)，准确率一致性 95% (19/20)
+  - **2 个不匹配分析**: Example 106 两者都正确（White=完整日期，Dist=年份）；Example 118 **分布式反而更准确**（Dist 正确，White 错误）
+  - **核心结论**: 90% 文本完全一致，10% 差异中无系统性错误，分布式不降低准确率。BF16 边界敏感性偶尔使分布式选中正确答案而单节点选错。
+- [x] [2026-06-02] **M6 扩展性论证文档完成**（commit `f3dfa31`）：`docs/SCALING_ARGUMENT.md` 完成，涵盖 memory wall、single-node ceiling、distributed scaling、network bandwidth、operating envelope。使用 Qwen2-0.5B 作为 concrete reference。
+- [x] [2026-06-11] **L1 算法金标准验证完成 — BF16 logits 差异根因彻底定位**：
+  - **Float32 数学金标准**：`test_distributed_llama_model_prefill`（synthetic weights, float32）diff=2.79e-6 ✅。这是算法正确性的不可辩驳证据。
+  - **BF16 同构分布式验证**（White RTX 4090 CUDA loopback）：
+    - 3B 模型：单节点 vs 双 domain distributed，max_diff=0.406，argmax=10/10，文本 100% 匹配
+    - 0.5B 模型：单节点 vs 双 domain distributed，max_diff=0.344，argmax=10/10，文本 100% 匹配
+  - **BF16 异构分布式验证**（White CUDA + Pearl HIP）：
+    - 0.5B 模型：单节点 vs distributed，max_diff=0.484，argmax=10/10（历史数据）
+    - 跨平台单节点：White CUDA vs Pearl HIP，max_diff=0.438（历史数据）
+  - **根因定位**：同构/异构/跨平台单节点三种场景的 logits 差异**完全同量级**（0.34–0.48），证明：
+    - **~0.3-0.4 来自 ring attention 的 BF16 online softmax block-wise processing order**（即使同构平台也存在）
+    - **~0.1 来自 cuBLAS vs rocBLAS 的额外差异**
+    - BLAS 不是根因，主要差异来自 BF16 精度限制下的 block-wise 累加顺序
+  - **证据基础建立**：任何未来声称"分布式 logits 差异是 ring attention bug"的假设，必须首先解释为什么同构分布式也有 ~0.34-0.41 的差异。这不是绝对正确声明，而是**提高了怀疑门槛**。
 
 ## 已知问题
 

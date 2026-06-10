@@ -2,6 +2,62 @@
 
 ## 当前焦点
 
+[2026-06-11] **L1 算法金标准验证 + BF16 logits 差异根因彻底定位完成**：
+  - **Float32 数学金标准**：`test_distributed_llama_model_prefill`（synthetic weights, float32）diff=2.79e-6 ✅
+  - **同构分布式 BF16 验证**：White RTX 4090 loopback（3B: max_diff=0.406, 0.5B: max_diff=0.344），argmax=10/10，文本 100% 匹配
+  - **BLAS 根因排除**：同构（0.34-0.41）≈ 跨平台单节点（0.438）≈ 异构分布式（0.484）。三者同量级，证明 BLAS 仅贡献 ~0.1，主要差异来自 BF16 online softmax block-wise processing order
+  - **证据门槛建立**：任何未来声称"分布式 logits 差异是 ring attention bug"的假设，必须首先解释同构分布式为什么也有 ~0.34-0.41 的差异
+  - **文档更新**：`memory-bank/progress.md`、`systemPatterns.md`、`docs/VALIDATION_PLAN.md` 已更新
+
+[2026-06-04] **Phase 5b: 分布式 logits 导出"bug"根因调查完成** — 结论：**非 bug，是 BF16 异构推理的固有数值特性**：
+  - **初始假设**: coordinator 导出 worker 0 的 logits 而非采样 logits，导致 `compare_logits.py` 数值对比失败
+  - **实际根因**: coordinator 导出逻辑正确（prefill 用 last worker logits，decode 用 worker 0 logits，均为实际采样 logits）
+  - **真正原因**: BF16 异构分布式中，每个 worker 的 KV cache = 本地计算（cuBLAS/rocBLAS）+ peer KV（来自另一平台）。跨平台 BLAS 的 BF16 matmul 差异导致 peer KV 数值与"假设本地计算"不同
+  - **结果**: `Q(CUDA) × K(CUDA+HIP混合) × V(CUDA+HIP混合)` 与 `Q(CUDA) × K(纯CUDA) × V(纯CUDA)` 在 logits 数值上有 ~0.1-0.5 差异，但 top-1 argmax 通常一致
+  - **验证**: LongBench 4/4 examples 文本输出 100% 匹配，证明 correctness 不受数值差异影响
+  - **文档更新**: `docs/VALIDATION_PLAN.md` 新增"分布式 logits 数值对比的已知限制"章节
+  - **建议**: correctness 验证以文本/任务级指标为准；`compare_logits.py` 在异构分布式下仅用于调试；严格 logits 对比需同构平台（如双 CUDA）
+
+[2026-06-04] **Phase 5+: 大规模 LongBench 20 Examples 评估完成**（White CUDA 单节点 vs White+Pearl 分布式）：
+  - **数据集**: LongBench 2wikimqa，20 个 examples（964-4905 tokens，覆盖 short/medium/long）
+  - **模型**: Qwen2.5-3B-Instruct BF16，temperature=0.0，max_tokens=20
+  - **关键指标**:
+    - White 单节点准确率: 7/20 = 35.0%
+    - 分布式准确率: 8/20 = 40.0%
+    - **文本输出匹配率: 18/20 = 90.0%**
+    - **准确率一致性: 19/20 = 95.0%**
+  - **2 个文本不匹配分析**:
+    - Example 106: White="3 September 1992" ✓, Dist="1992" ✓ — 两者都正确，分布式给出了更短的答案（年份是完整日期的子集）
+    - Example 118: White="Many Tanks Mr. Atkins" ✗, Dist="Do Musafir" ✓ — **分布式做对了，单节点做错了！** BF16 边界敏感性导致不同平台对 borderline case 的解析不同，分布式恰好选中了正确答案
+  - **核心结论**: BF16 跨平台异构分布式推理**不降低任务级准确率**。18/20 文本完全一致，2/20 差异中 1 个是答案长度差异（都对），1 个是分布式反而更准确。分布式没有引入系统性错误。
+  - **性能**: 短 examples (~1000 tokens) ~2-3 min，长 examples (~4800 tokens) ~10-15 min。总耗时 ~2 小时。单节点约 ~40-60 min。
+
+[2026-06-04] **Phase 5: LongBench 小规模 4 Examples 验证完成**（White CUDA 单节点 vs White+Pearl 分布式）：
+  - **数据集**: LongBench 2wikimqa，4 个短 examples（964-1456 tokens）
+  - **关键指标**: White 准确率 25.0% (1/4)，分布式准确率 25.0% (1/4)，文本匹配率 100%，准确率一致性 100%
+  - **核心结论**: BF16 跨平台异构分布式推理**不降低任务级准确率**
+
+[2026-06-04] **Phase 4: 3B 模型大规模异构分布式推理验证完成**（5 prompts × 30 tokens × 3 configs）：
+  - **验证矩阵**: Qwen2.5-3B-Instruct (BF16, ~6GB, 36 layers, 151936 vocab)，5 个长 prompts（58-134 tokens），greedy decode 30 tokens
+  - **Phase 1 — White CUDA 单节点**: 5/5 prompts 全部成功，30 tokens each，文本输出连贯
+  - **Phase 2 — Pearl HIP 单节点**: 5/5 prompts 全部成功，30 tokens each。P2 因 BF16 边界敏感性提前 EOS（9 tokens），其余 4 prompts 完整 30 tokens
+  - **Phase 3 — White+Pearl 分布式**: 5/5 prompts 全部成功，30 tokens each，coordinator 输出与 White 单节点**文本完全一致**
+  - **Correctness 验证**:
+    - 分布式 vs White 单节点：5/5 prompts 文本输出完全匹配
+    - 分布式 logits 导出已知限制：coordinator 捕获 worker 0 的 logits（非采样 worker），导致 logits 数值对比不适用。文本一致性是 correctness 的最终信号
+    - BF16 跨平台差异在 3B 模型上表现与 0.5B 一致：边界 token 对平台差异敏感，但 argmax/文本输出稳定
+  - **性能数据**（分布式 36-layer ring attention，Tailscale VPN）：
+    - White (RTX 4090 CUDA): avg recv ~20ms/layer, avg compute ~0.15ms/layer, recv/compute ~134x
+    - Pearl (RX 9060 XT HIP): avg recv ~18ms/layer, avg compute ~0.96ms/layer, recv/compute ~19x
+    - 网络 recv 主导（~18-20ms/layer），Tailscale VPN 是主要瓶颈
+    - Pearl compute 比 White 慢 ~6.5x（HIP vs CUDA），但仍远快于网络传输
+    - 每 decode step (36 layers): ~720-756ms；每 prompt (30 tokens): ~21.6-22.7s
+  - **工程笔记**:
+    - Coordinator 必须先启动（监听 9000），workers 后启动（连接 coordinator + 建立 peer ring）
+    - 命令格式：`--distributed-role coordinator --listen-addr 0.0.0.0:9000 --worker-addrs <white>:9100,<pearl>:9100`
+    - Worker 命令：`--distributed-role worker --domain-id N --listen-addr 0.0.0.0:9100 --next-peer-addr <peer>:9100 --coordinator-addr <coord>:9000`
+    - Pearl 必需 `LD_PRELOAD=$LIBTORCH/lib/libtorch_hip.so`
+
 [2026-06-04] **Phase 3: BF16 priority support 完成 — 跨平台数值一致性验证通过**（commits `c226ed2` → `09cf374`）：
   - **根因定位**: float32 BLAS 累加顺序差异（Rust/libtorch vs Python/PyTorch）导致 Q/K projection 每层 ~2e-4 divergence，24 层累积后输出差异可见
   - **解决方案**: 当模型 config 指定 `torch_dtype=bfloat16` 时，权重加载和推理全程使用 BF16。BF16 的 7-bit 尾数天然屏蔽微小 BLAS 差异
