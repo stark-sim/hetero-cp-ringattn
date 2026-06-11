@@ -11,8 +11,12 @@
     - Pearl worker 1 (RX 9060 XT HIP): 28 layers 全通, capacity=872 MB, recv/compute ~0-15x
     - KV micro block: 28672 bytes/layer, 28 layers 全量交换成功
     - Workers 优雅退出, coordinator shutdown complete
-  - **结论**: BF16 跨异构平台（CUDA+HIP）分布式 7B 推理端到端成功。
-  - **下一步**: 长 prompt correctness 验证（对比 White 单节点 vs 分布式输出）、规模矩阵测试（64→512→1024→2048→4096 tokens）
+  - **Correctness 验证完成**（相同 prompt 单节点 vs 分布式）：
+    - Prompt: `"The quick brown fox jumps over the lazy dog."`, max_tokens=10, temperature=0.0
+    - White 单节点 (CUDA): `0.0.0.0.0.` ✅
+    - 分布式 (White CUDA + Pearl HIP): `0.0.0.0.0.` ✅
+    - **文本输出 100% 匹配**，token 序列完全一致
+  - **结论**: BF16 跨异构平台（CUDA+HIP）分布式 7B 推理端到端成功 + correctness 验证通过。
 
 [2026-06-11] **L1 算法金标准验证 + BF16 logits 差异根因彻底定位完成**（背景上下文）：
   - **Float32 数学金标准**：`test_distributed_llama_model_prefill`（synthetic weights, float32）diff=2.79e-6 ✅

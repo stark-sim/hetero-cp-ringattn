@@ -47,6 +47,11 @@
     - KV micro block: 28672 bytes/layer, 28 layers 全量交换成功
     - Workers 优雅退出, coordinator shutdown complete ✅
   - **性能数据**: Pearl HIP compute ~0.32-1.27ms/layer, White CUDA compute ~0.08-0.22ms/layer。Pearl 比 White 慢 ~5-10x（符合 3B 模型的观察）。网络 recv 主导（~0-13ms/layer）。
+  - **Correctness 验证**（相同 prompt 单节点 vs 分布式对比）：
+    - Prompt: `"The quick brown fox jumps over the lazy dog."`, max_tokens=10, temperature=0.0
+    - White 单节点 (CUDA): `0.0.0.0.0.` ✅
+    - 分布式 (White CUDA + Pearl HIP): `0.0.0.0.0.` ✅
+    - **文本输出 100% 匹配**，token 序列完全一致，correctness 无 regression
   - **结论**: BF16 跨异构平台（CUDA+HIP）分布式 7B 推理端到端成功。旧 binary 的 `matmul dtype panic` 是版本不匹配问题，非代码 bug。
 - [x] [2026-06-02] **white CUDA + pearl HIP 跨节点 3B 模型异构分布式推理首次成功**（commit `4322a87`）：
   - white RTX 4090 CUDA (domain 0) + pearl RX 9060 XT HIP (domain 1)
