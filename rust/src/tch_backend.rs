@@ -36,13 +36,14 @@ pub mod backend {
             "cpu" => (tch::Device::Cpu, 1),
             "mps" => (tch::Device::Mps, 2),
             "cuda" => (tch::Device::Cuda(0), 3),
+            "hip" => (tch::Device::Cuda(0), 3),
             _ => {
                 if let Some(idx) = name.strip_prefix("cuda:") {
                     if let Ok(i) = idx.parse::<usize>() {
                         (tch::Device::Cuda(i), 3)
                     } else {
                         return Err(format!(
-                            "unsupported HCP_TCH_DEVICE={name}; expected cpu, mps, cuda, or cuda:N"
+                            "unsupported HCP_TCH_DEVICE={name}; expected cpu, mps, cuda, hip, or cuda:N"
                         ));
                     }
                 } else {

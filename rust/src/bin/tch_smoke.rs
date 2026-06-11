@@ -33,6 +33,7 @@ mod tch_smoke {
             "cpu" => tch::Device::Cpu,
             "mps" => tch::Device::Mps,
             "cuda" => tch::Device::Cuda(0),
+            "hip" => tch::Device::Cuda(0),
             _ => {
                 if let Some(index) = raw.strip_prefix("cuda:") {
                     if let Ok(idx) = index.parse::<usize>() {

@@ -29,6 +29,7 @@ pub fn run_inference(model_dir: &str, prompt: &str, max_tokens: usize, temperatu
             "cpu" => Device::Cpu,
             "mps" => Device::Mps,
             "cuda" => Device::Cuda(0),
+            "hip" => Device::Cuda(0),
             _ => {
                 if let Some(idx) = name.strip_prefix("cuda:") {
                     if let Ok(i) = idx.parse::<usize>() {
@@ -93,6 +94,7 @@ pub fn run_inference_and_export_logits(
             "cpu" => Device::Cpu,
             "mps" => Device::Mps,
             "cuda" => Device::Cuda(0),
+            "hip" => Device::Cuda(0),
             _ => {
                 if let Some(idx) = name.strip_prefix("cuda:") {
                     if let Ok(i) = idx.parse::<usize>() {
@@ -245,6 +247,7 @@ pub fn run_inference_and_export_hidden_states(
             "cpu" => Device::Cpu,
             "mps" => Device::Mps,
             "cuda" => Device::Cuda(0),
+            "hip" => Device::Cuda(0),
             _ => {
                 if let Some(idx) = name.strip_prefix("cuda:") {
                     if let Ok(i) = idx.parse::<usize>() {
@@ -409,6 +412,7 @@ pub fn run_prefill_debug_layer_0(
             "cpu" => Device::Cpu,
             "mps" => Device::Mps,
             "cuda" => Device::Cuda(0),
+            "hip" => Device::Cuda(0),
             _ => {
                 if let Some(idx) = name.strip_prefix("cuda:") {
                     if let Ok(i) = idx.parse::<usize>() {

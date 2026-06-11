@@ -148,6 +148,7 @@ fn select_device() -> Device {
             "cpu" => Device::Cpu,
             "mps" => Device::Mps,
             "cuda" => Device::Cuda(0),
+            "hip" => Device::Cuda(0),
             _ => {
                 if let Some(idx) = name.strip_prefix("cuda:") {
                     if let Ok(i) = idx.parse::<usize>() {
