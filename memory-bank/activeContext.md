@@ -2,7 +2,15 @@
 
 ## 当前焦点
 
-[2026-06-11] **L1 算法金标准验证 + BF16 logits 差异根因彻底定位完成**：
+[2026-06-11] **white+pearl 分布式 7B 验证 — White worker0 prefill panic，Blocked by White 离线**：
+  - White 单节点 7B CUDA 成功，Pearl 单节点 7B HIP OOM（16GB 限制）
+  - 分布式启动：coordinator + worker0 (White) + worker1 (Pearl) 网络握手成功
+  - **White worker0 panic**：`expected mat1 and mat2 to have the same dtype, but got: float != c10::BFloat16`
+  - **根因分析进行中**：当前 HEAD 代码在 Mac MPS (`num_domains=2`, 0.5B) 和 Pearl CPU (`num_domains=2`, 7B) 均测试通过，无 panic。White 上的 binary 行为异常（支持 `worker` 子命令和 `--config` 参数，与标准代码不符），推测为旧版本/本地修改版本。
+  - **Blocked**: White 完全离线（SSH timeout, ping 100% loss）。需等待恢复后重新编译最新代码并测试。
+  - **下一步**: White 恢复 → 检查 `/usr/local/bin/hcp-ringattn-rust` 来源 → 重新编译当前 HEAD → 使用 `--distributed-role worker` 启动 → 重新测试分布式 7B
+
+[2026-06-11] **L1 算法金标准验证 + BF16 logits 差异根因彻底定位完成**（背景上下文）：
   - **Float32 数学金标准**：`test_distributed_llama_model_prefill`（synthetic weights, float32）diff=2.79e-6 ✅
   - **同构分布式 BF16 验证**：White RTX 4090 loopback（3B: max_diff=0.406, 0.5B: max_diff=0.344），argmax=10/10，文本 100% 匹配
   - **BLAS 根因排除**：同构（0.34-0.41）≈ 跨平台单节点（0.438）≈ 异构分布式（0.484）。三者同量级，证明 BLAS 仅贡献 ~0.1，主要差异来自 BF16 online softmax block-wise processing order
