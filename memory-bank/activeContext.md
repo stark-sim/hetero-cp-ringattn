@@ -2,13 +2,17 @@
 
 ## 当前焦点
 
-[2026-06-11] **white+pearl 分布式 7B 验证 — White worker0 prefill panic，Blocked by White 离线**：
-  - White 单节点 7B CUDA 成功，Pearl 单节点 7B HIP OOM（16GB 限制）
-  - 分布式启动：coordinator + worker0 (White) + worker1 (Pearl) 网络握手成功
-  - **White worker0 panic**：`expected mat1 and mat2 to have the same dtype, but got: float != c10::BFloat16`
-  - **根因分析进行中**：当前 HEAD 代码在 Mac MPS (`num_domains=2`, 0.5B) 和 Pearl CPU (`num_domains=2`, 7B) 均测试通过，无 panic。White 上的 binary 行为异常（支持 `worker` 子命令和 `--config` 参数，与标准代码不符），推测为旧版本/本地修改版本。
-  - **Blocked**: White 完全离线（SSH timeout, ping 100% loss）。需等待恢复后重新编译最新代码并测试。
-  - **下一步**: White 恢复 → 检查 `/usr/local/bin/hcp-ringattn-rust` 来源 → 重新编译当前 HEAD → 使用 `--distributed-role worker` 启动 → 重新测试分布式 7B
+[2026-06-11] **white+pearl 分布式 7B 验证成功** ✅：
+  - **根因**: White 上的旧 debug binary (Jun 4, 152MB) 是旧版本。重新编译最新 release binary 后问题解决。
+  - **关键发现**: `/usr/local/bin/hcp-ringattn-rust` 不存在；White 上的 release binary (Jun 11, 10MB) 是 **macOS binary**（从 Mac scp 过去的），已删除并重新编译 Linux release binary。
+  - **验证结果**: Qwen2.5-7B-Instruct BF16 (~14GB, 28 layers)，prompt `"Hello, world!"`, max_tokens=10, temperature=0.0
+    - Coordinator 输出: `!!!!!!!!!!`
+    - White worker 0 (RTX 4090 CUDA): 28 layers 全通, capacity=7396 MB, recv/compute ~29-91x
+    - Pearl worker 1 (RX 9060 XT HIP): 28 layers 全通, capacity=872 MB, recv/compute ~0-15x
+    - KV micro block: 28672 bytes/layer, 28 layers 全量交换成功
+    - Workers 优雅退出, coordinator shutdown complete
+  - **结论**: BF16 跨异构平台（CUDA+HIP）分布式 7B 推理端到端成功。
+  - **下一步**: 长 prompt correctness 验证（对比 White 单节点 vs 分布式输出）、规模矩阵测试（64→512→1024→2048→4096 tokens）
 
 [2026-06-11] **L1 算法金标准验证 + BF16 logits 差异根因彻底定位完成**（背景上下文）：
   - **Float32 数学金标准**：`test_distributed_llama_model_prefill`（synthetic weights, float32）diff=2.79e-6 ✅

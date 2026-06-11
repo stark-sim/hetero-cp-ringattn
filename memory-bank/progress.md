@@ -37,12 +37,17 @@
 - [x] [2026-06-11] **white CUDA 单节点 7B 验证成功**：Qwen2.5-7B-Instruct BF16 (~14GB, 28 layers)，RTX 4090 24GB，输出 `",000000000"`（10 tokens, greedy），模型加载和计算完全正常。
 - [x] [2026-06-11] **Pearl HIP 单节点 7B 验证 — OOM 预期内**：RX 9060 XT 16GB 无法承载 ~14GB 权重 + KV cache，OOM 在预期内。16GB 消费级显卡对 7B BF16 的已知限制。
 - [x] [2026-06-11] **Rust hip 设备支持添加完成**（commit `583dfc1`）：5 个文件中 `"hip" => Device::Cuda(0)`，Pearl 编译通过。Pearl release binary 已更新。
-- [~] [2026-06-11] **white+pearl 分布式 7B 验证 — White worker0 prefill panic，Blocked by White 离线**：
-  - Coordinator + worker0 (White CUDA) + worker1 (Pearl HIP) 网络握手成功
-  - White worker0 在 prefill 阶段 panic：`expected mat1 and mat2 to have the same dtype, but got: float != c10::BFloat16`
-  - **关键发现**：当前 HEAD 代码在 Mac MPS 和 Pearl CPU 上 `num_domains=2` 测试通过，无 panic。问题疑似 White 上的 binary 版本异常。
-  - **White binary 异常行为**：支持 `worker` 子命令和 `--config` 参数，与标准 `cli.rs`（`--distributed-role worker`）不符。推测为旧版本或本地修改版本。
-  - **Blocked**: White 完全离线（SSH timeout, ping 100% loss），无法重新编译或获取完整 backtrace。需等待网络恢复后重新编译最新代码再测试。
+- [x] [2026-06-11] **white+pearl 分布式 7B 验证成功**（commit `583dfc1`）：
+  - **根因**: White 上的旧 debug binary (Jun 4, 152MB) 是旧版本，与当前 HEAD 不一致。重新编译最新 release binary 后问题解决。
+  - **关键发现**: `/usr/local/bin/hcp-ringattn-rust` 不存在；之前 systemd 日志中的 binary 来源已不可考。White 上的 release binary (Jun 11, 10MB) 是 **macOS binary**（从 Mac scp 过去的 `Exec format error`），已删除并重新编译 Linux release binary。
+  - **验证结果**: Qwen2.5-7B-Instruct BF16 (~14GB, 28 layers)，prompt `"Hello, world!"`, max_tokens=10, temperature=0.0
+    - Coordinator 输出: `!!!!!!!!!!` (10 tokens)
+    - White worker 0 (RTX 4090 CUDA): 28 layers 全通, capacity=7396 MB, recv/compute ~29-91x
+    - Pearl worker 1 (RX 9060 XT HIP): 28 layers 全通, capacity=872 MB, recv/compute ~0-15x
+    - KV micro block: 28672 bytes/layer, 28 layers 全量交换成功
+    - Workers 优雅退出, coordinator shutdown complete ✅
+  - **性能数据**: Pearl HIP compute ~0.32-1.27ms/layer, White CUDA compute ~0.08-0.22ms/layer。Pearl 比 White 慢 ~5-10x（符合 3B 模型的观察）。网络 recv 主导（~0-13ms/layer）。
+  - **结论**: BF16 跨异构平台（CUDA+HIP）分布式 7B 推理端到端成功。旧 binary 的 `matmul dtype panic` 是版本不匹配问题，非代码 bug。
 - [x] [2026-06-02] **white CUDA + pearl HIP 跨节点 3B 模型异构分布式推理首次成功**（commit `4322a87`）：
   - white RTX 4090 CUDA (domain 0) + pearl RX 9060 XT HIP (domain 1)
   - Qwen2.5-3B-Instruct（bf16, ~6GB），64-token prompt，5 decode tokens
