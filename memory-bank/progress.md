@@ -37,6 +37,14 @@
 - [x] [2026-06-11] **white CUDA 单节点 7B 验证成功**：Qwen2.5-7B-Instruct BF16 (~14GB, 28 layers)，RTX 4090 24GB，输出 `",000000000"`（10 tokens, greedy），模型加载和计算完全正常。
 - [x] [2026-06-11] **Pearl HIP 单节点 7B 验证 — OOM 预期内**：RX 9060 XT 16GB 无法承载 ~14GB 权重 + KV cache，OOM 在预期内。16GB 消费级显卡对 7B BF16 的已知限制。
 - [x] [2026-06-11] **Rust hip 设备支持添加完成**（commit `583dfc1`）：5 个文件中 `"hip" => Device::Cuda(0)`，Pearl 编译通过。Pearl release binary 已更新。
+- [~] [2026-06-12] **A800 (4x A800-SXM4-40GB) 环境搭建进行中**：
+  - SSH endpoint: `223.109.239.32:14216`
+  - Rust 1.96.0 安装完成
+  - libtorch 2.12.0+cu126 部署完成（用户自带）
+  - 从 PyPI wheel 提取 cuDNN/NCCL/cuSPARSELt/NVSHMEM/CUDA runtime 到项目 `third_party_libs/`
+  - `hcp-ringattn-rust` release binary 编译成功（1m 14s）
+  - **当前阻塞**: Qwen2.5-7B-Instruct 模型下载中（hf-mirror，4 个 safetensors，共 ~14GB，ETA ~30-50 分钟）
+  - 下一步：模型下载完成后运行单节点/多 domain 7B 验证、长上下文测试
 - [x] [2026-06-11] **white+pearl 分布式 7B 验证成功**（commit `583dfc1`）：
   - **根因**: White 上的旧 debug binary (Jun 4, 152MB) 是旧版本，与当前 HEAD 不一致。重新编译最新 release binary 后问题解决。
   - **关键发现**: `/usr/local/bin/hcp-ringattn-rust` 不存在；之前 systemd 日志中的 binary 来源已不可考。White 上的 release binary (Jun 11, 10MB) 是 **macOS binary**（从 Mac scp 过去的 `Exec format error`），已删除并重新编译 Linux release binary。

@@ -2,7 +2,14 @@
 
 ## 当前焦点
 
-[2026-06-11] **white+pearl 分布式 7B 验证成功** ✅：
+[2026-06-12] **A800 (4x A800-SXM4-40GB) 环境搭建与 7B 验证准备中**：
+  - **SSH**: `223.109.239.32:14216`
+  - **环境**: Rust 1.96.0 ✅, libtorch 2.12.0+cu126 ✅, binary 编译成功 ✅
+  - **依赖处理**: 从 PyPI wheel 提取 cuDNN/NCCL/cuSPARSELt/NVSHMEM/CUDA runtime 到项目 `third_party_libs/`，不越界 miniconda 环境
+  - **当前阻塞**: Qwen2.5-7B-Instruct 模型下载中（hf-mirror，4×safetensors，共 ~14GB），当前进度 ~36%，ETA ~40-50 分钟
+  - **下一步**: 模型下载完成后依次跑单节点 7B、4-domain 同节点分布式 7B、长上下文（4k/8k/16k/32k）测试
+
+[2026-06-11] **white+pearl 分布式 7B 验证成功** ✅（背景上下文）：
   - **根因**: White 上的旧 debug binary (Jun 4, 152MB) 是旧版本。重新编译最新 release binary 后问题解决。
   - **关键发现**: `/usr/local/bin/hcp-ringattn-rust` 不存在；White 上的 release binary (Jun 11, 10MB) 是 **macOS binary**（从 Mac scp 过去的），已删除并重新编译 Linux release binary。
   - **验证结果**: Qwen2.5-7B-Instruct BF16 (~14GB, 28 layers)，prompt `"Hello, world!"`, max_tokens=10, temperature=0.0
