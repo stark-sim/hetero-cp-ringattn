@@ -1,0 +1,15 @@
+timestamp: "2026-06-13T09:15:00Z"
+host: a100-4x (223.109.239.30:25412)
+operation: cleanup_untracked_a800_scripts
+stage: completed
+reason: >
+  A800-specific launch/monitor scripts were left untracked on the A100 host
+  after switching from A800 to A100. They are host-specific and misleading on A100.
+files_removed:
+  - /root/hetero-cp-ringattn/monitor_a800_4domain.sh
+  - /root/hetero-cp-ringattn/monitor_a800_long_context.sh
+  - /root/hetero-cp-ringattn/run_a800_4domain.sh
+  - /root/hetero-cp-ringattn/run_a800_env.sh
+  - /root/hetero-cp-ringattn/run_a800_long_context.sh
+  - /root/hetero-cp-ringattn/run_a800_tests.sh
+authorization: user-requested-sync-and-gap-cleanup
