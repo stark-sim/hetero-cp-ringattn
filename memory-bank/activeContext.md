@@ -2,6 +2,17 @@
 
 ## 当前焦点
 
+[2026-06-13] **超长 context 探索已暂停**：
+  - 用户决定优先推超长 context，必要时换模型。
+  - 选定模型：**Qwen/Qwen2.5-7B-Instruct-1M**（15.2 GB，max_position_embeddings=1,010,000，支持 1M context）。
+  - 下载尝试：
+    - `hf download` 因 xet-hub 超时/锁竞争失败。
+    - 改用 `aria2c` 从 hf-mirror 下载，仍被重定向到 xet-hub，速度不稳定。
+    - 已下载约 2.2 GB 后用户决定停机前停止下载。
+  - 磁盘状态：196G 总量，109G 已用，79G 可用，足够放下 15.2 GB 模型。
+  - 风险点：该模型 config 含 `dual_chunk_attention_config`（chunk_size=262144），我们的 Rust 实现在 256k 以内可能按标准 attention 工作，但 262k+ 需要额外支持。
+  - 下次恢复时：可直接用 `aria2c` 续传剩余 safetensors，或换用 modelscope / 其他镜像。
+
 [2026-06-13] **A100 (4x A100-SXM4-40GB) HCP 验证全部完成** ✅：
   - **SSH**: `ssh root@223.109.239.30 -p 25412`
   - **硬件**: 4× NVIDIA A100-SXM4-40GB, driver 610.43.02, compute cap 8.0, NVLink/SXM 互联
