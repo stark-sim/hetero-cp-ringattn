@@ -30,7 +30,7 @@ ssh_hosts:
     hostname: "223.109.239.30"
     username: "root"
     port: 25412
-    note: "4x NVIDIA A100-SXM4-40GB, driver 610.43.02, compute 8.0, libtorch 2.12.0+cu126, model ready. HCP single-node 7B + 4-domain distributed 7B + long-context (3.7k/7.4k/14.9k/29.8k tokens) all passed."
+    note: "4x NVIDIA A100-SXM4-40GB, driver 610.43.02, compute 8.0, libtorch 2.12.0+cu126, model ready. HCP single-node 7B + 4-domain distributed 7B + long-context (3.7k/7.4k/14.9k/29.8k tokens) all passed. Serial vs Pipeline overlap A/B at 29.8k tokens: Pipeline ~2.5% faster (317s vs 325s), identical output." 
     status: "validated"
     tags: ["gpu", "cuda", "a100"]
 

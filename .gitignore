@@ -5,9 +5,11 @@ reports/*
 !reports/**/
 reports/**/*.json
 reports/**/*.log
+reports/**/*.bin
 __pycache__/
 *.pyc
 .DS_Store
 rust/reports/
 config/test_weights.json
 models/
+third_party_libs/

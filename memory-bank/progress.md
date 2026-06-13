@@ -53,6 +53,7 @@
     - A100 NVLink 太快导致 network time 占比小，overlap 收益有限
   - 环境准备产物：`run_a100_env.sh`, `run_a100_single_node.sh`, `run_a100_4domain.sh`, `run_a100_long_context.sh`, `run_a100_tests.sh`, `run_a100_serial_vs_overlap.sh`, `monitor_a100_ab.sh`
   - `harness/infra.yaml` 已新增 `a100-4x` 条目
+  - 完整报告沉淀：`docs/A100_VALIDATION_REPORT.md`
 
 - [x] [2026-06-12] **A800 (4x A800-SXM4-40GB) 单节点 + 4-domain 同节点 7B 验证完成 + 长上下文 4k/8k/16k/32k 测试完成**：
   - SSH endpoint: `223.109.239.32:14216`
