@@ -1,0 +1,30 @@
+timestamp: "2026-06-13T12:30:00+00:00"
+type: "dangerous-operation"
+stage: "a100-serial-vs-overlap-ab"
+target:
+  server: "a100-4x"
+  host: "223.109.239.30"
+  user: "root"
+  port: 25412
+  note: "4x NVIDIA A100-SXM4-40GB, HCP serial vs pipeline overlap A/B comparison"
+risk_level: "medium"
+steps:
+  - "Hardware pre-check: nvidia-smi confirmed 4x A100 idle"
+  - "Generate single ~32k token prompt file /tmp/long_prompt_32k.txt"
+  - "Run serial baseline: HCP_DISABLE_OVERLAP=1, 4-domain 7B, max_tokens=5"
+  - "Run pipeline overlap: HCP_DISABLE_OVERLAP=0, 4-domain 7B, max_tokens=5"
+  - "Extract timing and compare outputs"
+  - "Update memory-bank and commit runbook"
+verification:
+  method: "Both runs exit=0, outputs match, wall-clock timing recorded"
+  actual: |
+    - Prompt: 29790 actual tokens (target 32768, round-trip tokenizer diff)
+    - Serial: start 2026-06-13T20:13:33+08:00, end 2026-06-13T20:18:58+08:00, T_serial=325s
+    - Pipeline: start 2026-06-13T20:18:58+08:00, end 2026-06-13T20:24:15+08:00, T_pipeline=317s
+    - Both generated: "The quick brown fox jumps"
+    - Pipeline speedup: ~2.5% (325s -> 317s)
+    - Pipeline worker recv/compute ratios: ~80-200x (network still dominates)
+rollback_plan: |
+  Processes exited cleanly; no rollback needed. Logs at /tmp/a100_ab_*.log.
+requested_by: "main-agent"
+guard_verdict: "AUTHORIZED"

@@ -22,7 +22,12 @@
       - 14.9k: `over the lazy dog.`
       - 29.8k: `The quick brown fox jumps`
     - ring attention 3 rounds 全通，workers 优雅退出
-  - **关键观察**: A100 上小序列（3.7k/7.4k）recv/compute 仍很高（~8-150x），network 主导；到 29.8k 时部分 worker/layer recv/compute 降至 ~5-8x，compute 开始与 network 可比
+  - **Serial vs Pipeline Overlap A/B 对比**（29.8k tokens, max_tokens=5）:
+    - Serial (`HCP_DISABLE_OVERLAP=1`): 325s, exit=0, generated `The quick brown fox jumps`
+    - Pipeline (`HCP_DISABLE_OVERLAP=0`): 317s, exit=0, generated `The quick brown fox jumps`
+    - **Pipeline 仅快 ~2.5%**（325s → 317s），几乎无收益
+    - **根因**: A100 SXM4 NVLink 互联带宽极高，单机四卡传输太快，network time 占比小；recv/compute 在 pipeline 下仍高达 ~80-200x，compute 远未成为瓶颈
+    - **结论**: 对 A100 单机四卡这种高速互联环境，当前 7B/32k 规模下 pipeline overlap 收益有限；overlap 的真正价值在跨节点/慢网络或更大规模（>32k / 更多 domain）场景
 
 [2026-06-12] **A800 (4x A800-SXM4-40GB) 单节点 + 4-domain 同节点 7B 验证完成**：
   - **SSH**: `223.109.239.32:14216`
