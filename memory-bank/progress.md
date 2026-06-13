@@ -37,14 +37,53 @@
 - [x] [2026-06-11] **white CUDA 单节点 7B 验证成功**：Qwen2.5-7B-Instruct BF16 (~14GB, 28 layers)，RTX 4090 24GB，输出 `",000000000"`（10 tokens, greedy），模型加载和计算完全正常。
 - [x] [2026-06-11] **Pearl HIP 单节点 7B 验证 — OOM 预期内**：RX 9060 XT 16GB 无法承载 ~14GB 权重 + KV cache，OOM 在预期内。16GB 消费级显卡对 7B BF16 的已知限制。
 - [x] [2026-06-11] **Rust hip 设备支持添加完成**（commit `583dfc1`）：5 个文件中 `"hip" => Device::Cuda(0)`，Pearl 编译通过。Pearl release binary 已更新。
-- [~] [2026-06-12] **A800 (4x A800-SXM4-40GB) 环境搭建进行中**：
+- [x] [2026-06-13] **A100 (4x A100-SXM4-40GB) HCP 验证全部完成**：
+  - SSH endpoint: `ssh root@223.109.239.30 -p 25412`
+  - 4× NVIDIA A100-SXM4-40GB, driver 610.43.02, compute cap 8.0, 每卡 40 GB
+  - 单节点 7B (cuda:0): ✅ 成功，~57s，生成 ` The quick brown fox jumps over the lazy dog.`
+  - 4-domain 同节点分布式 7B: ✅ 成功，exit=0，~56s，输出与单节点一致
+  - 长上下文 4-domain 7B (pipeline overlap): ✅ 4/4 通过，exit=0
+    - 实际 prompt tokens: 3724 / 7448 / 14895 / 29790
+    - 生成: `jumps over the lazy dog` / `dog. The quick brown` / `over the lazy dog.` / `The quick brown fox jumps`
+    - ring attention 3 rounds 全通，workers 优雅退出
+  - 环境准备产物：`run_a100_env.sh`, `run_a100_single_node.sh`, `run_a100_4domain.sh`, `run_a100_long_context.sh`, `run_a100_tests.sh`
+  - `harness/infra.yaml` 已新增 `a100-4x` 条目
+
+- [x] [2026-06-12] **A800 (4x A800-SXM4-40GB) 单节点 + 4-domain 同节点 7B 验证完成 + 长上下文 4k/8k/16k/32k 测试完成**：
   - SSH endpoint: `223.109.239.32:14216`
   - Rust 1.96.0 安装完成
   - libtorch 2.12.0+cu126 部署完成（用户自带）
   - 从 PyPI wheel 提取 cuDNN/NCCL/cuSPARSELt/NVSHMEM/CUDA runtime 到项目 `third_party_libs/`
   - `hcp-ringattn-rust` release binary 编译成功（1m 14s）
-  - **当前阻塞**: Qwen2.5-7B-Instruct 模型下载中（hf-mirror，4 个 safetensors，共 ~14GB，ETA ~30-50 分钟）
-  - 下一步：模型下载完成后运行单节点/多 domain 7B 验证、长上下文测试
+  - Qwen2.5-7B-Instruct 模型下载完成（hf-mirror，4 个 safetensors，共 ~14GB）
+  - **单节点 7B (CUDA:0)**: ✅ 成功，prompt `"The quick brown fox jumps over the lazy dog."`, max_tokens=10, temperature=0.0，生成 `The quick brown fox jumps over the lazy dog.\n`，exit=0
+  - **4-domain 同节点分布式 7B**: ✅ 成功，coordinator + 4 workers 在同一 A800 节点
+    - worker 0 → cuda:0, capacity=24923 MB
+    - worker 1 → cuda:1, capacity=22973 MB
+    - worker 2 → cuda:2, capacity=23569 MB
+    - worker 3 → cuda:3, capacity=23289 MB
+    - 28 layers ring attention 全通，workers 优雅退出，coordinator shutdown complete
+    - 生成结果与单节点一致：`The quick brown fox jumps over the lazy dog.\n`
+  - **长上下文 4-domain 7B 测试**（pipeline overlap 模式，HCP_DISABLE_OVERLAP=0）：
+    - Prompts: ~4097 / ~8193 / ~16386 / ~32751 tokens，每个 max_tokens=5，temperature=0.0
+    - 结果: 4/4 全部通过，exit=0
+      - 4k: `lazy dog. The quick`
+      - 8k: `fox jumps over the lazy`
+      - 16k: `the lazy dog. The`
+      - 32k: `quick brown fox jumps over`
+    - 总耗时: ~10 分 47 秒（02:13:50 → 02:24:37）
+    - 32k 边界修复: 首次 32764 tokens + 5 decode 触发 RoPE CUDA assert（position 32768 超出 max_position_embeddings=32768 的有效索引 `[0, 32767]`）；缩短 prompt 到 32751 tokens 后通过
+  - **Ring attention 环形运行确认**: 4-domain 形成 3 rounds KV ring，worker 日志显示 `round 0/1/2` 的 micro_block 接收和转发；pipeline 默认启用
+  - **计算重叠观察**:
+    - 4k/8k: recv/compute 约 30-150x，network 主导，GPU 利用率低（2-5%）
+    - 16k: recv/compute 下降到 ~50-100x，compute 时间开始显现
+    - 32k: 部分 worker/layer 的 recv/compute 降至 1-5x，compute 时间与 network 时间可比，pipeline overlap 开始发挥真正作用
+    - 结论：单机四卡高速互联下，小序列仍是 network-bound；32k 级别 compute 才与 network 可比拟，overlap 收益在此规模开始显现
+  - **工程教训**:
+    - coordinator CLI 默认 `num_domains=2`，多 domain 启动必须显式传 `--num-domains N`
+    - 1 GPU = 1 worker：首次尝试未给每个 worker 指定独立 GPU，4 个 worker 都落到 cuda:0 导致 OOM；修正为 `HCP_TORCH_DEVICE=cuda:$domain` 后正常
+    - 长上下文需为 decode tokens 预留位置，避免超过 `max_position_embeddings`
+
 - [x] [2026-06-11] **white+pearl 分布式 7B 验证成功**（commit `583dfc1`）：
   - **根因**: White 上的旧 debug binary (Jun 4, 152MB) 是旧版本，与当前 HEAD 不一致。重新编译最新 release binary 后问题解决。
   - **关键发现**: `/usr/local/bin/hcp-ringattn-rust` 不存在；之前 systemd 日志中的 binary 来源已不可考。White 上的 release binary (Jun 11, 10MB) 是 **macOS binary**（从 Mac scp 过去的 `Exec format error`），已删除并重新编译 Linux release binary。

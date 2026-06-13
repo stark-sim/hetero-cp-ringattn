@@ -1,0 +1,35 @@
+timestamp: "2026-06-13T09:12:00+00:00"
+type: "dangerous-operation"
+stage: "a100-environment-preparation"
+target:
+  server: "a100-4x"
+  host: "223.109.239.30"
+  user: "root"
+  port: 25412
+  note: "4x NVIDIA A100-SXM4-40GB, newly provisioned for hetero-cp-ringattn validation"
+risk_level: "low"
+steps:
+  - "SSH read-only inspection: nvidia-smi, GPU model/driver, existing processes, disk space"
+  - "Check hetero-cp-ringattn repo, libtorch, Rust toolchain, and Qwen2.5-7B-Instruct model availability"
+  - "Prepare A100 environment script (run_a100_env.sh) with correct PATH and LD_LIBRARY_PATH including third_party_libs/extracted"
+  - "Create A100 launch scripts: run_a100_single_node.sh, run_a100_4domain.sh, run_a100_long_context.sh, run_a100_tests.sh"
+  - "Verify release binary dynamic linking (libtorch_cuda, c10_cuda, cudart, cusparseLt, nccl, cudnn)"
+  - "Run default binary smoke (no GPU inference workload) to confirm tch CUDA path loads"
+  - "Update harness/infra.yaml with a100-4x host entry"
+  - "Update memory-bank activeContext.md and progress.md with preparation status"
+verification:
+  method: "Remote inspection + ldd + default smoke (no inference)"
+  expected: "4x A100 visible, binary links all CUDA libs, tch_attention_code=3 in default smoke, launch scripts present"
+  actual: |
+    - 4x A100-SXM4-40GB, driver 610.43.02, compute cap 8.0 detected
+    - GPUs currently occupied by external python processes
+    - Rust 1.96.0 available at ~/.cargo/bin
+    - libtorch 2.12.0+cu126 at /root/libtorch
+    - Model Qwen2.5-7B-Instruct present (~15 GB)
+    - ldd resolves libtorch_cuda.so, libc10_cuda.so, libcudart.so.12, libcusparseLt.so.0, libnccl.so.2, libcudnn.so.9
+    - Default smoke: tch_attention_code=3 (CUDA), all tch bridges 30/30 pass
+    - Launch scripts created and executable
+    - infra.yaml and memory-bank updated
+rollback_plan: "No destructive changes. Project-local file edits reversible via git."
+requested_by: "main-agent"
+guard_verdict: "AUTHORIZED"

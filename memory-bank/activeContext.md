@@ -2,12 +2,60 @@
 
 ## 当前焦点
 
-[2026-06-12] **A800 (4x A800-SXM4-40GB) 环境搭建与 7B 验证准备中**：
+[2026-06-13] **A100 (4x A100-SXM4-40GB) HCP 验证全部完成** ✅：
+  - **SSH**: `ssh root@223.109.239.30 -p 25412`
+  - **硬件**: 4× NVIDIA A100-SXM4-40GB, driver 610.43.02, compute cap 8.0, NVLink/SXM 互联
+  - **单节点 7B (cuda:0)**: ✅ 成功，~57s
+    - prompt: `"The quick brown fox jumps over the lazy dog."`, max_tokens=10, temperature=0.0
+    - generated: ` The quick brown fox jumps over the lazy dog.`
+  - **4-domain 同节点分布式 7B**: ✅ 成功，exit=0，~56s
+    - worker 0 → cuda:0, capacity=23419 MB
+    - worker 1 → cuda:1, capacity=24979 MB
+    - worker 2 → cuda:2, capacity=23569 MB
+    - worker 3 → cuda:3, capacity=24089 MB
+    - generated: ` The quick brown fox jumps over the lazy dog.`（与单节点一致）
+  - **长上下文 4-domain 7B 测试**（pipeline overlap 模式）: ✅ 4/4 全部通过，exit=0
+    - 实际 prompt tokens: 3724 / 7448 / 14895 / 29790（生成脚本 decode→encode  round-trip 导致实际略低于目标 4k/8k/16k/32k）
+    - 输出:
+      - 3.7k: `jumps over the lazy dog`
+      - 7.4k: `dog. The quick brown`
+      - 14.9k: `over the lazy dog.`
+      - 29.8k: `The quick brown fox jumps`
+    - ring attention 3 rounds 全通，workers 优雅退出
+  - **关键观察**: A100 上小序列（3.7k/7.4k）recv/compute 仍很高（~8-150x），network 主导；到 29.8k 时部分 worker/layer recv/compute 降至 ~5-8x，compute 开始与 network 可比
+
+[2026-06-12] **A800 (4x A800-SXM4-40GB) 单节点 + 4-domain 同节点 7B 验证完成**：
   - **SSH**: `223.109.239.32:14216`
   - **环境**: Rust 1.96.0 ✅, libtorch 2.12.0+cu126 ✅, binary 编译成功 ✅
   - **依赖处理**: 从 PyPI wheel 提取 cuDNN/NCCL/cuSPARSELt/NVSHMEM/CUDA runtime 到项目 `third_party_libs/`，不越界 miniconda 环境
-  - **当前阻塞**: Qwen2.5-7B-Instruct 模型下载中（hf-mirror，4×safetensors，共 ~14GB），当前进度 ~36%，ETA ~40-50 分钟
-  - **下一步**: 模型下载完成后依次跑单节点 7B、4-domain 同节点分布式 7B、长上下文（4k/8k/16k/32k）测试
+  - **模型**: Qwen2.5-7B-Instruct BF16 (~14GB, 28 layers) 已下载到 `/root/hetero-cp-ringattn/models/Qwen2.5-7B-Instruct/`
+  - **单节点 7B (CUDA:0)**: ✅ 成功，exit=0，生成 `The quick brown fox jumps over the lazy dog.\n`
+  - **4-domain 同节点分布式 7B**: ✅ 成功，exit=0，生成 `The quick brown fox jumps over the lazy dog.\n`
+    - worker 0 → cuda:0, capacity=24923 MB
+    - worker 1 → cuda:1, capacity=22973 MB
+    - worker 2 → cuda:2, capacity=23569 MB
+    - worker 3 → cuda:3, capacity=23289 MB
+    - 28 layers ring attention 全通，workers 优雅退出，coordinator shutdown complete
+  - **关键修复**: coordinator CLI 默认 `num_domains=2`，启动脚本必须显式传递 `--num_domains 4`；否则只接受 2 个 worker，剩余 worker 超时失败
+  - **铁律再次验证**: 1 GPU = 1 worker。首次尝试所有 worker 默认 `cuda:0` 导致 4 个 worker 挤在 GPU 0 上 OOM；修正为 `HCP_TORCH_DEVICE=cuda:$domain` 后每个 GPU 约 15-17GB，40GB 显存充裕
+
+[2026-06-13] **A800 长上下文 4-domain 7B 测试完成**（pipeline overlap 模式）：
+  - **模型**: Qwen2.5-7B-Instruct BF16, max_position_embeddings=32768
+  - **Prompts**: 4 个长度：~4k / ~8k / ~16k / ~32k tokens，每个 max_tokens=5，temperature=0.0
+  - **结果**: 4/4 全部通过，exit=0
+    - 4k: `lazy dog. The quick`
+    - 8k: `fox jumps over the lazy`
+    - 16k: `the lazy dog. The`
+    - 32k (32751 tokens): `quick brown fox jumps over`
+  - **总耗时**: ~10 分 47 秒（02:13:50 → 02:24:37）
+  - **32k 边界问题**: 首次尝试 32764 tokens + 5 decode 时，decode 第 5 个 token 位置达到 32768，触发 RoPE `index_select` CUDA device-side assert。将 prompt 缩短到 32751 tokens 后通过
+  - **Ring attention 环形运行确认**: 4-domain 形成 3 rounds KV ring，worker 日志显示 `round 0/1/2` 的 micro_block 接收和转发
+  - **计算重叠观察**:
+    - 4k/8k: recv/compute 约 30-150x，network 主导，GPU 利用率低（2-5%）
+    - 16k: recv/compute 下降到 ~50-100x，compute 开始显现
+    - 32k: 部分 worker/layer 的 recv/compute 降至 1-5x，compute 时间与 network 时间可比，pipeline overlap 开始发挥真正作用
+    - 结论：**单机四卡高速互联下，小序列仍是 network-bound；32k 级别 compute 才与 network 可比拟，overlap 收益在此规模开始显现**
+  - **下一步**: 可进一步做 32k 的 pipeline vs serial A/B 对比，量化 overlap 收益
 
 [2026-06-11] **white+pearl 分布式 7B 验证成功** ✅（背景上下文）：
   - **根因**: White 上的旧 debug binary (Jun 4, 152MB) 是旧版本。重新编译最新 release binary 后问题解决。

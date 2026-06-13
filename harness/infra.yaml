@@ -26,6 +26,14 @@ ssh_hosts:
     disk_after_cleanup: "95% used, 97G free (was 98%/45G)"
     tags: ["gpu", "cuda", "sd-cluster"]
 
+  - host: "a100-4x"
+    hostname: "223.109.239.30"
+    username: "root"
+    port: 25412
+    note: "4x NVIDIA A100-SXM4-40GB, driver 610.43.02, compute 8.0, libtorch 2.12.0+cu126, model ready. HCP single-node 7B + 4-domain distributed 7B + long-context (3.7k/7.4k/14.9k/29.8k tokens) all passed."
+    status: "validated"
+    tags: ["gpu", "cuda", "a100"]
+
 paths:
   mac:
     libtorch: "/Users/stark_sim/libtorch"
@@ -47,6 +55,11 @@ paths:
     models: "/home/user/models/qwen2-0.5b"
     cargo_bin: "~/.cargo/bin"
     project_root: "~/hetero-cp-ringattn"
+  a100-4x:
+    libtorch: "/root/libtorch"
+    models: "/root/hetero-cp-ringattn/models/Qwen2.5-7B-Instruct"
+    cargo_bin: "~/.cargo/bin"
+    project_root: "~/hetero-cp-ringattn"
 
 env:
   mac:
@@ -64,6 +77,11 @@ env:
     LD_LIBRARY_PATH: "/home/user/libtorch/lib"
     HCP_TCH_DEVICE: "cuda:0"
     PATH_PREFIX: "~/.cargo/bin:$PATH"
+  a100-4x:
+    LD_LIBRARY_PATH: "/root/libtorch/lib:/usr/local/cuda/lib64"
+    HCP_TCH_DEVICE: "cuda:0"
+    PATH_PREFIX: "~/.cargo/bin:/usr/local/cuda/bin:$PATH"
+    LIBTORCH: "/root/libtorch"
 
 build:
   cargo_features: "tch-backend"

@@ -1,0 +1,37 @@
+timestamp: "2026-06-13T11:55:00+00:00"
+type: "dangerous-operation"
+stage: "a100-inference-validation"
+target:
+  server: "a100-4x"
+  host: "223.109.239.30"
+  user: "root"
+  port: 25412
+  note: "4x NVIDIA A100-SXM4-40GB, all GPUs idle, HCP inference validation"
+risk_level: "medium"
+steps:
+  - "Hardware pre-check: nvidia-smi confirmed 4x A100 idle, no compute processes"
+  - "Run A100 single-node 7B validation: Qwen2.5-7B-Instruct BF16, cuda:0, prompt='The quick brown fox jumps over the lazy dog.', max_tokens=10, temp=0.0"
+  - "Run A100 4-domain distributed 7B validation: coordinator + 4 workers, one per GPU, same prompt"
+  - "Generate long prompts and run A100 4-domain long-context test (pipeline overlap, max_tokens=5, temp=0.0)"
+  - "Collect logs and outputs"
+verification:
+  method: "Check exit codes and coordinator logs"
+  actual: |
+    - Single-node: exit=0, generated " The quick brown fox jumps over the lazy dog.", ~36s
+      - log: /tmp/a100_single_node.log
+      - start: 2026-06-13T19:55:00+08:00, end: 2026-06-13T19:55:36+08:00
+    - 4-domain: exit=0, generated " The quick brown fox jumps over the lazy dog.", ~56s
+      - log: /tmp/a100_4d_coord.log, /tmp/a100_4d_w{0,1,2,3}.log
+      - start: 2026-06-13T19:37:43+08:00, end: 2026-06-13T19:38:39+08:00
+    - Long-context: exit=0, 4/4 requests completed
+      - log: /tmp/a100_lc_coord.log, /tmp/a100_lc_w{0,1,2,3}.log
+      - actual prompt tokens: 3724 / 7448 / 14895 / 29790
+      - 3.7k: "jumps over the lazy dog"
+      - 7.4k: "dog. The quick brown"
+      - 14.9k: "over the lazy dog."
+      - 29.8k: "The quick brown fox jumps"
+    - All workers reported graceful shutdown
+rollback_plan: |
+  No data mutations outside project logs. Processes exited cleanly; no rollback needed.
+requested_by: "main-agent"
+guard_verdict: "AUTHORIZED"
