@@ -2,6 +2,12 @@
 
 ## 当前焦点
 
+[2026-06-13] **战略转向：1M context + Thunderbolt RDMA 本地异构验证**
+- 用户决定将下一阶段核心目标定为：**在 white (RTX 4090 CUDA) 和 pearl (RX 9060 XT HIP) 两台本地机器上，通过 Thunderbolt 5/4 高速互联，验证 HCP Ring Attention 在 1M context 级别的可行性**。
+- 这是为了证明 HCP 的「未来意义」——当单节点显存墙不可避免时，异构设备 + 高速 P2P 互联是通向百万 token 的差异化路径。
+- 其他工程完善项（vLLM CUDA E2E、量化、多请求并发）被明确后置。
+- 详细计划：`docs/1M_CONTEXT_THUNDERBOLT_PLAN.md`。
+
 [2026-06-13] **超长 context 探索已暂停**：
   - 用户决定优先推超长 context，必要时换模型。
   - 选定模型：**Qwen/Qwen2.5-7B-Instruct-1M**（15.2 GB，max_position_embeddings=1,010,000，支持 1M context）。
