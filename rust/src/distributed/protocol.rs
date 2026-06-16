@@ -222,9 +222,18 @@ pub fn read_handshake(stream: &mut TcpStream) -> Result<WorkerHandshake, String>
 // QUIC variants
 // ---------------------------------------------------------------------------
 
+/// Returns the default QUIC frame/command timeout in seconds.
+/// Controlled by `HCP_QUIC_TIMEOUT_SECS` environment variable (default: 600).
+pub fn default_quic_timeout_secs() -> u64 {
+    std::env::var("HCP_QUIC_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(600)
+}
+
 /// Write a length-prefixed frame to a QUIC send stream.
 pub fn write_frame_quic(send: &mut SendStream, payload: &[u8], rt: &Handle) -> Result<(), String> {
-    write_frame_quic_timeout(send, payload, rt, 600)
+    write_frame_quic_timeout(send, payload, rt, default_quic_timeout_secs())
 }
 
 /// Write a length-prefixed frame with an explicit timeout.
@@ -252,7 +261,7 @@ pub fn write_frame_quic_timeout(
 
 /// Read a length-prefixed frame from a QUIC recv stream.
 pub fn read_frame_quic(recv: &mut RecvStream, rt: &Handle) -> Result<Vec<u8>, String> {
-    read_frame_quic_timeout(recv, rt, 600)
+    read_frame_quic_timeout(recv, rt, default_quic_timeout_secs())
 }
 
 /// Read a length-prefixed frame with an explicit timeout.
@@ -292,7 +301,7 @@ pub fn send_command_quic(
     cmd: &WorkerCommand,
     rt: &Handle,
 ) -> Result<(), String> {
-    send_command_quic_timeout(send, cmd, rt, 600)
+    send_command_quic_timeout(send, cmd, rt, default_quic_timeout_secs())
 }
 
 /// Send a command with an explicit timeout.
@@ -308,7 +317,7 @@ pub fn send_command_quic_timeout(
 
 /// Receive a command from a QUIC recv stream.
 pub fn recv_command_quic(recv: &mut RecvStream, rt: &Handle) -> Result<WorkerCommand, String> {
-    recv_command_quic_timeout(recv, rt, 600)
+    recv_command_quic_timeout(recv, rt, default_quic_timeout_secs())
 }
 
 /// Receive a command with an explicit timeout.

@@ -687,7 +687,7 @@ pub fn run() {
     for i in 0..args.num_domains {
         let (send, mut recv) = rt.block_on(async {
             let incoming = match tokio::time::timeout(
-                std::time::Duration::from_secs(600),
+                std::time::Duration::from_secs(crate::distributed::protocol::default_quic_timeout_secs()),
                 endpoint.accept()
             ).await {
                 Ok(Some(incoming)) => incoming,
