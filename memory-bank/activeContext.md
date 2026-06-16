@@ -2,8 +2,14 @@
 
 ## 当前焦点
 
-[2026-06-13] **战略转向：1M context + Thunderbolt RDMA 本地异构验证**
-- 用户决定将下一阶段核心目标定为：**在 white (RTX 4090 CUDA) 和 pearl (RX 9060 XT HIP) 两台本地机器上，通过 Thunderbolt 5/4 高速互联，验证 HCP Ring Attention 在 1M context 级别的可行性**。
+[2026-06-16] **战略转向：1M context + 2.5G 有线直连本地异构验证**
+- 用户决定将下一阶段核心目标定为：**在 white (RTX 4090 CUDA) 和 pearl (RX 9060 XT HIP) 两台本地机器上，通过 2.5G 有线直连验证 HCP Ring Attention 在 1M context 级别的可行性**。
+- 原 Thunderbolt 5/4 方案因主板无雷雳口放弃。
+- **网络基线已完成**（2026-06-16）：
+  - 2.5G 有线直连：~2.35 Gbps 双向对称，RTT ~0.1-0.2 ms
+  - WiFi：~250 Mbps，RTT 36-89 ms
+  - Tailscale 严重不对称：white→pearl ~1.8 Gbps / 0.77 ms，pearl→white ~300 Mbps / 39 ms（疑似走 relay/WiFi）
+- **决策**：HCP 验证使用有线直连 IP（white: `192.168.100.1`，pearl: `192.168.100.2`）。
 - 这是为了证明 HCP 的「未来意义」——当单节点显存墙不可避免时，异构设备 + 高速 P2P 互联是通向百万 token 的差异化路径。
 - 其他工程完善项（vLLM CUDA E2E、量化、多请求并发）被明确后置。
 - 详细计划：`docs/1M_CONTEXT_THUNDERBOLT_PLAN.md`。

@@ -3,11 +3,11 @@
 
 ssh_hosts:
   - host: "white"
-    hostname: "100.64.0.2"
+    hostname: "100.118.253.68"
     username: "stark"
     port: 22
-    note: "RTX 4090 CUDA, Tailscale VPN 访问"
-    tags: ["gpu", "cuda", "remote"]
+    note: "RTX 4090 CUDA. 2.5G wired direct to pearl: 192.168.100.1. Tailscale: 100.118.253.68."
+    tags: ["gpu", "cuda", "remote", "white"]
 
   - host: "sd-1"
     hostname: "100.64.0.93"
@@ -25,6 +25,13 @@ ssh_hosts:
     status: "ready"
     disk_after_cleanup: "95% used, 97G free (was 98%/45G)"
     tags: ["gpu", "cuda", "sd-cluster"]
+
+  - host: "pearl"
+    hostname: "100.111.242.55"
+    username: "stark"
+    port: 22
+    note: "RX 9060 XT HIP. 2.5G wired direct to white: 192.168.100.2. Tailscale: 100.111.242.55."
+    tags: ["gpu", "hip", "remote", "pearl"]
 
   - host: "a100-4x"
     hostname: "223.109.239.30"
@@ -45,6 +52,9 @@ paths:
     models: "/home/stark/models/Qwen2-0.5B"
     cargo_bin: "~/.cargo/bin"
     project_root: "~/hetero-cp-ringattn"
+    wired_ip: "192.168.100.1"
+    tailscale_ip: "100.118.253.68"
+    wifi_ip: "192.168.8.172"
   sd-1:
     libtorch: "/home/user/libtorch"
     models: "/home/user/models/qwen2-0.5b"
@@ -55,6 +65,15 @@ paths:
     models: "/home/user/models/qwen2-0.5b"
     cargo_bin: "~/.cargo/bin"
     project_root: "~/hetero-cp-ringattn"
+  pearl:
+    libtorch: "/home/stark/libtorch"
+    models: "/home/stark/models/Qwen2-0.5B"
+    cargo_bin: "~/.cargo/bin"
+    project_root: "~/hetero-cp-ringattn"
+    wired_ip: "192.168.100.2"
+    tailscale_ip: "100.111.242.55"
+    wifi_ip: "192.168.8.176"
+
   a100-4x:
     libtorch: "/root/libtorch"
     models: "/root/hetero-cp-ringattn/models/Qwen2.5-7B-Instruct"
@@ -69,6 +88,12 @@ env:
     LD_LIBRARY_PATH: "/home/stark/libtorch/lib"
     HCP_TCH_DEVICE: "cuda:0"
     PATH_PREFIX: "/home/stark/.cargo/bin:$PATH"
+    LD_PRELOAD: ""  # CUDA path does not need libtorch_hip preload
+  pearl:
+    LD_LIBRARY_PATH: "/home/stark/libtorch/lib"
+    HCP_TCH_DEVICE: "cuda:0"
+    PATH_PREFIX: "/home/stark/.cargo/bin:$PATH"
+    LD_PRELOAD: "/home/stark/libtorch/lib/libtorch_hip.so"
   sd-1:
     LD_LIBRARY_PATH: "/home/user/libtorch/lib"
     HCP_TCH_DEVICE: "cuda:0"
