@@ -192,12 +192,17 @@ pub struct QuicKvTransport {
 #[cfg(feature = "tch-backend")]
 impl QuicKvTransport {
     pub fn new(send: SendStream, recv: RecvStream, rt: Handle, device: Device) -> Self {
-        // Channel buffer = 1024：允许网络传输多个 block 的同时，主线程序列化后续 block。
+        // Channel buffer：允许网络传输多个 block 的同时，主线程序列化后续 block。
         // 这是 N-domain Serial 模式必需的：一次性 submit N 个 layer 的 blocks 时，
         // 如果 buffer 太小（如 2），send_task 和 recv_task 会在网络/缓冲区阻塞时互相死锁。
-        // 对于 1M context，micro block 数量可达数百个，64 不够；1024 提供足够 headroom。
-        let (send_tx, send_rx) = mpsc::channel::<SendCmd>(1024);
-        let (recv_tx, recv_rx) = mpsc::channel::<KvBlock>(1024);
+        // 对于 1M context，micro block 数量可达数百个，64 不够；但 1024 在 16GB GPU 上太占显存。
+        // 默认 512，可通过 HCP_KV_CHANNEL_BUFFER_SIZE 覆盖。
+        let buffer_size: usize = std::env::var("HCP_KV_CHANNEL_BUFFER_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(512);
+        let (send_tx, send_rx) = mpsc::channel::<SendCmd>(buffer_size);
+        let (recv_tx, recv_rx) = mpsc::channel::<KvBlock>(buffer_size);
 
         let send_task = rt.spawn(send_task_loop(send, send_rx));
         let recv_task = rt.spawn(recv_task_loop(recv, recv_tx, device));
