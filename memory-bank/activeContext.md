@@ -14,6 +14,13 @@
 - **当前限制**：`VllmBackend` 仍返回 one-hot logits；每次测试前必须清理 stale `VLLMEngineCor` 进程以避免 NPU 内存 profiling assert。
 - **下一步（可选）**：Phase 4 同进程 2-domain mixed backend smoke（NPU vLLM + CPU mock），Phase 5 真实 KV ring 数据面 + online softmax。
 
+[2026-06-17] **1M context 攻坚中**
+- 已验证 256K 和 512K distributed 成功。
+- 1M context 3:2 capacity-aware 分配到 layer 17/24 后因 pearl 16GB OOM 失败。
+- 已实施优化：QUIC timeout 可配置、KV channel buffer 可配置（默认 512）、精确的 1M token prompt。
+- 当前尝试 **2:1 显存比例切分**（white 666,666 tokens，pearl 333,334 tokens），监控任务 `bash-h7s95enr`。
+- 若 2:1 仍失败，可能需要 3 domain（white 双 worker）或接受 512K-700K 为 white+pearl 实际极限。
+
 [2026-06-16] **战略转向：1M context + 2.5G 有线直连本地异构验证**
 - 用户决定将下一阶段核心目标定为：**在 white (RTX 4090 CUDA) 和 pearl (RX 9060 XT HIP) 两台本地机器上，通过 2.5G 有线直连验证 HCP Ring Attention 在 1M context 级别的可行性**。
 - 原 Thunderbolt 5/4 方案因主板无雷雳口放弃。
