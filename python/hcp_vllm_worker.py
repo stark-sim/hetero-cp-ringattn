@@ -17,7 +17,9 @@ from hcp_worker_sdk import HcpWorkerBackend, KvBlock
 
 
 def _vllm_generate(llm, token_ids, sampling_params):
-    """兼容 vLLM 0.6.x 和 0.20.x 的 generate() API。"""
+    """兼容 vLLM 0.6.x 和 0.11.x 的 generate() API。"""
+    from vllm.inputs import TokensPrompt
+
     sig = inspect.signature(llm.generate)
     if "prompt_token_ids" in sig.parameters:
         # vLLM 0.6.x
@@ -26,11 +28,19 @@ def _vllm_generate(llm, token_ids, sampling_params):
             sampling_params=sampling_params,
         )
     else:
-        # vLLM 0.20.x: prompts 参数接受 list[int] (token IDs)
+        # vLLM 0.11.x: prompts 参数接受 TokensPrompt
         return llm.generate(
-            prompts=[token_ids],
+            prompts=[TokensPrompt(prompt_token_ids=token_ids)],
             sampling_params=sampling_params,
         )
+
+
+def _is_npu_available() -> bool:
+    try:
+        import torch_npu
+        return torch_npu.npu.is_available()
+    except Exception:
+        return False
 
 
 class VllmBackend(HcpWorkerBackend):
@@ -40,13 +50,17 @@ class VllmBackend(HcpWorkerBackend):
         from vllm import LLM, SamplingParams
 
         self.model_dir = model_dir
-        print(f"[vllm backend] loading model from {model_dir} ...")
+        self.device = device
+        if device == "npu" or (device == "cuda" and _is_npu_available()):
+            self.device = "npu"
+        print(f"[vllm backend] loading model from {model_dir} on {self.device} ...")
+        dtype = "float16" if self.device == "npu" else "float32"
         self.llm = LLM(
             model=model_dir,
-            dtype="float32",
+            dtype=dtype,
             trust_remote_code=True,
             tensor_parallel_size=1,
-            gpu_memory_utilization=0.4,
+            gpu_memory_utilization=0.5,
             enforce_eager=True,
             max_num_seqs=1,
         )
@@ -106,6 +120,10 @@ class VllmBackend(HcpWorkerBackend):
 
     @property
     def capacity_mb(self) -> int:
+        if self.device == "npu":
+            import torch_npu
+            free, _ = torch_npu.npu.mem_get_info()
+            return int(free // (1024 * 1024))
         if torch.cuda.is_available():
             free, _ = torch.cuda.mem_get_info()
             return int(free // (1024 * 1024))
