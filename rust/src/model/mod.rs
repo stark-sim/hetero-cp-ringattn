@@ -14,8 +14,8 @@
 
 pub mod config;
 pub mod error;
+pub mod sampling;
 pub use error::ModelError;
-#[cfg(feature = "tch-backend")]
 pub use config::ModelConfig;
 
 #[cfg(feature = "tch-backend")]
@@ -24,8 +24,6 @@ pub mod attention;
 pub mod cache;
 #[cfg(feature = "tch-backend")]
 pub use cache::KvCacheImpl;
-#[cfg(feature = "tch-backend")]
-pub mod sampling;
 #[cfg(feature = "tch-backend")]
 pub mod generator;
 #[cfg(feature = "tch-backend")]

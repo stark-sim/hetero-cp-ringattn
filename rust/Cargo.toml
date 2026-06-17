@@ -27,6 +27,7 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
 rcgen = "0.13"
 rustls = { version = "0.23", features = ["ring"] }
+rand = "0.8"
 
 [[bin]]
 name = "quic-echo-server"

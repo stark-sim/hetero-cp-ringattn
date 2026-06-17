@@ -14,11 +14,9 @@
 //! - `remote`: 远程 smoke test 入口
 //! - `smoke`: correctness 验证基础设施
 
-#[cfg(feature = "tch-backend")]
 mod api;
 mod cli;
 mod compute_runtime;
-#[cfg(feature = "tch-backend")]
 mod capacity;
 mod distributed;
 mod error;
@@ -228,19 +226,19 @@ pub fn run_cli() -> Result<(), RingError> {
         return Err(RingError::InvalidCli("tch-backend feature required for inference".to_string()));
     }
 
-    #[cfg(feature = "tch-backend")]
     if let Some(ref role) = args.distributed_role {
+        if role == "coordinator" {
+            distributed::coordinator::run();
+            return Ok(());
+        }
+        #[cfg(feature = "tch-backend")]
         if role == "worker" {
             distributed::worker::run();
             return Ok(());
-        } else if role == "coordinator" {
-            distributed::coordinator::run();
-            return Ok(());
-        } else {
-            return Err(RingError::InvalidCli(format!(
-                "invalid --distributed-role: {role}; expected worker|coordinator"
-            )));
         }
+        return Err(RingError::InvalidCli(format!(
+            "invalid --distributed-role: {role}; expected worker|coordinator"
+        )));
     }
 
     if args.remote_p2p_role.as_deref() == Some("cp-node") {

@@ -40,7 +40,13 @@ async def run_worker(
     next_peer_host: str,
     next_peer_port: int,
 ):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    from hcp_vllm_worker import _is_npu_available
+    if _is_npu_available():
+        device = "npu"
+    elif torch.cuda.is_available():
+        device = "cuda"
+    else:
+        device = "cpu"
     print(f"[vllm worker] loading model from {model_dir} on {device} ...")
     backend = VllmBackend(model_dir, device=device)
     print(f"[vllm worker] loaded, vocab_size={backend.vocab_size}, capacity={backend.capacity_mb} MB")

@@ -3,6 +3,63 @@ use crate::model::ModelError;
 #[cfg(feature = "tch-backend")]
 use tch::{Kind, Tensor};
 
+/// Pure-Rust sampling from a f32 logits slice (no libtorch required).
+#[cfg(not(feature = "tch-backend"))]
+pub(crate) fn sample_token_slice(logits: &[f32], temperature: f64, top_p: f64) -> Result<u32, ModelError> {
+    // Greedy decoding
+    if temperature <= 0.0 {
+        let mut best = 0usize;
+        let mut best_val = f32::NEG_INFINITY;
+        for (i, &v) in logits.iter().enumerate() {
+            if v > best_val {
+                best = i;
+                best_val = v;
+            }
+        }
+        return Ok(best as u32);
+    }
+
+    // Temperature scaling + softmax
+    let scaled: Vec<f32> = logits.iter().map(|&x| (x as f64 / temperature) as f32).collect();
+    let max = scaled.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let exp_sum: f32 = scaled.iter().map(|&x| (x - max).exp()).sum();
+    let mut probs: Vec<f32> = scaled.iter().map(|&x| (x - max).exp() / exp_sum).collect();
+
+    // Top-p (nucleus) filtering
+    if top_p > 0.0 && top_p < 1.0 {
+        let mut indexed: Vec<(usize, f32)> = probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut cumsum = 0.0f32;
+        let mut cutoff = indexed.len();
+        for (i, &(_, p)) in indexed.iter().enumerate() {
+            cumsum += p;
+            if cumsum > top_p as f32 {
+                cutoff = i + 1;
+                break;
+            }
+        }
+        let mut filtered = vec![0.0f32; probs.len()];
+        for (idx, p) in indexed.iter().take(cutoff) {
+            filtered[*idx] = *p;
+        }
+        let sum: f32 = filtered.iter().sum();
+        if sum > 0.0 {
+            probs = filtered.iter().map(|&p| p / sum).collect();
+        }
+    }
+
+    // Multinomial sampling via cumulative probabilities
+    let r: f32 = rand::random::<f32>();
+    let mut cumsum = 0.0f32;
+    for (i, &p) in probs.iter().enumerate() {
+        cumsum += p;
+        if r < cumsum {
+            return Ok(i as u32);
+        }
+    }
+    Ok((probs.len().saturating_sub(1)) as u32)
+}
+
 /// 【从 logits 采样单个 token】
 ///
 /// 这是 LLM 推理的"决策"步骤：模型输出一堆分数（logits），

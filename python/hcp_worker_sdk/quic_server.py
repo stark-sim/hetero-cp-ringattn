@@ -76,7 +76,11 @@ class QuicWorkerServer:
                 print(f"[worker {self.domain_id}] shutdown event received, exiting command loop")
                 break
 
-            cmd = await self.control_client.recv_command()
+            try:
+                cmd = await self.control_client.recv_command()
+            except ConnectionError:
+                print(f"[worker {self.domain_id}] coordinator closed connection, exiting")
+                break
             kind = cmd["kind"]
             print(f"[worker {self.domain_id}] received: {kind}")
 
@@ -159,6 +163,7 @@ class QuicWorkerServer:
 
     async def _handle_prefill(self, cmd: dict) -> dict:
         """Run prefill, exchange KV ring, return PrefillDone."""
+        request_id = cmd["request_id"]
         chunk = cmd["chunk"]
         self.seq_offset = cmd["seq_offset"]
 
@@ -176,12 +181,14 @@ class QuicWorkerServer:
         logits_bytes = logits.detach().cpu().numpy().astype("float32").tobytes()
         return {
             "kind": "PrefillDone",
+            "request_id": request_id,
             "last_logits_bytes": logits_bytes,
             "global_seq_len": self.global_seq_len,
         }
 
     async def _handle_decode(self, cmd: dict) -> dict:
         """Run decode, return DecodeDone."""
+        request_id = cmd["request_id"]
         token = cmd["token"]
         logits = self.backend.decode(token)
 
@@ -191,6 +198,7 @@ class QuicWorkerServer:
         logits_bytes = logits.detach().cpu().numpy().astype("float32").tobytes()
         return {
             "kind": "DecodeDone",
+            "request_id": request_id,
             "logits_bytes": logits_bytes,
         }
 

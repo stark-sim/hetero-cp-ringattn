@@ -12,13 +12,10 @@
 
 #![allow(dead_code)]
 
-#[cfg(feature = "tch-backend")]
 pub mod protocol;
-#[cfg(feature = "tch-backend")]
 pub mod coordinator;
+pub mod scheduler;
+pub mod transport;
+
 #[cfg(feature = "tch-backend")]
 pub mod worker;
-#[cfg(feature = "tch-backend")]
-pub mod scheduler;
-#[cfg(feature = "tch-backend")]
-pub mod transport;

@@ -15,14 +15,31 @@ use crate::distributed::protocol::{
     recv_response_quic, send_command_quic, WorkerCommand, WorkerResponse,
 };
 use crate::distributed::scheduler::{BatchScheduler, ActiveRequest};
-use crate::model::config::ModelConfig;
+use crate::model::ModelConfig;
+#[cfg(feature = "tch-backend")]
 use crate::model::sampling::sample_token;
+#[cfg(not(feature = "tch-backend"))]
+use crate::model::sampling::sample_token_slice;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tch::Tensor;
+
+#[cfg(feature = "tch-backend")]
+fn sample_from_logits_vec(logits: &[f32], temperature: f64, top_p: f64) -> Result<i64, String> {
+    let tensor = tch::Tensor::from_slice(logits);
+    sample_token(&tensor, temperature, top_p)
+        .map(|t| t as i64)
+        .map_err(|e| format!("{e}"))
+}
+
+#[cfg(not(feature = "tch-backend"))]
+fn sample_from_logits_vec(logits: &[f32], temperature: f64, top_p: f64) -> Result<i64, String> {
+    sample_token_slice(logits, temperature, top_p)
+        .map(|t| t as i64)
+        .map_err(|e| format!("{e}"))
+}
 
 #[derive(Debug)]
 struct CoordinatorArgs {
@@ -263,9 +280,8 @@ fn process_single_request(
             vocab_size, logits_vec.len()
         ));
     }
-    let logits_tensor = Tensor::from_slice(&logits_vec);
-    let mut next_token = match sample_token(&logits_tensor, temperature, top_p) {
-        Ok(t) => t as i64,
+    let mut next_token = match sample_from_logits_vec(&logits_vec, temperature, top_p) {
+        Ok(t) => t,
         Err(e) => return Err(format!("sample_token failed: {e}")),
     };
 
@@ -311,9 +327,8 @@ fn process_single_request(
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect();
-        let decode_tensor = Tensor::from_slice(&logits_vec);
-        next_token = match sample_token(&decode_tensor, temperature, top_p) {
-            Ok(t) => t as i64,
+        next_token = match sample_from_logits_vec(&logits_vec, temperature, top_p) {
+            Ok(t) => t,
             Err(e) => return Err(format!("sample_token failed at step {step}: {e}")),
         };
     }
@@ -520,9 +535,8 @@ fn prefill_single_request(
         });
         return Err(format!("logits size mismatch: expected {}, got {}", vocab_size, logits_vec.len()));
     }
-    let logits_tensor = Tensor::from_slice(&logits_vec);
-    let first_token = match sample_token(&logits_tensor, job.temperature, job.top_p) {
-        Ok(t) => t as i64,
+    let first_token = match sample_from_logits_vec(&logits_vec, job.temperature, job.top_p) {
+        Ok(t) => t,
         Err(e) => {
             let _ = job.tx.send(InferenceResult {
                 text: format!("[error: sample_token failed: {e}]"),
@@ -621,9 +635,8 @@ fn decode_iteration(
             eprintln!("[coordinator] request {request_id} logits size mismatch: expected {vocab_size}, got {}", logits_vec.len());
             continue;
         }
-        let logits_tensor = Tensor::from_slice(&logits_vec);
-        let next_token = match sample_token(&logits_tensor, req.temperature, req.top_p) {
-            Ok(t) => t,
+        let next_token = match sample_from_logits_vec(&logits_vec, req.temperature, req.top_p) {
+            Ok(t) => t as u32,
             Err(e) => {
                 eprintln!("[coordinator] request {request_id} sample_token failed: {e}");
                 continue;

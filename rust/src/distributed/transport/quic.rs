@@ -14,14 +14,20 @@
 //! 这种架构使得 attention 计算可以与 KV 传输完全重叠：
 //! 主线程在 `process_kv_block()` 计算的同时，send task 在后台把下一个 block
 //! 写入网络，recv task 在后台等待接收 peer block。
+#[cfg(feature = "tch-backend")]
 use crate::model::transport::{KvBlock, KvTransport};
-use quinn::{ClientConfig, Endpoint, RecvStream, SendStream, ServerConfig};
+#[cfg(feature = "tch-backend")]
+use quinn::SendStream;
+use quinn::{ClientConfig, Endpoint, RecvStream, ServerConfig};
 use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use std::net::SocketAddr;
 use std::sync::Arc;
+#[cfg(feature = "tch-backend")]
 use tch::{Device, Tensor};
+#[cfg(feature = "tch-backend")]
 use tokio::runtime::Handle;
+#[cfg(feature = "tch-backend")]
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug)]
@@ -128,7 +134,35 @@ pub fn create_endpoint(listen_addr: SocketAddr) -> Result<Endpoint, String> {
     Ok(endpoint)
 }
 
+#[derive(Debug)]
+pub enum ReadExactError {
+    Closed,
+    ReadError(quinn::ReadError),
+}
+
+impl std::fmt::Display for ReadExactError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadExactError::Closed => write!(f, "stream closed"),
+            ReadExactError::ReadError(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+pub async fn read_exact(stream: &mut RecvStream, buf: &mut [u8]) -> Result<(), ReadExactError> {
+    let mut offset = 0;
+    while offset < buf.len() {
+        match stream.read(&mut buf[offset..]).await {
+            Ok(Some(n)) => offset += n,
+            Ok(None) => return Err(ReadExactError::Closed),
+            Err(e) => return Err(ReadExactError::ReadError(e)),
+        }
+    }
+    Ok(())
+}
+
 /// 【发送命令】Data = 序列化后的 frame；Flush = 要求 send task 确认所有数据已提交。
+#[cfg(feature = "tch-backend")]
 enum SendCmd {
     Data(Vec<u8>),
     Flush(oneshot::Sender<()>),
@@ -139,6 +173,7 @@ enum SendCmd {
 /// 内部包含两个独立的 tokio tasks（send / recv），主线程通过 channel 与之交互。
 /// 所有 Tensor 序列化/反序列化发生在主线程（submit_send）和 recv task 中，
 /// channel 中只传递 `Vec<u8>`，避免 Tensor 跨线程移动的问题。
+#[cfg(feature = "tch-backend")]
 pub struct QuicKvTransport {
     /// 向 send task 发送命令（序列化 frame 或 flush marker）
     send_tx: mpsc::Sender<SendCmd>,
@@ -154,6 +189,7 @@ pub struct QuicKvTransport {
     device: Device,
 }
 
+#[cfg(feature = "tch-backend")]
 impl QuicKvTransport {
     pub fn new(send: SendStream, recv: RecvStream, rt: Handle, device: Device) -> Self {
         // Channel buffer = 1024：允许网络传输多个 block 的同时，主线程序列化后续 block。
@@ -181,6 +217,7 @@ impl QuicKvTransport {
 ///
 /// 这个 task 独立运行，即使主线程在进行 attention 计算，它也在后台
 /// 把 KV block 写入网络，实现计算-通信重叠。
+#[cfg(feature = "tch-backend")]
 async fn send_task_loop(mut send: SendStream, mut cmd_rx: mpsc::Receiver<SendCmd>) {
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -204,6 +241,7 @@ async fn send_task_loop(mut send: SendStream, mut cmd_rx: mpsc::Receiver<SendCmd
 ///
 /// 这个 task 独立运行，即使主线程在进行 attention 计算，它也在后台
 /// 等待接收 peer block，一有数据就推入 channel 供 poll_recv() 消费。
+#[cfg(feature = "tch-backend")]
 async fn recv_task_loop(mut recv: RecvStream, block_tx: mpsc::Sender<KvBlock>, device: Device) {
     let mut handshake_done = false;
     loop {
@@ -224,6 +262,7 @@ async fn recv_task_loop(mut recv: RecvStream, block_tx: mpsc::Sender<KvBlock>, d
 }
 
 /// 【序列化 KV block 为 Vec<u8> frame】
+#[cfg(feature = "tch-backend")]
 fn serialize_kv_block(block: &KvBlock) -> Result<Vec<u8>, String> {
     let (k_bytes, k_dtype) = tensor_to_bytes(&block.k)?;
     let (v_bytes, v_dtype) = tensor_to_bytes(&block.v)?;
@@ -255,6 +294,7 @@ fn serialize_kv_block(block: &KvBlock) -> Result<Vec<u8>, String> {
 }
 
 /// 【接收一个 KV block 从 QUIC recv stream】（async，可被 recv task 调用）
+#[cfg(feature = "tch-backend")]
 async fn recv_kv_block_from_stream(
     recv: &mut RecvStream,
     handshake_done: &mut bool,
@@ -318,6 +358,7 @@ async fn recv_kv_block_from_stream(
 }
 
 #[cfg(feature = "tch-backend")]
+#[cfg(feature = "tch-backend")]
 impl KvTransport for QuicKvTransport {
     /// 【提交异步发送】序列化 block 后推入 send channel，立即返回。
     ///
@@ -380,33 +421,8 @@ impl KvTransport for QuicKvTransport {
     }
 }
 
-#[derive(Debug)]
-pub enum ReadExactError {
-    Closed,
-    ReadError(quinn::ReadError),
-}
-
-impl std::fmt::Display for ReadExactError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ReadExactError::Closed => write!(f, "stream closed"),
-            ReadExactError::ReadError(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-pub async fn read_exact(stream: &mut RecvStream, buf: &mut [u8]) -> Result<(), ReadExactError> {
-    let mut offset = 0;
-    while offset < buf.len() {
-        match stream.read(&mut buf[offset..]).await {
-            Ok(Some(n)) => offset += n,
-            Ok(None) => return Err(ReadExactError::Closed),
-            Err(e) => return Err(ReadExactError::ReadError(e)),
-        }
-    }
-    Ok(())
-}
-
+#[cfg(feature = "tch-backend")]
+#[cfg(feature = "tch-backend")]
 fn tensor_to_bytes(t: &Tensor) -> Result<(Vec<u8>, String), String> {
     let flat = t.contiguous().view(-1).to_kind(tch::Kind::Float);
     let values: Vec<f32> = Vec::try_from(&flat).map_err(|e| format!("tensor to vec failed: {e}"))?;
@@ -421,6 +437,7 @@ fn tensor_to_bytes(t: &Tensor) -> Result<(Vec<u8>, String), String> {
     Ok((bytes, dtype.to_string()))
 }
 
+#[cfg(feature = "tch-backend")]
 fn bytes_to_tensor(bytes: &[u8], shape: &[i64], device: Device, dtype_str: &str) -> Result<Tensor, String> {
     let values: Vec<f32> = bytes.chunks_exact(4)
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))

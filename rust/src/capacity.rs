@@ -23,8 +23,12 @@
 //!   system RAM via `/proc/meminfo` (Linux) or `sysctl` (macOS).
 //! - **Conservative heuristics** for MPS (unified memory) and CPU (slower compute).
 
+#![allow(dead_code)]
+
+#[cfg(feature = "tch-backend")]
 use tch::Device;
 
+#[cfg(feature = "tch-backend")]
 /// Query an approximate free-memory capacity for the given device, in megabytes.
 ///
 /// The value is a heuristic:
