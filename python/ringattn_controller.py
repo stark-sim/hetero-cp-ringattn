@@ -9,6 +9,7 @@ HCP 快速原型控制器。
 """
 
 import argparse
+import base64
 import json
 import socket
 import struct
@@ -70,9 +71,9 @@ def main():
             "head_dim": head_dim,
             "seq_chunk_len": chunk_len,
             "block_size": d["block_size"],
-            "q_chunk": q_chunk.tobytes(),
-            "k_global": K.tobytes(),
-            "v_global": V.tobytes(),
+            "q_chunk": base64.b64encode(q_chunk.tobytes()).decode("ascii"),
+            "k_global": base64.b64encode(K.tobytes()).decode("ascii"),
+            "v_global": base64.b64encode(V.tobytes()).decode("ascii"),
         }
         data = json.dumps(payload).encode()
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
