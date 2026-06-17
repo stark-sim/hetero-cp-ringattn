@@ -2,6 +2,17 @@
 
 ## 已完成功能
 
+- [x] [2026-06-17] **昇腾 910B NPU 适配踏出第一步 — Python vLLM worker ↔ Rust coordinator 控制面 E2E 打通**：
+  - 硬件：单机 1× Ascend 910B4 (32 GB HBM)，Kunpeng-920 192-core，1.5 TiB RAM
+  - 环境：`torch 2.7.1+cpu` + `torch_npu 2.7.1` + `vllm 0.11.0` + `vllm-ascend 0.11.0`
+  - Phase 0：`scripts/test_vllm_npu.py` 成功在 910B 上加载 `Qwen2-0.5B` 并生成文本 ✅
+  - Phase 1：`python/hcp_vllm_worker.py` 自动检测 `torch_npu`，路由到 `device=npu`，dtype=`float16`，显存容量通过 `torch_npu.npu.mem_get_info()` 上报；修复 `_vllm_generate` 兼容 vLLM 0.11.x `TokensPrompt` API
+  - Phase 2：安装 Rust 1.96.0，配置 cargo 国内镜像，`cargo build --no-default-features --bin hcp-ringattn-rust` 通过
+  - Phase 3：核心重构让 Rust coordinator 脱离 libtorch（无 `--features tch-backend` 亦可编译运行），纯 Rust 采样替代 `tch::Tensor`；修复 Python QUIC bincode 协议（enum tag 顺序 + `request_id` 字段）；新增 `scripts/test_npu_worker_rust_coord.sh`
+  - E2E 结果：coordinator 与 Python NPU vLLM worker 完成 handshake → Prefill → SyncGlobalSeqLen → 3×Decode → ReleaseRequest → Shutdown，coordinator 输出 `generated: ! I'm` ✅
+  - 意义：HCP 控制面首次在昇腾 NPU 生态跑通，证明 Rust coordinator 作为纯控制平面可以驱动 Python vLLM-ascend backend，是 HCP 支持更多平台生态的一小半步
+  - 已知限制：`VllmBackend` 仍返回 one-hot logits（vLLM 公共 API 不暴露完整 logits），生成质量受限；NPU 内存释放需要彻底清理 stale EngineCore 进程
+
 - [x] [2026-04-24] 仓库已从 `honolulu` 抽离为 standalone HCP Ring Attention 研究仓。
 - [x] [2026-04-24] 已完成独立 C++ core skeleton：`Status`、`TensorDType`、`BoundaryTensor`、protocol、runtime 抽象。
 - [x] [2026-04-24] 已实现最小 `NoOpRingAttnRuntime`。

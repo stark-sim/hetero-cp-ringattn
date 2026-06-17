@@ -2,6 +2,18 @@
 
 ## 当前焦点
 
+[2026-06-17] **昇腾 910B NPU 适配踏出第一步 — Python vLLM worker ↔ Rust coordinator 控制面 E2E 已打通**：
+- 在单机 1× Ascend 910B4 (32 GB HBM) 上完成 HCP NPU 适配验证，作为 HCP 支持更多平台生态的一小半步。
+- **已完成**：
+  - vllm-ascend 单节点可用性验证 (`scripts/test_vllm_npu.py`)
+  - `VllmBackend` NPU 化：自动检测 `torch_npu`，`device=npu`，`float16`，显存容量上报
+  - Rust 1.96.0 安装 + `cargo build --no-default-features --bin hcp-ringattn-rust` 编译通过
+  - Rust coordinator 从 `tch-backend` feature 后解耦，实现无 libtorch 运行控制面
+  - Python QUIC bincode 协议修复（与 Rust `WorkerCommand/WorkerResponse` enum 顺序和 `request_id` 对齐）
+  - `scripts/test_npu_worker_rust_coord.sh` E2E 通过：coordinator 输出 `generated: ! I'm`
+- **当前限制**：`VllmBackend` 仍返回 one-hot logits；每次测试前必须清理 stale `VLLMEngineCor` 进程以避免 NPU 内存 profiling assert。
+- **下一步（可选）**：Phase 4 同进程 2-domain mixed backend smoke（NPU vLLM + CPU mock），Phase 5 真实 KV ring 数据面 + online softmax。
+
 [2026-06-16] **战略转向：1M context + 2.5G 有线直连本地异构验证**
 - 用户决定将下一阶段核心目标定为：**在 white (RTX 4090 CUDA) 和 pearl (RX 9060 XT HIP) 两台本地机器上，通过 2.5G 有线直连验证 HCP Ring Attention 在 1M context 级别的可行性**。
 - 原 Thunderbolt 5/4 方案因主板无雷雳口放弃。
