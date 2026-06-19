@@ -16,10 +16,9 @@
 
 [2026-06-19] **1M context 最终攻坚中**
 - 已验证 256K 和 512K distributed 成功。
-- v7（2:1 split, max_pos=1048576, buffer 512）prefill 跑到 **layer 23/24** 后因 pearl **内存碎片 OOM** 失败：已分配 11.67GB + 保留 3.29GB，剩余 464MB 不够分配 570MB。
-- 已实施修复：启动 v8 时设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 减少 HIP 显存碎片。
-- 当前重跑 v8（2:1 split, buffer 512, max_pos=1048576, expandable segments），监控任务 `bash-2825yf0t`。
-- 这是冲击 1M 的最后一次主要尝试。
+- v7（2:1 split）prefill 跑到 **layer 23/24** 后因 pearl **内存碎片 OOM** 失败。
+- v8（2:1 split + expandable segments）已启动但被用户叫停，改试 **3:1 split**。
+- 当前重跑 v9（3:1 split：white 750,000 / pearl 250,000；buffer 512；max_pos=1048576；expandable segments），监控任务 `bash-9272tkky`。
 
 [2026-06-16] **战略转向：1M context + 2.5G 有线直连本地异构验证**
 - 用户决定将下一阶段核心目标定为：**在 white (RTX 4090 CUDA) 和 pearl (RX 9060 XT HIP) 两台本地机器上，通过 2.5G 有线直连验证 HCP Ring Attention 在 1M context 级别的可行性**。
