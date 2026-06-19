@@ -125,7 +125,7 @@
    - 确认 tokenizer 和 config 一致
    - 生成 1M token 级别的长 prompt（复用 `scripts/generate_long_prompt.py`）
 
-### Phase 1：单节点与分布式 0.5B 长 context 验证（2-3 天）
+### Phase 1：单节点与分布式 0.5B 长 context 验证（✅ 已完成）
 
 1. **单节点 0.5B 1M context**
    - white 单节点尝试 1M tokens（24GB 应可 fit，但可能较慢）
@@ -157,7 +157,7 @@
    - 在 2.5G 有线直连高速链路上，overlap 收益可能不同于 WiFi/Tailscale
    - 预期：高速网络下 network time 占比降低，overlap 收益可能减小（与 A100 NVLink 类似）
 
-### Phase 3：报告与叙事（1-2 天）
+### Phase 3：报告与叙事（✅ 已完成）
 
 1. 生成结构化报告：
    - `reports/1m-context-thunderbolt-<timestamp>/`
@@ -223,7 +223,56 @@
 
 ---
 
-## 7. 与 A100 1M 模型的关系
+## 7. 执行结果（2026-06-19）
+
+### 7.1 最终验证
+
+**1M context 本地异构分布式推理成功**（white RTX 4090 CUDA + pearl RX 9060 XT HIP，2.5G 有线直连）：
+
+| 配置 | 值 |
+|------|-----|
+| 模型 | `Qwen2-0.5B-1M`（0.5B，24 layers，BF16，权重 ~1GB） |
+| Prompt | 精确 1,000,000 tokens（`gen_prompt` 生成，decode→encode round-trip 校验） |
+| 分片 | capacity-aware **3:1**（white 750,000 / pearl 250,000） |
+| KV buffer | `HCP_KV_CHANNEL_BUFFER_SIZE=512` |
+| QUIC timeout | `HCP_QUIC_TIMEOUT_SECS=14400` |
+| 显存策略 | `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`（white） |
+| Config patch | `max_position_embeddings=1048576`（原 1000000 会在 decode 时越界） |
+| 输出 | `generated:  the.`（5 decode tokens，temperature=0.0） |
+| 结果 | prefill 24/24 全通，decode 5/5 全通，exit=0，workers 优雅退出 ✅ |
+
+### 7.2 关键性能数据
+
+| 指标 | 数值 |
+|------|-----|
+| 总耗时 | ~2 小时 8 分钟（04:08 UTC → 06:16 UTC） |
+| prefill | ~1 小时 52 分钟 |
+| decode | ~16 分钟（~3 分钟 / token） |
+| white 显存峰值 | **23,999 MB**（RTX 4090 24GB 几乎占满） |
+| pearl 显存 | 未 OOM，16GB 内完成 |
+| decode GPU 利用率 | ~5%（memory-bound 特征） |
+
+### 7.3 攻克的关键问题
+
+1. **1M prefill 死锁**：KV transport `mpsc` buffer 默认 64，对 >64 micro blocks 不足，导致 prefill 死锁。通过环境变量 `HCP_KV_CHANNEL_BUFFER_SIZE=512` 解决。
+2. **QUIC 600s 超时**：大 context 下单层 KV 传输 + compute 可能超过 600s。通过 `HCP_QUIC_TIMEOUT_SECS=14400` 解决。
+3. **Decode 位置越界**：原 config `max_position_embeddings=1_000_000`，decode 第 1 个新 token 的位置为 1,000,000，触发 RoPE `index_select` 越界。patch 为 `1048576` 后解决。
+4. **pearl 16GB 碎片化 OOM**：2:1 split 在 layer 23/24 因 pearl 显存分配失败；改用 3:1 split 降低 pearl 压力，white 24GB 刚好 fit。
+
+### 7.4 与原始预期的差异
+
+- **原计划 1:1 分片可行**：实际因 activation / 工作集 / 显存碎片，pearl 16GB 无法承载 500K chunk；最终使用 **3:1 不均等分片**。
+- **white 显存接近 24GB 上限**：远超 §2.2 表格估算的 7GB，主要因为 CUDA allocator fragmentation、activation、中间 tensor 以及 KV cache 连续分配。`expandable_segments:True` 帮助 white 刚好 fit。
+- **2.5G 网络不是瓶颈**：prefill 耗时 ~1h52m，说明在 0.5B/1M 规模下 system 主要受显存容量和 memory-bound compute 限制，而非网络带宽。
+
+### 7.5 报告
+
+- 完整报告：`reports/1m-white-pearl-20260619/README.md`
+- 状态：**最小成功 ✅ 达成；完整成功中 Serial vs Pipeline A/B 与更大模型验证暂未执行。**
+
+---
+
+## 8. 与 A100 1M 模型的关系
 
 - **white+pearl 本地验证**：聚焦「异构 + 高速 P2P」这个差异化命题，模型用 0.5B。
 - **A100 1M 模型（Qwen2.5-7B-Instruct-1M）**：作为后续规模化验证目标，需要 4-8× A100 或支持权重分片。

@@ -2,23 +2,35 @@
 
 ## 当前焦点
 
-[2026-06-17] **昇腾 910B NPU 适配踏出第一步 — Python vLLM worker ↔ Rust coordinator 控制面 E2E 已打通**：
+[2026-06-19] **1M context 本地异构分布式验证成功** ✅
+- v9（3:1 split：white 750,000 / pearl 250,000；KV channel buffer 512；`max_position_embeddings=1048576`；`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`）跑通 1M context 端到端。
+- Coordinator 输出 `generated:  the.`，prefill 24/24 层全通，decode 5 tokens 全通，exit=0，workers 优雅退出。
+- 关键数据：
+  - 总耗时约 **2 小时 8 分钟**（04:08 UTC → 06:16 UTC）
+  - prefill：约 **1 小时 52 分钟**（24 层全通）
+  - decode：约 **16 分钟**（5 tokens，每 token ~3 分钟，受 1M KV cache memory-bound 限制）
+  - white 显存峰值：**23,999 MB**（RTX 4090 24GB 刚好 fit）
+  - pearl 显存：未 OOM，GPU 利用率 decode 阶段 ~5%（memory-bound 特征）
+- 攻克的关键问题：
+  - 1M 死锁：KV transport `mpsc` buffer 64 对 >64 micro blocks 不足，通过 `HCP_KV_CHANNEL_BUFFER_SIZE=512` 解决。
+  - 超长超时：QUIC 默认 600s 不够，通过 `HCP_QUIC_TIMEOUT_SECS=14400` 解决。
+  - Decode 越界：原 config `max_position_embeddings=1000000` 导致 position 1,000,000 触发 RoPE index 错误；patch 为 `1048576` 后解决。
+  - pearl 碎片化 OOM：2:1 split 在 layer 23/24 因 pearl 16GB 分配失败；改用 3:1 split 后 pearl 压力降低，white 24GB 刚好 fit。
+- 证明：在 2.5G 有线直连 + capacity-aware 不均等分片下，white（CUDA）+ pearl（HIP）可协同完成 1M context 推理。
+- 报告：`reports/1m-white-pearl-20260619/README.md`
+- 当前无未完成的 1M 攻坚任务；下一步是整理文档 / memory-bank，并决定是否需要更大模型 / 更多 domain 的验证。
+
+[2026-06-17] **昇腾 910B NPU 适配踏出第一步 — Python vLLM worker ↔ Rust coordinator 控制面 E2E 已打通**（背景上下文）：
 - 在单机 1× Ascend 910B4 (32 GB HBM) 上完成 HCP NPU 适配验证，作为 HCP 支持更多平台生态的一小半步。
 - **已完成**：
   - vllm-ascend 单节点可用性验证 (`scripts/test_vllm_npu.py`)
   - `VllmBackend` NPU 化：自动检测 `torch_npu`，`device=npu`，`float16`，显存容量上报
   - Rust 1.96.0 安装 + `cargo build --no-default-features --bin hcp-ringattn-rust` 编译通过
   - Rust coordinator 从 `tch-backend` feature 后解耦，实现无 libtorch 运行控制面
-  - Python QUIC bincode 协议修复（与 Rust `WorkerCommand/WorkerResponse` enum 顺序和 `request_id` 对齐）
+  - Python QUIC bincode 协议修复（与 Rust `WorkerCommand/WorkerResponse` enum 顺序和 `request_id` 字段对齐）
   - `scripts/test_npu_worker_rust_coord.sh` E2E 通过：coordinator 输出 `generated: ! I'm`
 - **当前限制**：`VllmBackend` 仍返回 one-hot logits；每次测试前必须清理 stale `VLLMEngineCor` 进程以避免 NPU 内存 profiling assert。
 - **下一步（可选）**：Phase 4 同进程 2-domain mixed backend smoke（NPU vLLM + CPU mock），Phase 5 真实 KV ring 数据面 + online softmax。
-
-[2026-06-19] **1M context 最终攻坚中**
-- 已验证 256K 和 512K distributed 成功。
-- v7（2:1 split）prefill 跑到 **layer 23/24** 后因 pearl **内存碎片 OOM** 失败。
-- v8（2:1 split + expandable segments）已启动但被用户叫停，改试 **3:1 split**。
-- 当前重跑 v9（3:1 split：white 750,000 / pearl 250,000；buffer 512；max_pos=1048576；expandable segments），监控任务 `bash-9272tkky`。
 
 [2026-06-16] **战略转向：1M context + 2.5G 有线直连本地异构验证**
 - 用户决定将下一阶段核心目标定为：**在 white (RTX 4090 CUDA) 和 pearl (RX 9060 XT HIP) 两台本地机器上，通过 2.5G 有线直连验证 HCP Ring Attention 在 1M context 级别的可行性**。

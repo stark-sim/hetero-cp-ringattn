@@ -2,6 +2,16 @@
 
 ## 已完成功能
 
+- [x] [2026-06-19] **1M context 本地异构分布式推理历史性成功**（white RTX 4090 CUDA + pearl RX 9060 XT HIP，2.5G 有线直连）：
+  - 模型：`Qwen2-0.5B-1M`（0.5B，24 layers，BF16，权重 ~1GB）
+  - 分片：capacity-aware 3:1 不均等分片（white 750,000 tokens / pearl 250,000 tokens）
+  - Prompt：精确 1,000,000 tokens（`gen_prompt` 生成并 decode→encode round-trip 校验）
+  - 关键配置：`HCP_KV_CHANNEL_BUFFER_SIZE=512`、`HCP_QUIC_TIMEOUT_SECS=14400`、`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`、`max_position_embeddings=1048576`
+  - 结果：coordinator 输出 `generated:  the.`，prefill 24/24 层全通，decode 5 tokens 全通，exit=0，workers 优雅退出。
+  - 性能：总耗时 ~2h 8m；prefill ~1h 52m；decode ~16m（每 token ~3m，1M context memory-bound）；white 显存峰值 23,999 MB（RTX 4090 24GB 刚好 fit）；pearl 16GB 内未 OOM。
+  - 意义：**首次在本地消费级异构设备（CUDA + HIP）上通过 HCP Ring Attention 完成 1,000,000 token context 的端到端推理**，验证了「单节点显存墙 + 高速 P2P 异构扩展」路径的可行性。
+  - 报告：`reports/1m-white-pearl-20260619/README.md`
+
 - [x] [2026-06-17] **昇腾 910B NPU 适配踏出第一步 — Python vLLM worker ↔ Rust coordinator 控制面 E2E 打通**：
   - 硬件：单机 1× Ascend 910B4 (32 GB HBM)，Kunpeng-920 192-core，1.5 TiB RAM
   - 环境：`torch 2.7.1+cpu` + `torch_npu 2.7.1` + `vllm 0.11.0` + `vllm-ascend 0.11.0`
