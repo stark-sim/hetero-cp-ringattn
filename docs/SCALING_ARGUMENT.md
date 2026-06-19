@@ -26,8 +26,11 @@ For **Qwen2-0.5B**:
 | head_dim | 64 |
 
 ```
-KV_bytes_per_token = 2 × 24 × 2 × 64 × 4 = 24,576 bytes/token ≈ 24 KB/token
+KV_bytes_per_token (fp32) = 2 × 24 × 2 × 64 × 4 = 24,576 bytes/token ≈ 24 KB/token
+KV_bytes_per_token (BF16) = 2 × 24 × 2 × 64 × 2 = 12,288 bytes/token ≈ 12 KB/token
 ```
+
+HCP 实际运行使用 BF16，因此 1M tokens 的 KV cache 总量约 **12 GB**；本节后续表格以 fp32 作为保守上界，实际 BF16 压力减半。
 
 ### 1.2 Context Length vs KV Cache
 
@@ -103,6 +106,25 @@ For 1M tokens across N domains:
 | 64K | 2 | RTX 4090 ×2 (local) | ~4 min | ✅ `progress.md` 2026-05-05 |
 | 512 | 3 | MPS + CUDA + HIP (cross-node) | ~2 min | ✅ This document |
 | 4K | 4 | MPS + CUDA×3 (cross-node VPN) | ~83 min | ✅ `progress.md` 2026-05-22 |
+| 1M | 2 | RTX 4090 (CUDA) + RX 9060 XT (HIP), 3:1 uneven | ~2h 8min | ✅ `reports/1m-white-pearl-20260619` |
+
+### 3.3 Capacity-Aware Uneven Sharding
+
+上述表格中的 2-domain 1M 成功案例**不是均分**的。white（RTX 4090, 24GB）承担 750K tokens，pearl（RX 9060 XT, 16GB）承担 250K tokens，比例为 **3:1**。
+
+**为什么必须不均等**：
+
+- 均分 1M tokens 时，每个 domain 需存储 500K tokens 的 KV cache（BF16 约 6GB）+ 权重 ~1GB + activation / 工作集 / allocator 碎片。
+- pearl 16GB 在 500K chunk 下于 layer 23/24 因连续分配失败而 OOM；2:1 与 3:2 split 同样失败。
+- 将 pearl 负载降到 250K tokens 后，其显存压力进入安全区；white 24GB 接近满载（峰值 23,999 MB），刚好 fit。
+
+**这推翻了 §6.1 中的简单假设**：单看 KV cache 时，2-domain 1M 似乎 fits 24GB；但实际运行中 activation、工作集和显存碎片会让 even-split 在 16GB 设备上失败。容量感知不均等分片不是优化，而是异构长 context 的**可行性前提**。
+
+**对 HCP 叙事的意义**：
+
+- 增加 domain 数量可以降低每个 domain 的 KV cache。
+- 在异构 cluster 中，分片比例必须按设备可用显存（以及算力、带宽）动态决定，而不是简单均分。
+- HCP 的 P2P ring + online softmax 天然支持任意 chunk size；collective-based CP 通常假设均分。
 
 ---
 
@@ -197,13 +219,15 @@ No two devices are identical in architecture, memory, or speed. Yet HCP's online
 
 Assuming Qwen2-0.5B with fp32 KV cache (24 KB/token):
 
-| Seq Len | 1× RTX 4090 | 2-domain | 4-domain | 8-domain | 16-domain |
-|---------|-------------|----------|----------|----------|-----------|
-| 128K | ✅ 3.0 GB | ✅ 1.5 GB | ✅ 0.75 GB | ✅ 0.38 GB | ✅ 0.19 GB |
-| 512K | ❌ OOM (~12GB) | ❌ OOM | ✅ 3.0 GB | ✅ 1.5 GB | ✅ 0.75 GB |
-| 1M | ❌ OOM | ❌ OOM | ✅ 6.0 GB | ✅ 3.0 GB | ✅ 1.5 GB |
-| 2M | ❌ OOM | ❌ OOM | ❌ OOM | ✅ 6.0 GB | ✅ 3.0 GB |
-| 10M | ❌ OOM | ❌ OOM | ❌ OOM | ❌ OOM | ✅ 15.0 GB |
+| Seq Len | 1× RTX 4090 | 2-domain (even) | 2-domain (capacity-aware) | 4-domain | 8-domain | 16-domain |
+|---------|-------------|-----------------|---------------------------|----------|----------|-----------|
+| 128K | ✅ 3.0 GB | ✅ 1.5 GB | ✅ 1.5 GB (any split) | ✅ 0.75 GB | ✅ 0.38 GB | ✅ 0.19 GB |
+| 512K | ❌ OOM (~12GB) | ❌ OOM | ✅ ~4 GB (3:1 on 24+16GB) | ✅ 3.0 GB | ✅ 1.5 GB | ✅ 0.75 GB |
+| 1M | ❌ OOM | ❌ OOM | ✅ ~12 GB (3:1 on 24+16GB) | ✅ 6.0 GB | ✅ 3.0 GB | ✅ 1.5 GB |
+| 2M | ❌ OOM | ❌ OOM | ❌ OOM | ❌ OOM | ✅ 6.0 GB | ✅ 3.0 GB |
+| 10M | ❌ OOM | ❌ OOM | ❌ OOM | ❌ OOM | ❌ OOM | ✅ 15.0 GB |
+
+> 注：表中数值仅为 KV cache（fp32 上界）；实际 BF16 减半。"capacity-aware" 列表示不均等分片在 24GB+16GB 异构组合上的可行性，已由 1M / 3:1 split 验证。
 
 ### 6.2 Network Feasibility Matrix
 
@@ -239,6 +263,7 @@ Per-domain total prefill transfer (Qwen2-0.5B, 24 layers):
 | 2026-05-05 | 2-domain local 64K | 64K | 2× RTX 4090 | ✅ ~4min |
 | 2026-05-22 | 4-domain cross-node 4K | 4K | MPS + 3× CUDA | ✅ ~83min (VPN) |
 | 2026-06-02 | 3-domain heterogeneous | 64–512 | MPS + CUDA + HIP | ✅ All exit=0 |
+| 2026-06-19 | 2-domain heterogeneous 1M | 1M | RTX 4090 (CUDA) + RX 9060 XT (HIP), 3:1 | ✅ ~2h 8min, white peak 23,999 MB |
 
 ---
 
@@ -251,4 +276,4 @@ HCP Ring Attention's value proposition is not incremental performance optimizati
 3. **Capacity-aware sharding** (memory-proportional token distribution)
 4. **Cross-platform transport** (QUIC over any network)
 
-As context lengths grow from 128K → 1M → 10M, the memory wall becomes unavoidable. HCP transforms this wall into a scheduling problem: add more domains, any domains, and the ring scales.
+As context lengths grow from 128K → 1M → 10M, the memory wall becomes unavoidable. HCP transforms this wall into a scheduling problem: add more domains, any domains, and the ring scales. The 2026-06-19 1M milestone proves this scheduling problem is solvable in practice on real heterogeneous hardware — but only with **capacity-aware uneven sharding**.

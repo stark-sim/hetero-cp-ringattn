@@ -425,3 +425,5 @@ Layer 1: HCP 协议层（可复用 SDK）
 | **Static Batching：等长 prompts + 0-token 填充** | `BatchGenerator` 支持 batch > 1，但要求所有 prompts 等长（避免 padding mask 的 correctness 风险）。已完成的 request 喂 0 token 保持 KV cache 形状一致。不实现连续 batching 或动态 padding，直到 correctness 基线更稳固 | [2026-05-09] |
 | **Transport 序列化必须携带 dtype 元数据** | TCP/QUIC transport 的 `tensor_to_bytes`/`bytes_to_tensor` 曾硬编码 `f32`，导致 BF16 KV block 跨节点传输后被重建为 Float32 tensor → `matmul` dtype 不匹配 panic。修复：序列化时记录 dtype（float32/float16/bfloat16/float64），反序列化后 `.to_kind(kind)` 还原原始 dtype。此教训适用于任何非 f32 精度的分布式 tensor 传输场景 | [2026-06-04] |
 | **Correctness-First 纪律：优化必须证明无害** | 在 correctness 流程完全走完之前，不实施任何可能损害服务质量的优化。包括但不限于：量化（FP8/INT8/BF16 KV cache）、近似 attention、非 deterministic kernel、跳过层/投机解码。每次提出优化前必须写 trade-off 分析：为什么默认存在、牺牲了什么、牺牲的东西在一般情况下的作用、对本项目的具体影响。见下方「Correctness-First 开发纪律」 | [2026-05-09] |
+
+| **容量感知非均等 CP 分片是异构长 context 的必需** | 2026-06-19 1M context 验证证明：24GB CUDA + 16GB HIP 无法通过 1:1 分片完成 1M，必须使用 capacity-aware 不均等分片（white 750K / pearl 250K，即 3:1）。均匀分片在异构显存下会因小显存设备 OOM 而失败；按可用显存比例分配 chunk 才能使 heterogeneous ring 达到可行性边界。该决策已通过 white+pearl 1M 端到端成功验证 | [2026-06-19] |

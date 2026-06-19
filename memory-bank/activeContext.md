@@ -18,6 +18,7 @@
   - pearl 碎片化 OOM：2:1 split 在 layer 23/24 因 pearl 16GB 分配失败；改用 3:1 split 后 pearl 压力降低，white 24GB 刚好 fit。
 - 证明：在 2.5G 有线直连 + capacity-aware 不均等分片下，white（CUDA）+ pearl（HIP）可协同完成 1M context 推理。
 - 报告：`reports/1m-white-pearl-20260619/README.md`
+- 文档已同步：`docs/1M_CONTEXT_THUNDERBOLT_PLAN.md` 补充执行结果；`docs/SCALING_ARGUMENT.md` 加入 1M 数据点与 capacity-aware 不均等分片分析；`memory-bank/systemPatterns.md` 新增「容量感知非均等 CP 分片是异构长 context 的必需」架构决策。
 - 当前无未完成的 1M 攻坚任务；下一步是整理文档 / memory-bank，并决定是否需要更大模型 / 更多 domain 的验证。
 
 [2026-06-17] **昇腾 910B NPU 适配踏出第一步 — Python vLLM worker ↔ Rust coordinator 控制面 E2E 已打通**（背景上下文）：
