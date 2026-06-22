@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>HCP Ring Attention 架构设计</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  background: linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #0f172a 100%);
+  color: #e2e8f0;
+  width: 1280px;
+  height: 720px;
+  overflow: hidden;
+}
+.page {
+  width: 1280px;
+  height: 720px;
+  padding: 40px 50px;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+.header {
+  text-align: center;
+  margin-bottom: 24px;
+}
+.header h1 {
+  font-size: 32px;
+  font-weight: 700;
+  background: linear-gradient(90deg, #60a5fa, #a78bfa);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  letter-spacing: 2px;
+}
+.header .subtitle {
+  font-size: 14px;
+  color: #94a3b8;
+  margin-top: 6px;
+}
+.content {
+  display: flex;
+  gap: 30px;
+  flex: 1;
+}
+.left-col {
+  flex: 1.1;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.right-col {
+  flex: 0.9;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.card {
+  background: rgba(30, 41, 59, 0.7);
+  border: 1px solid rgba(96, 165, 250, 0.15);
+  border-radius: 12px;
+  padding: 16px 20px;
+  backdrop-filter: blur(8px);
+}
+.card h3 {
+  font-size: 15px;
+  color: #60a5fa;
+  margin-bottom: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.card h3 .icon { font-size: 18px; }
+.card p, .card li {
+  font-size: 12.5px;
+  color: #cbd5e1;
+  line-height: 1.6;
+}
+.card ul { padding-left: 16px; }
+.card li { margin-bottom: 3px; }
+.highlight {
+  color: #fbbf24;
+  font-weight: 600;
+}
+.chart-area {
+  background: rgba(30, 41, 59, 0.7);
+  border: 1px solid rgba(96, 165, 250, 0.15);
+  border-radius: 12px;
+  padding: 16px;
+  text-align: center;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+}
+.chart-area img {
+  max-width: 100%;
+  max-height: 280px;
+  border-radius: 8px;
+}
+.chart-area .chart-title {
+  font-size: 14px;
+  color: #60a5fa;
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+.metrics-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  margin-top: 8px;
+}
+.metrics-table th {
+  background: rgba(96, 165, 250, 0.15);
+  color: #60a5fa;
+  padding: 6px 8px;
+  text-align: left;
+  border-radius: 4px 4px 0 0;
+}
+.metrics-table td {
+  padding: 5px 8px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+  color: #e2e8f0;
+}
+.metrics-table td:first-child {
+  color: #94a3b8;
+  width: 40%;
+}
+.footer {
+  text-align: center;
+  font-size: 11px;
+  color: #64748b;
+  margin-top: 12px;
+}
+.accent-line {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 4px;
+  background: linear-gradient(90deg, #3b82f6, #8b5cf6, #ec4899);
+}
+</style>
+</head>
+<body>
+<div class="page" data-document-role="page" data-label="HCP Ring Attention 架构设计">
+  <div class="accent-line"></div>
+  
+  <div class="header">
+    <h1>HCP Ring Attention 架构设计</h1>
+    <div class="subtitle">异构场景下合作 · 非均等显存 · P2P Ring 网络模型</div>
+  </div>
+  
+  <div class="content">
+    <div class="left-col">
+      <div class="card">
+        <h3><span class="icon">🔷</span> 异构场景下合作：P2P Ring 网络模型</h3>
+        <ul>
+          <li>传统 CP 采用 <span class="highlight">Collective</span> (all-gather/all-to-all)，依赖 NCCL 和同构 GPU</li>
+          <li>HCP 回归 Ring Attention 论文原始 <span class="highlight">P2P</span> 设计：每个 domain 只与邻居通信</li>
+          <li>发送 K/V block 到 next host，同时从 previous host 接收 K/V block</li>
+          <li>online softmax 增量更新，支持任意互联拓扑（TCP/QUIC/RDMA）</li>
+        </ul>
+      </div>
+      
+      <div class="card">
+        <h3><span class="icon">🔶</span> 非均等显存：Capacity-Aware 分片</h3>
+        <ul>
+          <li>Worker handshake 上报 device 可用显存，Coordinator 按 <span class="highlight">capacity 比例</span>分配</li>
+          <li>1:1 均分 → Pearl 16GB OOM（layer 17/24 失败）❌</li>
+          <li>3:1 分片 → White 750K / Pearl 250K → <span class="highlight">成功</span> ✅</li>
+          <li>这是异构长 context 的<span class="highlight">必需策略</span></li>
+        </ul>
+      </div>
+      
+      <div class="card">
+        <h3><span class="icon">🔹</span> Ring-attn P2P 网络模型</h3>
+        <ul>
+          <li><span class="highlight">Micro KV Block</span> 细粒度切分：防止大 block 传输死锁</li>
+          <li><span class="highlight">Pipeline Overlap</span>：compute 与 network I/O 重叠</li>
+          <li><span class="highlight">QUIC Transport</span>：单 connection + per-layer bidirectional stream</li>
+          <li>并发 send+recv (tokio::join!) 避免 ring 死锁</li>
+        </ul>
+      </div>
+    </div>
+    
+    <div class="right-col">
+      <div class="chart-area">
+        <div class="chart-title">1M Context @ 24GB+16GB 跑通成果</div>
+        <img src="https://raw.githubusercontent.com/stark-sim/hetero-cp-ringattn/main/hcp_1m_pie_charts_v2.png" alt="数据饼图">
+      </div>
+      
+      <div class="card">
+        <h3><span class="icon">📊</span> 关键指标</h3>
+        <table class="metrics-table">
+          <tr><td>分片比例</td><td><span class="highlight">3:1</span> (white 750K / pearl 250K)</td></tr>
+          <tr><td>Prefill</td><td>24/24 层全通, ~1h 52m</td></tr>
+          <tr><td>Decode</td><td>5 tokens, ~16m</td></tr>
+          <tr><td>总耗时</td><td>~2h 8m</td></tr>
+          <tr><td>White 显存峰值</td><td><span class="highlight">23,999 MB</span> (24GB 刚好 fit)</td></tr>
+          <tr><td>Pearl 显存</td><td>未 OOM, 16GB 内完成</td></tr>
+          <tr><td>生成结果</td><td><span class="highlight">"the."</span> (exit=0)</td></tr>
+        </table>
+      </div>
+    </div>
+  </div>
+  
+  <div class="footer">
+    HCP Ring Attention | 首次在本地消费级异构设备完成 1,000,000 token context 端到端推理 | 2026.06.19
+  </div>
+</div>
+</body>
+</html>
