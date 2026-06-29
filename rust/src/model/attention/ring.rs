@@ -1,5 +1,6 @@
 use crate::model::ModelError;
 use super::backend::AttentionBackend;
+use super::strategy::RingSchedulingStrategy;
 
 #[cfg(feature = "tch-backend")]
 use tch::{Device, Kind, Tensor};
@@ -53,6 +54,44 @@ pub struct HcpRingAttentionBackend {
     /// 【本地序列的原始位置 id】用于 Striped / 非连续分片场景。
     /// 如果为 None，则默认假设本地 chunk 是原始序列中的连续段。
     position_ids: Option<Tensor>,
+    /// 【调度策略】仅影响输入分片方式，不影响 online softmax 数学。
+    strategy: RingSchedulingStrategy,
+    /// 【本地 KV cache 的全局起始位置】用于 micro-block 元数据。
+    /// 对于非连续分片，等于 position_ids 的第一个元素。
+    kv_base_global_start: usize,
+}
+
+#[cfg(feature = "tch-backend")]
+impl Default for HcpRingAttentionBackend {
+    fn default() -> Self {
+        let device = Device::Cpu;
+        Self {
+            q_proj: Tensor::zeros([1, 1], (Kind::Float, device)),
+            k_proj: Tensor::zeros([1, 1], (Kind::Float, device)),
+            v_proj: Tensor::zeros([1, 1], (Kind::Float, device)),
+            o_proj: Tensor::zeros([1, 1], (Kind::Float, device)),
+            q_bias: None,
+            k_bias: None,
+            v_bias: None,
+            rope: crate::model::layers::RotaryEmbedding::new(1, 1, 1.0, device),
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 1,
+            scale: 1.0,
+            num_domains: 1,
+            layer_idx: 0,
+            kv_transport: None,
+            local_domain_id: 0,
+            seq_offset: 0,
+            prefill_kv_len: 0,
+            is_prefill_done: false,
+            micro_kv_block_size: 0,
+            disable_overlap: false,
+            position_ids: None,
+            strategy: RingSchedulingStrategy::default(),
+            kv_base_global_start: 0,
+        }
+    }
 }
 
 #[cfg(feature = "tch-backend")]
@@ -95,6 +134,8 @@ impl HcpRingAttentionBackend {
                 .map(|v| v == "1" || v == "true")
                 .unwrap_or(false),
             position_ids: None,
+            strategy: RingSchedulingStrategy::default(),
+            kv_base_global_start: 0,
         })
     }
 
@@ -1041,6 +1082,7 @@ impl AttentionBackend for HcpRingAttentionBackend {
     fn set_distributed(&mut self, domain_id: usize, seq_offset: usize, transport: Option<Box<dyn KvTransport>>) {
         self.local_domain_id = domain_id;
         self.seq_offset = seq_offset;
+        self.kv_base_global_start = seq_offset;
         // Only replace transport if explicitly provided (None means "keep existing").
         if let Some(t) = transport {
             self.kv_transport = Some(t);
@@ -1050,6 +1092,10 @@ impl AttentionBackend for HcpRingAttentionBackend {
         // requests, causing narrow() to fail when the new KV cache is shorter.
         self.is_prefill_done = false;
         self.prefill_kv_len = 0;
+    }
+
+    fn set_strategy(&mut self, strategy: RingSchedulingStrategy) {
+        self.strategy = strategy;
     }
     fn forward(
         &mut self,
@@ -1268,6 +1314,7 @@ mod tests {
             disable_overlap: false,
             position_ids: None,
             micro_kv_block_size: 0,
+            ..Default::default()
         };
 
         let mut rm = Tensor::full(
@@ -1361,6 +1408,7 @@ mod tests {
             disable_overlap: false,
             position_ids: None,
             micro_kv_block_size: 0,
+                    ..Default::default()
         };
 
         let actual = backend.ring_attention(&q, &k, &v, None, 0).unwrap();
@@ -1416,6 +1464,7 @@ mod tests {
             disable_overlap: false,
             position_ids: None,
             micro_kv_block_size: 0,
+                    ..Default::default()
         };
 
         let actual = backend.ring_attention(&q, &k, &v, Some(&mask), 0).unwrap();
@@ -1469,6 +1518,7 @@ mod tests {
             disable_overlap: false,
             position_ids: None,
             micro_kv_block_size: 0,
+                    ..Default::default()
         };
 
         // Without transport, ring_attention processes only local KV.
@@ -1559,6 +1609,7 @@ mod tests {
             disable_overlap: false,
             position_ids: None,
             micro_kv_block_size: 0,
+                    ..Default::default()
         };
         let out0 = backend0.ring_attention(&q_all, &k0_local, &v0_local, None, 0).unwrap();
 
@@ -1596,6 +1647,7 @@ mod tests {
             disable_overlap: false,
             position_ids: None,
             micro_kv_block_size: 0,
+                    ..Default::default()
         };
         let out1 = backend1.ring_attention(&q_all, &k1_local, &v1_local, None, half as usize).unwrap();
 
@@ -1665,6 +1717,7 @@ mod tests {
             disable_overlap: false,
             position_ids: None,
             micro_kv_block_size: 0,
+                    ..Default::default()
         };
 
         // hidden states for decode step
@@ -1759,6 +1812,7 @@ mod tests {
             disable_overlap: false,
             position_ids: None,
             micro_kv_block_size: 0,
+                    ..Default::default()
         };
         let out0 = backend0.ring_attention(&q0, &k0, &v0, Some(&mask), 0).unwrap();
 
@@ -1796,6 +1850,7 @@ mod tests {
             disable_overlap: false,
             position_ids: None,
             micro_kv_block_size: 0,
+                    ..Default::default()
         };
         let out1 = backend1.ring_attention(&q1, &k1, &v1, Some(&mask), half as usize).unwrap();
 
@@ -1817,10 +1872,10 @@ mod tests {
 
     /// 2-domain uneven (3:1) ring attention perf comparison test.
     /// Compares vanilla capacity-aware continuous chunks vs weighted Striped permutation.
-    /// Run with: cargo test --features tch-backend test_ring_attention_uneven_perf -- --nocapture
+    /// Run with: cargo test --features tch-backend test_ring_attention_derivatives_uneven_perf -- --nocapture
     #[cfg(feature = "tch-backend")]
     #[test]
-    fn test_ring_attention_uneven_perf() {
+    fn test_ring_attention_derivatives_uneven_perf() {
         let device = tch::Device::Cpu;
         let num_heads = 8i64;
         let head_dim = 128i64;
@@ -1839,40 +1894,31 @@ mod tests {
         let attn = scores_masked.softmax(-1, Kind::Float);
         let expected = attn.matmul(&v);
 
-        // Run vanilla baseline.
-        std::env::set_var("HCP_PERF_LOG", "/tmp/ring_perf_vanilla.jsonl");
-        let _ = std::fs::remove_file("/tmp/ring_perf_vanilla.jsonl");
-        let (vanilla_actual, diff_vanilla) = run_uneven_ring_attention(
-            &q, &k, &v, &mask, &chunks, false, scale, num_heads, head_dim, device,
-        );
-        let vanilla_diff = (&expected - &vanilla_actual).abs().mean(Kind::Float).double_value(&[]);
-        assert!(vanilla_diff < 1e-4, "Vanilla uneven ring attention correctness failed: {}", vanilla_diff);
-        assert!(diff_vanilla < 1e-4, "Vanilla per-worker diff too large: {}", diff_vanilla);
+        for strategy in RingSchedulingStrategy::all() {
+            let name = format!("{:?}", strategy).to_lowercase();
+            let log_path = format!("/tmp/ring_perf_{}.jsonl", name);
+            std::env::set_var("HCP_PERF_LOG", &log_path);
+            let _ = std::fs::remove_file(&log_path);
 
-        // Run weighted striped permutation.
-        std::env::set_var("HCP_PERF_LOG", "/tmp/ring_perf_striped.jsonl");
-        let _ = std::fs::remove_file("/tmp/ring_perf_striped.jsonl");
-        let (striped_actual, diff_striped) = run_uneven_ring_attention(
-            &q, &k, &v, &mask, &chunks, true, scale, num_heads, head_dim, device,
-        );
-        let has_nan = striped_actual.isnan().any().double_value(&[]) != 0.0;
-        assert!(!has_nan, "Striped output contains NaN");
-        let striped_diff = (&expected - &striped_actual).abs().mean(Kind::Float).double_value(&[]);
-        assert!(striped_diff < 1e-4, "Striped uneven ring attention correctness failed: {}", striped_diff);
-        assert!(diff_striped < 1e-4, "Striped per-worker diff too large: {}", diff_striped);
+            let (actual, per_worker_diff) = run_uneven_ring_attention(
+                &q, &k, &v, &mask, &chunks, *strategy, scale, num_heads, head_dim, device,
+            );
+            let has_nan = actual.isnan().any().double_value(&[]) != 0.0;
+            assert!(!has_nan, "{} output contains NaN", name);
+            let diff = (&expected - &actual).abs().mean(Kind::Float).double_value(&[]);
+            assert!(diff < 1e-4, "{} uneven ring attention correctness failed: {}", name, diff);
+            assert!(per_worker_diff < 1e-4, "{} per-worker diff too large: {}", name, per_worker_diff);
 
-        println!("Vanilla correctness diff = {}, Striped correctness diff = {}", vanilla_diff, striped_diff);
-
-        // Parse perf logs and print comparison.
-        let vanilla = parse_perf_log("/tmp/ring_perf_vanilla.jsonl");
-        let striped = parse_perf_log("/tmp/ring_perf_striped.jsonl");
-        println!("\n=== Vanilla (capacity-aware continuous) ===");
-        print_perf_summary(&vanilla);
-        println!("\n=== Striped (weighted permutation) ===");
-        print_perf_summary(&striped);
+            println!("{} correctness diff = {}", name, diff);
+            let rows = parse_perf_log(&log_path);
+            println!("\n=== {} ===", name);
+            print_perf_summary(&rows);
+        }
     }
 
-    /// Run 2-domain uneven ring attention. Returns per-domain outputs and max per-domain diff.
+    /// Run N-domain uneven ring attention with a chosen scheduling strategy.
+    /// Returns the output reconstructed in original sequence order and the
+    /// max per-position diff against the full local reference.
     #[cfg(feature = "tch-backend")]
     fn run_uneven_ring_attention(
         q: &Tensor,
@@ -1880,55 +1926,29 @@ mod tests {
         v: &Tensor,
         mask: &Tensor,
         chunks: &[usize],
-        striped: bool,
+        strategy: RingSchedulingStrategy,
         scale: f64,
         num_heads: i64,
         head_dim: i64,
         device: tch::Device,
     ) -> (Tensor, f64) {
         use crate::model::transport::MockKvTransport;
+        use crate::model::attention::strategy::{build_assignment, build_domain_positions, build_inverse_perm, position_ids_tensor};
 
         let seq_len = q.size()[2] as usize;
         let num_domains = chunks.len();
 
-        // Build assignment: each original position -> domain.
-        let assignment: Vec<usize> = if striped {
-            // Weighted round-robin schedule, e.g. [3,1] -> [0,1,0,0]
-            let mut sched = Vec::new();
-            let mut remaining: Vec<_> = chunks.iter().cloned().enumerate().collect();
-            while remaining.iter().any(|(_, c)| *c > 0) {
-                for (domain, count) in remaining.iter_mut() {
-                    if *count > 0 {
-                        sched.push(*domain);
-                        *count -= 1;
-                    }
-                }
-            }
-            (0..seq_len).map(|p| sched[p % sched.len()]).collect()
-        } else {
-            // Continuous chunks.
-            let mut assign = Vec::with_capacity(seq_len);
-            for (domain, &chunk) in chunks.iter().enumerate() {
-                assign.extend(std::iter::repeat(domain).take(chunk));
-            }
-            assign
-        };
+        let assignment = build_assignment(chunks, strategy);
+        let positions = build_domain_positions(&assignment);
+        let inverse_perm = build_inverse_perm(&assignment);
 
-        // Per-domain positions (in original order).
-        let mut positions: Vec<Vec<usize>> = vec![Vec::new(); num_domains];
-        for (p, &domain) in assignment.iter().enumerate() {
-            positions[domain].push(p);
-        }
-
-        // Gather tensors by domain.
+        // Gather tensors by domain (local storage order follows the assignment scan).
         let mut q_d: Vec<Tensor> = Vec::new();
         let mut k_d: Vec<Tensor> = Vec::new();
         let mut v_d: Vec<Tensor> = Vec::new();
         let mut pos_d: Vec<Tensor> = Vec::new();
         for domain in 0..num_domains {
-            let pos_t = Tensor::f_from_slice::<i64>(
-                &positions[domain].iter().map(|&p| p as i64).collect::<Vec<_>>(),
-            ).unwrap().to_device(device);
+            let pos_t = position_ids_tensor(&positions[domain], device);
             q_d.push(q.index_select(2, &pos_t));
             k_d.push(k.index_select(2, &pos_t));
             v_d.push(v.index_select(2, &pos_t));
@@ -1945,8 +1965,8 @@ mod tests {
             let mut transport = MockKvTransport::new();
             transport.push(crate::model::transport::KvBlock {
                 layer_idx: 0,
-                global_seq_start: *positions[peer].first().unwrap(),
-                global_seq_end: *positions[peer].last().unwrap() + 1,
+                global_seq_start: positions[peer].first().copied().unwrap_or(0),
+                global_seq_end: positions[peer].last().copied().unwrap_or(0) + 1,
                 k: k_d[peer].shallow_clone(),
                 v: v_d[peer].shallow_clone(),
                 micro_block_idx: 0,
@@ -1970,12 +1990,15 @@ mod tests {
                 layer_idx: 0,
                 kv_transport: Some(Box::new(transports.pop().unwrap())),
                 local_domain_id: domain,
-                seq_offset: if striped { 0 } else { positions[domain][0] },
+                seq_offset: positions[domain].first().copied().unwrap_or(0),
                 prefill_kv_len: 0,
                 is_prefill_done: false,
                 disable_overlap: false,
                 position_ids: Some(pos_d[domain].shallow_clone()),
                 micro_kv_block_size: 0,
+                strategy,
+                kv_base_global_start: positions[domain].first().copied().unwrap_or(0),
+                ..Default::default()
             };
             backends.push(backend);
         }
@@ -1983,25 +2006,14 @@ mod tests {
         // Run attention.
         let mut outputs: Vec<Tensor> = Vec::new();
         for domain in 0..num_domains {
-            let global_start = if striped { 0 } else { positions[domain][0] };
+            let global_start = positions[domain].first().copied().unwrap_or(0);
             let out = backends[domain]
                 .ring_attention(&q_d[domain], &k_d[domain], &v_d[domain], Some(&mask), global_start)
                 .unwrap();
             outputs.push(out);
         }
 
-        // Inverse permutation: reconstruct original order.
-        let mut inverse_perm = vec![0i64; seq_len];
-        let mut offsets = vec![0usize; num_domains];
-        for (domain, chunk) in chunks.iter().enumerate() {
-            offsets[domain + 1..].iter_mut().for_each(|o| *o += chunk);
-        }
-        let cursor = offsets.clone();
-        for domain in 0..num_domains {
-            for (idx, &orig_pos) in positions[domain].iter().enumerate() {
-                inverse_perm[orig_pos] = (cursor[domain] + idx) as i64;
-            }
-        }
+        // Reconstruct original order.
         let inverse_t = Tensor::f_from_slice::<i64>(&inverse_perm).unwrap().to_device(device);
         let concatenated = Tensor::cat(&outputs, 2);
         let actual = concatenated.index_select(2, &inverse_t);
@@ -2023,8 +2035,6 @@ mod tests {
             }
         }
 
-        // 返回已按原始序列顺序重建的完整输出，以及逐位置最大 diff。
-        // 这样 vanilla（连续分片）和 striped（加权置换）都可以用同一方式与 reference 比较。
         (actual, max_diff)
     }
 

@@ -7,6 +7,8 @@
 //! 所有单节点和分布式推理都使用 HcpRingAttentionBackend，
 //! 它通过固定 chunk-size 上限避免 O(seq²) 的 scores 显存爆炸。
 
+pub mod strategy;
+
 #[cfg(feature = "tch-backend")]
 pub mod backend;
 #[cfg(feature = "tch-backend")]
@@ -16,3 +18,4 @@ pub mod ring;
 pub use backend::{AttentionBackend, LocalAttentionBackend};
 #[cfg(feature = "tch-backend")]
 pub use ring::HcpRingAttentionBackend;
+pub use strategy::{build_assignment, build_domain_positions, build_inverse_perm, position_ids_tensor, RingSchedulingStrategy};

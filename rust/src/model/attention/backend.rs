@@ -42,6 +42,13 @@ pub trait AttentionBackend: Send {
         // Local backend 不需要分布式配置，noop
     }
 
+    /// Optional: set the ring scheduling strategy (vanilla/striped/zigzag).
+    /// Only `HcpRingAttentionBackend` implements this; others are no-ops.
+    #[allow(dead_code)]
+    fn set_strategy(&mut self, _strategy: crate::model::attention::RingSchedulingStrategy) {
+        // Local backend 不需要调度策略，noop
+    }
+
     /// Return `&mut dyn Any` for downcasting to concrete backend types (debug only).
     #[cfg(feature = "tch-backend")]
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
