@@ -28,19 +28,67 @@ type: `hypothesis` · status: `open` · confidence: 0.5 · importance: 0.9 · so
 路线 B（HCP 为主 + 内联 PageAttention）：HCP 自身管理 page/block 粒度的 KV，内联 PageAttention 的 scheduling/block 机制，深度整合以获得最佳性能。
 需要并行验证两条路线的工程可行性、correctness 风险和对 vLLM 版本升级的耦合度。
 
-_updated: 2026-06-29 06:01:28_
-### 1M white+pearl 是可行性里程碑，而非生产实用配置
+_updated: 2026-06-29 06:06:09_
+### [论文] Striped Attention: Faster Ring Attention for Causal Transformers
 
-type: `belief` · status: `held` · confidence: 0.9 · importance: 0.85 · source: `user-reflection`
+type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.9 · source: `https://arxiv.org/abs/2311.09431`
 
-在 16GB + 24GB 两台消费级机器上跑通 1M context 证明了 HCP 异构不均等 CP 的可行性边界，但 decode 每 token ~3 分钟、white 显存几乎满载，距离实际生产部署仍有显著差距。其价值在于验证架构路径，而非直接作为产品配置。
+作者：William Brandon 等 (MIT)，arXiv:2311.09431，2023。
+核心发现：因果 attention 的三角结构导致 Ring Attention 工作负载不均。
+方案：每个 device 持有均匀分布在整个序列上的 token 子集（striped permutation），而非连续 chunk。
+效果：A100 256K 序列上端到端吞吐提升最高 1.45×；16×TPUv4 786K 序列上 1.65×。
+实现复杂度：只需在 forward 开始前对输入序列做一次 permutation，并调整 attention mask 结构。
+与 HCP 相关性：直接相关，可能缓解 pearl 等小/慢 domain 在 Phase 2 成为瓶颈的问题。
 
-_updated: 2026-06-29 06:01:28_
+_updated: 2026-06-29 06:06:09_
+### 先做：Stripe Attention 调研与 HCP 适配性分析
+
+type: `task` · status: `ongoing` · confidence: 0.75 · importance: 0.9 · source: `user-direction`
+
+具体步骤：
+1. 精读 Striped Attention 论文（arXiv:2311.09431），提取 permutation + mask 调整细节。
+2. 在 HCP Rust correctness model 中实现 striped permutation 原型，验证与同构/异构 uneven chunk 的兼容性。
+3. 对比 vanilla ring vs striped 在因果 attention 下的 per-domain 计算量（理论 + 模拟）。
+4. 输出设计文档：如何在 capacity-aware 不均等分片下应用 stripe（或不适用）。
+
+_updated: 2026-06-29 06:06:09_
 ### 异构 CP 对网络速度敏感，CXL / 类 RDMA 互联可显著突破网线局限
 
 type: `hypothesis` · status: `open` · confidence: 0.6 · importance: 0.85 · source: `user-direction`
 
 当前 2.5G 有线以太网在 1M context 下不是带宽瓶颈（prefill 受显存与 memory-bound compute 主导），但随着 chunk 缩小、domain 增多或模型变大，KV ring 的通信量会快速上升。需要系统测试不同 RTT/带宽（WiFi、2.5G、10G、RDMA、CXL）对 prefill/decode 的边际收益，论证在异构节点上投资高速互联（CXL / GPU Direct / RDMA）能否取得与增加显存同量级的回报。
+
+_updated: 2026-06-29 06:06:09_
+### [论文] Ring Attention with Blockwise Transformers for Near-Infinite Context
+
+type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.85 · source: `https://arxiv.org/abs/2310.01889`
+
+作者：Hao Liu, Matei Zaharia, Pieter Abbeel (UC Berkeley)，arXiv:2310.01889，ICLR 2024。
+提出 blockwise attention + online softmax，使 self-attention 计算可分布到多个设备；KV block 沿 ring 传递。
+HCP 的数学基础即来源于此。
+
+_updated: 2026-06-29 06:06:09_
+### Ring Attention 主流衍生方案综述
+
+type: `claim` · status: `held` · confidence: 0.75 · importance: 0.85 · source: `web-search-survey`
+
+除原始 Ring Attention 与 Striped Attention 外，当前主流/相关方案包括：
+- Ring Flash Attention（zhuzilin 等开源）：将 FlashAttention kernel 与 Ring 通信重叠。
+- ZigZag Ring Attention（ring-flash-attention issue #2 / Megatron-Core）：通过折叠 query 维度并在 worker 间镜像 block 平衡负载。
+- DeepSpeed Ulysses（Microsoft, arXiv:2309.14509）：用 all-to-all 替代 all-gather/reduce-scatter 的序列并行，聚焦同构集群通信效率。
+- USP（Tencent, arXiv:2405.07719）：统一 Ulysses + Ring Attention 的序列并行框架。
+- Context Parallelism for Scalable Million-Token Inference（arXiv:2411.01783）：面向推理的 context parallelism。
+- MoBA (Mixture of Block Attention, arXiv:2502.13189)：块级稀疏 attention，可与 ring 结合。
+- XAttention (arXiv:2502.xxxxx)：block sparse attention with antidiagonal scoring。
+- MTraining (arXiv:2510.18830)：基于 Striped Ring Attention 的动态稀疏 attention 训练系统。
+- Mnemosyne (arXiv:2409.17264)：多百万 token 推理服务系统，讨论 Ring/Striped 在推理中的 head-of-line blocking 与 batching 局限。
+
+_updated: 2026-06-29 06:06:09_
+### 1M white+pearl 是可行性里程碑，而非生产实用配置
+
+type: `belief` · status: `held` · confidence: 0.9 · importance: 0.85 · source: `user-reflection`
+
+在 16GB + 24GB 两台消费级机器上跑通 1M context 证明了 HCP 异构不均等 CP 的可行性边界，但 decode 每 token ~3 分钟、white 显存几乎满载，距离实际生产部署仍有显著差距。其价值在于验证架构路径，而非直接作为产品配置。
 
 _updated: 2026-06-29 06:01:28_
 ### Stripe Ring Attention 可适配 HCP 并改善异构负载均衡
