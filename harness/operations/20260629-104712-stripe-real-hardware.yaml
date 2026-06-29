@@ -1,0 +1,64 @@
+timestamp: "2026-06-29T10:47:12+00:00"
+type: "dangerous-operation"
+stage: "stripe-real-hardware-validation"
+target:
+  hosts:
+    - host: "white"
+      hostname: "100.118.253.68"
+      device: "RTX 4090 CUDA"
+    - host: "pearl"
+      hostname: "100.111.242.55"
+      device: "RX 9060 XT HIP"
+risk_level: "medium"
+guard_verdict: "AUTHORIZED"
+steps_executed:
+  - "SSH reachability confirmed on both hosts"
+  - "nvidia-smi on white: RTX 4090, 23680 MiB free; rocminfo on pearl: RX 9060 XT HIP runtime loaded"
+  - "git pull origin main on both hosts (fast-forward 530dc29 -> 531a915)"
+  - "cargo test --features tch-backend test_ring_attention_uneven_perf -- --nocapture on white CUDA"
+  - "cargo test --features tch-backend test_ring_attention_uneven_perf -- --nocapture on pearl HIP"
+  - "Copied /tmp/white_stripe_test.log and /tmp/pearl_stripe_test.log to local reports/stripe-real-hardware-20260629/"
+results:
+  white_cuda:
+    vanilla:
+      domain_0_total_ms: 131.145
+      domain_0_local_ms: 130.301
+      domain_0_peer_ms: 0.029
+      domain_1_total_ms: 54.646
+      domain_1_local_ms: 5.513
+      domain_1_peer_ms: 48.963
+      correctness_diff: 1.264e-8
+    striped:
+      domain_0_total_ms: 164.816
+      domain_0_local_ms: 114.024
+      domain_0_peer_ms: 50.135
+      domain_1_total_ms: 57.025
+      domain_1_local_ms: 7.758
+      domain_1_peer_ms: 49.076
+      correctness_diff: 1.253e-8
+  pearl_hip:
+    vanilla:
+      domain_0_total_ms: 158.229
+      domain_0_local_ms: 157.542
+      domain_0_peer_ms: 0.046
+      domain_1_total_ms: 89.073
+      domain_1_local_ms: 13.735
+      domain_1_peer_ms: 74.888
+      correctness_diff: 1.264e-8
+    striped:
+      domain_0_total_ms: 224.809
+      domain_0_local_ms: 154.179
+      domain_0_peer_ms: 70.347
+      domain_1_total_ms: 87.38
+      domain_1_local_ms: 11.559
+      domain_1_peer_ms: 75.617
+      correctness_diff: 1.255e-8
+verification:
+  method: "cargo test passed on both hosts; correctness diff < 1e-4; perf logs show GPU compute times"
+  passed: true
+notes: |
+  Both CUDA and HIP confirm the CPU mock finding: in a single-process 2-domain 3:1 split,
+  Striped shifts peer compute to domain 0 and makes the bottleneck worse. Domain 1 wall-time
+  stays flat. This test does NOT exercise cross-node P2P/QUIC transport; true heterogeneous
+  multi-node validation still pending.
+requested_by: "main-agent"

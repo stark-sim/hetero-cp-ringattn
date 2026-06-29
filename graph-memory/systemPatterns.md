@@ -89,6 +89,13 @@ type: `decision` · status: `held` · confidence: 0.9 · importance: 0.85 · sou
 - 最终结论需记录到 graph-memory 和 commit message。
 
 _updated: 2026-06-29 07:58:41_
+### 默认保留 capacity-aware 连续分片，Striped 暂不启用
+
+type: `decision` · status: `held` · confidence: 0.85 · importance: 0.85
+
+基于 CPU mock、white CUDA、pearl HIP 三重证据：在 2-domain 3:1 seq_len=4096 场景下，Striped 均未改善负载均衡，反而增加瓶颈 domain 0 的 wall-time。\n\n决策：\n1. HCP 默认调度策略继续采用 capacity-aware 连续分片。\n2. Striped Attention 代码保留在仓库中（作为可选项和对比基准），但不作为默认路径。\n3. 若未来在真实 multi-node 大 context（如 1M）实验中出现新的反证，可重新评估。
+
+_updated: 2026-06-29 12:44:16_
 ### QUIC Transport 配置：512MB stream window / 1GB connection window / 300s idle timeout
 
 type: `decision` · status: `held` · confidence: 0.9 · importance: 0.8 · source: `memory-bank/techContext.md`

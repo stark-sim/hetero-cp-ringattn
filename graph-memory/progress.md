@@ -2,6 +2,20 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-06-29] white RTX 4090 CUDA 上 Striped 未改善负载均衡
+
+type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `harness/operations/20260629-104712-stripe-real-hardware.yaml`
+
+测试：cargo test --features tch-backend test_ring_attention_uneven_perf -- --nocapture\n主机：white (Tailscale 100.118.253.68), RTX 4090, libtorch CUDA\n配置：seq_len=4096, 2 domain, chunk=[3072,1024] (3:1)\n\nVanilla：\n- domain 0 total=131.1ms (local=130.3ms, peer=0.03ms)\n- domain 1 total=54.6ms (local=5.5ms, peer=49.0ms)\n\nStriped：\n- domain 0 total=164.8ms (local=114.0ms, peer=50.1ms)\n- domain 1 total=57.0ms (local=7.8ms, peer=49.1ms)\n\ncorrectness diff 均 < 1.3e-8。\n\n结论：在 white CUDA 单进程 3:1 场景下，Striped 使瓶颈 domain 0 总耗时增加约 26%，未改善 wall-time。
+
+_updated: 2026-06-29 12:44:16_
+### [2026-06-29] pearl RX 9060 XT HIP 上 Striped 未改善负载均衡
+
+type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `harness/operations/20260629-104712-stripe-real-hardware.yaml`
+
+测试：cargo test --features tch-backend test_ring_attention_uneven_perf -- --nocapture\n主机：pearl (Tailscale 100.111.242.55), RX 9060 XT, libtorch HIP\n配置：seq_len=4096, 2 domain, chunk=[3072,1024] (3:1)\n\nVanilla：\n- domain 0 total=158.2ms (local=157.5ms, peer=0.05ms)\n- domain 1 total=89.1ms (local=13.7ms, peer=74.9ms)\n\nStriped：\n- domain 0 total=224.8ms (local=154.2ms, peer=70.3ms)\n- domain 1 total=87.4ms (local=11.6ms, peer=75.6ms)\n\ncorrectness diff 均 < 1.3e-8。\n\n结论：在 pearl HIP 单进程 3:1 场景下，Striped 使瓶颈 domain 0 总耗时增加约 42%，未改善 wall-time；pearl 整体比 white 慢约 1.2-1.4x。
+
+_updated: 2026-06-29 12:44:16_
 ### CPU mock 只能验证语法和逻辑依赖，不能指导 LLM 服务架构设计
 
 type: `lesson` · status: `held` · confidence: 0.95 · importance: 0.9
