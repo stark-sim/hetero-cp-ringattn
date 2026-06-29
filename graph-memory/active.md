@@ -6,16 +6,16 @@
 
 type: `hypothesis` · status: `ongoing` · confidence: 0.6 · importance: 0.95 · source: `user-direction`
 
-核心目标：论证 CXL / 类 RDMA 高速互联对异构推理服务上主流舞台的决定性作用。\n\n当前状态：\n- white 与 pearl 之间最高 2.5G 有线以太网，已构成异构长 context 推理的潜在瓶颈。\n- 实验设计已完成：用 tc 在 192.168.100.x 链路上限速，对比 2500M/1000M/500M/100M 下的 HCP prefill+decode 延迟。\n- 当前阻塞：white 和 pearl 执行 tc 需要 sudo 密码，无法自动化限速。\n\n关键问题：\n1. 当前 2.5G 是否已经让某些 workload 进入 network-bound？\n2. prefill 和 decode 对带宽的敏感度分别是多少？\n3. 使 HCP 的 P2P KV ring 在长 context 下不被网络拖慢，需要多高的带宽？\n4. 如何用现有两台机器构建有说服力的 CXL/RDMA 必要性论证？
+核心目标：论证 CXL / 类 RDMA 高速互联对异构推理服务上主流舞台的决定性作用。\n\n当前状态：\n- white 与 pearl 之间最高 2.5G 有线以太网。\n- Pilot 结果（seq=4096, Qwen2-0.5B-1M）：基线 2.35G 总耗时 21s；限速 100M 总耗时 206s，慢约 10 倍。\n- 完整矩阵（baseline / 1000M / 500M / 100M × 2 reps）正在后台运行。\n\n关键问题：\n1. 网络带宽下降时，HCP 端到端时间如何变化？\n2. prefill 和 decode 对带宽的敏感度是否不同？\n3. 使 P2P KV ring 不被网络拖慢，需要多高的带宽？\n4. 如何用现有两台机器构建有说服力的 CXL/RDMA 必要性论证？
 
-_updated: 2026-06-29 13:40:16_
+_updated: 2026-06-29 14:02:37_
 ### 设计 white-pearl 网络带宽敏感度实验
 
-type: `task` · status: `blocked` · confidence: 0.8 · importance: 0.95
+type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.95
 
-目标：用 white (CUDA) + pearl (HIP) 的 2.5G 有线链路，通过 tc 限速对比，量化网络带宽对 HCP 异构推理 prefill/decode 的影响。\n\n实验设计草案：\n1. 基线测量：iperf3 确认 192.168.100.x 实际带宽。\n2. 测试配置：\n   - 模型：Qwen2-0.5B（减少运行时间）\n   - seq_len: 4096, 16384\n   - max_new_tokens: 5\n   - 带宽：2500M（基线）、1000M、500M、100M\n   - 每种配置重复 3 次取平均\n3. 数据收集：总 wall-time、coordinator/worker log、iperf3 结果。\n4. 分析：绘制 latency vs bandwidth 曲线，判断当前是否 network-bound，估算使通信可被隐藏所需带宽。\n\n当前阻塞：white 和 pearl 均需要 sudo 密码才能执行 tc qdisc 限速。
+目标：用 white-pearl 限速实验量化网络带宽对 HCP 异构推理的影响。\n\n已完成：\n- 实验设计：tc tbf 限速 + iperf3 验证 + HCP 跨节点推理。\n- Pilot：基线 2.35G 21s vs 100M 206s，证明网络是关键瓶颈。\n\n进行中：\n- 完整矩阵：baseline / 1000M / 500M / 100M × 2 reps，后台运行中。\n\n阻塞：无（sudo 密码已从 secure inventory 获取）。
 
-_updated: 2026-06-29 13:40:16_
+_updated: 2026-06-29 14:02:37_
 ### 下一阶段：从 1M 可行性验证走向多条扩展线探索
 
 type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.95 · source: `user-direction`

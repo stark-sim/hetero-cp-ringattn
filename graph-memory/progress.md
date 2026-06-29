@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-06-29] white-pearl 限速 pilot：100M 带宽下 HCP 慢 10x
+
+type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.95 · source: `harness/operations/ (pending full matrix record)`
+
+实验：white (RTX 4090 CUDA) + pearl (RX 9060 XT HIP)，Qwen2-0.5B-1M，seq_len=4096，max_tokens=5，使用 tc tbf 在 192.168.100.x 有线链路上限速。\n\n结果：\n- 基线 2.35Gbps：总耗时 21s\n- 限速 100Mbps：总耗时 206s\n\n结论：\n1. 网络带宽对 HCP 跨节点异构推理有决定性影响。\n2. 当带宽从 2.35G 降到 100M 时，端到端时间增加约 10 倍，说明当前 P2P KV ring 在低速网络下通信成为绝对瓶颈。\n3. 这为 CXL / 类 RDMA 高速互联的必要性提供了直接实验证据。\n\n下一步：完整矩阵（baseline / 1000M / 500M / 100M × 2 reps）正在后台运行。
+
+_updated: 2026-06-29 14:02:37_
 ### [2026-06-29] white RTX 4090 CUDA 上 Striped 未改善负载均衡
 
 type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `harness/operations/20260629-104712-stripe-real-hardware.yaml`
