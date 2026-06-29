@@ -359,7 +359,7 @@ async fn recv_kv_block_from_stream(
     let k = bytes_to_tensor(&k_bytes, &k_shape, device, k_dtype)?;
     let v = bytes_to_tensor(&v_bytes, &v_shape, device, v_dtype)?;
 
-    Ok(Some(KvBlock { layer_idx, global_seq_start, global_seq_end, k, v, micro_block_idx, total_micro_blocks }))
+    Ok(Some(KvBlock { layer_idx, global_seq_start, global_seq_end, k, v, micro_block_idx, total_micro_blocks, position_ids: None }))
 }
 
 #[cfg(feature = "tch-backend")]

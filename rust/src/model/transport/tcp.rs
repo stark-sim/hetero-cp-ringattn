@@ -237,6 +237,7 @@ impl KvTransport for TcpKvTransport {
             v,
             micro_block_idx,
             total_micro_blocks,
+            position_ids: None,
         }))
     }
 }

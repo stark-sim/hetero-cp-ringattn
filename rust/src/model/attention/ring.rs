@@ -50,6 +50,9 @@ pub struct HcpRingAttentionBackend {
     /// 【禁用 overlap】当设置 HCP_DISABLE_OVERLAP=1 时，回到串行模式
     ///（先全部 exchange 完，再统一 compute），用于对比测试。
     disable_overlap: bool,
+    /// 【本地序列的原始位置 id】用于 Striped / 非连续分片场景。
+    /// 如果为 None，则默认假设本地 chunk 是原始序列中的连续段。
+    position_ids: Option<Tensor>,
 }
 
 #[cfg(feature = "tch-backend")]
@@ -91,6 +94,7 @@ impl HcpRingAttentionBackend {
             disable_overlap: std::env::var("HCP_DISABLE_OVERLAP")
                 .map(|v| v == "1" || v == "true")
                 .unwrap_or(false),
+            position_ids: None,
         })
     }
 
@@ -118,31 +122,30 @@ impl HcpRingAttentionBackend {
     fn process_kv_block(
         &self,
         q_chunk: &Tensor,            // 当前 Q chunk，shape: [batch, num_heads, q_chunk_len, head_dim]
-        q_global_start: usize,       // 这个 Q chunk 在全局序列中的起始位置
-        q_global_end: usize,         // 这个 Q chunk 在全局序列中的结束位置
+        q_pos: &Tensor,              // 当前 Q chunk 的原始全局位置，shape: [q_chunk_len] (Int64)
         k_chunk: &Tensor,            // 当前 K block，shape: [batch, num_heads, kv_chunk_len, head_dim]
         v_chunk: &Tensor,            // 当前 V block，shape: [batch, num_heads, kv_chunk_len, head_dim]
-        kv_global_start: usize,      // 这个 K/V block 在全局序列中的起始位置
-        kv_global_end: usize,        // 这个 K/V block 在全局序列中的结束位置
+        k_pos: &Tensor,              // 当前 K/V block 的原始全局位置，shape: [kv_chunk_len] (Int64)
         rm: &mut Tensor,             // 【running max】当前见过的最大 score（可变的引用）
         rs: &mut Tensor,             // 【running sum】当前 softmax 分母的累加和
         obh: &mut Tensor,            // 【output buffer】当前加权累加的输出
         apply_causal_mask: bool,     // 【是否应用因果掩码】true=因果路径, false=非因果路径
     ) {
-        let kv_chunk_len = (kv_global_end - kv_global_start) as i64;
+        let kv_chunk_len = k_pos.size()[0];
 
-        // ====== Early Return 优化（仅因果路径）======
-        // 因果 Attention 的规则：当前 token 只能看到自己和过去的 token，不能看到未来的 token。
-        // 如果 kv_global_start >= q_global_end，说明这个 KV block 的所有位置都在 Q chunk 的右边，
-        // 对当前 Q 来说全部是"未来"，应该被 mask 掉。直接 return 可以省掉一次矩阵乘法。
-        // 
-        // 非因果路径（如 protocol smoke）没有"未来"概念，所有 KV 都应该被处理，不能跳过。
-        if apply_causal_mask && (kv_chunk_len <= 0 || kv_global_start >= q_global_end) {
-            return;
-        }
-        // 非因果路径下，空 block 仍然跳过。
+        // 空 block 跳过。
         if kv_chunk_len <= 0 {
             return;
+        }
+
+        // Early Return 优化（仅因果路径）：如果 KV block 的最小位置严格大于 Q chunk 的最大位置，
+        // 说明所有 KV 都在 Q 的"未来"，会被 causal mask 完全屏蔽，直接跳过可省一次矩阵乘法。
+        if apply_causal_mask {
+            let k_min = k_pos.min().int64_value(&[]);
+            let q_max = q_pos.max().int64_value(&[]);
+            if k_min > q_max {
+                return;
+            }
         }
 
         // ====== 第一步：计算 Attention Scores ======
@@ -167,25 +170,17 @@ impl HcpRingAttentionBackend {
         if apply_causal_mask {
             // MPS backend has bugs with masked_fill and arange on device.
             // Build position tensors on CPU then move to device; use add+mul instead of masked_fill.
-            let q_pos = Tensor::arange_start(
-                q_global_start as i64,
-                q_global_end as i64,
-                (Kind::Int64, Device::Cpu),
-            )
-            .unsqueeze(1)
-            .unsqueeze(0)
-            .unsqueeze(0)
-            .to_device(q_chunk.device());
-            let k_pos = Tensor::arange_start(
-                kv_global_start as i64,
-                kv_global_end as i64,
-                (Kind::Int64, Device::Cpu),
-            )
-            .unsqueeze(0)
-            .unsqueeze(0)
-            .unsqueeze(0)
-            .to_device(q_chunk.device());
-            let causal = q_pos.ge_tensor(&k_pos);
+            let q_pos_t = q_pos
+                .unsqueeze(1)
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .to_device(q_chunk.device());
+            let k_pos_t = k_pos
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .to_device(q_chunk.device());
+            let causal = q_pos_t.ge_tensor(&k_pos_t);
             // MPS masked_fill bug workaround: use where_self instead of add+mul.
             // add+mul (logical_not().to_kind(Float) * NEG_INFINITY) produces NaN
             // because 0.0 * NEG_INFINITY = NaN in IEEE 754.
@@ -238,15 +233,27 @@ impl HcpRingAttentionBackend {
         // shape: [batch, num_heads, q_chunk_len]
         let local_max = scores.amax(&[3i64][..], false);
 
+        // 处理因果掩码下的"全屏蔽 query"：如果某个 query 在当前 block 中所有 KV
+        // 都位于未来（scores 全为 -inf），local_max 会是 -inf。直接计算
+        // exp(-inf - (-inf)) 会得到 NaN，进而污染整个状态。这里把 local_max 中的
+        // -inf 替换为 0，使得 weights 在该 query 上全为 0，local_sum/local_pv 也为 0，
+        // 同时保留原始 local_max = -inf 用于后续 exp_local = 0 的缩放。
+        let q_kind = q_chunk.kind();
+        let neg_inf_t = Tensor::from(f64::NEG_INFINITY)
+            .to_kind(q_kind)
+            .to_device(q_chunk.device());
+        let all_masked = local_max.eq_tensor(&neg_inf_t);
+        let local_max_safe = local_max.masked_fill(&all_masked, 0.0);
+
         // weights: 当前 block 的 score 减去最大值后取指数。
         // 减最大值是为了数值稳定性（防止 exp 爆炸）。
         // shape: [batch, num_heads, q_chunk_len, kv_chunk_len]
-        let weights = (&scores - local_max.unsqueeze(3)).exp();
+        let weights = (&scores - local_max_safe.unsqueeze(3)).exp();
 
         // local_sum: 当前 block 的权重之和（softmax 的分母的一部分）。
         // sum_dim_intlist(&[3i64][..], false, q_chunk.kind()): 在第 3 维求和。
         // shape: [batch, num_heads, q_chunk_len]
-        let local_sum = weights.sum_dim_intlist(&[3i64][..], false, q_chunk.kind());
+        let local_sum = weights.sum_dim_intlist(&[3i64][..], false, q_kind);
 
         // local_pv: 当前 block 的加权 Value 之和（softmax 的分子的一部分）。
         // weights [batch, num_heads, q_chunk_len, kv_chunk_len] @ V [batch, num_heads, kv_chunk_len, head_dim]
@@ -266,6 +273,9 @@ impl HcpRingAttentionBackend {
         // new_sum: 合并后的 softmax 分母。
         // &*rs 同理，解引用 rs（&mut Tensor）得到 Tensor。
         let new_sum = &exp_prev * &*rs + &exp_local * &local_sum;
+        // 当某个 query 在当前及之前所有 block 中都被屏蔽时，new_sum 可能为 0。
+        // 直接除以 0 会产生 NaN；将该位置替换为 1，此时分子也为 0，输出保持 0。
+        let new_sum_safe = new_sum.where_self(&new_sum.ne(0.0), &Tensor::ones_like(&new_sum));
 
         // 更新输出 obh。
         // 公式：new_out = (exp_prev * prev_sum * prev_out + exp_local * local_pv) / new_sum
@@ -273,7 +283,7 @@ impl HcpRingAttentionBackend {
         // 以便和 [batch, num_heads, q_chunk_len, head_dim] 做 element-wise 乘法（广播）。
         *obh = (&exp_prev.unsqueeze(3) * &rs.unsqueeze(3) * &*obh
             + &exp_local.unsqueeze(3) * &local_pv)
-            / &new_sum.unsqueeze(3);
+            / &new_sum_safe.unsqueeze(3);
 
         // 更新 running max 和 running sum，供下一个 KV block 使用。
         *rm = new_max;
@@ -366,8 +376,7 @@ impl HcpRingAttentionBackend {
         // ====== 预创建所有 Q chunk 的状态 ======
         struct QChunkState {
             q_chunk: Tensor,
-            q_global_start: usize,
-            q_global_end: usize,
+            q_pos: Tensor, // [q_chunk_len] Int64，原始全局位置
             rm: Tensor,
             rs: Tensor,
             obh: Tensor,
@@ -378,17 +387,23 @@ impl HcpRingAttentionBackend {
             let q_end = (q_start + q_chunk_size).min(seq_len as usize);
             let q_chunk_len = (q_end - q_start) as i64;
             let q_chunk = q.narrow(2, q_start as i64, q_chunk_len);
-            let (q_gs, q_ge) = if apply_causal {
-                (global_seq_start + q_start, global_seq_start + q_end)
-            } else {
-                (0, seq_len as usize)
+            let q_pos = match self.position_ids.as_ref() {
+                Some(pos) => pos.narrow(0, q_start as i64, q_chunk_len),
+                None => Tensor::arange_start(
+                    (global_seq_start + q_start) as i64,
+                    (global_seq_start + q_end) as i64,
+                    (Kind::Int64, Device::Cpu),
+                ),
             };
             let q_kind = q.kind();
             q_states.push(QChunkState {
                 q_chunk,
-                q_global_start: q_gs,
-                q_global_end: q_ge,
-                rm: Tensor::full([batch, num_heads, q_chunk_len], f64::NEG_INFINITY, (q_kind, q.device())),
+                q_pos,
+                // 初始 running max 用一个有限大负数而非 -inf。
+                // 原因：Striped / 非连续分片下，某个 query 可能在第一个 block 就全被因果掩码屏蔽；
+                // 若 rm = -inf，online softmax 的 exp(-inf - (-inf)) 会产生 NaN。
+                // -1e4 对 Half/BFloat16/Float/Double 都可表示，且 exp(-1e4) 在所有浮点格式下都为 0。
+                rm: Tensor::full([batch, num_heads, q_chunk_len], -1e4_f64, (q_kind, q.device())),
                 rs: Tensor::zeros([batch, num_heads, q_chunk_len], (q_kind, q.device())),
                 obh: Tensor::zeros([batch, num_heads, q_chunk_len, head_dim], (q_kind, q.device())),
             });
@@ -413,19 +428,46 @@ impl HcpRingAttentionBackend {
                 .map(|i| {
                     let start = i * micro_kv_block_size;
                     let end = ((i + 1) * micro_kv_block_size).min(send_kv_len);
+                    let len_i64 = (end - start) as i64;
+                    let pos_ids = self.position_ids.as_ref().map(|pos| pos.narrow(0, start as i64, len_i64));
                     KvBlock {
                         layer_idx: self.layer_idx,
                         global_seq_start: global_seq_start + start,
                         global_seq_end: global_seq_start + end,
-                        k: k_to_send.narrow(2, start as i64, (end - start) as i64),
-                        v: v_to_send.narrow(2, start as i64, (end - start) as i64),
+                        k: k_to_send.narrow(2, start as i64, len_i64),
+                        v: v_to_send.narrow(2, start as i64, len_i64),
                         micro_block_idx: i,
                         total_micro_blocks: num_micro,
+                        position_ids: pos_ids,
                     }
                 })
                 .collect()
         } else {
             Vec::new()
+        };
+
+        // 构造本地 KV chunk 的原始位置 id（连续或非连续分片）
+        let build_k_pos = |start: usize, end: usize| -> Tensor {
+            match self.position_ids.as_ref() {
+                Some(pos) => pos.narrow(0, start as i64, (end - start) as i64),
+                None => Tensor::arange_start(
+                    (global_seq_start + start) as i64,
+                    (global_seq_start + end) as i64,
+                    (Kind::Int64, Device::Cpu),
+                ),
+            }
+        };
+
+        // 构造 peer KvBlock 的原始位置 id
+        let peer_k_pos = |block: &KvBlock| -> Tensor {
+            match block.position_ids.as_ref() {
+                Some(pos) => pos.shallow_clone(),
+                None => Tensor::arange_start(
+                    block.global_seq_start as i64,
+                    block.global_seq_end as i64,
+                    (Kind::Int64, Device::Cpu),
+                ),
+            }
         };
 
         // ====== 接收一个 micro block（poll_recv + recv_kv_block fallback）======
@@ -519,14 +561,10 @@ impl HcpRingAttentionBackend {
                         let kv_chunk_len = (*kv_end - *kv_start) as i64;
                         let k_chunk = k.narrow(2, *kv_start as i64, kv_chunk_len);
                         let v_chunk = v.narrow(2, *kv_start as i64, kv_chunk_len);
-                        let (kv_gs, kv_ge) = if apply_causal {
-                            (global_seq_start + kv_start, global_seq_start + kv_end)
-                        } else {
-                            (0, seq_len as usize)
-                        };
+                        let k_pos = build_k_pos(*kv_start, *kv_end);
                         self.process_kv_block(
-                            &state.q_chunk, state.q_global_start, state.q_global_end,
-                            &k_chunk, &v_chunk, kv_gs, kv_ge,
+                            &state.q_chunk, &state.q_pos,
+                            &k_chunk, &v_chunk, &k_pos,
                             &mut state.rm, &mut state.rs, &mut state.obh,
                             apply_causal,
                         );
@@ -540,11 +578,11 @@ impl HcpRingAttentionBackend {
                     let mut sorted = round_blocks.clone();
                     sorted.sort_by_key(|b| b.global_seq_start);
                     for micro_block in &sorted {
+                        let k_pos = peer_k_pos(micro_block);
                         for state in q_states.iter_mut() {
                             self.process_kv_block(
-                                &state.q_chunk, state.q_global_start, state.q_global_end,
-                                &micro_block.k, &micro_block.v,
-                                micro_block.global_seq_start, micro_block.global_seq_end,
+                                &state.q_chunk, &state.q_pos,
+                                &micro_block.k, &micro_block.v, &k_pos,
                                 &mut state.rm, &mut state.rs, &mut state.obh,
                                 apply_causal,
                             );
@@ -571,14 +609,10 @@ impl HcpRingAttentionBackend {
                         let kv_chunk_len = (*kv_end - *kv_start) as i64;
                         let k_chunk = k.narrow(2, *kv_start as i64, kv_chunk_len);
                         let v_chunk = v.narrow(2, *kv_start as i64, kv_chunk_len);
-                        let (kv_gs, kv_ge) = if apply_causal {
-                            (global_seq_start + kv_start, global_seq_start + kv_end)
-                        } else {
-                            (0, seq_len as usize)
-                        };
+                        let k_pos = build_k_pos(*kv_start, *kv_end);
                         self.process_kv_block(
-                            &state.q_chunk, state.q_global_start, state.q_global_end,
-                            &k_chunk, &v_chunk, kv_gs, kv_ge,
+                            &state.q_chunk, &state.q_pos,
+                            &k_chunk, &v_chunk, &k_pos,
                             &mut state.rm, &mut state.rs, &mut state.obh,
                             apply_causal,
                         );
@@ -630,11 +664,11 @@ impl HcpRingAttentionBackend {
 
                         // Step 2: 立刻处理这个 block（transport borrow 已释放）
                         let compute_start = std::time::Instant::now();
+                        let k_pos = peer_k_pos(&block);
                         for state in q_states.iter_mut() {
                             self.process_kv_block(
-                                &state.q_chunk, state.q_global_start, state.q_global_end,
-                                &block.k, &block.v,
-                                block.global_seq_start, block.global_seq_end,
+                                &state.q_chunk, &state.q_pos,
+                                &block.k, &block.v, &k_pos,
                                 &mut state.rm, &mut state.rs, &mut state.obh,
                                 apply_causal,
                             );
@@ -684,14 +718,10 @@ impl HcpRingAttentionBackend {
                     let kv_chunk_len = (*kv_end - *kv_start) as i64;
                     let k_chunk = k.narrow(2, *kv_start as i64, kv_chunk_len);
                     let v_chunk = v.narrow(2, *kv_start as i64, kv_chunk_len);
-                    let (kv_gs, kv_ge) = if apply_causal {
-                        (global_seq_start + kv_start, global_seq_start + kv_end)
-                    } else {
-                        (0, seq_len as usize)
-                    };
+                    let k_pos = build_k_pos(*kv_start, *kv_end);
                     self.process_kv_block(
-                        &state.q_chunk, state.q_global_start, state.q_global_end,
-                        &k_chunk, &v_chunk, kv_gs, kv_ge,
+                        &state.q_chunk, &state.q_pos,
+                        &k_chunk, &v_chunk, &k_pos,
                         &mut state.rm, &mut state.rs, &mut state.obh,
                         apply_causal,
                     );
@@ -1236,6 +1266,7 @@ mod tests {
             prefill_kv_len: 0,
             is_prefill_done: false,
             disable_overlap: false,
+            position_ids: None,
             micro_kv_block_size: 0,
         };
 
@@ -1251,10 +1282,11 @@ mod tests {
         );
 
         // 非因果模式：所有 Q 都能看到所有 K/V
+        let q_pos = Tensor::arange_start(0, query_len, (Kind::Int64, Device::Cpu));
+        let k_pos = Tensor::arange_start(0, block_len, (Kind::Int64, Device::Cpu));
         backend.process_kv_block(
-            &q, 0, query_len as usize,
-            &k, &v,
-            0, block_len as usize,
+            &q, &q_pos,
+            &k, &v, &k_pos,
             &mut rm, &mut rs, &mut obh,
             false,
         );
@@ -1327,6 +1359,7 @@ mod tests {
             prefill_kv_len: 0,
             is_prefill_done: false,
             disable_overlap: false,
+            position_ids: None,
             micro_kv_block_size: 0,
         };
 
@@ -1381,6 +1414,7 @@ mod tests {
             prefill_kv_len: 0,
             is_prefill_done: false,
             disable_overlap: false,
+            position_ids: None,
             micro_kv_block_size: 0,
         };
 
@@ -1433,6 +1467,7 @@ mod tests {
             prefill_kv_len: 0,
             is_prefill_done: false,
             disable_overlap: false,
+            position_ids: None,
             micro_kv_block_size: 0,
         };
 
@@ -1500,6 +1535,7 @@ mod tests {
             v: v1_hist.shallow_clone(),
             micro_block_idx: 0,
             total_micro_blocks: 1,
+            position_ids: None,
         });
 
         let mut backend0 = HcpRingAttentionBackend {
@@ -1521,6 +1557,7 @@ mod tests {
             prefill_kv_len: 0,
             is_prefill_done: false,
             disable_overlap: false,
+            position_ids: None,
             micro_kv_block_size: 0,
         };
         let out0 = backend0.ring_attention(&q_all, &k0_local, &v0_local, None, 0).unwrap();
@@ -1535,6 +1572,7 @@ mod tests {
             v: v0_hist.shallow_clone(),
             micro_block_idx: 0,
             total_micro_blocks: 1,
+            position_ids: None,
         });
 
         let mut backend1 = HcpRingAttentionBackend {
@@ -1556,6 +1594,7 @@ mod tests {
             prefill_kv_len: 0,
             is_prefill_done: false,
             disable_overlap: false,
+            position_ids: None,
             micro_kv_block_size: 0,
         };
         let out1 = backend1.ring_attention(&q_all, &k1_local, &v1_local, None, half as usize).unwrap();
@@ -1624,6 +1663,7 @@ mod tests {
             prefill_kv_len: 0,
             is_prefill_done: false,
             disable_overlap: false,
+            position_ids: None,
             micro_kv_block_size: 0,
         };
 
@@ -1695,6 +1735,7 @@ mod tests {
             v: v1.shallow_clone(),
             micro_block_idx: 0,
             total_micro_blocks: 1,
+            position_ids: None,
         });
 
         let mut backend0 = HcpRingAttentionBackend {
@@ -1716,6 +1757,7 @@ mod tests {
             prefill_kv_len: 0,
             is_prefill_done: false,
             disable_overlap: false,
+            position_ids: None,
             micro_kv_block_size: 0,
         };
         let out0 = backend0.ring_attention(&q0, &k0, &v0, Some(&mask), 0).unwrap();
@@ -1730,6 +1772,7 @@ mod tests {
             v: v0.shallow_clone(),
             micro_block_idx: 0,
             total_micro_blocks: 1,
+            position_ids: None,
         });
 
         let mut backend1 = HcpRingAttentionBackend {
@@ -1751,6 +1794,7 @@ mod tests {
             prefill_kv_len: 0,
             is_prefill_done: false,
             disable_overlap: false,
+            position_ids: None,
             micro_kv_block_size: 0,
         };
         let out1 = backend1.ring_attention(&q1, &k1, &v1, Some(&mask), half as usize).unwrap();
@@ -1771,20 +1815,17 @@ mod tests {
         assert!(diff_val < 1e-4, "Distributed ring attention differs from local causal: {}", diff_val);
     }
 
-    /// 2-domain uneven (3:1) ring attention perf baseline test.
-    /// Run with: HCP_PERF_LOG=/tmp/ring_perf.jsonl cargo test --features tch-backend test_ring_attention_uneven_perf -- --nocapture
+    /// 2-domain uneven (3:1) ring attention perf comparison test.
+    /// Compares vanilla capacity-aware continuous chunks vs weighted Striped permutation.
+    /// Run with: cargo test --features tch-backend test_ring_attention_uneven_perf -- --nocapture
     #[cfg(feature = "tch-backend")]
     #[test]
     fn test_ring_attention_uneven_perf() {
-        use crate::model::transport::MockKvTransport;
-
         let device = tch::Device::Cpu;
         let num_heads = 8i64;
         let head_dim = 128i64;
         let seq_len = 4096i64;
-        // 3:1 uneven split
-        let chunk0 = 3072i64;
-        let chunk1 = seq_len - chunk0;
+        let chunks = vec![3072usize, 1024usize]; // 3:1
 
         tch::manual_seed(2024);
         let q = Tensor::randn([1, num_heads, seq_len, head_dim], (Kind::Float, device));
@@ -1798,88 +1839,214 @@ mod tests {
         let attn = scores_masked.softmax(-1, Kind::Float);
         let expected = attn.matmul(&v);
 
-        let q0 = q.narrow(2, 0, chunk0);
-        let k0 = k.narrow(2, 0, chunk0);
-        let v0 = v.narrow(2, 0, chunk0);
-        let q1 = q.narrow(2, chunk0, chunk1);
-        let k1 = k.narrow(2, chunk0, chunk1);
-        let v1 = v.narrow(2, chunk0, chunk1);
+        // Run vanilla baseline.
+        std::env::set_var("HCP_PERF_LOG", "/tmp/ring_perf_vanilla.jsonl");
+        let _ = std::fs::remove_file("/tmp/ring_perf_vanilla.jsonl");
+        let (vanilla_actual, diff_vanilla) = run_uneven_ring_attention(
+            &q, &k, &v, &mask, &chunks, false, scale, num_heads, head_dim, device,
+        );
+        let vanilla_diff = (&expected - &vanilla_actual).abs().mean(Kind::Float).double_value(&[]);
+        assert!(vanilla_diff < 1e-4, "Vanilla uneven ring attention correctness failed: {}", vanilla_diff);
+        assert!(diff_vanilla < 1e-4, "Vanilla per-worker diff too large: {}", diff_vanilla);
+
+        // Run weighted striped permutation.
+        std::env::set_var("HCP_PERF_LOG", "/tmp/ring_perf_striped.jsonl");
+        let _ = std::fs::remove_file("/tmp/ring_perf_striped.jsonl");
+        let (striped_actual, diff_striped) = run_uneven_ring_attention(
+            &q, &k, &v, &mask, &chunks, true, scale, num_heads, head_dim, device,
+        );
+        let has_nan = striped_actual.isnan().any().double_value(&[]) != 0.0;
+        assert!(!has_nan, "Striped output contains NaN");
+        let striped_diff = (&expected - &striped_actual).abs().mean(Kind::Float).double_value(&[]);
+        assert!(striped_diff < 1e-4, "Striped uneven ring attention correctness failed: {}", striped_diff);
+        assert!(diff_striped < 1e-4, "Striped per-worker diff too large: {}", diff_striped);
+
+        println!("Vanilla correctness diff = {}, Striped correctness diff = {}", vanilla_diff, striped_diff);
+
+        // Parse perf logs and print comparison.
+        let vanilla = parse_perf_log("/tmp/ring_perf_vanilla.jsonl");
+        let striped = parse_perf_log("/tmp/ring_perf_striped.jsonl");
+        println!("\n=== Vanilla (capacity-aware continuous) ===");
+        print_perf_summary(&vanilla);
+        println!("\n=== Striped (weighted permutation) ===");
+        print_perf_summary(&striped);
+    }
+
+    /// Run 2-domain uneven ring attention. Returns per-domain outputs and max per-domain diff.
+    #[cfg(feature = "tch-backend")]
+    fn run_uneven_ring_attention(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        mask: &Tensor,
+        chunks: &[usize],
+        striped: bool,
+        scale: f64,
+        num_heads: i64,
+        head_dim: i64,
+        device: tch::Device,
+    ) -> (Tensor, f64) {
+        use crate::model::transport::MockKvTransport;
+
+        let seq_len = q.size()[2] as usize;
+        let num_domains = chunks.len();
+
+        // Build assignment: each original position -> domain.
+        let assignment: Vec<usize> = if striped {
+            // Weighted round-robin schedule, e.g. [3,1] -> [0,1,0,0]
+            let mut sched = Vec::new();
+            let mut remaining: Vec<_> = chunks.iter().cloned().enumerate().collect();
+            while remaining.iter().any(|(_, c)| *c > 0) {
+                for (domain, count) in remaining.iter_mut() {
+                    if *count > 0 {
+                        sched.push(*domain);
+                        *count -= 1;
+                    }
+                }
+            }
+            (0..seq_len).map(|p| sched[p % sched.len()]).collect()
+        } else {
+            // Continuous chunks.
+            let mut assign = Vec::with_capacity(seq_len);
+            for (domain, &chunk) in chunks.iter().enumerate() {
+                assign.extend(std::iter::repeat(domain).take(chunk));
+            }
+            assign
+        };
+
+        // Per-domain positions (in original order).
+        let mut positions: Vec<Vec<usize>> = vec![Vec::new(); num_domains];
+        for (p, &domain) in assignment.iter().enumerate() {
+            positions[domain].push(p);
+        }
+
+        // Gather tensors by domain.
+        let mut q_d: Vec<Tensor> = Vec::new();
+        let mut k_d: Vec<Tensor> = Vec::new();
+        let mut v_d: Vec<Tensor> = Vec::new();
+        let mut pos_d: Vec<Tensor> = Vec::new();
+        for domain in 0..num_domains {
+            let pos_t = Tensor::f_from_slice::<i64>(
+                &positions[domain].iter().map(|&p| p as i64).collect::<Vec<_>>(),
+            ).unwrap().to_device(device);
+            q_d.push(q.index_select(2, &pos_t));
+            k_d.push(k.index_select(2, &pos_t));
+            v_d.push(v.index_select(2, &pos_t));
+            pos_d.push(pos_t);
+        }
 
         let rope = crate::model::layers::RotaryEmbedding::new(head_dim as usize, 16384, 10000.0, device);
 
-        // Worker 0 receives peer KV [chunk0..seq_len]
-        let mut transport0 = MockKvTransport::new();
-        transport0.push(crate::model::transport::KvBlock {
-            layer_idx: 0,
-            global_seq_start: chunk0 as usize,
-            global_seq_end: seq_len as usize,
-            k: k1.shallow_clone(),
-            v: v1.shallow_clone(),
-            micro_block_idx: 0,
-            total_micro_blocks: 1,
-        });
-        let mut backend0 = HcpRingAttentionBackend {
-            q_proj: Tensor::randn([1, 1], (Kind::Float, device)),
-            k_proj: Tensor::randn([1, 1], (Kind::Float, device)),
-            v_proj: Tensor::randn([1, 1], (Kind::Float, device)),
-            o_proj: Tensor::randn([1, 1], (Kind::Float, device)),
-            q_bias: None, k_bias: None, v_bias: None,
-            rope: rope.clone(),
-            num_heads: num_heads as usize,
-            num_kv_heads: num_heads as usize,
-            head_dim: head_dim as usize,
-            scale,
-            num_domains: 2,
-            layer_idx: 0,
-            kv_transport: Some(Box::new(transport0)),
-            local_domain_id: 0,
-            seq_offset: 0,
-            prefill_kv_len: 0,
-            is_prefill_done: false,
-            disable_overlap: false,
-            micro_kv_block_size: 0,
-        };
-        let out0 = backend0.ring_attention(&q0, &k0, &v0, Some(&mask), 0).unwrap();
+        // Create transports and backends.
+        let mut backends: Vec<HcpRingAttentionBackend> = Vec::new();
+        let mut transports: Vec<MockKvTransport> = Vec::new();
+        for domain in 0..num_domains {
+            let peer = (domain + 1) % num_domains;
+            let mut transport = MockKvTransport::new();
+            transport.push(crate::model::transport::KvBlock {
+                layer_idx: 0,
+                global_seq_start: *positions[peer].first().unwrap(),
+                global_seq_end: *positions[peer].last().unwrap() + 1,
+                k: k_d[peer].shallow_clone(),
+                v: v_d[peer].shallow_clone(),
+                micro_block_idx: 0,
+                total_micro_blocks: 1,
+                position_ids: Some(pos_d[peer].shallow_clone()),
+            });
+            transports.push(transport);
 
-        // Worker 1 receives peer KV [0..chunk0]
-        let mut transport1 = MockKvTransport::new();
-        transport1.push(crate::model::transport::KvBlock {
-            layer_idx: 0,
-            global_seq_start: 0,
-            global_seq_end: chunk0 as usize,
-            k: k0.shallow_clone(),
-            v: v0.shallow_clone(),
-            micro_block_idx: 0,
-            total_micro_blocks: 1,
-        });
-        let mut backend1 = HcpRingAttentionBackend {
-            q_proj: Tensor::randn([1, 1], (Kind::Float, device)),
-            k_proj: Tensor::randn([1, 1], (Kind::Float, device)),
-            v_proj: Tensor::randn([1, 1], (Kind::Float, device)),
-            o_proj: Tensor::randn([1, 1], (Kind::Float, device)),
-            q_bias: None, k_bias: None, v_bias: None,
-            rope,
-            num_heads: num_heads as usize,
-            num_kv_heads: num_heads as usize,
-            head_dim: head_dim as usize,
-            scale,
-            num_domains: 2,
-            layer_idx: 0,
-            kv_transport: Some(Box::new(transport1)),
-            local_domain_id: 1,
-            seq_offset: chunk0 as usize,
-            prefill_kv_len: 0,
-            is_prefill_done: false,
-            disable_overlap: false,
-            micro_kv_block_size: 0,
-        };
-        let out1 = backend1.ring_attention(&q1, &k1, &v1, Some(&mask), chunk0 as usize).unwrap();
+            let backend = HcpRingAttentionBackend {
+                q_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+                k_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+                v_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+                o_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+                q_bias: None, k_bias: None, v_bias: None,
+                rope: rope.clone(),
+                num_heads: num_heads as usize,
+                num_kv_heads: num_heads as usize,
+                head_dim: head_dim as usize,
+                scale,
+                num_domains,
+                layer_idx: 0,
+                kv_transport: Some(Box::new(transports.pop().unwrap())),
+                local_domain_id: domain,
+                seq_offset: if striped { 0 } else { positions[domain][0] },
+                prefill_kv_len: 0,
+                is_prefill_done: false,
+                disable_overlap: false,
+                position_ids: Some(pos_d[domain].shallow_clone()),
+                micro_kv_block_size: 0,
+            };
+            backends.push(backend);
+        }
 
-        let expected0 = expected.narrow(2, 0, chunk0);
-        let expected1 = expected.narrow(2, chunk0, chunk1);
-        let diff0 = (&expected0 - &out0).abs().mean(Kind::Float).double_value(&[]);
-        let diff1 = (&expected1 - &out1).abs().mean(Kind::Float).double_value(&[]);
-        println!("worker0 diff={}, worker1 diff={}", diff0, diff1);
-        assert!(diff0 < 1e-4 && diff1 < 1e-4, "Uneven ring attention correctness failed");
+        // Run attention.
+        let mut outputs: Vec<Tensor> = Vec::new();
+        for domain in 0..num_domains {
+            let global_start = if striped { 0 } else { positions[domain][0] };
+            let out = backends[domain]
+                .ring_attention(&q_d[domain], &k_d[domain], &v_d[domain], Some(&mask), global_start)
+                .unwrap();
+            outputs.push(out);
+        }
+
+        // Inverse permutation: reconstruct original order.
+        let mut inverse_perm = vec![0i64; seq_len];
+        let mut offsets = vec![0usize; num_domains];
+        for (domain, chunk) in chunks.iter().enumerate() {
+            offsets[domain + 1..].iter_mut().for_each(|o| *o += chunk);
+        }
+        let cursor = offsets.clone();
+        for domain in 0..num_domains {
+            for (idx, &orig_pos) in positions[domain].iter().enumerate() {
+                inverse_perm[orig_pos] = (cursor[domain] + idx) as i64;
+            }
+        }
+        let inverse_t = Tensor::f_from_slice::<i64>(&inverse_perm).unwrap().to_device(device);
+        let concatenated = Tensor::cat(&outputs, 2);
+        let actual = concatenated.index_select(2, &inverse_t);
+
+        // Compute per-domain diff against expected slice in original order.
+        let expected_full = {
+            let scores = q.matmul(&k.transpose(2, 3)) * scale;
+            let scores_masked = scores + mask.shallow_clone();
+            let attn = scores_masked.softmax(-1, Kind::Float);
+            attn.matmul(v)
+        };
+        let mut max_diff = 0.0f64;
+        for domain in 0..num_domains {
+            for &orig_pos in &positions[domain] {
+                let expected_slice = expected_full.narrow(2, orig_pos as i64, 1);
+                let actual_slice = actual.narrow(2, orig_pos as i64, 1);
+                let d = (&expected_slice - &actual_slice).abs().mean(Kind::Float).double_value(&[]);
+                max_diff = max_diff.max(d);
+            }
+        }
+
+        // 返回已按原始序列顺序重建的完整输出，以及逐位置最大 diff。
+        // 这样 vanilla（连续分片）和 striped（加权置换）都可以用同一方式与 reference 比较。
+        (actual, max_diff)
+    }
+
+    /// Simple JSONL perf log parser for test summary.
+    #[cfg(feature = "tch-backend")]
+    fn parse_perf_log(path: &str) -> Vec<std::collections::HashMap<String, String>> {
+        let content = std::fs::read_to_string(path).unwrap_or_default();
+        content.lines().filter_map(|line| {
+            serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(line).ok()
+                .map(|m| m.into_iter().map(|(k, v)| (k, v.to_string())).collect())
+        }).collect()
+    }
+
+    #[cfg(feature = "tch-backend")]
+    fn print_perf_summary(rows: &[std::collections::HashMap<String, String>]) {
+        for row in rows {
+            let domain = row.get("domain").cloned().unwrap_or_default();
+            let total = row.get("total_ms").cloned().unwrap_or_default();
+            let local = row.get("local_compute_ms").cloned().unwrap_or_default();
+            let peer = row.get("peer_compute_ms").cloned().unwrap_or_default();
+            let recv = row.get("recv_ms").cloned().unwrap_or_default();
+            println!("domain {}: total={}ms local_compute={}ms peer_compute={}ms recv={}ms", domain, total, local, peer, recv);
+        }
     }
 }

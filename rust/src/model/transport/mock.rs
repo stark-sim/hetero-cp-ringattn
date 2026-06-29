@@ -117,6 +117,7 @@ impl KvTransport for LinkedMockKvTransport {
             v: block.v.shallow_clone(),
             micro_block_idx: block.micro_block_idx,
             total_micro_blocks: block.total_micro_blocks,
+            position_ids: block.position_ids.as_ref().map(|t| t.shallow_clone()),
         };
         self.peer_inbox.lock().unwrap().push_back(cloned);
         Ok(())

@@ -29,12 +29,15 @@ pub struct KvBlock {
     /// 【micro block 总数】该 domain 在这一 round 中总共有多少个 micro blocks。
     /// 默认 1 表示未切分（单个 block）。
     pub total_micro_blocks: usize,
+    /// 【原始位置 id】用于 Striped / 非均等 permutation 场景下的 causal mask。
+    /// 如果为 None，则默认使用 [global_seq_start, global_seq_end) 的连续位置。
+    pub position_ids: Option<Tensor>,
 }
 
 impl KvBlock {
     /// 【创建单个未切分的 KV block】向后兼容的便捷构造函数。
     pub fn single(layer_idx: usize, global_seq_start: usize, global_seq_end: usize, k: Tensor, v: Tensor) -> Self {
-        Self { layer_idx, global_seq_start, global_seq_end, k, v, micro_block_idx: 0, total_micro_blocks: 1 }
+        Self { layer_idx, global_seq_start, global_seq_end, k, v, micro_block_idx: 0, total_micro_blocks: 1, position_ids: None }
     }
 }
 
@@ -48,6 +51,7 @@ impl Clone for KvBlock {
             v: self.v.shallow_clone(),
             micro_block_idx: self.micro_block_idx,
             total_micro_blocks: self.total_micro_blocks,
+            position_ids: self.position_ids.as_ref().map(|t| t.shallow_clone()),
         }
     }
 }

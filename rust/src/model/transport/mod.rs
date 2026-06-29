@@ -53,6 +53,7 @@ mod tests {
             v: v.shallow_clone(),
             micro_block_idx: 0,
             total_micro_blocks: 1,
+            position_ids: None,
         };
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
