@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-06-29] white-pearl 完整带宽矩阵：100 Mbps 下 HCP 慢 10-30x
+
+type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.95 · source: `reports/bw-matrix-20260629-220317 / harness operations`
+
+实验：white (RTX 4090 CUDA) + pearl (RX 9060 XT HIP)，Qwen2-0.5B-1M，seq_len=4096，max_tokens=5，tc tbf 在 192.168.100.x 有线链路上限速，iperf3 验证实际带宽。\n\n结果（2 reps）：\n- baseline 2.35 Gbps：20.5 s avg（20/21 s）\n- 1000 Mbps：29.5 s avg（28/31 s）→ 1.44x slowdown\n- 500 Mbps：50.0 s avg（50/50 s）→ 2.44x slowdown\n- 100 Mbps：445 s avg（206/684 s）→ 21.7x slowdown（中位数 445 s）\n\n报告目录：reports/bw-matrix-20260629-220317/\n\n关键发现：\n1. 端到端时间随带宽下降呈非线性增长；100 Mbps 时通信成为绝对瓶颈。\n2. 100 Mbps 两次重复差异极大（206 s vs 684 s），提示低速下系统状态（热节流、设备调度、QUIC 拥塞控制）可能放大波动。\n3. 500 Mbps 已使 4K+5 token 任务慢约 2.4x；1 Gbps 仍慢约 1.4x。\n\n结论：P2P KV ring 对跨节点带宽极度敏感；要释放异构 CP 的实用性，需要远高于千兆以太网的互联带宽（CXL / RDMA / 高速 NVLink）。
+
+_updated: 2026-06-29 14:32:15_
 ### [2026-06-29] white-pearl 限速 pilot：100M 带宽下 HCP 慢 10x
 
 type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.95 · source: `harness/operations/ (pending full matrix record)`

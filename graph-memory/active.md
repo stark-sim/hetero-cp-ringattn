@@ -4,18 +4,18 @@
 
 ### 异构 CP 对网络速度敏感，CXL / 类 RDMA 互联可显著突破网线局限
 
-type: `hypothesis` · status: `ongoing` · confidence: 0.6 · importance: 0.95 · source: `user-direction`
+type: `hypothesis` · status: `ongoing` · confidence: 0.85 · importance: 0.95 · source: `user-direction`
 
-核心目标：论证 CXL / 类 RDMA 高速互联对异构推理服务上主流舞台的决定性作用。\n\n当前状态：\n- white 与 pearl 之间最高 2.5G 有线以太网。\n- Pilot 结果（seq=4096, Qwen2-0.5B-1M）：基线 2.35G 总耗时 21s；限速 100M 总耗时 206s，慢约 10 倍。\n- 完整矩阵（baseline / 1000M / 500M / 100M × 2 reps）正在后台运行。\n\n关键问题：\n1. 网络带宽下降时，HCP 端到端时间如何变化？\n2. prefill 和 decode 对带宽的敏感度是否不同？\n3. 使 P2P KV ring 不被网络拖慢，需要多高的带宽？\n4. 如何用现有两台机器构建有说服力的 CXL/RDMA 必要性论证？
+核心目标：论证 CXL / 类 RDMA 高速互联对异构推理服务上主流舞台的决定性作用。\n\n当前状态：\n- white 与 pearl 之间最高 2.5 G 有线以太网。\n- Pilot（seq=4096, Qwen2-0.5B-1M）：基线 2.35 G 21 s；100 M 206 s，慢约 10 倍。\n- 完整矩阵（baseline / 1000 M / 500 M / 100 M × 2 reps）：\n  - baseline 20.5 s；1000 M 29.5 s（1.44x）；500 M 50 s（2.44x）；100 M 445 s（21.7x）。\n\n关键结论：\n1. 跨节点 P2P KV ring 对带宽极度敏感；100 M 时通信成为绝对瓶颈。\n2. 即使 1 Gbps，端到端仍有 1.4x 惩罚；要接近单节点效率需要 ≥2.35 Gbps 甚至更高带宽。\n3. 100 M 两次重复差异大（206 s vs 684 s），需调查低速下的波动来源。\n\n仍开放问题：\n- 100 M 高方差的根因（热节流 / QUIC / 设备调度）？\n- 更长 seq、decode-only、更大模型下的带宽阈值是否会更低？\n- 能否用现有两台机器构建可发表的 CXL/RDMA 必要性论证？
 
-_updated: 2026-06-29 14:02:37_
-### 设计 white-pearl 网络带宽敏感度实验
+_updated: 2026-06-29 14:32:15_
+### HCP P2P KV ring 在 ≤1 Gbps 跨节点以太网下会成为端到端瓶颈
 
-type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.95
+type: `belief` · status: `held` · confidence: 0.85 · importance: 0.95 · source: `ev-net-speed-matrix-20260629`
 
-目标：用 white-pearl 限速实验量化网络带宽对 HCP 异构推理的影响。\n\n已完成：\n- 实验设计：tc tbf 限速 + iperf3 验证 + HCP 跨节点推理。\n- Pilot：基线 2.35G 21s vs 100M 206s，证明网络是关键瓶颈。\n\n进行中：\n- 完整矩阵：baseline / 1000M / 500M / 100M × 2 reps，后台运行中。\n\n阻塞：无（sudo 密码已从 secure inventory 获取）。
+基于 white-pearl 限速矩阵：\n- 2.35 Gbps 基线 20.5 s\n- 1 Gbps 29.5 s（1.44x）\n- 500 Mbps 50 s（2.44x）\n- 100 Mbps 445 s（21.7x）\n\n在 Qwen2-0.5B-1M、seq=4096、max_tokens=5 的异构推理任务中，端到端 latency 随跨节点带宽下降呈非线性增长。低于 1 Gbps 时，P2P KV ring 的通信时间显著超过计算时间；100 Mbps 时通信完全主导总时间。\n\n推论：若要在生产环境中部署异构 CP 推理，需要 CXL / RDMA / 高速 NVLink 等级别的互联带宽，否则网络将把多卡聚合的显存优势抵消为极高的延迟惩罚。
 
-_updated: 2026-06-29 14:02:37_
+_updated: 2026-06-29 14:32:15_
 ### 下一阶段：从 1M 可行性验证走向多条扩展线探索
 
 type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.95 · source: `user-direction`
@@ -232,6 +232,13 @@ type: `claim` · status: `held` · confidence: 0.85 · importance: 0.8 · source
 process_kv_block 在因果路径下会跳过 kv_global_start >= q_global_end 的 block。连续 chunk 场景下，持有靠前 token 的大 domain 会跳过来自后续小 domain 的 peer block，导致其 peer_compute 接近零；而小 domain 必须处理来自大 domain 的全部历史 KV。这是 vanilla ring 在 capacity-aware 不均等分片下出现 3.6× 耗时差距的根本原因。
 
 _updated: 2026-06-29 07:44:40_
+### 100 Mbps 重复实验方差极大的根因未明
+
+type: `uncertainty` · status: `open` · confidence: 0.6 · importance: 0.75 · source: `ev-net-speed-matrix-20260629`
+
+完整矩阵中 100 Mbps 两次重复分别为 206 s 和 684 s，差距超过 3x。可能原因包括：\n1. pearl RX 9060 XT 热节流或功耗状态变化。\n2. QUIC / tch-rs 在低速链路上的拥塞控制或重传行为。\n3. 操作系统 / 网络栈的 bufferbloat 或 tc burst 参数导致偶发排队。\n4. 模型 / runtime 内部某个 warmup / cache / 分配路径在第二次运行时触发不同路径。\n\n在把 100 Mbps 数字作为核心论据前，需要复现并解释该方差。
+
+_updated: 2026-06-29 14:32:15_
 ### 训练场景评估：Striped Attention 训练收益对 HCP 当前目标意义有限
 
 type: `claim` · status: `held` · confidence: 0.75 · importance: 0.7 · source: `paper-analysis + user-direction`

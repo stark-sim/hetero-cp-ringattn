@@ -175,6 +175,26 @@ From verified A/B tests (`progress.md`, 2026-05-12):
 
 **Implication**: For small scales (512 tokens), network overhead is manageable but can dominate on weak networks. For large scales (64K+ tokens), the absolute transfer volume becomes significant regardless of latency. HCP's split-phase pipeline + micro KV block architecture is designed to hide network latency, but its effectiveness depends on the compute/network ratio.
 
+### 4.4 Empirical Bandwidth Sensitivity (white ↔ pearl, 2026-06-29)
+
+We measured end-to-end latency while throttling the wired Ethernet link between white (RTX 4090 CUDA) and pearl (RX 9060 XT HIP) using `tc tbf`. Workload: Qwen2-0.5B-1M, seq_len=4096, max_tokens=5, 2-domain uneven split.
+
+| Link bandwidth | Measured throughput | End-to-end latency | Slowdown vs baseline |
+|----------------|--------------------:|-------------------:|---------------------:|
+| 2.35 Gbps (baseline) | 2.35 Gbps | 20.5 s | 1.0× |
+| 1 Gbps | 951 Mbps | 29.5 s | 1.4× |
+| 500 Mbps | 478 Mbps | 50.0 s | 2.4× |
+| 100 Mbps | 94.9 Mbps | 445 s* | 21.7× |
+
+\* 100 Mbps shows high run-to-run variance (206 s vs 684 s), which is itself an open diagnostic question, but even the faster run is a ~10× penalty.
+
+**Key takeaways**:
+1. The penalty is non-linear: a 4.3× reduction in bandwidth (2.35 Gbps → 500 Mbps) already produces a 2.4× latency increase.
+2. At 100 Mbps the network is the absolute bottleneck; logs show `recv/compute` ratios in the thousands.
+3. Even 1 Gbps consumer Ethernet leaves a measurable 1.4× penalty on a small 4K-sequence task. For 1M tokens, the same per-link traffic volume would be ~250× larger, making 1 Gbps untenable.
+
+Report with raw logs and plot: `reports/bw-matrix-20260629-220317/README.md`.
+
 ---
 
 ## 5. Why HCP Wins
