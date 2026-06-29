@@ -68,6 +68,15 @@ type: `decision` · status: `held` · confidence: 0.85 · importance: 0.85 · so
 当前处于 correctness 验证阶段，尚未进入性能调优。在全部 target 设备上稳定通过前，禁止实施量化、近似 attention、非 deterministic kernel、投机/跳过层优化。每次提出优化前必须写 trade-off 分析。
 
 _updated: 2026-06-29 05:34:19_
+### Striped Attention HCP 适配计划
+
+type: `decision` · status: `held` · confidence: 0.8 · importance: 0.85 · source: `docs/STRIPE_ATTENTION_ADAPTATION_PLAN.md`
+
+已将详细实现计划写入 docs/STRIPE_ATTENTION_ADAPTATION_PLAN.md。
+核心思路：通过细粒度 scheduling unit 实现 capacity-aware 不均等 stripe；用原始位置 id 计算 causal mask；worker 输入/输出做 permutation / inverse-permutation；online softmax 与 KV transport 不变。
+实施顺序：先在 correctness model 验证，再改 coordinator/worker，最后跑 uneven 分布式 smoke。
+
+_updated: 2026-06-29 06:18:40_
 ### QUIC Transport 配置：512MB stream window / 1GB connection window / 300s idle timeout
 
 type: `decision` · status: `held` · confidence: 0.9 · importance: 0.8 · source: `memory-bank/techContext.md`

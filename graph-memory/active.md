@@ -19,17 +19,6 @@ type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.95 · sour
 3. Block KV cache + vLLM 集成：插件解耦 vs HCP 内联 PageAttention 两条路线。
 
 _updated: 2026-06-29 06:01:28_
-### 先做：Stripe Attention 调研与 HCP 适配性分析
-
-type: `task` · status: `ongoing` · confidence: 0.75 · importance: 0.9 · source: `user-direction`
-
-精读已完成。下一步：
-1. 在 HCP Rust correctness model 中实现 striped permutation（含 RoPE position id permutation）。
-2. 修改 online softmax mask 逻辑以匹配 Striped GetMask。
-3. 用同构/异构 uneven chunk 配置跑 correctness test，测量 per-domain 计算量。
-4. 输出设计文档：capacity-aware 不均等分片下如何应用 stripe，以及是否需同时调整 chunk 分配策略。
-
-_updated: 2026-06-29 06:16:16_
 ### 精读：Striped Attention 机制与 HCP 适配点
 
 type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.9 · source: `https://ar5iv.org/html/2311.09431`
