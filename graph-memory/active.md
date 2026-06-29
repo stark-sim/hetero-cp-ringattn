@@ -23,12 +23,9 @@ _updated: 2026-06-29 06:01:28_
 
 type: `task` · status: `ongoing` · confidence: 0.75 · importance: 0.9 · source: `user-direction`
 
-CPU mock 对比已完成：
-1. Vanilla 与 Striped correctness 均通过（diff < 1e-4）。
-2. 在 homogenous CPU 上 Striped 使 domain 0 总耗时从 118ms 增至 185ms，未显现负载均衡收益。
-3. 下一步：在真实 heterogeneous 硬件（white CUDA + pearl HIP）上复跑同配置，判断 pearl 较慢时 Striped 是否能缓解瓶颈。
+CPU mock 对比已完成（仅作为逻辑正确性验证）：\n1. Vanilla 与 Striped correctness 均通过（diff < 1e-4）。\n2. 在 homogenous CPU 上 Striped 使 domain 0 总耗时从 118ms 增至 185ms，未显现负载均衡收益——但这仅在 CPU 上成立，不能外推到加速卡。\n3. 下一步必须在真实 heterogeneous 硬件（white CUDA + pearl HIP）上复跑，才能对架构设计下结论。
 
-_updated: 2026-06-29 10:46:05_
+_updated: 2026-06-29 12:35:36_
 ### 精读：Striped Attention 机制与 HCP 适配点
 
 type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.9 · source: `https://ar5iv.org/html/2311.09431`
@@ -82,16 +79,16 @@ _updated: 2026-06-29 06:06:09_
 
 type: `claim` · status: `held` · confidence: 0.8 · importance: 0.85 · source: `user-direction + design-reasoning`
 
-capacity-aware 连续分片与加权 Striped 是 HCP 的两种候选调度策略。当前 CPU mock 证据显示：在 homogeneous 算力、3:1 分片下，Striped 把 peer compute 从小 domain 转移到大 domain，使瓶颈 domain 0 更慢，未表现出 wall-time 收益。真实 heterogeneous 硬件（pearl 较慢）验证 pending；若仍无收益，根据简洁性原则应默认保留连续分片。
+capacity-aware 连续分片与加权 Striped 是 HCP 的两种候选调度策略。\n\n当前状态：\n- CPU mock 验证：两种策略数值正确，但在 homogeneous CPU 上 Striped 使大 domain 更慢。\n- 该结果仅证明代码逻辑无误，不能作为 LLM 服务架构决策的依据。\n- 真实 heterogeneous 硬件（white CUDA + pearl HIP）验证 pending；若真实硬件上仍无收益，根据简洁性原则应默认保留连续分片。
 
-_updated: 2026-06-29 10:46:05_
+_updated: 2026-06-29 12:35:36_
 ### 在真实异构硬件上验证 Striped 负载均衡收益
 
 type: `task` · status: `ongoing` · confidence: 0.75 · importance: 0.85
 
-在 white (RTX 4090 CUDA) + pearl (RX 9060 XT HIP) 上复跑 4096/3:1 或 1M context 的 vanilla vs striped 对比。关键问题：当 pearl 算力明显慢于 white 时，Striped 是否能将 wall-time 差距拉近到容量比例（3:1）附近，还是会因增加 white 负担而恶化端到端耗时。
+在 white (RTX 4090 CUDA) + pearl (RX 9060 XT HIP) 上复跑 4096/3:1 或 1M context 的 vanilla vs striped 对比。\n\n关键认知：CPU mock 只能验证代码逻辑正确性，对 LLM 服务架构设计没有决定意义；必须上加速卡才能判断 Striped 是否能在真实 heterogeneous 算力下改善负载均衡。\n\n关键问题：\n1. 当 pearl 算力明显慢于 white 时，Striped 是否能将 wall-time 差距拉近到容量比例（3:1）附近？\n2. 还是会因增加 white 的 peer compute 负担而恶化端到端耗时？\n3. 真实显存占用与 P2P/QUIC 传输开销是否会让 Striped 不可行？
 
-_updated: 2026-06-29 10:46:05_
+_updated: 2026-06-29 12:35:36_
 ### Striped Attention 可以推广到 capacity-aware 不均等分片
 
 type: `claim` · status: `held` · confidence: 0.75 · importance: 0.85 · source: `paper-analysis + design-reasoning`
