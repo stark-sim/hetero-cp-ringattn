@@ -33,6 +33,7 @@ Coordinator (Rust) ──QUIC──► Worker / Domain ──► 域内后端（
 - 🔄 核心目标：论证 CXL / 类 RDMA 高速互联对异构推理服务上主流舞台的必要性
 - ⏸️ 已挂起：更大模型 / 更多 domain / 更长 seq 验证（受限于当前硬件环境）
 - ⏸️ 已挂起：Striped Attention / Stripe Ring Attention 适配（非均等切分兼容性问题未解）
+- ⏸️ 已降级：Ring Attention 家族综述（claim-ring-derivatives）仅作为文献背景，不再作为独立实现线推进
 
 ## 关键约束
 

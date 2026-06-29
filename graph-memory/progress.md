@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### 综述类支撑线必须有真实实现和硬件对比才有说服力
+
+type: `lesson` · status: `held` · confidence: 0.9 · importance: 0.85 · source: `user-direction`
+
+在论证 CXL/RDMA 必要性时，最初计划用 Ring Attention 家族综述作为辅助证据。用户指出这不够：如果只是文献综述，没有基于 HCP 的真实实现和 white/pearl 硬件对比，无法形成有工作量、有说服力的论证。\n\n教训：\n1. 任何“方案对比”类 claim，必须有可运行的代码和可重复的测量。\n2. 当直接实验（hyp-net-speed）已经很强时，不要为了“显得完整”而引入高成本实现线。\n3. 文献综述只能作为背景，不能替代实验证据。
+
+_updated: 2026-06-29 15:48:58_
 ### [2026-06-29] white-pearl 完整带宽矩阵：100 Mbps 下 HCP 慢 10-30x
 
 type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.95 · source: `reports/bw-matrix-20260629-220317 / harness operations`

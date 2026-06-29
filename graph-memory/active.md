@@ -2,6 +2,13 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 下一阶段：从 1M 可行性验证走向多条扩展线探索
+
+type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.95 · source: `user-direction`
+
+当前核心方向：论证 CXL / 类 RDMA 高速互联对异构推理服务上主流舞台的重要性。\n\n已挂起方向：\n1. 更大模型 / 更多 domain 验证（受限于硬件环境）。\n2. Striped Attention / Stripe Ring Attention（非均等切分兼容性问题未解）。\n3. claim-ring-derivatives：Ring Attention 家族综述与实现对比线已降级为文献引用背景，不再作为独立实现线推进。\n\n仍开放的 graph 线：\n- hyp-net-speed：CXL/RDMA 必要性（核心）。\n- hyp-block-kv-vllm：Block KV cache + vLLM 集成（工程扩展线）。
+
+_updated: 2026-06-29 15:48:58_
 ### 异构 CP 对网络速度敏感，CXL / 类 RDMA 互联可显著突破网线局限
 
 type: `hypothesis` · status: `ongoing` · confidence: 0.85 · importance: 0.95 · source: `user-direction`
@@ -16,13 +23,6 @@ type: `belief` · status: `held` · confidence: 0.85 · importance: 0.95 · sour
 基于 white-pearl 限速矩阵：\n- 2.35 Gbps 基线 20.5 s\n- 1 Gbps 29.5 s（1.44x）\n- 500 Mbps 50 s（2.44x）\n- 100 Mbps 445 s（21.7x）\n\n在 Qwen2-0.5B-1M、seq=4096、max_tokens=5 的异构推理任务中，端到端 latency 随跨节点带宽下降呈非线性增长。低于 1 Gbps 时，P2P KV ring 的通信时间显著超过计算时间；100 Mbps 时通信完全主导总时间。\n\n推论：若要在生产环境中部署异构 CP 推理，需要 CXL / RDMA / 高速 NVLink 等级别的互联带宽，否则网络将把多卡聚合的显存优势抵消为极高的延迟惩罚。
 
 _updated: 2026-06-29 14:32:15_
-### 下一阶段：从 1M 可行性验证走向多条扩展线探索
-
-type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.95 · source: `user-direction`
-
-当前核心方向：论证 CXL / 类 RDMA 高速互联对异构推理服务上主流舞台的重要性。\n\n已挂起方向：\n1. 更大模型 / 更多 domain 验证（受限于硬件环境）。\n2. Striped Attention / Stripe Ring Attention（非均等切分兼容性问题未解）。\n3. 1M 里程碑不再作为当前论证的直接证据。\n\n仍开放的 graph 线：\n- hyp-net-speed：CXL/RDMA 必要性（核心）。\n- hyp-block-kv-vllm：Block KV cache + vLLM 集成（工程扩展线）。\n- claim-ring-derivatives：Ring Attention 衍生方案综述（可作为 CXL/RDMA 论证的支撑：P2P-only 算法家族需要高速互联才能释放潜力）。
-
-_updated: 2026-06-29 13:27:24_
 ### 当前焦点：1M 异构分布式推理已闭环
 
 type: `task` · status: `superseded` · confidence: 0.95 · importance: 0.95 · source: `memory-bank/activeContext.md`
@@ -93,6 +93,13 @@ type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.9 · sou
 与 HCP 相关性：直接相关，可能缓解 pearl 等小/慢 domain 在 Phase 2 成为瓶颈的问题。
 
 _updated: 2026-06-29 06:06:09_
+### 决策：将 claim-ring-derivatives 降级为文献引用背景
+
+type: `decision` · status: `held` · confidence: 0.85 · importance: 0.85 · source: `user-direction`
+
+用户指出：claim-ring-derivatives 如果只是综述而没有真实实现和硬件对比，缺乏说服力和工作量。\n\n评估结果：\n- Ring Flash Attention 实现成本高（kernel 层）。\n- ZigZag 实现成本中等但可能重蹈 Striped + uneven 兼容覆辙。\n- hyp-net-speed 已有直接带宽证据，足以支撑 CXL/RDMA 必要性。\n\n因此将该线从“需实现的支撑线”降级为“文献引用背景”，资源继续集中在 hyp-net-speed 深化。
+
+_updated: 2026-06-29 15:48:58_
 ### 1M white+pearl 是可行性里程碑，而非生产实用配置
 
 type: `belief` · status: `held` · confidence: 0.9 · importance: 0.85 · source: `user-reflection`
@@ -195,22 +202,13 @@ type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.85 · sou
 HCP 的数学基础即来源于此。
 
 _updated: 2026-06-29 06:06:09_
-### Ring Attention 主流衍生方案综述
+### Ring Attention 衍生方案综述仅作为文献背景，不单独实现
 
-type: `claim` · status: `held` · confidence: 0.75 · importance: 0.85 · source: `web-search-survey`
+type: `claim` · status: `suspended` · confidence: 0.8 · importance: 0.8 · source: `user-direction + cost-benefit review`
 
-除原始 Ring Attention 与 Striped Attention 外，当前主流/相关方案包括：
-- Ring Flash Attention（zhuzilin 等开源）：将 FlashAttention kernel 与 Ring 通信重叠。
-- ZigZag Ring Attention（ring-flash-attention issue #2 / Megatron-Core）：通过折叠 query 维度并在 worker 间镜像 block 平衡负载。
-- DeepSpeed Ulysses（Microsoft, arXiv:2309.14509）：用 all-to-all 替代 all-gather/reduce-scatter 的序列并行，聚焦同构集群通信效率。
-- USP（Tencent, arXiv:2405.07719）：统一 Ulysses + Ring Attention 的序列并行框架。
-- Context Parallelism for Scalable Million-Token Inference（arXiv:2411.01783）：面向推理的 context parallelism。
-- MoBA (Mixture of Block Attention, arXiv:2502.13189)：块级稀疏 attention，可与 ring 结合。
-- XAttention (arXiv:2502.xxxxx)：block sparse attention with antidiagonal scoring。
-- MTraining (arXiv:2510.18830)：基于 Striped Ring Attention 的动态稀疏 attention 训练系统。
-- Mnemosyne (arXiv:2409.17264)：多百万 token 推理服务系统，讨论 Ring/Striped 在推理中的 head-of-line blocking 与 batching 局限。
+原始 Ring Attention、Striped Attention、ZigZag Ring Attention、Ring Flash Attention 等方案都基于 P2P KV ring，天然对跨节点带宽敏感。\n\n此前曾考虑作为独立 graph 线推进并做真实实现对比；经评估后降级为文献引用背景：\n1. Ring Flash Attention 需要自定义 CUDA/HIP kernel 或深度集成 vLLM kernel，工作量大。\n2. ZigZag 与 Striped 类似，会引入非均等切分兼容性问题。\n3. 当前 hyp-net-speed 已给出 100 Mbps 下 10-30x slowdown 的直接证据，无需通过 derivative 实现对比来论证 CXL/RDMA 必要性。\n\n结论：在写作 CXL/RDMA 论证材料时可引用这些工作的 P2P-only 共性作为理论支撑，但不再投入实现资源。
 
-_updated: 2026-06-29 06:06:09_
+_updated: 2026-06-29 15:48:58_
 ### 下一步决策：更大模型 / 更多 domain？
 
 type: `uncertainty` · status: `suspended` · confidence: 0.5 · importance: 0.8 · source: `memory-bank/activeContext.md`
