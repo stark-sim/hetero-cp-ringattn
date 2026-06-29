@@ -29,7 +29,19 @@ type: `task` · status: `ongoing` · confidence: 0.75 · importance: 0.9 · sour
 3. 用原始位置 id 构造 causal mask，确保 correctness diff < 1e-4。
 4. 评估 scheduling unit 粒度（1 token vs 64 tokens vs 256 tokens）对负载均衡和 mask 开销的影响。
 
-_updated: 2026-06-29 07:49:48_
+_updated: 2026-06-29 07:53:53_
+### 任务：实现并对比两种 HCP 调度策略
+
+type: `task` · status: `ongoing` · confidence: 0.75 · importance: 0.9 · source: `user-direction`
+
+把 capacity-aware 连续分片和加权 Striped 作为两条线同时推进：
+1. 保持当前 3:1 连续分片作为 baseline，优化空间较小但可作为参照。
+2. 实现加权 Striped correctness 原型，复跑同一 perf 测试。
+3. 在相同 seq_len、chunk 比例、设备配置下对比 HCP_PERF_LOG。
+4. 输出对比报告：wall-time 差距、per-token compute 成本、通信 bytes、decode 复杂度。
+5. 根据结果决定 HCP 默认调度策略，或保留两者作为配置选项。
+
+_updated: 2026-06-29 07:53:53_
 ### 精读：Striped Attention 机制与 HCP 适配点
 
 type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.9 · source: `https://ar5iv.org/html/2311.09431`
@@ -79,6 +91,30 @@ type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.9 · sou
 与 HCP 相关性：直接相关，可能缓解 pearl 等小/慢 domain 在 Phase 2 成为瓶颈的问题。
 
 _updated: 2026-06-29 06:06:09_
+### HCP 调度策略对比：capacity-aware 连续分片 vs 加权 Striped
+
+type: `claim` · status: `held` · confidence: 0.8 · importance: 0.85 · source: `user-direction + design-reasoning`
+
+之前的 3:1 capacity-aware 连续分片是在尚未研究 Striped Attention 时提出的方案；它不一定比 Striped 更简洁或更优。两者应作为 HCP 的两种候选调度策略并行推进、对比评估。
+
+方案 A：capacity-aware 连续分片（current）
+- 每个 domain 持有原始序列中一段连续的 token。
+- 优点：实现简单，与 RoPE/位置编码天然对齐，decode 时新 token 追加逻辑直观。
+- 缺点：因果 attention 下 early-return 导致负载不均，小 domain 可能成为瓶颈。
+
+方案 B：加权 Striped permutation
+- 每个 domain 的 token 按容量比例均匀散布在原始序列中。
+- 优点：消除 early-return 不对称，负载按 capacity 比例平滑分配。
+- 缺点：需要位置 id permutation、inverse permutation、按原始位置构造 mask，实现更复杂。
+
+评估维度：
+1. 同构/异构设备下的 wall-time 均衡性
+2. 不同网络带宽下的通信开销（striped 不增加总通信量，但可能改变 micro block 粒度）
+3. decode 阶段新 token 归属与 inverse permutation 的复杂度
+4. 与 FlashAttention / PageAttention 等 kernel 的兼容性
+5. 实现复杂度和可维护性
+
+_updated: 2026-06-29 07:53:53_
 ### Striped Attention 可以推广到 capacity-aware 不均等分片
 
 type: `claim` · status: `held` · confidence: 0.75 · importance: 0.85 · source: `paper-analysis + design-reasoning`
