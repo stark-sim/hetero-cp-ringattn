@@ -23,13 +23,13 @@ _updated: 2026-06-29 06:01:28_
 
 type: `task` · status: `ongoing` · confidence: 0.75 · importance: 0.9 · source: `baseline-analysis`
 
-基于 docs/STRIPE_ATTENTION_ADAPTATION_PLAN.md，先在 test_ring_attention_uneven_perf 中增加 striped 模式：
-1. 添加 permutation/inverse_permutation 生成（细粒度 scheduling unit）。
-2. 修改 causal mask 使用原始位置 id。
-3. 保持 online softmax 不变，验证 correctness diff < 1e-4。
-4. 收集 striped 模式下的 HCP_PERF_LOG，与 vanilla 对比 domain 0/1 的 total_ms。
+实现 capacity-aware Striped correctness 原型：
+1. 设计加权 permutation：给定 chunk_sizes，生成周期为 sum(chunk_sizes) 的循环调度，   如 3:1 对应模式 [0,0,0,1]。
+2. 在 test_ring_attention_uneven_perf 中新增 striped 模式，比较 vanilla vs striped 的 HCP_PERF_LOG。
+3. 用原始位置 id 构造 causal mask，确保 correctness diff < 1e-4。
+4. 评估 scheduling unit 粒度（1 token vs 64 tokens vs 256 tokens）对负载均衡和 mask 开销的影响。
 
-_updated: 2026-06-29 07:44:40_
+_updated: 2026-06-29 07:49:48_
 ### 精读：Striped Attention 机制与 HCP 适配点
 
 type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.9 · source: `https://ar5iv.org/html/2311.09431`
@@ -79,6 +79,32 @@ type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.9 · sou
 与 HCP 相关性：直接相关，可能缓解 pearl 等小/慢 domain 在 Phase 2 成为瓶颈的问题。
 
 _updated: 2026-06-29 06:06:09_
+### Striped Attention 可以推广到 capacity-aware 不均等分片
+
+type: `claim` · status: `held` · confidence: 0.75 · importance: 0.85 · source: `paper-analysis + design-reasoning`
+
+原始 Striped Attention 论文假设每个 device 持有 L/N 个 token（均分），但其核心思想——让各 device 的 token 均匀散布在原始序列中——可以推广到任意比例。
+
+推广方式：加权循环调度（weighted round-robin scheduling unit）
+- 对 3:1 的 2-domain 场景，调度周期为 4，模式为 [0,0,0,1]。
+- device 0 持有所有满足 p mod 4 ∈ {0,1,2} 的位置，占 75%。
+- device 1 持有所有满足 p mod 4 = 3 的位置，占 25%。
+- 当 scheduling unit 足够小（如 1 token 或几十 tokens）时，每个 device 的位置在原始序列中近似均匀散布。
+
+为什么这能保留 Striped 的好处：
+1. early-return 不对称性被消除：domain 0 的 Q 会“看到”domain 1 的部分历史 KV，   不再像连续 chunk 那样整 block 被跳过。
+2. 负载按容量比例分配：domain 0 处理约 75% 的有效 attention pair，domain 1 处理约 25%，   与它们的 chunk 比例一致，符合 capacity-aware 的初衷。
+3. 不需要改变通信原语：仍然是 Q 固定、KV 沿 ring P2P 传递。
+
+需要放弃原始论文的简单 block-triangular mask：
+- 加权 stripe 的 residue 关系不再是简单的 j<k 或 j>k。
+- 必须改用原始位置 id 比较来构造 causal mask（已在适配计划中提出）。
+
+限制：
+- 论文中的理论 2× speedup 上界仅在均分且 N 较大时严格成立；  不均等场景下收益是启发式的，取决于 scheduling unit 大小和具体比例。
+- scheduling unit 过大时，device 的 token 会局部聚集，early-return 会重新出现。
+
+_updated: 2026-06-29 07:49:48_
 ### 基线测量：vanilla Ring Attention 在 3:1 不均等分片下的 compute 失衡
 
 type: `evidence` · status: `held` · confidence: 0.8 · importance: 0.85 · source: `HCP_PERF_LOG /tmp/ring_perf_8192.jsonl`
@@ -164,23 +190,20 @@ type: `belief` · status: `held` · confidence: 0.9 · importance: 0.85 · sourc
 在 16GB + 24GB 两台消费级机器上跑通 1M context 证明了 HCP 异构不均等 CP 的可行性边界，但 decode 每 token ~3 分钟、white 显存几乎满载，距离实际生产部署仍有显著差距。其价值在于验证架构路径，而非直接作为产品配置。
 
 _updated: 2026-06-29 06:01:28_
+### Striped 预计能将 3:1 分片下的 domain 总耗时差距从 ~3.6× 降到 ~1.2× 以内
+
+type: `hypothesis` · status: `open` · confidence: 0.65 · importance: 0.8 · source: `theoretical projection`
+
+在 3:1 不均等分片下，加权 Striped 预计能消除 vanilla ring 的 early-return 不对称性，使 domain 0/1 的 wall-time 比例从实测 3.6:1 向容量比例 3:1（同构设备）或更接近设备能力比例收敛。
+关键判断：striped 不会让两个 domain 耗时完全相等（因为它们本来就持有不同 token 数），而是让“每 token 的 compute 成本”在两个 domain 上更均衡，避免小 domain 因处理全部历史 KV 而额外过载，也避免大 domain 因 peer block 被整段跳过而长时间空闲等待。
+最终效果取决于：scheduling unit 粒度、device 相对算力、KV cache memory bandwidth。
+
+_updated: 2026-06-29 07:49:48_
 ### Vanilla Ring Attention 的 early-return 在不均等分片下加剧负载不均
 
 type: `claim` · status: `held` · confidence: 0.85 · importance: 0.8 · source: `code-inspection + baseline measurement`
 
 process_kv_block 在因果路径下会跳过 kv_global_start >= q_global_end 的 block。连续 chunk 场景下，持有靠前 token 的大 domain 会跳过来自后续小 domain 的 peer block，导致其 peer_compute 接近零；而小 domain 必须处理来自大 domain 的全部历史 KV。这是 vanilla ring 在 capacity-aware 不均等分片下出现 3.6× 耗时差距的根本原因。
-
-_updated: 2026-06-29 07:44:40_
-### Striped 预计能将 3:1 分片下的 domain 总耗时差距从 ~3.6× 降到 ~1.2× 以内
-
-type: `hypothesis` · status: `open` · confidence: 0.6 · importance: 0.8 · source: `theoretical projection`
-
-Striped permutation 让每个 domain 的 Q 和 KV 均匀散布在原始序列中，early-return 条件对两个 domain 大致对称，每个 domain 都会处理大量 peer block。
-在 seq_len=4096、3:1 分片的理想模型下：
-- vanilla 有效 attention pair 数：domain0 ≈ 4.72M，domain1 ≈ 3.69M，比例 1.28:1
-- 实测 wall-time 比例 3.6:1，主要来自 local chunk 大小差异与 early-return 的非对称性
-- striped 下每个 domain 处理的 pair 数应接近 50%/50%，wall-time 比例预计接近 1:1（同构设备）
-需要实现后在相同测试上验证。
 
 _updated: 2026-06-29 07:44:40_
 ### 下一步决策：更大模型 / 更多 domain？
