@@ -19,6 +19,17 @@ type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.95 · sour
 3. Block KV cache + vLLM 集成：插件解耦 vs HCP 内联 PageAttention 两条路线。
 
 _updated: 2026-06-29 06:01:28_
+### 下一步：实现 Striped correctness model 原型并复跑基线测试
+
+type: `task` · status: `ongoing` · confidence: 0.75 · importance: 0.9 · source: `baseline-analysis`
+
+基于 docs/STRIPE_ATTENTION_ADAPTATION_PLAN.md，先在 test_ring_attention_uneven_perf 中增加 striped 模式：
+1. 添加 permutation/inverse_permutation 生成（细粒度 scheduling unit）。
+2. 修改 causal mask 使用原始位置 id。
+3. 保持 online softmax 不变，验证 correctness diff < 1e-4。
+4. 收集 striped 模式下的 HCP_PERF_LOG，与 vanilla 对比 domain 0/1 的 total_ms。
+
+_updated: 2026-06-29 07:44:40_
 ### 精读：Striped Attention 机制与 HCP 适配点
 
 type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.9 · source: `https://ar5iv.org/html/2311.09431`
@@ -68,6 +79,24 @@ type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.9 · sou
 与 HCP 相关性：直接相关，可能缓解 pearl 等小/慢 domain 在 Phase 2 成为瓶颈的问题。
 
 _updated: 2026-06-29 06:06:09_
+### 基线测量：vanilla Ring Attention 在 3:1 不均等分片下的 compute 失衡
+
+type: `evidence` · status: `held` · confidence: 0.8 · importance: 0.85 · source: `HCP_PERF_LOG /tmp/ring_perf_8192.jsonl`
+
+测试配置：seq_len=4096，2 domain，chunk0=3072 (75%)，chunk1=1024 (25%)，num_heads=8，head_dim=128，float32 CPU。
+命令：DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib HCP_PERF_LOG=/tmp/ring_perf_8192.jsonl cargo test --features tch-backend test_ring_attention_uneven_perf -- --nocapture
+
+测量结果（单次 layer，mock transport）：
+- domain 0 (大 domain): total 150.3 ms，local_compute 148.0 ms，peer_compute 0.001 ms
+- domain 1 (小 domain): total 41.4 ms，local_compute 14.7 ms，peer_compute 26.2 ms
+- domain 0 总耗时约为 domain 1 的 3.6 倍
+
+解读：
+- 由于 chunk 连续且因果 mask，domain 0 的 peer KV（来自 domain 1，全局位置 3072-4096）全部位于 Q0 的“未来”，触发 early-return，几乎不耗计算。
+- domain 1 的 Q 需要 attend 到 domain 0 的全部 3072 个位置，因此 peer_compute 占其总时间 63%。
+- 在相同算力设备上，大 domain 成为瓶颈；在异构设备上，若小 domain 算力更慢，瓶颈会进一步恶化。
+
+_updated: 2026-06-29 07:44:40_
 ### Stripe Ring Attention 可适配 HCP 并改善异构负载均衡
 
 type: `hypothesis` · status: `open` · confidence: 0.75 · importance: 0.85 · source: `user-direction`
@@ -135,6 +164,25 @@ type: `belief` · status: `held` · confidence: 0.9 · importance: 0.85 · sourc
 在 16GB + 24GB 两台消费级机器上跑通 1M context 证明了 HCP 异构不均等 CP 的可行性边界，但 decode 每 token ~3 分钟、white 显存几乎满载，距离实际生产部署仍有显著差距。其价值在于验证架构路径，而非直接作为产品配置。
 
 _updated: 2026-06-29 06:01:28_
+### Vanilla Ring Attention 的 early-return 在不均等分片下加剧负载不均
+
+type: `claim` · status: `held` · confidence: 0.85 · importance: 0.8 · source: `code-inspection + baseline measurement`
+
+process_kv_block 在因果路径下会跳过 kv_global_start >= q_global_end 的 block。连续 chunk 场景下，持有靠前 token 的大 domain 会跳过来自后续小 domain 的 peer block，导致其 peer_compute 接近零；而小 domain 必须处理来自大 domain 的全部历史 KV。这是 vanilla ring 在 capacity-aware 不均等分片下出现 3.6× 耗时差距的根本原因。
+
+_updated: 2026-06-29 07:44:40_
+### Striped 预计能将 3:1 分片下的 domain 总耗时差距从 ~3.6× 降到 ~1.2× 以内
+
+type: `hypothesis` · status: `open` · confidence: 0.6 · importance: 0.8 · source: `theoretical projection`
+
+Striped permutation 让每个 domain 的 Q 和 KV 均匀散布在原始序列中，early-return 条件对两个 domain 大致对称，每个 domain 都会处理大量 peer block。
+在 seq_len=4096、3:1 分片的理想模型下：
+- vanilla 有效 attention pair 数：domain0 ≈ 4.72M，domain1 ≈ 3.69M，比例 1.28:1
+- 实测 wall-time 比例 3.6:1，主要来自 local chunk 大小差异与 early-return 的非对称性
+- striped 下每个 domain 处理的 pair 数应接近 50%/50%，wall-time 比例预计接近 1:1（同构设备）
+需要实现后在相同测试上验证。
+
+_updated: 2026-06-29 07:44:40_
 ### 下一步决策：更大模型 / 更多 domain？
 
 type: `uncertainty` · status: `open` · confidence: 0.5 · importance: 0.8 · source: `memory-bank/activeContext.md`
