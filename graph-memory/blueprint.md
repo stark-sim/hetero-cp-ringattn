@@ -24,12 +24,15 @@ Coordinator (Rust) ──QUIC──► Worker / Domain ──► 域内后端（
 - **域内黑盒**：HCP 只关心跨域数据流，不规定 CUDA / MPS / NPU 内部实现。
 - **调度面**：coordinator 根据设备 capacity 动态分配 chunk sizes，worker 上报可用显存/内存。
 
-## 当前状态（2026-06-19）
+## 当前状态（2026-06-29）
 
 - ✅ 1M context 本地异构分布式推理成功（RTX 4090 CUDA + RX 9060 XT HIP，3:1 分片）
 - ✅ 昇腾 910B NPU 控制面 E2E 打通
 - ✅ Rust correctness model、QUIC transport、capacity-aware 分片均已验证
-- 🔄 下一步：决定更大模型 / 更多 domain 的验证路线
+- ✅ Striped Attention 原型已验证：在 white/pearl 单进程 3:1 场景下未改善负载均衡，已挂起
+- 🔄 核心目标：论证 CXL / 类 RDMA 高速互联对异构推理服务上主流舞台的必要性
+- ⏸️ 已挂起：更大模型 / 更多 domain / 更长 seq 验证（受限于当前硬件环境）
+- ⏸️ 已挂起：Striped Attention / Stripe Ring Attention 适配（非均等切分兼容性问题未解）
 
 ## 关键约束
 

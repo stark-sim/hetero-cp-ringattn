@@ -2,21 +2,25 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 下一阶段：从 1M 可行性验证走向多条扩展线探索
+
+type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.95 · source: `user-direction`
+
+当前核心方向：论证 CXL / 类 RDMA 高速互联对异构推理服务上主流舞台的重要性。\n\n已挂起方向：\n1. 更大模型 / 更多 domain 验证（受限于硬件环境）。\n2. Striped Attention / Stripe Ring Attention（非均等切分兼容性问题未解）。\n3. 1M 里程碑不再作为当前论证的直接证据。\n\n仍开放的 graph 线：\n- hyp-net-speed：CXL/RDMA 必要性（核心）。\n- hyp-block-kv-vllm：Block KV cache + vLLM 集成（工程扩展线）。\n- claim-ring-derivatives：Ring Attention 衍生方案综述（可作为 CXL/RDMA 论证的支撑：P2P-only 算法家族需要高速互联才能释放潜力）。
+
+_updated: 2026-06-29 13:27:24_
+### 异构 CP 对网络速度敏感，CXL / 类 RDMA 互联可显著突破网线局限
+
+type: `hypothesis` · status: `ongoing` · confidence: 0.6 · importance: 0.95 · source: `user-direction`
+
+核心目标：论证 CXL / 类 RDMA 高速互联对异构推理服务上主流舞台的决定性作用。\n\n当前状态：\n- white 与 pearl 之间最高 2.5G 有线以太网，已构成异构长 context 推理的明显瓶颈（尤其 decode 阶段）。\n- 以 2.5G 为上限做限速实验，可定位当前是 compute-bound 还是 network-bound，并估算使通信可被隐藏所需的带宽阈值。\n- 该假设独立于 1M 里程碑、更大模型、更多 domain、Striped Attention 等已挂起线路。\n\n关键问题：\n1. 在 white+pearl 异构环境下，prefill 和 decode 分别对网络带宽的敏感度如何？\n2. 当前 2.5G 是否已经让某些 workload 进入 network-bound？\n3. 使 HCP 的 P2P KV ring 在长 context 下不被网络拖慢，需要多高的带宽？\n4. 如何用现有两台机器 + 限速工具，构建有说服力的 CXL/RDMA 必要性论证？
+
+_updated: 2026-06-29 13:27:24_
 ### 当前焦点：1M 异构分布式推理已闭环
 
 type: `task` · status: `superseded` · confidence: 0.95 · importance: 0.95 · source: `memory-bank/activeContext.md`
 
 1M v9（3:1 split）成功，prefill 24/24 + decode 5/5，exit=0。文档已同步：1M_CONTEXT_THUNDERBOLT_PLAN.md、SCALING_ARGUMENT.md、systemPatterns.md。当前无未完成的 1M 攻坚任务；下一步决定是否需要更大模型 / 更多 domain 验证。
-
-_updated: 2026-06-29 06:01:28_
-### 下一阶段：从 1M 可行性验证走向多条扩展线探索
-
-type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.95 · source: `user-direction`
-
-1M 只是众多验证线中的一条。接下来需要并行探索：
-1. 网络速度对异构 CP 收益的影响（CXL / 类 RDMA 方向）。
-2. Stripe Ring Attention 等算法升级在 HCP 框架中的适用性。
-3. Block KV cache + vLLM 集成：插件解耦 vs HCP 内联 PageAttention 两条路线。
 
 _updated: 2026-06-29 06:01:28_
 ### 任务：实现并对比两种 HCP 调度策略
@@ -82,6 +86,20 @@ type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.9 · sou
 与 HCP 相关性：直接相关，可能缓解 pearl 等小/慢 domain 在 Phase 2 成为瓶颈的问题。
 
 _updated: 2026-06-29 06:06:09_
+### 1M white+pearl 是可行性里程碑，而非生产实用配置
+
+type: `belief` · status: `held` · confidence: 0.9 · importance: 0.85 · source: `user-reflection`
+
+1M white+pearl 是可行性里程碑，证明异构不均等 CP 在极端长 context 下可以跑通。但它不是生产实用配置，也不是论证 CXL/RDMA 必要性的核心证据。当前 CXL/RDMA 论证应基于网络带宽对 P2P KV ring 吞吐的直接影响，而非 1M 端到端结果。
+
+_updated: 2026-06-29 13:27:24_
+### Stripe Ring Attention 可适配 HCP 并改善异构负载均衡
+
+type: `hypothesis` · status: `suspended` · confidence: 0.75 · importance: 0.85 · source: `user-direction`
+
+挂起：与 Striped Attention 一并挂起。在 Striped + 非均等切分的兼容性问题解决前，不再推进 Stripe Ring Attention 适配。
+
+_updated: 2026-06-29 13:27:24_
 ### HCP 调度策略对比：capacity-aware 连续分片 vs 加权 Striped
 
 type: `claim` · status: `held` · confidence: 0.8 · importance: 0.85 · source: `user-direction + design-reasoning`
@@ -140,13 +158,6 @@ type: `evidence` · status: `held` · confidence: 0.8 · importance: 0.85 · sou
 - 在相同算力设备上，大 domain 成为瓶颈；在异构设备上，若小 domain 算力更慢，瓶颈会进一步恶化。
 
 _updated: 2026-06-29 07:44:40_
-### Stripe Ring Attention 可适配 HCP 并改善异构负载均衡
-
-type: `hypothesis` · status: `open` · confidence: 0.75 · importance: 0.85 · source: `user-direction`
-
-将 Striped Attention 的 striped permutation 引入 HCP，以缓解因果 attention 下 Ring Attention 的负载不均。具体需验证：1) 不均等 chunk size 下的 permutation 定义；2) RoPE position ids 的同步 permutation；3) 对 pearl 类慢节点的实际加速效果。预计对长序列、多 domain 场景收益最大。
-
-_updated: 2026-06-29 06:16:16_
 ### P2P-only 异构场景下的 Ring Attention 衍生方案筛选
 
 type: `decision` · status: `held` · confidence: 0.8 · importance: 0.85 · source: `web-survey + paper analysis`
@@ -168,13 +179,6 @@ type: `decision` · status: `held` · confidence: 0.8 · importance: 0.85 · sou
 - Mnemosyne：服务调度系统，非算法本身。
 
 _updated: 2026-06-29 06:16:16_
-### 异构 CP 对网络速度敏感，CXL / 类 RDMA 互联可显著突破网线局限
-
-type: `hypothesis` · status: `open` · confidence: 0.6 · importance: 0.85 · source: `user-direction`
-
-当前 2.5G 有线以太网在 1M context 下不是带宽瓶颈（prefill 受显存与 memory-bound compute 主导），但随着 chunk 缩小、domain 增多或模型变大，KV ring 的通信量会快速上升。需要系统测试不同 RTT/带宽（WiFi、2.5G、10G、RDMA、CXL）对 prefill/decode 的边际收益，论证在异构节点上投资高速互联（CXL / GPU Direct / RDMA）能否取得与增加显存同量级的回报。
-
-_updated: 2026-06-29 06:06:09_
 ### [论文] Ring Attention with Blockwise Transformers for Near-Infinite Context
 
 type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.85 · source: `https://arxiv.org/abs/2310.01889`
@@ -200,13 +204,13 @@ type: `claim` · status: `held` · confidence: 0.75 · importance: 0.85 · sourc
 - Mnemosyne (arXiv:2409.17264)：多百万 token 推理服务系统，讨论 Ring/Striped 在推理中的 head-of-line blocking 与 batching 局限。
 
 _updated: 2026-06-29 06:06:09_
-### 1M white+pearl 是可行性里程碑，而非生产实用配置
+### 下一步决策：更大模型 / 更多 domain？
 
-type: `belief` · status: `held` · confidence: 0.9 · importance: 0.85 · source: `user-reflection`
+type: `uncertainty` · status: `suspended` · confidence: 0.5 · importance: 0.8 · source: `memory-bank/activeContext.md`
 
-在 16GB + 24GB 两台消费级机器上跑通 1M context 证明了 HCP 异构不均等 CP 的可行性边界，但 decode 每 token ~3 分钟、white 显存几乎满载，距离实际生产部署仍有显著差距。其价值在于验证架构路径，而非直接作为产品配置。
+挂起：当前基础实验环境只有 white + pearl 两台机器，且 1M 实验已证明可行性边界。更大模型 / 更多 domain 的验证需要额外硬件资源，与当前核心目标（论证 CXL/RDMA 对异构推理服务的重要性）不直接相关。
 
-_updated: 2026-06-29 06:01:28_
+_updated: 2026-06-29 13:27:24_
 ### Striped 预计能将 3:1 分片下的 domain 总耗时差距从 ~3.6× 降到 ~1.2× 以内
 
 type: `hypothesis` · status: `rejected` · confidence: 0.1 · importance: 0.8 · source: `theoretical projection`
@@ -221,13 +225,6 @@ type: `claim` · status: `held` · confidence: 0.85 · importance: 0.8 · source
 process_kv_block 在因果路径下会跳过 kv_global_start >= q_global_end 的 block。连续 chunk 场景下，持有靠前 token 的大 domain 会跳过来自后续小 domain 的 peer block，导致其 peer_compute 接近零；而小 domain 必须处理来自大 domain 的全部历史 KV。这是 vanilla ring 在 capacity-aware 不均等分片下出现 3.6× 耗时差距的根本原因。
 
 _updated: 2026-06-29 07:44:40_
-### 下一步决策：更大模型 / 更多 domain？
-
-type: `uncertainty` · status: `open` · confidence: 0.5 · importance: 0.8 · source: `memory-bank/activeContext.md`
-
-1M 里程碑已达成，需决定后续方向：1) 引入第三台设备做 3-domain 1M 降低单设备压力；2) 7B 1M context 可行性评估；3) KV cache 量化/压缩以缩短 decode 时间和降低显存占用。
-
-_updated: 2026-06-29 05:34:19_
 ### 训练场景评估：Striped Attention 训练收益对 HCP 当前目标意义有限
 
 type: `claim` · status: `held` · confidence: 0.75 · importance: 0.7 · source: `paper-analysis + user-direction`
