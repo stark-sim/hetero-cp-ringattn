@@ -6,6 +6,11 @@ use tch::{Device, Kind, Tensor};
 #[cfg(feature = "tch-backend")]
 use crate::model::transport::{KvBlock, KvTransport};
 
+#[cfg(feature = "tch-backend")]
+use std::time::Instant;
+#[cfg(feature = "tch-backend")]
+use std::io::Write;
+
 /// Ring-attention backend that splits sequence into chunks and computes
 /// attention via online softmax over K/V blocks.
 ///
@@ -275,6 +280,28 @@ impl HcpRingAttentionBackend {
         *rs = new_sum;
     }
 
+    /// 将单个 perf event 以 JSONL 格式追加到 `HCP_PERF_LOG` 指定的文件。
+    #[cfg(feature = "tch-backend")]
+    fn emit_perf_event(&self, event_type: &str, fields: &[(&str, &str)]) {
+        if let Ok(path) = std::env::var("HCP_PERF_LOG") {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let ts = format!("{}.{:03}Z", now.as_secs(), now.subsec_millis());
+            let mut line = format!(
+                "{{\"ts\":\"{}\",\"event\":\"{}\",\"domain\":{},\"layer\":{}",
+                ts, event_type, self.local_domain_id, self.layer_idx
+            );
+            for (k, v) in fields {
+                line.push_str(&format!(",\"{}\":{}", k, v));
+            }
+            line.push_str("}\n");
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                let _ = file.write_all(line.as_bytes());
+            }
+        }
+    }
+
     /// 【Ring Attention 核心算法 — Split-Phase Pipeline + micro_KV_block 版】
     ///
     /// 【micro_KV_block 设计动机】
@@ -301,6 +328,17 @@ impl HcpRingAttentionBackend {
         let num_heads = q.size()[1];
         let seq_len = q.size()[2];
         let head_dim = q.size()[3];
+
+        let ring_start = Instant::now();
+        let mut perf_local_compute_ms = 0.0_f64;
+        let mut perf_peer_compute_ms = 0.0_f64;
+        let mut perf_recv_ms = 0.0_f64;
+        let mut perf_send_ms = 0.0_f64;
+        let mut perf_forward_ms = 0.0_f64;
+        let mut perf_flush_ms = 0.0_f64;
+        let mut perf_kv_sent_bytes: usize = 0;
+        let mut perf_kv_recv_bytes: usize = 0;
+        let mut perf_micro_block_count: usize = 0;
 
         // ====== 确定 chunk 大小 ======
         let q_chunk_size = (seq_len as usize)
@@ -406,22 +444,45 @@ impl HcpRingAttentionBackend {
         if has_transport {
             let num_rounds = self.num_domains.saturating_sub(1);
 
+            // 统计本地待发送 KV bytes（发送端+转发端都会复用）
+            let local_elem_bytes = match k.kind() {
+                Kind::Float => 4,
+                Kind::Half => 2,
+                Kind::BFloat16 => 2,
+                Kind::Double => 8,
+                _ => 4,
+            };
+            perf_kv_sent_bytes = local_micro_blocks.iter()
+                .map(|b| b.k.numel() * local_elem_bytes + b.v.numel() * local_elem_bytes)
+                .sum();
+
             if self.disable_overlap {
                 // ====== 【串行模式】先全部 exchange，再统一 compute ======
                 let all_peer_micro_blocks: Vec<Vec<KvBlock>> = {
                     let transport = self.kv_transport.as_mut().unwrap();
 
                     // 1. 发送所有本地 micro blocks
+                    let send_start = Instant::now();
                     for micro_block in &local_micro_blocks {
                         transport.submit_send(micro_block).map_err(|e| ModelError::Backend(format!("submit_send: {e}")))?;
                     }
                     transport.flush_send().map_err(|e| ModelError::Backend(format!("flush_send: {e}")))?;
+                    perf_send_ms = send_start.elapsed().as_secs_f64() * 1000.0;
 
                     // 2. 收集所有 peer micro blocks（所有 rounds）
+                    let recv_start = Instant::now();
                     let mut all_blocks: Vec<Vec<KvBlock>> = Vec::new();
                     for round in 0..num_rounds {
                         let mut round_blocks = Vec::new();
                         while let Some(block) = recv_micro_block(transport.as_mut()).map_err(|e| ModelError::Backend(format!("recv_micro_block: {e}")))? {
+                            let elem_bytes = match block.k.kind() {
+                                Kind::Float => 4,
+                                Kind::Half => 2,
+                                Kind::BFloat16 => 2,
+                                Kind::Double => 8,
+                                _ => 4,
+                            };
+                            perf_kv_recv_bytes += block.k.numel() * elem_bytes + block.v.numel() * elem_bytes;
                             let is_last = block.micro_block_idx + 1 == block.total_micro_blocks;
                             round_blocks.push(block);
                             if is_last { break; }
@@ -430,16 +491,29 @@ impl HcpRingAttentionBackend {
 
                         // 转发（最后一轮不需要）
                         if round < num_rounds - 1 {
+                            let fwd_start = Instant::now();
                             for block in &all_blocks[round] {
+                                let elem_bytes = match block.k.kind() {
+                                    Kind::Float => 4,
+                                    Kind::Half => 2,
+                                    Kind::BFloat16 => 2,
+                                    Kind::Double => 8,
+                                    _ => 4,
+                                };
+                                perf_kv_sent_bytes += block.k.numel() * elem_bytes + block.v.numel() * elem_bytes;
                                 transport.submit_send(block).map_err(|e| ModelError::Backend(format!("forward submit_send: {e}")))?;
                             }
                             transport.flush_send().map_err(|e| ModelError::Backend(format!("flush_send: {e}")))?;
+                            perf_forward_ms += fwd_start.elapsed().as_secs_f64() * 1000.0;
                         }
                     }
+                    perf_recv_ms = recv_start.elapsed().as_secs_f64() * 1000.0;
+                    perf_micro_block_count = all_blocks.iter().map(|r| r.len()).sum();
                     all_blocks
                 }; // transport borrow 结束
 
                 // 3. 本地 KV compute
+                let local_compute_start = Instant::now();
                 for state in q_states.iter_mut() {
                     for (kv_start, kv_end) in &kv_chunks {
                         let kv_chunk_len = (*kv_end - *kv_start) as i64;
@@ -458,8 +532,10 @@ impl HcpRingAttentionBackend {
                         );
                     }
                 }
+                perf_local_compute_ms = local_compute_start.elapsed().as_secs_f64() * 1000.0;
 
                 // 4. Peer KV compute（按 round 顺序，每个 round 内按 seq 排序）
+                let peer_compute_start = Instant::now();
                 for round_blocks in &all_peer_micro_blocks {
                     let mut sorted = round_blocks.clone();
                     sorted.sort_by_key(|b| b.global_seq_start);
@@ -475,17 +551,21 @@ impl HcpRingAttentionBackend {
                         }
                     }
                 }
+                perf_peer_compute_ms = peer_compute_start.elapsed().as_secs_f64() * 1000.0;
             } else {
                 // ====== 【Pipeline 模式】compute-communication overlap ======
                 {
                     let transport = self.kv_transport.as_mut().unwrap();
                     // Phase 0: 逐个 submit_send 本地 micro blocks（send task 后台传输）
+                    let phase0_start = Instant::now();
                     for micro_block in &local_micro_blocks {
                         transport.submit_send(micro_block).map_err(|e| ModelError::Backend(format!("submit_send: {e}")))?;
                     }
+                    perf_send_ms = phase0_start.elapsed().as_secs_f64() * 1000.0;
                 } // transport borrow 结束
 
                 // Phase 1: 本地 KV compute（与 Phase 0 的网络传输重叠）
+                let phase1_start = Instant::now();
                 for state in q_states.iter_mut() {
                     for (kv_start, kv_end) in &kv_chunks {
                         let kv_chunk_len = (*kv_end - *kv_start) as i64;
@@ -504,6 +584,7 @@ impl HcpRingAttentionBackend {
                         );
                     }
                 }
+                perf_local_compute_ms = phase1_start.elapsed().as_secs_f64() * 1000.0;
 
                 // Phase 2: 循环接收 peer micro blocks，逐个 process，转发
                 // 【streaming compute】收到一个 block 就立刻处理，不等全部收完。
@@ -537,6 +618,7 @@ impl HcpRingAttentionBackend {
                             _ => 4,
                         };
                         let recv_bytes = block.k.numel() * elem_bytes + block.v.numel() * elem_bytes;
+                        perf_kv_recv_bytes += recv_bytes;
                         let is_last = block.micro_block_idx + 1 == block.total_micro_blocks;
                         // 防御性断言：micro blocks 必须按顺序到达（QUIC stream 保证有序）
                         debug_assert_eq!(block.micro_block_idx, expected_micro_idx, "micro blocks must arrive in order; expected {expected_micro_idx}, got {}", block.micro_block_idx);
@@ -563,8 +645,11 @@ impl HcpRingAttentionBackend {
 
                         // Step 3: 转发（最后一轮不需要）
                         if round < num_rounds.saturating_sub(1) {
+                            let fwd_start = std::time::Instant::now();
                             let transport = self.kv_transport.as_mut().unwrap();
                             transport.submit_send(&block).map_err(|e| ModelError::Backend(format!("forward submit_send: {e}")))?;
+                            perf_forward_ms += fwd_start.elapsed().as_secs_f64() * 1000.0;
+                            perf_kv_sent_bytes += recv_bytes;
                         }
 
                         if is_last { break; }
@@ -580,11 +665,16 @@ impl HcpRingAttentionBackend {
                     println!("[ring_attention] layer {} Phase 2 summary: {micro_block_count} micro blocks, avg recv={avg_recv_ms:.2}ms, avg compute={avg_compute_ms:.2}ms, recv/compute={overlap_ratio:.2}x",
                         self.layer_idx);
                 }
+                perf_recv_ms = total_recv_time.as_secs_f64() * 1000.0;
+                perf_peer_compute_ms = total_compute_time.as_secs_f64() * 1000.0;
+                perf_micro_block_count = micro_block_count;
 
                 // Phase 3: Flush
                 {
+                    let flush_start = Instant::now();
                     let transport = self.kv_transport.as_mut().unwrap();
                     transport.flush_send().map_err(|e| ModelError::Backend(format!("flush_send: {e}")))?;
+                    perf_flush_ms = flush_start.elapsed().as_secs_f64() * 1000.0;
                 }
             }
         } else {
@@ -609,7 +699,28 @@ impl HcpRingAttentionBackend {
             }
         }
 
-        // ====== Phase 4: 提取输出 ======
+        // ====== Phase 4: 提取输出 & perf 上报 ======
+        let total_ms = ring_start.elapsed().as_secs_f64() * 1000.0;
+        if has_transport {
+            self.emit_perf_event(
+                "ring_attention",
+                &[
+                    ("total_ms", &format!("{:.3}", total_ms)),
+                    ("local_compute_ms", &format!("{:.3}", perf_local_compute_ms)),
+                    ("peer_compute_ms", &format!("{:.3}", perf_peer_compute_ms)),
+                    ("recv_ms", &format!("{:.3}", perf_recv_ms)),
+                    ("send_ms", &format!("{:.3}", perf_send_ms)),
+                    ("forward_ms", &format!("{:.3}", perf_forward_ms)),
+                    ("flush_ms", &format!("{:.3}", perf_flush_ms)),
+                    ("kv_sent_bytes", &perf_kv_sent_bytes.to_string()),
+                    ("kv_recv_bytes", &perf_kv_recv_bytes.to_string()),
+                    ("micro_blocks", &perf_micro_block_count.to_string()),
+                    ("num_domains", &self.num_domains.to_string()),
+                    ("seq_len", &seq_len.to_string()),
+                    ("overlap", &if self.disable_overlap { "0" } else { "1" }),
+                ],
+            );
+        }
         let outputs: Vec<Tensor> = q_states.into_iter().map(|s| s.obh).collect();
         Ok(Tensor::cat(&outputs, 2))
     }
@@ -1658,5 +1769,117 @@ mod tests {
         let diff_val: f64 = diff.double_value(&[]);
         println!("Distributed ring attention diff = {}", diff_val);
         assert!(diff_val < 1e-4, "Distributed ring attention differs from local causal: {}", diff_val);
+    }
+
+    /// 2-domain uneven (3:1) ring attention perf baseline test.
+    /// Run with: HCP_PERF_LOG=/tmp/ring_perf.jsonl cargo test --features tch-backend test_ring_attention_uneven_perf -- --nocapture
+    #[cfg(feature = "tch-backend")]
+    #[test]
+    fn test_ring_attention_uneven_perf() {
+        use crate::model::transport::MockKvTransport;
+
+        let device = tch::Device::Cpu;
+        let num_heads = 8i64;
+        let head_dim = 128i64;
+        let seq_len = 4096i64;
+        // 3:1 uneven split
+        let chunk0 = 3072i64;
+        let chunk1 = seq_len - chunk0;
+
+        tch::manual_seed(2024);
+        let q = Tensor::randn([1, num_heads, seq_len, head_dim], (Kind::Float, device));
+        let k = Tensor::randn([1, num_heads, seq_len, head_dim], (Kind::Float, device));
+        let v = Tensor::randn([1, num_heads, seq_len, head_dim], (Kind::Float, device));
+
+        let scale = 1.0 / (head_dim as f64).sqrt();
+        let scores = q.matmul(&k.transpose(2, 3)) * scale;
+        let mask = make_causal_mask(seq_len, device);
+        let scores_masked = scores + mask.shallow_clone();
+        let attn = scores_masked.softmax(-1, Kind::Float);
+        let expected = attn.matmul(&v);
+
+        let q0 = q.narrow(2, 0, chunk0);
+        let k0 = k.narrow(2, 0, chunk0);
+        let v0 = v.narrow(2, 0, chunk0);
+        let q1 = q.narrow(2, chunk0, chunk1);
+        let k1 = k.narrow(2, chunk0, chunk1);
+        let v1 = v.narrow(2, chunk0, chunk1);
+
+        let rope = crate::model::layers::RotaryEmbedding::new(head_dim as usize, 16384, 10000.0, device);
+
+        // Worker 0 receives peer KV [chunk0..seq_len]
+        let mut transport0 = MockKvTransport::new();
+        transport0.push(crate::model::transport::KvBlock {
+            layer_idx: 0,
+            global_seq_start: chunk0 as usize,
+            global_seq_end: seq_len as usize,
+            k: k1.shallow_clone(),
+            v: v1.shallow_clone(),
+            micro_block_idx: 0,
+            total_micro_blocks: 1,
+        });
+        let mut backend0 = HcpRingAttentionBackend {
+            q_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            k_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            v_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            o_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            q_bias: None, k_bias: None, v_bias: None,
+            rope: rope.clone(),
+            num_heads: num_heads as usize,
+            num_kv_heads: num_heads as usize,
+            head_dim: head_dim as usize,
+            scale,
+            num_domains: 2,
+            layer_idx: 0,
+            kv_transport: Some(Box::new(transport0)),
+            local_domain_id: 0,
+            seq_offset: 0,
+            prefill_kv_len: 0,
+            is_prefill_done: false,
+            disable_overlap: false,
+            micro_kv_block_size: 0,
+        };
+        let out0 = backend0.ring_attention(&q0, &k0, &v0, Some(&mask), 0).unwrap();
+
+        // Worker 1 receives peer KV [0..chunk0]
+        let mut transport1 = MockKvTransport::new();
+        transport1.push(crate::model::transport::KvBlock {
+            layer_idx: 0,
+            global_seq_start: 0,
+            global_seq_end: chunk0 as usize,
+            k: k0.shallow_clone(),
+            v: v0.shallow_clone(),
+            micro_block_idx: 0,
+            total_micro_blocks: 1,
+        });
+        let mut backend1 = HcpRingAttentionBackend {
+            q_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            k_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            v_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            o_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+            q_bias: None, k_bias: None, v_bias: None,
+            rope,
+            num_heads: num_heads as usize,
+            num_kv_heads: num_heads as usize,
+            head_dim: head_dim as usize,
+            scale,
+            num_domains: 2,
+            layer_idx: 0,
+            kv_transport: Some(Box::new(transport1)),
+            local_domain_id: 1,
+            seq_offset: chunk0 as usize,
+            prefill_kv_len: 0,
+            is_prefill_done: false,
+            disable_overlap: false,
+            micro_kv_block_size: 0,
+        };
+        let out1 = backend1.ring_attention(&q1, &k1, &v1, Some(&mask), chunk0 as usize).unwrap();
+
+        let expected0 = expected.narrow(2, 0, chunk0);
+        let expected1 = expected.narrow(2, chunk0, chunk1);
+        let diff0 = (&expected0 - &out0).abs().mean(Kind::Float).double_value(&[]);
+        let diff1 = (&expected1 - &out1).abs().mean(Kind::Float).double_value(&[]);
+        println!("worker0 diff={}, worker1 diff={}", diff0, diff1);
+        assert!(diff0 < 1e-4 && diff1 < 1e-4, "Uneven ring attention correctness failed");
     }
 }
