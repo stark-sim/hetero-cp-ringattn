@@ -2,18 +2,25 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 异构 CP 对网络速度敏感，CXL / 类 RDMA 互联可显著突破网线局限
+
+type: `hypothesis` · status: `ongoing` · confidence: 0.6 · importance: 0.95 · source: `user-direction`
+
+核心目标：论证 CXL / 类 RDMA 高速互联对异构推理服务上主流舞台的决定性作用。\n\n当前状态：\n- white 与 pearl 之间最高 2.5G 有线以太网，已构成异构长 context 推理的潜在瓶颈。\n- 实验设计已完成：用 tc 在 192.168.100.x 链路上限速，对比 2500M/1000M/500M/100M 下的 HCP prefill+decode 延迟。\n- 当前阻塞：white 和 pearl 执行 tc 需要 sudo 密码，无法自动化限速。\n\n关键问题：\n1. 当前 2.5G 是否已经让某些 workload 进入 network-bound？\n2. prefill 和 decode 对带宽的敏感度分别是多少？\n3. 使 HCP 的 P2P KV ring 在长 context 下不被网络拖慢，需要多高的带宽？\n4. 如何用现有两台机器构建有说服力的 CXL/RDMA 必要性论证？
+
+_updated: 2026-06-29 13:40:16_
+### 设计 white-pearl 网络带宽敏感度实验
+
+type: `task` · status: `blocked` · confidence: 0.8 · importance: 0.95
+
+目标：用 white (CUDA) + pearl (HIP) 的 2.5G 有线链路，通过 tc 限速对比，量化网络带宽对 HCP 异构推理 prefill/decode 的影响。\n\n实验设计草案：\n1. 基线测量：iperf3 确认 192.168.100.x 实际带宽。\n2. 测试配置：\n   - 模型：Qwen2-0.5B（减少运行时间）\n   - seq_len: 4096, 16384\n   - max_new_tokens: 5\n   - 带宽：2500M（基线）、1000M、500M、100M\n   - 每种配置重复 3 次取平均\n3. 数据收集：总 wall-time、coordinator/worker log、iperf3 结果。\n4. 分析：绘制 latency vs bandwidth 曲线，判断当前是否 network-bound，估算使通信可被隐藏所需带宽。\n\n当前阻塞：white 和 pearl 均需要 sudo 密码才能执行 tc qdisc 限速。
+
+_updated: 2026-06-29 13:40:16_
 ### 下一阶段：从 1M 可行性验证走向多条扩展线探索
 
 type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.95 · source: `user-direction`
 
 当前核心方向：论证 CXL / 类 RDMA 高速互联对异构推理服务上主流舞台的重要性。\n\n已挂起方向：\n1. 更大模型 / 更多 domain 验证（受限于硬件环境）。\n2. Striped Attention / Stripe Ring Attention（非均等切分兼容性问题未解）。\n3. 1M 里程碑不再作为当前论证的直接证据。\n\n仍开放的 graph 线：\n- hyp-net-speed：CXL/RDMA 必要性（核心）。\n- hyp-block-kv-vllm：Block KV cache + vLLM 集成（工程扩展线）。\n- claim-ring-derivatives：Ring Attention 衍生方案综述（可作为 CXL/RDMA 论证的支撑：P2P-only 算法家族需要高速互联才能释放潜力）。
-
-_updated: 2026-06-29 13:27:24_
-### 异构 CP 对网络速度敏感，CXL / 类 RDMA 互联可显著突破网线局限
-
-type: `hypothesis` · status: `ongoing` · confidence: 0.6 · importance: 0.95 · source: `user-direction`
-
-核心目标：论证 CXL / 类 RDMA 高速互联对异构推理服务上主流舞台的决定性作用。\n\n当前状态：\n- white 与 pearl 之间最高 2.5G 有线以太网，已构成异构长 context 推理的明显瓶颈（尤其 decode 阶段）。\n- 以 2.5G 为上限做限速实验，可定位当前是 compute-bound 还是 network-bound，并估算使通信可被隐藏所需的带宽阈值。\n- 该假设独立于 1M 里程碑、更大模型、更多 domain、Striped Attention 等已挂起线路。\n\n关键问题：\n1. 在 white+pearl 异构环境下，prefill 和 decode 分别对网络带宽的敏感度如何？\n2. 当前 2.5G 是否已经让某些 workload 进入 network-bound？\n3. 使 HCP 的 P2P KV ring 在长 context 下不被网络拖慢，需要多高的带宽？\n4. 如何用现有两台机器 + 限速工具，构建有说服力的 CXL/RDMA 必要性论证？
 
 _updated: 2026-06-29 13:27:24_
 ### 当前焦点：1M 异构分布式推理已闭环
