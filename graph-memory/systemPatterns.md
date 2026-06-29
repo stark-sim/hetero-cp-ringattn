@@ -77,6 +77,18 @@ type: `decision` · status: `held` · confidence: 0.8 · importance: 0.85 · sou
 实施顺序：先在 correctness model 验证，再改 coordinator/worker，最后跑 uneven 分布式 smoke。
 
 _updated: 2026-06-29 06:18:40_
+### HCP 设计原则：简洁性 / Occam's Razor
+
+type: `decision` · status: `held` · confidence: 0.9 · importance: 0.85 · source: `~/.agents/AGENTS.md`
+
+全局 AGENTS.md 已加入简洁性原则：如果更复杂的设计没有可验证的明显收益，就选择更简单的方案。
+对 HCP 当前工作的影响：
+- Striped Attention 的引入必须通过与 capacity-aware 连续分片的实际对比来证明其价值。
+- 如果 Striped 在 wall-time、代码复杂度、decode 复杂度、kernel 兼容性上没有明显优势，  则保留更简单的 capacity-aware 连续分片。
+- 决策必须基于同一测试配置下的 HCP_PERF_LOG 数据，而不是论文理论 speedup。
+- 最终结论需记录到 graph-memory 和 commit message。
+
+_updated: 2026-06-29 07:58:41_
 ### QUIC Transport 配置：512MB stream window / 1GB connection window / 300s idle timeout
 
 type: `decision` · status: `held` · confidence: 0.9 · importance: 0.8 · source: `memory-bank/techContext.md`

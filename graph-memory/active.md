@@ -96,25 +96,25 @@ _updated: 2026-06-29 06:06:09_
 type: `claim` · status: `held` · confidence: 0.8 · importance: 0.85 · source: `user-direction + design-reasoning`
 
 之前的 3:1 capacity-aware 连续分片是在尚未研究 Striped Attention 时提出的方案；它不一定比 Striped 更简洁或更优。两者应作为 HCP 的两种候选调度策略并行推进、对比评估。
+根据全局 AGENTS.md 的简洁性原则，如果 Striped 没有可验证的明显收益，应选择更简单的连续分片。
 
 方案 A：capacity-aware 连续分片（current）
-- 每个 domain 持有原始序列中一段连续的 token。
 - 优点：实现简单，与 RoPE/位置编码天然对齐，decode 时新 token 追加逻辑直观。
 - 缺点：因果 attention 下 early-return 导致负载不均，小 domain 可能成为瓶颈。
 
 方案 B：加权 Striped permutation
-- 每个 domain 的 token 按容量比例均匀散布在原始序列中。
 - 优点：消除 early-return 不对称，负载按 capacity 比例平滑分配。
 - 缺点：需要位置 id permutation、inverse permutation、按原始位置构造 mask，实现更复杂。
 
-评估维度：
-1. 同构/异构设备下的 wall-time 均衡性
+评估维度（按简洁性原则加权）：
+1. 同构/异构设备下的 wall-time 均衡性（必须有数据）
 2. 不同网络带宽下的通信开销（striped 不增加总通信量，但可能改变 micro block 粒度）
 3. decode 阶段新 token 归属与 inverse permutation 的复杂度
 4. 与 FlashAttention / PageAttention 等 kernel 的兼容性
 5. 实现复杂度和可维护性
+6. 如果以上维度没有明显 winner，默认选择方案 A。
 
-_updated: 2026-06-29 07:53:53_
+_updated: 2026-06-29 07:58:41_
 ### Striped Attention 可以推广到 capacity-aware 不均等分片
 
 type: `claim` · status: `held` · confidence: 0.75 · importance: 0.85 · source: `paper-analysis + design-reasoning`
@@ -231,10 +231,10 @@ _updated: 2026-06-29 06:01:28_
 type: `hypothesis` · status: `open` · confidence: 0.65 · importance: 0.8 · source: `theoretical projection`
 
 在 3:1 不均等分片下，加权 Striped 预计能消除 vanilla ring 的 early-return 不对称性，使 domain 0/1 的 wall-time 比例从实测 3.6:1 向容量比例 3:1（同构设备）或更接近设备能力比例收敛。
-关键判断：striped 不会让两个 domain 耗时完全相等（因为它们本来就持有不同 token 数），而是让“每 token 的 compute 成本”在两个 domain 上更均衡，避免小 domain 因处理全部历史 KV 而额外过载，也避免大 domain 因 peer block 被整段跳过而长时间空闲等待。
-最终效果取决于：scheduling unit 粒度、device 相对算力、KV cache memory bandwidth。
+关键判断：striped 不会让两个 domain 耗时完全相等（因为它们本来就持有不同 token 数），而是让“每 token 的 compute 成本”在两个 domain 上更均衡。
+但如果实测显示 wall-time 收益不足以抵消实现复杂度、decode 复杂度或 kernel 兼容性问题，根据简洁性原则，应回退到 capacity-aware 连续分片并寻找其他优化点（如 network speed、kernel fusion）。
 
-_updated: 2026-06-29 07:49:48_
+_updated: 2026-06-29 07:58:41_
 ### Vanilla Ring Attention 的 early-return 在不均等分片下加剧负载不均
 
 type: `claim` · status: `held` · confidence: 0.85 · importance: 0.8 · source: `code-inspection + baseline measurement`
