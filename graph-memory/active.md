@@ -19,29 +19,16 @@ type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.95 · sour
 3. Block KV cache + vLLM 集成：插件解耦 vs HCP 内联 PageAttention 两条路线。
 
 _updated: 2026-06-29 06:01:28_
-### 下一步：实现 Striped correctness model 原型并复跑基线测试
-
-type: `task` · status: `ongoing` · confidence: 0.75 · importance: 0.9 · source: `baseline-analysis`
-
-实现 capacity-aware Striped correctness 原型：
-1. 设计加权 permutation：给定 chunk_sizes，生成周期为 sum(chunk_sizes) 的循环调度，   如 3:1 对应模式 [0,0,0,1]。
-2. 在 test_ring_attention_uneven_perf 中新增 striped 模式，比较 vanilla vs striped 的 HCP_PERF_LOG。
-3. 用原始位置 id 构造 causal mask，确保 correctness diff < 1e-4。
-4. 评估 scheduling unit 粒度（1 token vs 64 tokens vs 256 tokens）对负载均衡和 mask 开销的影响。
-
-_updated: 2026-06-29 07:53:53_
 ### 任务：实现并对比两种 HCP 调度策略
 
 type: `task` · status: `ongoing` · confidence: 0.75 · importance: 0.9 · source: `user-direction`
 
-把 capacity-aware 连续分片和加权 Striped 作为两条线同时推进：
-1. 保持当前 3:1 连续分片作为 baseline，优化空间较小但可作为参照。
-2. 实现加权 Striped correctness 原型，复跑同一 perf 测试。
-3. 在相同 seq_len、chunk 比例、设备配置下对比 HCP_PERF_LOG。
-4. 输出对比报告：wall-time 差距、per-token compute 成本、通信 bytes、decode 复杂度。
-5. 根据结果决定 HCP 默认调度策略，或保留两者作为配置选项。
+CPU mock 对比已完成：
+1. Vanilla 与 Striped correctness 均通过（diff < 1e-4）。
+2. 在 homogenous CPU 上 Striped 使 domain 0 总耗时从 118ms 增至 185ms，未显现负载均衡收益。
+3. 下一步：在真实 heterogeneous 硬件（white CUDA + pearl HIP）上复跑同配置，判断 pearl 较慢时 Striped 是否能缓解瓶颈。
 
-_updated: 2026-06-29 07:53:53_
+_updated: 2026-06-29 10:46:05_
 ### 精读：Striped Attention 机制与 HCP 适配点
 
 type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.9 · source: `https://ar5iv.org/html/2311.09431`
@@ -95,26 +82,16 @@ _updated: 2026-06-29 06:06:09_
 
 type: `claim` · status: `held` · confidence: 0.8 · importance: 0.85 · source: `user-direction + design-reasoning`
 
-之前的 3:1 capacity-aware 连续分片是在尚未研究 Striped Attention 时提出的方案；它不一定比 Striped 更简洁或更优。两者应作为 HCP 的两种候选调度策略并行推进、对比评估。
-根据全局 AGENTS.md 的简洁性原则，如果 Striped 没有可验证的明显收益，应选择更简单的连续分片。
+capacity-aware 连续分片与加权 Striped 是 HCP 的两种候选调度策略。当前 CPU mock 证据显示：在 homogeneous 算力、3:1 分片下，Striped 把 peer compute 从小 domain 转移到大 domain，使瓶颈 domain 0 更慢，未表现出 wall-time 收益。真实 heterogeneous 硬件（pearl 较慢）验证 pending；若仍无收益，根据简洁性原则应默认保留连续分片。
 
-方案 A：capacity-aware 连续分片（current）
-- 优点：实现简单，与 RoPE/位置编码天然对齐，decode 时新 token 追加逻辑直观。
-- 缺点：因果 attention 下 early-return 导致负载不均，小 domain 可能成为瓶颈。
+_updated: 2026-06-29 10:46:05_
+### 在真实异构硬件上验证 Striped 负载均衡收益
 
-方案 B：加权 Striped permutation
-- 优点：消除 early-return 不对称，负载按 capacity 比例平滑分配。
-- 缺点：需要位置 id permutation、inverse permutation、按原始位置构造 mask，实现更复杂。
+type: `task` · status: `ongoing` · confidence: 0.75 · importance: 0.85
 
-评估维度（按简洁性原则加权）：
-1. 同构/异构设备下的 wall-time 均衡性（必须有数据）
-2. 不同网络带宽下的通信开销（striped 不增加总通信量，但可能改变 micro block 粒度）
-3. decode 阶段新 token 归属与 inverse permutation 的复杂度
-4. 与 FlashAttention / PageAttention 等 kernel 的兼容性
-5. 实现复杂度和可维护性
-6. 如果以上维度没有明显 winner，默认选择方案 A。
+在 white (RTX 4090 CUDA) + pearl (RX 9060 XT HIP) 上复跑 4096/3:1 或 1M context 的 vanilla vs striped 对比。关键问题：当 pearl 算力明显慢于 white 时，Striped 是否能将 wall-time 差距拉近到容量比例（3:1）附近，还是会因增加 white 负担而恶化端到端耗时。
 
-_updated: 2026-06-29 07:58:41_
+_updated: 2026-06-29 10:46:05_
 ### Striped Attention 可以推广到 capacity-aware 不均等分片
 
 type: `claim` · status: `held` · confidence: 0.75 · importance: 0.85 · source: `paper-analysis + design-reasoning`
@@ -228,13 +205,11 @@ type: `belief` · status: `held` · confidence: 0.9 · importance: 0.85 · sourc
 _updated: 2026-06-29 06:01:28_
 ### Striped 预计能将 3:1 分片下的 domain 总耗时差距从 ~3.6× 降到 ~1.2× 以内
 
-type: `hypothesis` · status: `open` · confidence: 0.65 · importance: 0.8 · source: `theoretical projection`
+type: `hypothesis` · status: `questioned` · confidence: 0.4 · importance: 0.8 · source: `theoretical projection`
 
-在 3:1 不均等分片下，加权 Striped 预计能消除 vanilla ring 的 early-return 不对称性，使 domain 0/1 的 wall-time 比例从实测 3.6:1 向容量比例 3:1（同构设备）或更接近设备能力比例收敛。
-关键判断：striped 不会让两个 domain 耗时完全相等（因为它们本来就持有不同 token 数），而是让“每 token 的 compute 成本”在两个 domain 上更均衡。
-但如果实测显示 wall-time 收益不足以抵消实现复杂度、decode 复杂度或 kernel 兼容性问题，根据简洁性原则，应回退到 capacity-aware 连续分片并寻找其他优化点（如 network speed、kernel fusion）。
+在 homogeneous CPU mock 上，3:1 分片的 Striped 没有降低 domain 耗时差距，反而让大 domain 更慢。该假设在 heterogeneous 真实硬件（pearl 较慢）上是否成立仍待验证；当前证据使其置信度下降。
 
-_updated: 2026-06-29 07:58:41_
+_updated: 2026-06-29 10:46:05_
 ### Vanilla Ring Attention 的 early-return 在不均等分片下加剧负载不均
 
 type: `claim` · status: `held` · confidence: 0.85 · importance: 0.8 · source: `code-inspection + baseline measurement`

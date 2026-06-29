@@ -2,6 +2,29 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-06-29] Striped correctness原型在CPU mock上验证通过
+
+type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.85 · source: `cargo test / rust/src/model/attention/ring.rs`
+
+测试：cargo test --features tch-backend test_ring_attention_uneven_perf -- --nocapture
+配置：seq_len=4096, 2 domain, chunk=[3072,1024] (3:1), CPU Float32, mock transport。
+
+Correctness：
+- Vanilla diff = 2.8e-8
+- Striped diff = 2.6e-8
+均 < 1e-4，数值正确。
+
+Perf（单次 layer，CPU mock）：
+Vanilla：
+- domain 0 total=118.5ms (local=117.0ms, peer=0.02ms)
+- domain 1 total=46.3ms (local=15.8ms, peer=30.0ms)
+Striped：
+- domain 0 total=184.6ms (local=129.6ms, peer=53.3ms)
+- domain 1 total=50.8ms (local=15.9ms, peer=34.6ms)
+
+关键发现：在 homogenous CPU 上，Striped 把部分 peer compute 从 domain 1 转移到 domain 0，使原本就是瓶颈的 domain 0 更慢；domain 0/1 总耗时比从约 2.6x 扩大到约 3.6x。
+
+_updated: 2026-06-29 10:46:05_
 ### [2026-06-19] 1M context 本地异构分布式推理成功
 
 type: `session` · status: `closed` · confidence: 1.0 · importance: 1.0 · source: `memory-bank/progress.md`
