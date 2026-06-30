@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-06-29] Ring Attention derivatives Phase 1: CPU mock correctness and load balance
+
+type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `cargo test --features tch-backend test_ring_attention_derivatives_uneven_perf`
+
+在 Rust 中新增 RingSchedulingStrategy（Vanilla / Striped / ZigZag）和 assignment helper，并在 CPU mock 上验证 2-domain 3:1 不均等分片（seq=4096, num_heads=8, head_dim=128）。\n\n结果（单次 layer）：\n- Vanilla：domain0=74ms, domain1=47ms，瓶颈 domain0。\n- Striped：domain0=149ms, domain1=50ms，把 peer compute 推给 domain0，反而更慢。\n- ZigZag：domain0=64ms, domain1=39ms，两个 domain 都变快，负载更均衡。\n\n所有策略 correctness diff < 3e-8。\n\n结论：\n1. ZigZag 在 uneven 3:1 分片下有效改善了负载均衡。\n2. Striped 在当前加权 round-robin 实现下对 3:1 场景不适用（与之前挂起结论一致）。\n3. 需要真实硬件（white CUDA + pearl HIP）验证这些趋势是否保持。
+
+_updated: 2026-06-29 16:01:43_
 ### 综述类支撑线必须有真实实现和硬件对比才有说服力
 
 type: `lesson` · status: `held` · confidence: 0.9 · importance: 0.85 · source: `user-direction`

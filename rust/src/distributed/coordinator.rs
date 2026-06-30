@@ -15,6 +15,7 @@ use crate::distributed::protocol::{
     recv_response_quic, send_command_quic, WorkerCommand, WorkerResponse,
 };
 use crate::distributed::scheduler::{BatchScheduler, ActiveRequest};
+use crate::model::attention::strategy::{build_assignment, build_domain_positions, RingSchedulingStrategy};
 use crate::model::ModelConfig;
 #[cfg(feature = "tch-backend")]
 use crate::model::sampling::sample_token;
@@ -41,6 +42,30 @@ fn sample_from_logits_vec(logits: &[f32], temperature: f64, top_p: f64) -> Resul
         .map_err(|e| format!("{e}"))
 }
 
+/// Apply a ring scheduling strategy to a prompt and return per-domain inputs.
+///
+/// Returns a vector of `(chunk, position_ids, seq_offset)` for each domain,
+/// where `chunk` holds the token ids in local storage order, `position_ids`
+/// holds the corresponding global positions, and `seq_offset` is the first
+/// global position (used for KV metadata and guards).
+fn apply_ring_strategy(
+    prompt_ids: &[i64],
+    chunk_sizes: &[usize],
+    strategy: RingSchedulingStrategy,
+) -> Vec<(Vec<i64>, Vec<i64>, i64)> {
+    let assignment = build_assignment(chunk_sizes, strategy);
+    let positions = build_domain_positions(&assignment);
+    positions
+        .iter()
+        .map(|pos| {
+            let chunk: Vec<i64> = pos.iter().map(|&p| prompt_ids[p]).collect();
+            let pos_ids: Vec<i64> = pos.iter().map(|&p| p as i64).collect();
+            let seq_offset = pos.first().copied().unwrap_or(0) as i64;
+            (chunk, pos_ids, seq_offset)
+        })
+        .collect()
+}
+
 #[derive(Debug)]
 struct CoordinatorArgs {
     model_dir: String,
@@ -63,6 +88,8 @@ struct CoordinatorArgs {
     prompts_file: Option<String>,
     /// Export raw logits to directory for correctness validation.
     export_logits_dir: Option<String>,
+    /// Ring attention scheduling strategy (vanilla/striped/zigzag).
+    ring_strategy: RingSchedulingStrategy,
 }
 
 fn parse_args() -> CoordinatorArgs {
@@ -80,6 +107,7 @@ fn parse_args() -> CoordinatorArgs {
     let mut prompt_file = None;
     let mut prompts_file = None;
     let mut export_logits_dir = None;
+    let mut ring_strategy = RingSchedulingStrategy::Vanilla;
 
     let mut args = std::env::args().skip(1); // skip binary name
     while let Some(arg) = args.next() {
@@ -104,6 +132,11 @@ fn parse_args() -> CoordinatorArgs {
             "--prompt-file" => prompt_file = Some(args.next().unwrap()),
             "--prompts-file" => prompts_file = Some(args.next().unwrap()),
             "--export-logits" => export_logits_dir = Some(args.next().unwrap()),
+            "--ring-strategy" => {
+                let s = args.next().unwrap();
+                ring_strategy = RingSchedulingStrategy::from_str(&s)
+                    .unwrap_or_else(|| panic!("unknown --ring-strategy: {s}"));
+            }
             _ => eprintln!("[coordinator] unknown arg: {arg}"),
         }
     }
@@ -123,6 +156,7 @@ fn parse_args() -> CoordinatorArgs {
         prompt_file,
         prompts_file,
         export_logits_dir,
+        ring_strategy,
     }
 }
 
@@ -169,6 +203,7 @@ fn process_single_request(
     worker_capacities: &[u64],
     rt: &tokio::runtime::Runtime,
     export_logits_dir: Option<&str>,
+    strategy: RingSchedulingStrategy,
 ) -> Result<InferenceResult, String> {
     let eos_token = config.eos_token_id();
     let vocab_size = config.vocab_size;
@@ -226,20 +261,17 @@ fn process_single_request(
         }
     }
 
-    let mut chunk_boundaries = vec![0usize];
-    for size in &chunk_sizes {
-        chunk_boundaries.push(chunk_boundaries.last().unwrap() + size);
-    }
+    // Apply ring scheduling strategy (vanilla/striped/zigzag).
+    let domain_inputs = apply_ring_strategy(&prompt_ids, &chunk_sizes, strategy);
 
     // Prefill
     for (domain_id, (send, _recv)) in worker_streams.iter_mut().enumerate() {
-        let start = chunk_boundaries[domain_id];
-        let end = chunk_boundaries[domain_id + 1];
-        let chunk = &prompt_ids[start..end];
+        let (chunk, position_ids, seq_offset) = &domain_inputs[domain_id];
         let cmd = WorkerCommand::Prefill {
             request_id,
-            chunk: chunk.to_vec(),
-            seq_offset: start as i64,
+            chunk: chunk.clone(),
+            seq_offset: *seq_offset,
+            position_ids: Some(position_ids.clone()),
         };
         send_command_quic(send, &cmd, rt.handle()).map_err(|e| format!("send Prefill failed: {e}"))?;
     }
@@ -251,8 +283,8 @@ fn process_single_request(
             .map_err(|e| format!("recv PrefillDone failed: {e}"))?;
         match resp {
             WorkerResponse::PrefillDone { last_logits_bytes: bytes, global_seq_len, .. } => {
-                max_global_seq_len = max_global_seq_len.max(global_seq_len);
-                if domain_id == num_domains - 1 {
+                if global_seq_len > max_global_seq_len {
+                    max_global_seq_len = global_seq_len;
                     last_logits_bytes = bytes;
                 }
             }
@@ -378,6 +410,7 @@ fn prefill_single_request(
     capacity_aware: bool,
     worker_capacities: &[u64],
     rt: &tokio::runtime::Runtime,
+    strategy: RingSchedulingStrategy,
 ) -> Result<ActiveRequest, String> {
     let eos_token = config.eos_token_id();
     let vocab_size = config.vocab_size;
@@ -446,6 +479,10 @@ fn prefill_single_request(
         }
     }
 
+    // Apply ring scheduling strategy (vanilla/striped/zigzag).
+    let domain_inputs = apply_ring_strategy(&prompt_ids, &chunk_sizes, strategy);
+
+    // Legacy chunk boundaries (only meaningful for vanilla; kept for ActiveRequest compatibility).
     let mut chunk_boundaries = vec![0usize];
     for size in &chunk_sizes {
         chunk_boundaries.push(chunk_boundaries.last().unwrap() + size);
@@ -453,13 +490,12 @@ fn prefill_single_request(
 
     // Prefill
     for (domain_id, (send, _recv)) in worker_streams.iter_mut().enumerate() {
-        let start = chunk_boundaries[domain_id];
-        let end = chunk_boundaries[domain_id + 1];
-        let chunk = &prompt_ids[start..end];
+        let (chunk, position_ids, seq_offset) = &domain_inputs[domain_id];
         let cmd = WorkerCommand::Prefill {
             request_id: job.request_id,
-            chunk: chunk.to_vec(),
-            seq_offset: start as i64,
+            chunk: chunk.clone(),
+            seq_offset: *seq_offset,
+            position_ids: Some(position_ids.clone()),
         };
         if let Err(e) = send_command_quic(send, &cmd, rt.handle()) {
             let _ = job.tx.send(InferenceResult {
@@ -489,8 +525,8 @@ fn prefill_single_request(
         };
         match resp {
             WorkerResponse::PrefillDone { last_logits_bytes: bytes, global_seq_len, .. } => {
-                max_global_seq_len = max_global_seq_len.max(global_seq_len);
-                if domain_id == num_domains - 1 {
+                if global_seq_len > max_global_seq_len {
+                    max_global_seq_len = global_seq_len;
                     last_logits_bytes = bytes;
                 }
             }
@@ -756,6 +792,7 @@ pub fn run() {
                 &worker_capacities,
                 &rt,
                 args.export_logits_dir.as_deref(),
+                args.ring_strategy,
             ) {
                 Ok(result) => {
                     println!("[coordinator] generated: {}", result.text);
@@ -848,7 +885,7 @@ pub fn run() {
             // 2a: Prefill a pending request if batch has room
             if scheduler.can_admit() && !scheduler.pending_is_empty() {
                 if let Some(job) = scheduler.try_dequeue_pending() {
-                    match prefill_single_request(job, &tokenizer, &config, &mut guard, &args.chunk_sizes, args.capacity_aware, &worker_capacities, &rt) {
+                    match prefill_single_request(job, &tokenizer, &config, &mut guard, &args.chunk_sizes, args.capacity_aware, &worker_capacities, &rt, args.ring_strategy) {
                         Ok(active_req) => {
                             active_counter.fetch_add(1, Ordering::SeqCst);
                             scheduler.add_active(active_req);

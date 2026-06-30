@@ -40,6 +40,9 @@ pub struct LlamaModel {
     /// Input tensors are cast to this dtype at the start of forward,
     /// and logits are cast back to Float at the end.
     pub dtype: Kind,
+    /// Optional per-domain prefill position ids for non-contiguous scheduling
+    /// strategies (Striped / ZigZag).  Consumed during the next prefill forward.
+    pub prefill_position_ids: Option<Tensor>,
 }
 
 #[cfg(feature = "tch-backend")]
@@ -108,7 +111,7 @@ impl LlamaModel {
             _ => Kind::Float,
         };
 
-        Ok(Self { config, embedding, layers, norm, lm_head, seq_offset: 0, num_domains, global_seq_len: 0, is_prefill_done: false, dtype })
+        Ok(Self { config, embedding, layers, norm, lm_head, seq_offset: 0, num_domains, global_seq_len: 0, is_prefill_done: false, dtype, prefill_position_ids: None })
     }
 
     /// 【为模型中所有 attention 后端配置分布式传输】
@@ -149,6 +152,16 @@ impl LlamaModel {
     /// `kv_caches`: per-layer KV caches; `None` means no caching for that layer
     ///
     /// Returns logits: `[batch, seq_len, vocab_size]`
+    /// Set the non-contiguous prefill position ids consumed by the next forward.
+    /// Pass `None` to clear.
+    pub fn set_prefill_position_ids(&mut self, position_ids: &[i64], device: Device) {
+        self.prefill_position_ids = Some(
+            Tensor::from_slice(position_ids)
+                .to_device(device)
+                .to_kind(Kind::Int64),
+        );
+    }
+
     pub fn forward(&mut self, input_ids: &Tensor, kv_caches: &mut KvCaches) -> Result<Tensor, ModelError> {
         // Disable gradient computation for inference. Without this, PyTorch
         // retains the entire computation graph across all 24 layers, which
@@ -168,27 +181,44 @@ impl LlamaModel {
             hidden_states = hidden_states.to_kind(self.dtype);
         }
 
-        // Guard: prevent position_ids from exceeding RoPE cache / model capacity.
-        if let Some(max_pos) = self.config.max_position_embeddings {
-            let max_pos = max_pos as i64;
-            if self.seq_offset + seq_len > max_pos {
-                return Err(ModelError::Generation(format!(
-                    "sequence length {} + offset {} exceeds max_position_embeddings {}; prompt too long",
-                    seq_len, self.seq_offset, max_pos
-                )));
-            }
-        }
-
         // Position IDs: [batch, seq_len]
         let is_prefill = !self.is_prefill_done;
         let position_ids = if is_prefill {
-            // Prefill: sequential positions [seq_offset, seq_offset+1, ..., seq_offset+seq_len-1]
-            // global_seq_len tracks the rightmost global position this domain has processed.
-            // For distributed decode, all domains must agree on the global prompt length.
-            self.global_seq_len = (self.seq_offset + seq_len) as usize;
-            self.is_prefill_done = true;
-            let base = Tensor::arange(seq_len, (Kind::Int64, device)) + self.seq_offset;
-            base.unsqueeze(0).repeat([batch, 1])
+            // Prefill: use explicit position ids for non-contiguous scheduling
+            // (Striped / ZigZag), otherwise fall back to sequential positions.
+            if let Some(pos_ids) = self.prefill_position_ids.take() {
+                let max_pos = pos_ids.max().int64_value(&[]);
+                // Guard: prevent position_ids from exceeding RoPE cache / model capacity.
+                if let Some(model_max_pos) = self.config.max_position_embeddings {
+                    if max_pos >= model_max_pos as i64 {
+                        return Err(ModelError::Generation(format!(
+                            "position id {} exceeds max_position_embeddings {}; prompt too long",
+                            max_pos, model_max_pos
+                        )));
+                    }
+                }
+                self.global_seq_len = (max_pos + 1) as usize;
+                self.is_prefill_done = true;
+                pos_ids.unsqueeze(0).repeat([batch, 1])
+            } else {
+                // Guard: prevent position_ids from exceeding RoPE cache / model capacity.
+                if let Some(max_pos) = self.config.max_position_embeddings {
+                    let max_pos = max_pos as i64;
+                    if self.seq_offset + seq_len > max_pos {
+                        return Err(ModelError::Generation(format!(
+                            "sequence length {} + offset {} exceeds max_position_embeddings {}; prompt too long",
+                            seq_len, self.seq_offset, max_pos
+                        )));
+                    }
+                }
+                // Prefill: sequential positions [seq_offset, seq_offset+1, ..., seq_offset+seq_len-1]
+                // global_seq_len tracks the rightmost global position this domain has processed.
+                // For distributed decode, all domains must agree on the global prompt length.
+                self.global_seq_len = (self.seq_offset + seq_len) as usize;
+                self.is_prefill_done = true;
+                let base = Tensor::arange(seq_len, (Kind::Int64, device)) + self.seq_offset;
+                base.unsqueeze(0).repeat([batch, 1])
+            }
         } else {
             // Decode: position = global_seq_len (same across all distributed domains).
             // In distributed CP, each domain only holds local KV cache, so cache_len

@@ -14,10 +14,13 @@ use tokio::runtime::Handle;
 pub enum WorkerCommand {
     /// Run prefill on the given token IDs for a specific request.
     /// `seq_offset` is the global start position of this chunk (domain0=0, domain1=chunk0_len, etc.)
+    /// `position_ids` optionally overrides the default [seq_offset, seq_offset+1, ...) ordering
+    /// for non-contiguous scheduling strategies such as Striped or ZigZag.
     Prefill {
         request_id: u64,
         chunk: Vec<i64>,
         seq_offset: i64,
+        position_ids: Option<Vec<i64>>,
     },
     /// Run single-token decode for a specific request.
     Decode {
@@ -429,6 +432,7 @@ mod tests {
             request_id: 1,
             chunk: vec![1, 2, 3],
             seq_offset: 0,
+            position_ids: None,
         };
         let bytes = bincode::serialize(&cmd).unwrap();
         println!("Prefill cmd: {:?}", bytes);

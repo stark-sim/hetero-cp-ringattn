@@ -116,18 +116,29 @@ impl TchWorkerBackend {
     ///
     /// Operates on `self.kv_caches` and updates `self.model` state.
     /// The caller is responsible for saving/restoring state if needed.
-    fn do_prefill(&mut self, chunk: &[i64], seq_offset: usize) -> Result<(Vec<f32>, usize), String> {
+    fn do_prefill(
+        &mut self,
+        chunk: &[i64],
+        seq_offset: usize,
+        position_ids: Option<&[i64]>,
+    ) -> Result<(Vec<f32>, usize), String> {
         // Reset KV cache for a new request.
         self.kv_caches = self.model.create_kv_caches();
         self.model.is_prefill_done = false;
         self.model.global_seq_len = 0;
+        self.model.prefill_position_ids = None;
 
         self.model.seq_offset = seq_offset as i64;
-        // Update per-layer seq_offset for causal mask global position computation
+        // Update per-layer seq_offset and scheduling strategy state.
         for layer in self.model.layers.iter_mut() {
             layer
                 .attention
                 .set_distributed(self.domain_id, seq_offset, None);
+        }
+
+        if let Some(pos) = position_ids {
+            self.model
+                .set_prefill_position_ids(pos, self.device);
         }
 
         let input = Tensor::from_slice(chunk)
@@ -137,6 +148,9 @@ impl TchWorkerBackend {
             .model
             .forward(&input, &mut self.kv_caches)
             .map_err(|e| format!("prefill forward failed: {e}"))?;
+
+        // Clear one-shot position ids so they are not reused by decode.
+        self.model.prefill_position_ids = None;
 
         let last_logits = logits.narrow(1, logits.size()[1] - 1, 1).squeeze();
         let logits_vec: Vec<f32> =
@@ -163,8 +177,9 @@ impl WorkerBackend for TchWorkerBackend {
         &mut self,
         chunk: &[i64],
         seq_offset: usize,
+        position_ids: Option<&[i64]>,
     ) -> Result<(Vec<f32>, usize), String> {
-        self.do_prefill(chunk, seq_offset)
+        self.do_prefill(chunk, seq_offset, position_ids)
     }
 
     fn decode(&mut self, token: i64) -> Result<Vec<f32>, String> {
@@ -188,8 +203,9 @@ impl WorkerBackend for TchWorkerBackend {
         request_id: u64,
         chunk: &[i64],
         seq_offset: usize,
+        position_ids: Option<&[i64]>,
     ) -> Result<(Vec<f32>, usize), String> {
-        let (logits_vec, global_seq_len) = self.do_prefill(chunk, seq_offset)?;
+        let (logits_vec, global_seq_len) = self.do_prefill(chunk, seq_offset, position_ids)?;
 
         // Save the freshly computed KV cache and model state into per-request context.
         self.request_contexts.insert(request_id, RequestContext {
@@ -313,11 +329,11 @@ mod tests {
         let prompt_b: Vec<i64> = (10..10 + seq_len).collect();
 
         // Prefill both requests on both backends
-        let (logits_a_batch, _) = backend_batch.prefill_request(1, &prompt_a, 0).unwrap();
-        let (logits_b_batch, _) = backend_batch.prefill_request(2, &prompt_b, 0).unwrap();
+        let (logits_a_batch, _) = backend_batch.prefill_request(1, &prompt_a, 0, None).unwrap();
+        let (logits_b_batch, _) = backend_batch.prefill_request(2, &prompt_b, 0, None).unwrap();
 
-        let (logits_a_ref, _) = backend_ref.prefill_request(1, &prompt_a, 0).unwrap();
-        let (logits_b_ref, _) = backend_ref.prefill_request(2, &prompt_b, 0).unwrap();
+        let (logits_a_ref, _) = backend_ref.prefill_request(1, &prompt_a, 0, None).unwrap();
+        let (logits_b_ref, _) = backend_ref.prefill_request(2, &prompt_b, 0, None).unwrap();
 
         // Verify prefill logits match (sanity check)
         let prefill_diff_a = Tensor::from_slice(&logits_a_batch)

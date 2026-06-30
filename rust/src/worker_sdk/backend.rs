@@ -45,6 +45,8 @@ pub trait WorkerBackend: Send {
     /// # Arguments
     /// - `chunk`: token ID 列表，本 domain 负责的 prompt 分片
     /// - `seq_offset`: 本 chunk 在全局序列中的起始位置
+    /// - `position_ids`: 可选的非连续全局位置（Striped/ZigZag 策略使用）。
+    ///   为 None 时后端按 [seq_offset, seq_offset+1, ...) 构造位置。
     ///
     /// # Returns
     /// - `last_logits`: 最后一个 token 的 logits（`Vec<f32>`，长度 = vocab_size）
@@ -53,6 +55,7 @@ pub trait WorkerBackend: Send {
         &mut self,
         chunk: &[i64],
         seq_offset: usize,
+        position_ids: Option<&[i64]>,
     ) -> Result<(Vec<f32>, usize), String>;
 
     /// 执行单 token decode forward。
@@ -75,8 +78,9 @@ pub trait WorkerBackend: Send {
         _request_id: u64,
         chunk: &[i64],
         seq_offset: usize,
+        position_ids: Option<&[i64]>,
     ) -> Result<(Vec<f32>, usize), String> {
-        self.prefill(chunk, seq_offset)
+        self.prefill(chunk, seq_offset, position_ids)
     }
 
     /// 【请求感知的 decode】支持多请求隔离的 decode。

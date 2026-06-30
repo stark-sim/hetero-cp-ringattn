@@ -130,11 +130,12 @@ impl WorkerRuntime {
             println!("[worker {domain_id}] received command: {cmd:?}");
 
             match cmd {
-                WorkerCommand::Prefill { request_id, chunk, seq_offset } => {
+                WorkerCommand::Prefill { request_id, chunk, seq_offset, position_ids } => {
                     let seq_offset = seq_offset as usize;
+                    let pos_slice = position_ids.as_deref();
                     let (logits_vec, global_seq_len) = self
                         .backend
-                        .prefill_request(request_id, &chunk, seq_offset)
+                        .prefill_request(request_id, &chunk, seq_offset, pos_slice)
                         .map_err(|e| format!("prefill failed: {e}"))?;
 
                     let logits_bytes: Vec<u8> =

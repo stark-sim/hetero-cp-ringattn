@@ -279,6 +279,7 @@ impl WorkerBackend for VllmWorkerBackend {
         &mut self,
         chunk: &[i64],
         seq_offset: usize,
+        _position_ids: Option<&[i64]>,
     ) -> Result<(Vec<f32>, usize), String> {
         let resp = self.send_cmd(&VllmCommand {
             cmd: "prefill".to_string(),
@@ -308,6 +309,7 @@ impl WorkerBackend for VllmWorkerBackend {
         request_id: u64,
         chunk: &[i64],
         seq_offset: usize,
+        _position_ids: Option<&[i64]>,
     ) -> Result<(Vec<f32>, usize), String> {
         let resp = self.send_cmd(&VllmCommand {
             cmd: "prefill_request".to_string(),
@@ -442,7 +444,7 @@ mod tests {
         assert!(backend.device() == Device::Cuda(0));
 
         // Test prefill.
-        let (logits, global_seq_len) = backend.prefill(&[1, 2, 3], 0).unwrap();
+        let (logits, global_seq_len) = backend.prefill(&[1, 2, 3], 0, None).unwrap();
         assert_eq!(logits.len(), 100); // mock vocab_size = 100
         assert_eq!(global_seq_len, 3);
 
@@ -459,7 +461,7 @@ mod tests {
         assert_eq!(results[1].1.len(), 100);
 
         // Test request-aware methods.
-        let (logits, global_seq_len) = backend.prefill_request(99, &[10, 11], 0).unwrap();
+        let (logits, global_seq_len) = backend.prefill_request(99, &[10, 11], 0, None).unwrap();
         assert_eq!(logits.len(), 100);
         assert_eq!(global_seq_len, 2);
 
