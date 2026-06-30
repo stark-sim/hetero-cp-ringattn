@@ -52,7 +52,21 @@ Ring Flash Attention is a **kernel-level** optimization: it replaces the local a
 
 If future hardware provides a much faster interconnect, Ring Flash becomes relevant again; the existing `RingSchedulingStrategy` abstraction leaves a clean insertion point.
 
-## Appendix: 100 Mbps stability check
+## Appendix A: Single-node vs distributed time breakdown
+
+The ~15 s distributed numbers are **not** GPU compute time.  A single RTX 4090 completes the same 4096-token forward+decode in 0.12 s.  The distributed ring is slow because it ships KV blocks across the network every layer.
+
+| Configuration | Hardware | Time | Slowdown vs single-node CUDA |
+|---------------|----------|-----:|-----------------------------:|
+| Single-node CUDA | RTX 4090 (white) | **0.12 s** | 1× |
+| Single-node CPU | MacBook Pro M-series | 4.5 s | ~38× |
+| Single-node MPS | MacBook Pro M-series | 5.2 s | ~43× |
+| Distributed 2-domain vanilla (1:1) | RTX 4090 CUDA + RX 9060 XT HIP | ~15.1 s | ~126× |
+| Distributed 2-domain at 100 Mbps | RTX 4090 CUDA + RX 9060 XT HIP | ~206 s | ~1717× |
+
+So yes, the accelerators are far faster than CPU when used locally.  HCP's distributed path is slower than single-node CPU at 4K tokens because the network dominates.
+
+## Appendix B: 100 Mbps stability check
 
 A single 100 Mbps measurement can be misleading.  We re-ran the same 4096-token task 3× with no shaping and 5× with `tc tbf rate 100mbit` on the direct 192.168.100.x link.
 
@@ -61,7 +75,7 @@ A single 100 Mbps measurement can be misleading.  We re-ran the same 4096-token 
 | Baseline  | 17 s | 18 s | 17 s | — | — | **17.3 s** |
 | 100 Mbps  | 204 s | 205 s | 217 s | 203 s | 203 s | **206.4 s** |
 
-**Slowdown at 100 Mbps:** ~11.9×.
+**Slowdown at 100 Mbps:** ~11.9× vs the distributed baseline, and ~1717× vs single-node CUDA.
 
 The first 100 Mbps attempt produced a 38 s outlier and a later failed 604 s run; with clean process cleanup and repeated measurements the true value converges to ~206 s with <3% variance.  This confirms that the cross-node link is the dominant term and that low-bandwidth interconnects make heterogeneous CP impractical regardless of scheduling strategy.
 

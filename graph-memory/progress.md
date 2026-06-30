@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-06-30] 单节点 vs 分布式：4096 token 时间分解
+
+type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.95 · source: `local CPU/MPS benchmark + white CUDA single-node benchmark`
+
+用同样的 Qwen2-0.5B 类模型对 4095-token prompt + 5 token decode 进行单节点基准测试，并与 HCP 分布式环结果对比。\n\n结果：\n- white RTX 4090 单节点 CUDA：0.12s\n- 本地 Mac CPU：4.5s\n- 本地 Mac MPS：5.2s\n- HCP 2-domain vanilla 1:1（RTX 4090 CUDA + RX 9060 XT HIP）：~15.1s\n- HCP 2-domain 100 Mbps：~206s\n\n关键结论：\n1. GPU 单节点速度远超 CPU（0.12s vs 4.5s）。\n2. HCP 分布式在 4K token 下比单节点 CPU 还慢（15s vs 4.5s），因为跨节点 KV 传输占主导。\n3. 这不是 CPU/GPU 问题，而是“单节点本地内存” vs “多节点网络”的问题。\n4. HCP 的价值在于打破超长上下文下的内存墙，而不是在小长度下加速。\n\n报告：reports/single-node-vs-distributed/
+
+_updated: 2026-06-30 05:33:11_
 ### [2026-06-30] 100 Mbps 重复实验稳定结果
 
 type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `manual cross-node bandwidth experiment on white/pearl`
