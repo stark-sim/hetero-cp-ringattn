@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-06-30] 1:1 chunk split derivative comparison on white+pearl
+
+type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `manual cross-node run on white/pearl`
+
+在 white (RTX 4090 CUDA) + pearl (RX 9060 XT HIP) 上运行 --chunk-sizes 2048,2048 的等分切分，比较 Vanilla / Striped / ZigZag。\n\n配置：Qwen2-0.5B-1M，seq_len=4096，max_tokens=5。\n\n结果（perf log 聚合，单位 ms）：\n- Vanilla：domain0 total=15122 (recv 14423, local 146), domain1 total=14516 (recv 12804, local 656)；瓶颈 15122 ms。\n- Striped：domain0 total=15547 (recv 14795, local 133), domain1 total=14722 (recv 12601, local 662)；瓶颈 15547 ms。\n- ZigZag：domain0 total=15331 (recv 14675, local 132), domain1 total=14640 (recv 12919, local 651)；瓶颈 15331 ms。\n\n关键发现：\n1. 1:1 等分消除了 3:1 容量感知切分的负载不均，但三种策略差异仍在 <6%。\n2. 网络 recv 仍占绝对主导，1:1 并未改善端到端瓶颈。\n3. ZigZag 的理论优势（负载均衡 + 减少边界）在当前 tailscale 链路上无法体现。\n\n报告：reports/ring-derivatives-1to1-20260630-122906/
+
+_updated: 2026-06-30 04:41:51_
 ### [2026-06-30] Ring Attention derivatives Phase 2: real white+pearl comparison
 
 type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.95 · source: `manual cross-node run on white/pearl`
