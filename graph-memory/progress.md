@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-06-30] 100 Mbps 重复实验稳定结果
+
+type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `manual cross-node bandwidth experiment on white/pearl`
+
+在 white+pearl 上对 Qwen2-0.5B-1M / seq=4096 / max_tokens=5 进行带宽稳定性复测。\n\n方法：\n- 使用 tc tbf 在 enp10s0 / enp8s0 上限制为 100 Mbps。\n- 每次运行前彻底清理进程并等待端口释放。\n- 基线（无 tc）跑 3 次，100 Mbps 跑 5 次。\n\n结果：\n- 基线：17s, 18s, 17s；均值 17.3s。\n- 100 Mbps：204s, 205s, 217s, 203s, 203s；均值 206.4s（方差 <3%）。\n\n结论：\n1. 单次 100 Mbps 测出的 38s 和 604s 是偶发离群值，不是真实分布。\n2. 稳定状态下 100 Mbps 带来约 11.9×  slowdown。\n3. 这进一步支持 hyp-net-speed：跨节点带宽是 HCP 性能的决定性因素。\n\n报告：reports/bw-stability-20260630-132311/
+
+_updated: 2026-06-30 05:23:34_
 ### [2026-06-30] 1:1 chunk split derivative comparison on white+pearl
 
 type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `manual cross-node run on white/pearl`

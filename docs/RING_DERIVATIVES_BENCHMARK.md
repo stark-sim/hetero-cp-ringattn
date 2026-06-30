@@ -52,6 +52,19 @@ Ring Flash Attention is a **kernel-level** optimization: it replaces the local a
 
 If future hardware provides a much faster interconnect, Ring Flash becomes relevant again; the existing `RingSchedulingStrategy` abstraction leaves a clean insertion point.
 
+## Appendix: 100 Mbps stability check
+
+A single 100 Mbps measurement can be misleading.  We re-ran the same 4096-token task 3× with no shaping and 5× with `tc tbf rate 100mbit` on the direct 192.168.100.x link.
+
+| Condition | Rep 1 | Rep 2 | Rep 3 | Rep 4 | Rep 5 | Mean |
+|-----------|------:|------:|------:|------:|------:|-----:|
+| Baseline  | 17 s | 18 s | 17 s | — | — | **17.3 s** |
+| 100 Mbps  | 204 s | 205 s | 217 s | 203 s | 203 s | **206.4 s** |
+
+**Slowdown at 100 Mbps:** ~11.9×.
+
+The first 100 Mbps attempt produced a 38 s outlier and a later failed 604 s run; with clean process cleanup and repeated measurements the true value converges to ~206 s with <3% variance.  This confirms that the cross-node link is the dominant term and that low-bandwidth interconnects make heterogeneous CP impractical regardless of scheduling strategy.
+
 ## Takeaway
 
 HCP's heterogeneous design is not a vanilla-only demo.  It can host the main algorithmic variants of the Ring Attention family.  However, those variants do not rescue performance on a slow tailscale/consumer-Ethernet link.  That makes high-bandwidth, low-latency interconnects (CXL / RDMA / NVLink-class links) a prerequisite for heterogeneous CP to be practical, not optional.

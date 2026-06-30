@@ -2,6 +2,13 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 异构 CP 对网络速度敏感，CXL / 类 RDMA 互联可显著突破网线局限
+
+type: `hypothesis` · status: `held` · confidence: 0.85 · importance: 0.95 · source: `user-direction`
+
+HCP 跨节点推理性能对网络带宽极度敏感。\n\n证据：\n1. 2026-06-29 带宽矩阵：100 Mbps 下单次测得 206s/684s，方差大。\n2. 2026-06-30 稳定性复测：100 Mbps 5 次重复得到 204/205/217/203/203s，均值 206.4s，方差 <3%。\n3. 基线 3 次重复 17/18/17s，均值 17.3s。\n4. 100 Mbps 相对基线 slowdown 约 11.9×。\n\n结论：跨节点带宽是 HCP 端到端性能的首要瓶颈；CXL / 类 RDMA 高速互联不是可选项，而是必要前提。
+
+_updated: 2026-06-30 05:23:34_
 ### 下一阶段：从 1M 可行性验证走向多条扩展线探索
 
 type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.95 · source: `user-direction`
@@ -9,13 +16,6 @@ type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.95 · sour
 当前核心方向：论证 CXL / 类 RDMA 高速互联对异构推理服务上主流舞台的重要性。\n\n已完成/持有：\n1. hyp-net-speed：white-pearl 带宽矩阵证明 100 Mbps 下 10-30x slowdown。\n2. claim-ring-derivatives：在 HCP 上实现并对比 Vanilla/Striped/ZigZag；Ring Flash 因当前网络瓶颈挂起。\n\n仍挂起方向：\n1. 更大模型 / 更多 domain / 更长 seq 验证（受限于硬件环境）。\n\n仍开放工程线：\n- hyp-block-kv-vllm：Block KV cache + vLLM 集成。
 
 _updated: 2026-06-30 03:34:13_
-### 异构 CP 对网络速度敏感，CXL / 类 RDMA 互联可显著突破网线局限
-
-type: `hypothesis` · status: `ongoing` · confidence: 0.85 · importance: 0.95 · source: `user-direction`
-
-核心目标：论证 CXL / 类 RDMA 高速互联对异构推理服务上主流舞台的决定性作用。\n\n当前状态：\n- white 与 pearl 之间最高 2.5 G 有线以太网。\n- Pilot（seq=4096, Qwen2-0.5B-1M）：基线 2.35 G 21 s；100 M 206 s，慢约 10 倍。\n- 完整矩阵（baseline / 1000 M / 500 M / 100 M × 2 reps）：\n  - baseline 20.5 s；1000 M 29.5 s（1.44x）；500 M 50 s（2.44x）；100 M 445 s（21.7x）。\n\n关键结论：\n1. 跨节点 P2P KV ring 对带宽极度敏感；100 M 时通信成为绝对瓶颈。\n2. 即使 1 Gbps，端到端仍有 1.4x 惩罚；要接近单节点效率需要 ≥2.35 Gbps 甚至更高带宽。\n3. 100 M 两次重复差异大（206 s vs 684 s），需调查低速下的波动来源。\n\n仍开放问题：\n- 100 M 高方差的根因（热节流 / QUIC / 设备调度）？\n- 更长 seq、decode-only、更大模型下的带宽阈值是否会更低？\n- 能否用现有两台机器构建可发表的 CXL/RDMA 必要性论证？
-
-_updated: 2026-06-29 14:32:15_
 ### HCP P2P KV ring 在 ≤1 Gbps 跨节点以太网下会成为端到端瓶颈
 
 type: `belief` · status: `held` · confidence: 0.85 · importance: 0.95 · source: `ev-net-speed-matrix-20260629`
