@@ -6,9 +6,9 @@
 
 type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.95 · source: `user-direction`
 
-当前核心方向：论证 CXL / 类 RDMA 高速互联对异构推理服务上主流舞台的重要性。\n\n并行推进：\n1. hyp-net-speed：CXL/RDMA 必要性（核心）。\n2. claim-ring-derivatives：在 HCP 上实现并对比 Ring Attention 家族（Vanilla/Striped/ZigZag/Ring-Flash），证明异构设计不是 demo。\n\n已挂起方向：\n1. 更大模型 / 更多 domain 验证（受限于硬件环境）。\n2. Striped 单独推进已并入 derivatives 线。\n\n仍开放工程线：\n- hyp-block-kv-vllm：Block KV cache + vLLM 集成。
+当前核心方向：论证 CXL / 类 RDMA 高速互联对异构推理服务上主流舞台的重要性。\n\n已完成/持有：\n1. hyp-net-speed：white-pearl 带宽矩阵证明 100 Mbps 下 10-30x slowdown。\n2. claim-ring-derivatives：在 HCP 上实现并对比 Vanilla/Striped/ZigZag；Ring Flash 因当前网络瓶颈挂起。\n\n仍挂起方向：\n1. 更大模型 / 更多 domain / 更长 seq 验证（受限于硬件环境）。\n\n仍开放工程线：\n- hyp-block-kv-vllm：Block KV cache + vLLM 集成。
 
-_updated: 2026-06-29 16:01:43_
+_updated: 2026-06-30 03:34:13_
 ### 异构 CP 对网络速度敏感，CXL / 类 RDMA 互联可显著突破网线局限
 
 type: `hypothesis` · status: `ongoing` · confidence: 0.85 · importance: 0.95 · source: `user-direction`
@@ -204,11 +204,18 @@ HCP 的数学基础即来源于此。
 _updated: 2026-06-29 06:06:09_
 ### Ring Attention 衍生方案综述仅作为文献背景，不单独实现
 
-type: `claim` · status: `ongoing` · confidence: 0.8 · importance: 0.8 · source: `user-direction + cost-benefit review`
+type: `claim` · status: `held` · confidence: 0.8 · importance: 0.8 · source: `user-direction + cost-benefit review`
 
-原始 Ring Attention、Striped Attention、ZigZag Ring Attention、Ring Flash Attention 等方案都基于 P2P KV ring，天然对跨节点带宽敏感。\n\n已完成：\n- Phase 1：在 Rust 中抽象出 RingSchedulingStrategy，实现 Vanilla / Striped / ZigZag 的 assignment 与 CPU mock 正确性验证。\n- Phase 2：把策略接入 coordinator，在 white CUDA + pearl HIP 真实硬件上完成三种策略对比。\n\n关键结论：\n1. HCP 的异构设计能承载 Vanilla/Striped/ZigZag 三种调度策略。\n2. 在现有 tailscale 网络下，策略差异 <6%，网络 recv 是绝对瓶颈。\n3. 这反向强化了 CXL/RDMA 必要性：即使算法层面优化调度，只要跨节点带宽不够，端到端仍然被通信锁住。\n\n仍待完成：\n- Phase 3：Ring Flash Attention（通过 PyO3 SDPA 或 kernel 集成实现局部 tile 的 FlashAttention 计算）。
+原始 Ring Attention、Striped Attention、ZigZag Ring Attention 等方案都基于 P2P KV ring，天然对跨节点带宽敏感。\n\n已完成：\n- Phase 1：在 Rust 中抽象出 RingSchedulingStrategy，实现 Vanilla / Striped / ZigZag 的 assignment 与 CPU mock 正确性验证。\n- Phase 2：把策略接入 coordinator，在 white CUDA + pearl HIP 真实硬件上完成三种策略对比。\n- Phase 4：撰写 docs/RING_DERIVATIVES_BENCHMARK.md 并更新 SCALING_ARGUMENT.md。\n\n关键结论：\n1. HCP 的异构设计能承载 Vanilla/Striped/ZigZag 三种调度策略。\n2. 在现有 tailscale 网络下，策略差异 <6%，网络 recv 是绝对瓶颈。\n3. Ring Flash Attention 是 kernel 层优化，在当前网络瓶颈下无法改善端到端性能，因此作为独立实现线挂起；未来高速互联可用时，RingSchedulingStrategy 已预留接入点。
 
-_updated: 2026-06-30 03:23:34_
+_updated: 2026-06-30 03:34:13_
+### 决策：Ring Flash Attention 实现线挂起
+
+type: `decision` · status: `held` · confidence: 0.85 · importance: 0.8 · source: `real-hardware measurements`
+
+Ring Flash Attention 的核心收益是减少 local attention tile 的 HBM 访问，从而加速计算。\n\n评估：\n- 当前 white+pearl 4K 任务中，local compute 只占总时间 <12%，网络 recv 占 >88%。\n- 实现 Ring Flash 需要自定义 CUDA/HIP kernel 或 PyO3 SDPA 桥接，工程量大。\n- 即使完美实现，也只能压缩那 <12% 的时间，无法改善跨节点带宽瓶颈。\n\n结论：在当前阶段不投入 Ring Flash 实现资源，优先用现有 Vanilla/Striped/ZigZag 证据完成 CXL/RDMA 必要性论证。未来网络升级后可重启。
+
+_updated: 2026-06-30 03:34:13_
 ### 下一步决策：更大模型 / 更多 domain？
 
 type: `uncertainty` · status: `suspended` · confidence: 0.5 · importance: 0.8 · source: `memory-bank/activeContext.md`

@@ -284,10 +284,17 @@ Per-domain total prefill transfer (Qwen2-0.5B, 24 layers):
 | 2026-05-22 | 4-domain cross-node 4K | 4K | MPS + 3× CUDA | ✅ ~83min (VPN) |
 | 2026-06-02 | 3-domain heterogeneous | 64–512 | MPS + CUDA + HIP | ✅ All exit=0 |
 | 2026-06-19 | 2-domain heterogeneous 1M | 1M | RTX 4090 (CUDA) + RX 9060 XT (HIP), 3:1 | ✅ ~2h 8min, white peak 23,999 MB |
+| 2026-06-30 | Ring derivatives comparison | 4K | RTX 4090 (CUDA) + RX 9060 XT (HIP) | ✅ Vanilla/Striped/ZigZag all pass |
 
 ---
 
-## 8. Conclusion
+## 8. Algorithmic Generality
+
+HCP is not limited to vanilla Ring Attention.  A direct comparison of Vanilla, Striped, and ZigZag scheduling on white+pearl (4K tokens) shows that all three run correctly on heterogeneous hardware.  However, even the best scheduling cannot overcome the cross-node bandwidth bottleneck: `recv_ms` dominates total time (>88%).  See `docs/RING_DERIVATIVES_BENCHMARK.md` for the full table and interpretation.
+
+---
+
+## 9. Conclusion
 
 HCP Ring Attention's value proposition is not incremental performance optimization — it is **fundamental capability extension**. Single-node inference cannot scale past ~131K tokens on consumer hardware (verified). PyTorch CP cannot run on heterogeneous hardware (by design). HCP is the only architecture that combines:
 
