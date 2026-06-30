@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-06-30] vLLM Block-Aware Ring 提取 PoC
+
+type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.85 · source: `white RTX 4090 vLLM 0.6.4 experiment`
+
+在 white RTX 4090 上使用 vLLM 0.6.4 + Qwen2.5-3B 验证：\n\n1. 可以定位 CacheEngine.gpu_cache[layer] 的物理 block 布局：shape=(2, num_gpu_blocks, block_size, num_kv_heads, head_dim)。\n2. 可以读取任意物理 block 的 K/V：gpu_cache[layer][0/1, block_id]。\n3. 可以将序列化后的 block 写入新的未使用物理 slot，字节级一致。\n4. 通过 scheduler.block_manager.get_block_table(seq) 可以获取序列的 block table。\n\n结论：vLLM Block-Aware Ring 的 block 提取/写入路径可行，不需要修改 attention kernel。\n\n脚本：scripts/poc_vllm_block_extract.py, scripts/inspect_vllm_blocks.py
+
+_updated: 2026-06-30 09:19:48_
 ### [2026-06-30] 正常规模工作负载对比：3B/7B，1K/4K
 
 type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `manual cross-node runs on white/pearl + white CPU/CUDA single-node benchmarks`

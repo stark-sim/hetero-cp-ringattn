@@ -30,6 +30,13 @@ type: `task` · status: `superseded` · confidence: 0.95 · importance: 0.95 · 
 1M v9（3:1 split）成功，prefill 24/24 + decode 5/5，exit=0。文档已同步：1M_CONTEXT_THUNDERBOLT_PLAN.md、SCALING_ARGUMENT.md、systemPatterns.md。当前无未完成的 1M 攻坚任务；下一步决定是否需要更大模型 / 更多 domain 验证。
 
 _updated: 2026-06-29 06:01:28_
+### Block KV cache + vLLM 集成：插件解耦 vs HCP 内联 PageAttention 双路线
+
+type: `hypothesis` · status: `ongoing` · confidence: 0.5 · importance: 0.9 · source: `user-direction`
+
+vLLM 与 HCP Ring Attention 的融合路线已确定为：不改 vLLM attention kernel，以 vLLM physical block 为粒度做跨节点 KV 交换（plugin 路线）。\n\n已完成：\n- 分析 vLLM 0.6.4 CacheEngine 结构。\n- PoC 验证 KV block 提取与重新写入可行。\n- 撰写 docs/VLLM_BLOCK_RING_PLUGIN.md 设计文档。\n\n下一步：\n1. 实现 VllmBlockRingBackend.prefill + block 提取。\n2. 单机构建两 worker PoC：prefill 两个 chunk，交换 block，合并 block table，decode 一步。\n3. 与 HCP coordinator/KvTransport 集成，做跨节点验证。
+
+_updated: 2026-06-30 09:19:48_
 ### 决策：以 Ring Attention 为 HCP 模型策略继续推进
 
 type: `decision` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `user direction`
@@ -78,16 +85,6 @@ HCP 适配关键点：
 - 当前 HCP 中 pearl（小/慢 domain）在 Phase 2 接收更多 remote block 的瓶颈，有望通过 striped 缓解。
 
 _updated: 2026-06-29 06:16:16_
-### Block KV cache + vLLM 集成：插件解耦 vs HCP 内联 PageAttention 双路线
-
-type: `hypothesis` · status: `open` · confidence: 0.5 · importance: 0.9 · source: `user-direction`
-
-当前 HCP 主要关注整段 KV cache 的 P2P 传输。下一步探索与 vLLM 生态结合：
-路线 A（插件解耦）：HCP 作为 vLLM 外部的 context-parallel 插件，通过标准接口交换 block-level KV，保持 vLLM 内部完整。
-路线 B（HCP 为主 + 内联 PageAttention）：HCP 自身管理 page/block 粒度的 KV，内联 PageAttention 的 scheduling/block 机制，深度整合以获得最佳性能。
-需要并行验证两条路线的工程可行性、correctness 风险和对 vLLM 版本升级的耦合度。
-
-_updated: 2026-06-29 06:06:09_
 ### [论文] Striped Attention: Faster Ring Attention for Causal Transformers
 
 type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.9 · source: `https://arxiv.org/abs/2311.09431`
