@@ -30,6 +30,13 @@ MODEL_DIR="${MODEL_DIR:-/home/stark/models/Qwen2-0.5B-1M}"
 SEQ_LEN="${SEQ_LEN:-4096}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-5}"
 STRATEGIES="${STRATEGIES:-vanilla striped zigzag}"
+CHUNK_SIZES="${CHUNK_SIZES:-}"
+# If CHUNK_SIZES is set, pass --chunk-sizes to the coordinator to override
+# the default capacity-aware split.  Use e.g. CHUNK_SIZES=2048,2048 for 1:1.
+CHUNK_SIZES_ARG=""
+if [ -n "${CHUNK_SIZES}" ]; then
+    CHUNK_SIZES_ARG="--chunk-sizes ${CHUNK_SIZES}"
+fi
 
 BASE_PORT="${BASE_PORT:-29600}"
 RUN_ID="ring-derivatives-$(date +%Y%m%d-%H%M%S)"
@@ -172,7 +179,7 @@ export LD_LIBRARY_PATH=/home/stark/libtorch/lib:\${LD_LIBRARY_PATH:-}
   --max-tokens ${MAX_NEW_TOKENS} \
   --num-domains 2 \
   --listen-addr 0.0.0.0:${COORD_PORT} \
-  --ring-strategy ${STRATEGY}
+  --ring-strategy ${STRATEGY} ${CHUNK_SIZES_ARG}
 EOF
     remote_run "${WHITE_SSH}" "${STRAT_REPORT}/coordinator.sh" "coordinator_${RUN_ID}_${STRATEGY}.sh" >"${STRAT_REPORT}/coordinator.log" 2>&1 || true
 
