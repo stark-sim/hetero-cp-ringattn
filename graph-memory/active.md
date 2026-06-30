@@ -2,6 +2,13 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 下一阶段：从 1M 可行性验证走向多条扩展线探索
+
+type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.95 · source: `user-direction`
+
+当前核心方向：以 Ring Attention 为策略基础，推进与 vLLM 的 Block KV cache 集成。\n\n已完成/持有：\n1. hyp-net-speed：white-pearl 带宽矩阵与稳定性复测证明网络是首要瓶颈。\n2. claim-ring-derivatives：在 HCP 上实现并对比 Vanilla/Striped/ZigZag；Ring Flash 挂起。\n3. decision-ring-attn-chosen：用户确认以 Ring Attention 为模型策略继续推进。\n\n下一步开放工程线：\n- hyp-block-kv-vllm：Block KV cache + vLLM 集成。
+
+_updated: 2026-06-30 09:00:34_
 ### 异构 CP 对网络速度敏感，CXL / 类 RDMA 互联可显著突破网线局限
 
 type: `hypothesis` · status: `held` · confidence: 0.85 · importance: 0.95 · source: `user-direction`
@@ -9,13 +16,6 @@ type: `hypothesis` · status: `held` · confidence: 0.85 · importance: 0.95 · 
 HCP 跨节点推理性能对网络带宽极度敏感。\n\n证据（正常规模工作负载）：\n1. Qwen2.5-3B/1K 单节点 CUDA 0.14s，分布式 ~12s（~85× 慢）。\n2. Qwen2.5-3B/4K 单节点 CUDA 0.27s，分布式 ~40s（~148× 慢）。\n3. 分布式 3B 甚至慢于单节点 CPU（3B/1K 12s vs 7.8s；3B/4K 40s vs 29s）。\n4. 策略差异仅在 3B/1K 可见（ZigZag ~5%），4K 时被网络完全掩盖。\n5. 7B bf16 无法装入 pearl 16GB HIP，分布式 7B 在当前无量化路径下不可行。\n\n结论：对正常规模的 3B/7B 模型和 1K/4K seq，跨节点网络仍是首要瓶颈；CXL/类 RDMA 高速互联是 HCP 实用的必要前提。
 
 _updated: 2026-06-30 06:27:31_
-### 下一阶段：从 1M 可行性验证走向多条扩展线探索
-
-type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.95 · source: `user-direction`
-
-当前核心方向：论证 CXL / 类 RDMA 高速互联对异构推理服务上主流舞台的重要性。\n\n已完成/持有：\n1. hyp-net-speed：white-pearl 带宽矩阵证明 100 Mbps 下 10-30x slowdown。\n2. claim-ring-derivatives：在 HCP 上实现并对比 Vanilla/Striped/ZigZag；Ring Flash 因当前网络瓶颈挂起。\n\n仍挂起方向：\n1. 更大模型 / 更多 domain / 更长 seq 验证（受限于硬件环境）。\n\n仍开放工程线：\n- hyp-block-kv-vllm：Block KV cache + vLLM 集成。
-
-_updated: 2026-06-30 03:34:13_
 ### HCP P2P KV ring 在 ≤1 Gbps 跨节点以太网下会成为端到端瓶颈
 
 type: `belief` · status: `held` · confidence: 0.85 · importance: 0.95 · source: `ev-net-speed-matrix-20260629`
@@ -30,6 +30,13 @@ type: `task` · status: `superseded` · confidence: 0.95 · importance: 0.95 · 
 1M v9（3:1 split）成功，prefill 24/24 + decode 5/5，exit=0。文档已同步：1M_CONTEXT_THUNDERBOLT_PLAN.md、SCALING_ARGUMENT.md、systemPatterns.md。当前无未完成的 1M 攻坚任务；下一步决定是否需要更大模型 / 更多 domain 验证。
 
 _updated: 2026-06-29 06:01:28_
+### 决策：以 Ring Attention 为 HCP 模型策略继续推进
+
+type: `decision` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `user direction`
+
+用户确认：ZigZag/Striped/Vanilla 的策略差异已理解，继续以 Ring Attention 作为 HCP 的跨节点上下文并行策略。\n\n当前选择：\n- 调度策略保留 Vanilla 为默认，ZigZag 在中小长度/计算敏感场景可作为备选。\n- Ring Flash Attention 因当前网络瓶颈挂起。\n\n下一步：推进 hyp-block-kv-vllm（Block KV cache + vLLM 集成）。
+
+_updated: 2026-06-30 09:00:34_
 ### 任务：实现并对比两种 HCP 调度策略
 
 type: `task` · status: `suspended` · confidence: 0.75 · importance: 0.9 · source: `user-direction`
