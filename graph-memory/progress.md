@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-06-30] Ring Attention derivatives Phase 2: real white+pearl comparison
+
+type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.95 · source: `manual cross-node run on white/pearl`
+
+在 white (RTX 4090 CUDA) + pearl (RX 9060 XT HIP) 真实异构硬件上运行 Vanilla / Striped / ZigZag 三种调度策略。\n\n配置：Qwen2-0.5B-1M，seq_len=4096，max_tokens=5，tailscale 网络。\n\n结果（perf log 聚合，单位 ms）：\n- Vanilla：domain0 total=15077 (recv 14477, local 133), domain1 total=14392 (recv 12663, local 648)；瓶颈 15077 ms。\n- Striped：domain0 total=14759 (recv 14140, local 119), domain1 total=13948 (recv 12256, local 652)；瓶颈 14759 ms。\n- ZigZag：domain0 total=15578 (recv 14906, local 129), domain1 total=14773 (recv 13040, local 656)；瓶颈 15578 ms。\n\n关键发现：\n1. 三种策略在真实异构硬件上全部跑通，无 NaN / crash。\n2. 网络 recv 占绝对主导（domain0 >95%，domain1 ~88%），调度策略对负载均衡的改善被网络带宽完全掩盖。\n3. 三种策略端到端差异 <6%，说明当前 tailscale 链路已经是瓶颈。\n4. Striped 改变了生成 token 序列（与 vanilla/zigzag 不同），这在无意义重复 prompt 的小模型上是可接受的位置敏感性表现。\n\n报告：reports/ring-derivatives-manual-20260630-112010/
+
+_updated: 2026-06-30 03:23:34_
 ### [2026-06-29] Ring Attention derivatives Phase 1: CPU mock correctness and load balance
 
 type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `cargo test --features tch-backend test_ring_attention_derivatives_uneven_perf`

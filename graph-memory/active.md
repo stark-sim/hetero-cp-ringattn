@@ -206,9 +206,9 @@ _updated: 2026-06-29 06:06:09_
 
 type: `claim` · status: `ongoing` · confidence: 0.8 · importance: 0.8 · source: `user-direction + cost-benefit review`
 
-原始 Ring Attention、Striped Attention、ZigZag Ring Attention、Ring Flash Attention 等方案都基于 P2P KV ring，天然对跨节点带宽敏感。\n\n当前状态：已从“仅文献综述”升级为“在 HCP 真实代码上实现并对比”的独立工作线。Phase 1 已完成：在 Rust 中抽象出 RingSchedulingStrategy，实现 Vanilla / Striped / ZigZag 的 assignment 与 CPU mock 正确性验证。\n\n下一步：把策略接入 coordinator，在 white/pearl 真实硬件上对比三种策略的 wall-time 和负载均衡。
+原始 Ring Attention、Striped Attention、ZigZag Ring Attention、Ring Flash Attention 等方案都基于 P2P KV ring，天然对跨节点带宽敏感。\n\n已完成：\n- Phase 1：在 Rust 中抽象出 RingSchedulingStrategy，实现 Vanilla / Striped / ZigZag 的 assignment 与 CPU mock 正确性验证。\n- Phase 2：把策略接入 coordinator，在 white CUDA + pearl HIP 真实硬件上完成三种策略对比。\n\n关键结论：\n1. HCP 的异构设计能承载 Vanilla/Striped/ZigZag 三种调度策略。\n2. 在现有 tailscale 网络下，策略差异 <6%，网络 recv 是绝对瓶颈。\n3. 这反向强化了 CXL/RDMA 必要性：即使算法层面优化调度，只要跨节点带宽不够，端到端仍然被通信锁住。\n\n仍待完成：\n- Phase 3：Ring Flash Attention（通过 PyO3 SDPA 或 kernel 集成实现局部 tile 的 FlashAttention 计算）。
 
-_updated: 2026-06-29 16:01:43_
+_updated: 2026-06-30 03:23:34_
 ### 下一步决策：更大模型 / 更多 domain？
 
 type: `uncertainty` · status: `suspended` · confidence: 0.5 · importance: 0.8 · source: `memory-bank/activeContext.md`
