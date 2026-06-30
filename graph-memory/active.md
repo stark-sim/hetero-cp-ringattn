@@ -6,9 +6,9 @@
 
 type: `hypothesis` · status: `held` · confidence: 0.85 · importance: 0.95 · source: `user-direction`
 
-HCP 跨节点推理性能对网络带宽极度敏感。\n\n证据：\n1. 2026-06-29 带宽矩阵：100 Mbps 下单次测得 206s/684s，方差大。\n2. 2026-06-30 稳定性复测：100 Mbps 5 次重复得到 204/205/217/203/203s，均值 206.4s，方差 <3%。\n3. 基线 3 次重复 17/18/17s，均值 17.3s。\n4. 单节点 white RTX 4090 CUDA 完成同样 4096-token 任务只需 0.12s；HCP 分布式基线约 15s（~126× 慢），100 Mbps 约 206s（~1717× 慢）。\n5. 单节点 CPU（Mac）4.5s 也快于 HCP 分布式基线，证明瓶颈不是 GPU 算力，而是跨节点网络。\n\n结论：跨节点带宽是 HCP 端到端性能的首要瓶颈；CXL / 类 RDMA 高速互联不是可选项，而是必要前提。
+HCP 跨节点推理性能对网络带宽极度敏感。\n\n证据（正常规模工作负载）：\n1. Qwen2.5-3B/1K 单节点 CUDA 0.14s，分布式 ~12s（~85× 慢）。\n2. Qwen2.5-3B/4K 单节点 CUDA 0.27s，分布式 ~40s（~148× 慢）。\n3. 分布式 3B 甚至慢于单节点 CPU（3B/1K 12s vs 7.8s；3B/4K 40s vs 29s）。\n4. 策略差异仅在 3B/1K 可见（ZigZag ~5%），4K 时被网络完全掩盖。\n5. 7B bf16 无法装入 pearl 16GB HIP，分布式 7B 在当前无量化路径下不可行。\n\n结论：对正常规模的 3B/7B 模型和 1K/4K seq，跨节点网络仍是首要瓶颈；CXL/类 RDMA 高速互联是 HCP 实用的必要前提。
 
-_updated: 2026-06-30 05:33:11_
+_updated: 2026-06-30 06:27:31_
 ### 下一阶段：从 1M 可行性验证走向多条扩展线探索
 
 type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.95 · source: `user-direction`

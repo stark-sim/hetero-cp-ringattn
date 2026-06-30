@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-06-30] 正常规模工作负载对比：3B/7B，1K/4K
+
+type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `manual cross-node runs on white/pearl + white CPU/CUDA single-node benchmarks`
+
+在 white+pearl 上对 Qwen2.5-3B / 7B 进行单节点与分布式对比，seq=1024/4096。\n\n单节点基线（white）：\n- 3B/1K CUDA 0.14s, CPU 7.78s\n- 3B/4K CUDA 0.27s, CPU 29.26s\n- 7B/1K CUDA 0.22s, CPU 17.58s\n- 7B/4K CUDA 0.52s, CPU 64.09s\n\n分布式 3B 策略对比（1:1 切分）：\n- 1K：Vanilla mean 12.2s, Striped 11.9s (-2.5%), ZigZag 11.5s (-5.5%)\n- 4K：Vanilla 39.8s, Striped 39.8s, ZigZag 39.6s (<1% 差异)\n\n关键结论：\n1. 在正常 3B/1K 场景下，ZigZag 比 Vanilla 有约 5% 收益，但方差与收益同量级。\n2. 在 3B/4K 下，跨节点传输主导，策略差异消失。\n3. 分布式 3B GPU 仍慢于单节点 CPU：1K 12s vs 7.8s；4K 40s vs 29s。\n4. 7B bf16 无法在 pearl 的 16GB HIP 卡上加载，分布式 7B 需要量化支持。\n\n报告：reports/normal-workloads-3b-20260630-142629/
+
+_updated: 2026-06-30 06:27:31_
 ### [2026-06-30] 单节点 vs 分布式：4096 token 时间分解
 
 type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.95 · source: `local CPU/MPS benchmark + white CUDA single-node benchmark`

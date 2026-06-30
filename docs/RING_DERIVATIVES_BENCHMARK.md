@@ -52,6 +52,43 @@ Ring Flash Attention is a **kernel-level** optimization: it replaces the local a
 
 If future hardware provides a much faster interconnect, Ring Flash becomes relevant again; the existing `RingSchedulingStrategy` abstraction leaves a clean insertion point.
 
+## Normal-workload comparison: 3B / 7B models, 1K / 4K sequences
+
+The earlier 0.5B-1M numbers are an extreme exploration scenario.  Below is a more realistic comparison on **Qwen2.5-3B** and **Qwen2.5-7B** at normal 1K and 4K sequence lengths.
+
+### Single-node baselines (white)
+
+| Model | Seq | CUDA | CPU |
+|-------|-----|-----:|----:|
+| 3B | 1K | **0.14 s** | 7.78 s |
+| 3B | 4K | **0.27 s** | 29.26 s |
+| 7B | 1K | **0.22 s** | 17.58 s |
+| 7B | 4K | **0.52 s** | 64.09 s |
+
+### Distributed 3B strategy comparison (white CUDA + pearl HIP, 1:1 split)
+
+**seq=1K**
+
+| Strategy | mean bottleneck (ms) | min (ms) | max (ms) | vs vanilla |
+|----------|---------------------:|---------:|---------:|-----------:|
+| Vanilla  | 12216 | 10411 | 13382 | — |
+| Striped  | 11914 | 11162 | 12711 | -2.5% |
+| ZigZag   | 11546 | 10591 | 12570 | -5.5% |
+
+**seq=4K**
+
+| Strategy | bottleneck (ms) | vs vanilla |
+|----------|----------------:|-----------:|
+| Vanilla  | 39818 | — |
+| Striped  | 39818 | 0.0% |
+| ZigZag   | 39553 | -0.7% |
+
+### What this shows
+
+1. **Strategy effects only appear at small scale.**  ZigZag gives a ~5% win at 3B/1K, where compute is still a visible fraction of wall time.  At 3B/4K the cross-node transfer swamps everything and the three strategies converge.
+2. **Distributed GPU is still slower than single-node CPU at normal lengths.**  3B/1K distributed ~12 s vs CPU 7.8 s; 3B/4K distributed ~40 s vs CPU 29 s.
+3. **7B cannot run distributed on this hardware.**  Qwen2.5-7B in bf16 does not fit on pearl's 16GB RX 9060 XT; it OOMs during weight load.  A quantized 7B path would be needed.
+
 ## Appendix A: Single-node vs distributed time breakdown
 
 The ~15 s distributed numbers are **not** GPU compute time.  A single RTX 4090 completes the same 4096-token forward+decode in 0.12 s.  The distributed ring is slow because it ships KV blocks across the network every layer.
