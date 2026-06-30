@@ -55,6 +55,7 @@ pub struct HcpRingAttentionBackend {
     /// 如果为 None，则默认假设本地 chunk 是原始序列中的连续段。
     position_ids: Option<Tensor>,
     /// 【调度策略】仅影响输入分片方式，不影响 online softmax 数学。
+    #[allow(dead_code)]
     strategy: RingSchedulingStrategy,
     /// 【本地 KV cache 的全局起始位置】用于 micro-block 元数据。
     /// 对于非连续分片，等于 position_ids 的第一个元素。

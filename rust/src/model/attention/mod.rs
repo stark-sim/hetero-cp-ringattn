@@ -15,7 +15,7 @@ pub mod backend;
 pub mod ring;
 
 #[cfg(feature = "tch-backend")]
-pub use backend::{AttentionBackend, LocalAttentionBackend};
+pub use backend::AttentionBackend;
 #[cfg(feature = "tch-backend")]
 pub use ring::HcpRingAttentionBackend;
-pub use strategy::{build_assignment, build_domain_positions, build_inverse_perm, position_ids_tensor, RingSchedulingStrategy};
+pub use strategy::RingSchedulingStrategy;

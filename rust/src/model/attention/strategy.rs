@@ -25,6 +25,7 @@ pub enum RingSchedulingStrategy {
 
 impl RingSchedulingStrategy {
     /// All supported variants, useful for benchmarks.
+    #[allow(dead_code)]
     pub fn all() -> &'static [RingSchedulingStrategy] {
         &[
             RingSchedulingStrategy::Vanilla,
@@ -56,7 +57,7 @@ pub fn build_assignment(chunks: &[usize], strategy: RingSchedulingStrategy) -> V
         RingSchedulingStrategy::Vanilla => {
             let mut assign = Vec::with_capacity(seq_len);
             for (domain, &chunk) in chunks.iter().enumerate() {
-                assign.extend(std::iter::repeat(domain).take(chunk));
+                assign.extend(vec![domain; chunk]);
             }
             assign
         }
@@ -91,14 +92,14 @@ pub fn build_assignment(chunks: &[usize], strategy: RingSchedulingStrategy) -> V
             }
             let mut assignment = vec![0usize; seq_len];
             let mut pos = 0usize;
-            for domain in 0..num_domains {
-                for _ in 0..prefix_lens[domain] {
+            for (domain, &len) in prefix_lens.iter().enumerate() {
+                for _ in 0..len {
                     assignment[pos] = domain;
                     pos += 1;
                 }
             }
-            for domain in (0..num_domains).rev() {
-                for _ in 0..suffix_lens[domain] {
+            for (domain, &len) in suffix_lens.iter().enumerate().rev() {
+                for _ in 0..len {
                     assignment[pos] = domain;
                     pos += 1;
                 }
@@ -124,6 +125,7 @@ pub fn build_domain_positions(assignment: &[usize]) -> Vec<Vec<usize>> {
 ///
 /// For each global position `p`, `inverse[p]` is the index in the concatenated
 /// `[output_0, output_1, ...]` tensor that corresponds to `p`.
+#[allow(dead_code)]
 pub fn build_inverse_perm(assignment: &[usize]) -> Vec<i64> {
     let positions = build_domain_positions(assignment);
     let num_domains = positions.len();
@@ -142,6 +144,7 @@ pub fn build_inverse_perm(assignment: &[usize]) -> Vec<i64> {
 
 #[cfg(feature = "tch-backend")]
 /// Convert a list of global positions into a 1-D Int64 tensor on `device`.
+#[allow(dead_code)]
 pub fn position_ids_tensor(positions: &[usize], device: tch::Device) -> tch::Tensor {
     let ids: Vec<i64> = positions.iter().map(|&p| p as i64).collect();
     tch::Tensor::from_slice(&ids).to_device(device)
