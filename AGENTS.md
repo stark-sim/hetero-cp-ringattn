@@ -57,6 +57,18 @@ This project uses a graph-backed memory system in `graph-memory/` for cross-sess
 - `distributed_worker.rs` supports `--local-domain-ids 0,1` for multi-domain workers in a single process, but this is for local development convenience. For true cross-node heterogeneous validation, each platform must run its own worker process(es).
 - Record cross-node results with explicit worker distribution: which domain runs on which platform and device.
 
+### Environment Variable Hygiene (multi-node / multi-library setups)
+
+When running on heterogeneous hosts that mix libtorch, CUDA, ROCm, and conda, follow these rules to avoid "whoever loads first wins" library conflicts:
+
+1. **Never globally export `LD_PRELOAD`.**  It injects into every process spawned from that shell and will eventually break unrelated tools (conda, rocm-smi, etc.).  Preload only at command scope:
+   - Interactive: `hiprun <command>`
+   - Scripts: `LD_PRELOAD=/path/libtorch_hip.so ./binary ...` (single-line prefix)
+2. **Set each environment variable in exactly one place.**  Put machine/device-level vars (`LIBTORCH`, `LD_LIBRARY_PATH`, device indices) in `~/.bashrc` (inherited by children).  Put functions/aliases like `hiprun` only in `~/.bashrc` (functions are not exported).  Do not duplicate the same logic in `~/.profile`.
+3. **Make `LD_LIBRARY_PATH` updates idempotent.**  Do not repeatedly `export LD_LIBRARY_PATH=new:$LD_LIBRARY_PATH` on every shell source.  Use a helper such as `_ld_prepend`, or use a temporary prefix for one-shot commands.
+4. **Do not keep catch-all library directories (e.g. `miniconda3/lib`, multiple torch installs) in the global `LD_LIBRARY_PATH`.**  Conflicting `libstdc++`, `libzstd`, or `libtorch` copies will shadow each other and produce nondeterministic load errors.  Project-specific libraries should be referenced in project scripts or scoped wrappers like `hiprun`.
+5. **Prefer even stronger isolation with direnv (`.envrc`)** if the current global-dotfile setup becomes hard to maintain.
+
 ### Special Commands:
 - `memory bank update` / `graph memory update` / `memory bank güncelle` -> Review and update graph memory, regenerate markdown views
 - `memory bank status` / `graph memory status` / `memory bank durumu` -> Show current active/progress summary
