@@ -13,6 +13,7 @@ engine_args = EngineArgs(
     enforce_eager=True,
     max_num_seqs=1,
     block_size=16,
+    device="cuda",
 )
 engine = LLMEngine.from_engine_args(engine_args)
 
