@@ -256,11 +256,18 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
         seq_start: int,
         seq_end: int,
         block_table: List[int],
+        table_seq_offset: int = 0,
     ) -> KvBlock:
-        """Extract K/V for a range using an explicit physical block table."""
+        """Extract K/V for a range using an explicit physical block table.
+
+        ``table_seq_offset`` is the global token position represented by
+        ``block_table[0]``.  For a peer chunk that starts at global position
+        ``G``, pass ``table_seq_offset=G`` so the physical block indices line
+        up with the requested global ``seq_start..seq_end``.
+        """
         block_size = self.block_size
-        start_block = seq_start // block_size
-        end_block = (seq_end + block_size - 1) // block_size
+        start_block = (seq_start - table_seq_offset) // block_size
+        end_block = (seq_end - table_seq_offset + block_size - 1) // block_size
         physical_ids = block_table[start_block:end_block]
 
         k_blocks = []

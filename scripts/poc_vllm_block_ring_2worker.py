@@ -104,6 +104,7 @@ def main():
             seq_start=len(chunk_a),
             seq_end=len(chunk_a) + len(chunk_b),
             block_table=peer_btable,
+            table_seq_offset=len(chunk_a),
         )
         plugin.apply_peer_kv(layer_idx, peer_kv)
 
