@@ -35,6 +35,8 @@ def main():
     ), help="Input prompt text")
     parser.add_argument("--chunk-len", type=int, default=16, help="Tokens in the local chunk (multiple of vLLM block_size)")
     parser.add_argument("--gpu-mem", type=float, default=0.5)
+    parser.add_argument("--baseline", action="store_true",
+                        help="Prefill the full prompt directly via the plugin and decode (no peer exchange)")
     args = parser.parse_args()
 
     # Load tokenizer to split prompt deterministically.
@@ -85,6 +87,24 @@ def main():
         f"chunk-len ({args.chunk_len}) must be a multiple of "
         f"vLLM block_size ({plugin.block_size}) so peer KV starts on a block boundary"
     )
+
+    # ------------------------------------------------------------------
+    # Optional baseline: prefill the whole prompt directly, no peer exchange.
+    # ------------------------------------------------------------------
+    if args.baseline:
+        print(f"[dist] baseline prefill full prompt ({len(token_ids)} tokens)")
+        plugin.prefill(token_ids, seq_offset=0)
+        plugin.set_global_tokens(token_ids)
+        dist_logits = plugin.decode(token_ids[-1])
+        dist_token = int(dist_logits.argmax())
+        print(f"[dist] baseline next token: {dist_token} ('{tokenizer.decode([dist_token])}')")
+        match = dist_token == ref_token
+        print(f"\n[result] tokens match: {match}")
+        if not match:
+            print("WARNING: baseline decode disagrees with reference.")
+            sys.exit(1)
+        plugin.shutdown()
+        return
 
     # Domain 0 prefills chunk A.
     print(f"[dist] prefill chunk A: {chunk_a}")
