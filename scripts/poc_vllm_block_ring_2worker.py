@@ -118,6 +118,11 @@ def main():
     peer_btable = plugin.prefill_peer_chunk(chunk_b, seq_offset=len(chunk_a))
     print(f"[dist] peer block table: {peer_btable}")
 
+    # TEMP: inspect which slots in the peer block were written.
+    peer_k0, peer_v0 = plugin.extract_block(0, peer_btable[0])
+    print(f"[TEMP] peer block k shape {tuple(peer_k0.shape)}, token norms: "
+          f"{peer_k0.reshape(plugin.block_size, -1).norm(dim=1).tolist()}")
+
     for layer_idx in range(plugin.num_layers):
         peer_kv = plugin.get_kv_block_from_table(
             layer_idx,
