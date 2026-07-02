@@ -74,6 +74,8 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
         self.num_gpu_blocks = self.cache_config.num_gpu_blocks
 
         self.vocab_size = self.model_config.get_vocab_size()
+        hf_config = getattr(self.model_config, "hf_config", None)
+        self.rope_base = getattr(hf_config, "rope_theta", 10000.0)
         self._history: List[int] = []
         self._request_id = "ring_attn_request"
         self._seq_id = 0
@@ -81,7 +83,9 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
         # Combined block table used for decode; set after peer KV exchange.
         self._combined_block_table: Optional[List[int]] = None
         self._local_block_table: List[int] = []
-        self._remote_block_pool: List[int] = []
+        # Physical blocks reserved for the current peer chunk.  Shared across
+        # all layers because one block table is used for every layer in vLLM.
+        self._remote_block_table: List[int] = []
 
         print(
             f"[vllm block ring] loaded, vocab_size={self.vocab_size}, "
@@ -174,6 +178,10 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
     def load_model(self, model_dir: str, device: str) -> None:
         pass
 
+    def set_global_tokens(self, tokens: List[int]) -> None:
+        """Set the full global token sequence after KV exchange."""
+        self._history = list(tokens)
+
     def _allocate_local_blocks(self, num_tokens: int) -> List[int]:
         """Allocate physical blocks for a local token sequence."""
         from vllm.utils import Device
@@ -238,11 +246,22 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
         all blocks that intersect the requested range.  The peer side will
         write them into matching positions in its combined block table.
         """
+        return self.get_kv_block_from_table(
+            layer_idx, seq_start, seq_end, self.get_local_block_table()
+        )
+
+    def get_kv_block_from_table(
+        self,
+        layer_idx: int,
+        seq_start: int,
+        seq_end: int,
+        block_table: List[int],
+    ) -> KvBlock:
+        """Extract K/V for a range using an explicit physical block table."""
         block_size = self.block_size
         start_block = seq_start // block_size
         end_block = (seq_end + block_size - 1) // block_size
-        local_blocks = self.get_local_block_table()
-        physical_ids = local_blocks[start_block:end_block]
+        physical_ids = block_table[start_block:end_block]
 
         k_blocks = []
         v_blocks = []
@@ -259,25 +278,70 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
 
         return KvBlock(layer_idx, seq_start, seq_end, k, v)
 
+    def prefill_peer_chunk(self, chunk: List[int], seq_offset: int) -> List[int]:
+        """
+        Prefill a peer chunk into a fresh set of physical blocks.
+
+        This is useful for single-process sanity checks where both the local
+        and peer chunks are prefilled by the same vLLM instance.  The returned
+        block ids can be passed to get_kv_block_from_table() and then to
+        apply_peer_kv().
+        """
+        from vllm.sequence import (
+            ExecuteModelRequest,
+            SequenceData,
+            SequenceGroupMetadata,
+        )
+
+        peer_block_table = self._allocate_local_blocks(len(chunk))
+        seq_data = SequenceData.from_seqs(chunk)
+        seq_group_metadata = SequenceGroupMetadata(
+            request_id=f"{self._request_id}_peer_{seq_offset}",
+            is_prompt=True,
+            seq_data={self._seq_id: seq_data},
+            sampling_params=None,
+            block_tables={self._seq_id: peer_block_table},
+            do_sample=False,
+        )
+        execute_model_req = ExecuteModelRequest(
+            seq_group_metadata_list=[seq_group_metadata]
+        )
+        self.llm.llm_engine.model_executor.execute_model(execute_model_req)
+        return peer_block_table
+
     def apply_peer_kv(self, layer_idx: int, peer_block: KvBlock) -> None:
         """
         Insert peer KV blocks into reserved physical slots.
 
         The peer_block.k/v tensors are expected to be stacked physical blocks
-        in global token order.  We reserve a contiguous run of free physical
-        blocks and write them in.
+        in global token order.  The same physical blocks are reused for every
+        layer because vLLM's block table is shared across layers.
+
+        Peer workers prefill their chunk with local positions (0..chunk_len-1),
+        so we rotate the peer keys by the global start offset so that RoPE
+        positions match the global sequence during decode.
         """
         if peer_block.k.numel() == 0:
             return
 
         num_blocks = peer_block.k.shape[0]
-        reserved = self._reserve_remote_blocks(num_blocks)
-        for i, bid in enumerate(reserved):
-            self.insert_block(layer_idx, bid, peer_block.k[i], peer_block.v[i])
-
         if layer_idx == 0:
-            # Build the combined block table once, after layer 0.
-            self._build_combined_block_table(peer_block.global_seq_start, reserved)
+            # Reserve once and reuse the same physical ids for all layers.
+            self._remote_block_table = self._reserve_remote_blocks(num_blocks)
+            self._build_combined_block_table(peer_block.global_seq_start)
+        else:
+            # Sanity check: every layer must ship the same number of blocks.
+            assert len(self._remote_block_table) == num_blocks, (
+                f"peer block count mismatch at layer {layer_idx}: "
+                f"expected {len(self._remote_block_table)}, got {num_blocks}"
+            )
+
+        # Correct RoPE positions from local (0-based) to global.
+        peer_k = self._rope_delta_rotate_keys(
+            peer_block.k, peer_block.global_seq_start
+        )
+        for i, bid in enumerate(self._remote_block_table):
+            self.insert_block(layer_idx, bid, peer_k[i], peer_block.v[i])
 
     def _reserve_remote_blocks(self, num_blocks: int) -> List[int]:
         """Reserve free physical blocks for incoming peer KV."""
@@ -286,24 +350,64 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
         from vllm.utils import Device
 
         reserved = []
+        prev_block = None
         for _ in range(num_blocks):
             # Use the allocator directly to obtain a mutable GPU block.
             block = bm.block_allocator.allocate_mutable_block(
-                prev_block=None, device=Device.GPU
+                prev_block=prev_block, device=Device.GPU
             )
             assert block.block_id is not None
             reserved.append(block.block_id)
-        self._remote_block_pool.extend(reserved)
+            prev_block = block
         return reserved
 
-    def _build_combined_block_table(
-        self, peer_seq_start: int, peer_reserved: List[int]
-    ) -> None:
+    def _rope_delta_rotate_keys(
+        self, k_blocks: torch.Tensor, delta: int
+    ) -> torch.Tensor:
+        """
+        Rotate cached key vectors by ``delta`` positions.
+
+        Peer workers prefill with local positions (0..chunk_len-1).  Applying
+        a delta rotation brings those keys to their global positions so that
+        RoPE-aligned decode queries attend correctly.  Values are not
+        position-dependent and are left unchanged.
+        """
+        if delta == 0:
+            return k_blocks
+
+        orig_shape = k_blocks.shape
+        # [num_blocks * block_size, num_kv_heads, head_dim]
+        k = k_blocks.reshape(-1, *orig_shape[2:])
+        dtype = k.dtype
+        device = k.device
+        kf = k.to(torch.float32)
+
+        # Reshape to complex pairs (Neox/GPT-NeoX style RoPE).
+        head_dim = self.head_dim
+        x = kf.reshape(*kf.shape[:-1], head_dim // 2, 2)
+        x_complex = torch.view_as_complex(x)
+
+        inv_freq = 1.0 / (
+            self.rope_base
+            ** (
+                torch.arange(0, head_dim, 2, device=device, dtype=torch.float32)
+                / head_dim
+            )
+        )
+        angles = delta * inv_freq  # [head_dim // 2]
+        rot = torch.exp(1j * angles)  # [head_dim // 2]
+
+        x_rot = x_complex * rot[None, None, :]
+        x_out = torch.view_as_real(x_rot)  # [L, H, head_dim//2, 2]
+        return x_out.reshape(orig_shape).to(dtype)
+
+    def _build_combined_block_table(self, peer_seq_start: int) -> None:
         """
         Merge local and remote physical block ids into a single block table
         in global token order.
         """
         local_table = self.get_local_block_table()
+        peer_reserved = self._remote_block_table
         peer_start_block = (peer_seq_start + self.block_size - 1) // self.block_size
         # Simple two-domain merge: local covers [0, peer_start), remote covers
         # [peer_start, peer_start + len(peer_reserved)).

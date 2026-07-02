@@ -29,8 +29,11 @@ from hcp_vllm_block_ring_plugin import VllmBlockRingPlugin
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-dir", required=True, help="Path to HF model")
-    parser.add_argument("--prompt", default="The capital of France is", help="Input prompt text")
-    parser.add_argument("--chunk-len", type=int, default=4, help="Tokens in the local chunk")
+    parser.add_argument("--prompt", default=(
+        "The quick brown fox jumps over the lazy dog while the cat sleeps "
+        "on the warm sunny afternoon near the old oak tree."
+    ), help="Input prompt text")
+    parser.add_argument("--chunk-len", type=int, default=16, help="Tokens in the local chunk (multiple of vLLM block_size)")
     parser.add_argument("--gpu-mem", type=float, default=0.5)
     args = parser.parse_args()
 
@@ -78,6 +81,10 @@ def main():
         dtype="float32",
         gpu_memory_utilization=args.gpu_mem,
     )
+    assert args.chunk_len % plugin.block_size == 0, (
+        f"chunk-len ({args.chunk_len}) must be a multiple of "
+        f"vLLM block_size ({plugin.block_size}) so peer KV starts on a block boundary"
+    )
 
     # Domain 0 prefills chunk A.
     print(f"[dist] prefill chunk A: {chunk_a}")
@@ -85,30 +92,29 @@ def main():
     local_btable = plugin.get_local_block_table()
     print(f"[dist] local block table: {local_btable}")
 
-    # Simulate receiving domain 1's chunk B by allocating remote slots and
-    # copying A's blocks there, then pretending B's blocks are in A's slots.
-    # For a real cross-node run, the tensors would be serialized and sent.
-    num_remote_blocks = (len(chunk_b) + plugin.block_size - 1) // plugin.block_size
-    remote_bids = plugin._reserve_remote_blocks(num_remote_blocks)
-    print(f"[dist] reserved remote slots: {remote_bids}")
+    # Prefill chunk B into its own physical blocks (simulating domain 1),
+    # then extract its KV and apply it as peer KV on domain 0.
+    print(f"[dist] prefill peer chunk B: {chunk_b}")
+    peer_btable = plugin.prefill_peer_chunk(chunk_b, seq_offset=len(chunk_a))
+    print(f"[dist] peer block table: {peer_btable}")
 
-    # In the simulation we copy A's KV into the remote slots (pretend they are
-    # B's KV).  The combined block table is then local + remote in token order.
     for layer_idx in range(plugin.num_layers):
-        for i, rbid in enumerate(remote_bids):
-            # Just copy the i-th local block into the remote slot.
-            local_bid = local_btable[i % len(local_btable)]
-            k, v = plugin.extract_block(layer_idx, local_bid)
-            plugin.insert_block(layer_idx, rbid, k, v)
+        peer_kv = plugin.get_kv_block_from_table(
+            layer_idx,
+            seq_start=len(chunk_a),
+            seq_end=len(chunk_a) + len(chunk_b),
+            block_table=peer_btable,
+        )
+        plugin.apply_peer_kv(layer_idx, peer_kv)
 
-    # Build combined block table: local blocks cover chunk A, remote blocks
-    # cover the rest.
-    plugin._build_combined_block_table(len(chunk_a), remote_bids)
     print(f"[dist] combined block table: {plugin._combined_block_table}")
 
-    # Decode: append the first token of chunk B as the decode input.
-    decode_input = chunk_b[0]
-    print(f"[dist] decode input token: {decode_input}")
+    # Set the full global sequence so the decode step sees the complete prompt.
+    plugin.set_global_tokens(token_ids)
+
+    # Decode: the next token is generated from the last prompt token.
+    decode_input = token_ids[-1]
+    print(f"[dist] decode input token (last prompt token): {decode_input}")
     dist_logits = plugin.decode(decode_input)
     dist_token = int(dist_logits.argmax())
     print(f"[dist] next token: {dist_token} ('{tokenizer.decode([dist_token])}')")
