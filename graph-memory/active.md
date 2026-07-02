@@ -34,9 +34,9 @@ _updated: 2026-06-29 06:01:28_
 
 type: `hypothesis` · status: `ongoing` · confidence: 0.5 · importance: 0.9 · source: `user-direction`
 
-vLLM 与 HCP Ring Attention 的融合路线已确定为：不改 vLLM attention kernel，以 vLLM physical block 为粒度做跨节点 KV 交换（plugin 路线）。\n\n已完成：\n- 分析 vLLM 0.6.4 CacheEngine 结构。\n- PoC 验证 KV block 提取与重新写入可行。\n- 撰写 docs/VLLM_BLOCK_RING_PLUGIN.md 设计文档。\n\n下一步：\n1. 实现 VllmBlockRingBackend.prefill + block 提取。\n2. 单机构建两 worker PoC：prefill 两个 chunk，交换 block，合并 block table，decode 一步。\n3. 与 HCP coordinator/KvTransport 集成，做跨节点验证。
+vLLM 与 HCP Ring Attention 的融合路线已确定为：不改 vLLM attention kernel，以 vLLM physical block 为粒度做跨节点 KV 交换（plugin 路线）。\n\n已完成：\n- 分析 vLLM 0.6.4 CacheEngine 结构。\n- PoC 验证 KV block 提取与重新写入可行。\n- 撰写 docs/VLLM_BLOCK_RING_PLUGIN.md 设计文档。\n- 搜索确认无现成 vLLM gfx1200 wheel；正在 pearl 上用 TheRock gfx120X-all nightly + 源码编译 vLLM 0.6.4。\n\n下一步：\n1. 等待 pearl 上 vLLM 源码编译完成并验证最小预fill。\n2. 实现 VllmBlockRingBackend.prefill + block 提取。\n3. 跨节点 2-worker PoC：white vLLM CUDA + pearl vLLM ROCm。
 
-_updated: 2026-06-30 09:19:48_
+_updated: 2026-07-02 14:15:47_
 ### 决策：以 Ring Attention 为 HCP 模型策略继续推进
 
 type: `decision` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `user direction`

@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-07-01] 搜索 vLLM RDNA4/gfx1200 社区轮子结果
+
+type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.8 · source: `web search`
+
+搜索结论：\n\n1. 未发现可直接 pip install 的 vLLM 0.6.4 gfx1200 预编译 wheel。\n2. ROCm TheRock 提供 per-family nightly Python 包：gfx120X-all 索引（https://rocm.nightlies.amd.com/v2/gfx120X-all/），包含 PyTorch/ROCm 对 gfx1200/gfx1201 的支持。\n3. vLLM 上游 rocm/vllm-dev:base Docker 的 PYTORCH_ROCM_ARCH 已包含 gfx1200;gfx1201，说明源码构建的 arch list 已经支持。\n4. Step-Audio 的 Dockerfile 展示了在 gfx1151/gfx1200/gfx1201 上源码构建 vLLM 的 patch 路径。\n5. 社区 ROCmLibs 提供 gfx1201 的 hipblaslt/rocblas 库，但主要用于 Windows/koboldcpp。\n\n结论：没有现成轮子；最可行路径是用 TheRock gfx120X-all  nightly PyTorch + 源码编译 vLLM 0.6.4，目标 arch gfx1200。
+
+_updated: 2026-07-02 14:15:47_
 ### [2026-06-30] vLLM Block-Aware Ring 提取 PoC
 
 type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.85 · source: `white RTX 4090 vLLM 0.6.4 experiment`
