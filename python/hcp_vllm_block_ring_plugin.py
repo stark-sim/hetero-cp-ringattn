@@ -294,12 +294,14 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
         )
 
         peer_block_table = self._allocate_local_blocks(len(chunk))
+        from vllm import SamplingParams
+
         seq_data = SequenceData.from_seqs(chunk)
         seq_group_metadata = SequenceGroupMetadata(
             request_id=f"{self._request_id}_peer_{seq_offset}",
             is_prompt=True,
             seq_data={self._seq_id: seq_data},
-            sampling_params=None,
+            sampling_params=SamplingParams(temperature=0, max_tokens=1),
             block_tables={self._seq_id: peer_block_table},
             do_sample=False,
         )
