@@ -417,7 +417,11 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
                 / head_dim
             )
         )
-        angles = delta * inv_freq  # [head_dim // 2]
+        # Rotate by -delta: the peer prefilled with local positions 0..L-1,
+        # but the key must appear at global positions delta..delta+L-1.
+        # Standard RoPE applies key rotation exp(-i*m*theta); shifting by
+        # +delta positions therefore multiplies by exp(-i*delta*theta).
+        angles = -delta * inv_freq  # [head_dim // 2]
         rot = torch.exp(1j * angles)  # [head_dim // 2]
 
         x_rot = x_complex * rot[None, None, :]
