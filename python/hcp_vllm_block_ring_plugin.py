@@ -304,7 +304,7 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
         in global token order.
         """
         local_table = self.get_local_block_table()
-        peer_start_block = peer_seq_start // self.block_size
+        peer_start_block = (peer_seq_start + self.block_size - 1) // self.block_size
         # Simple two-domain merge: local covers [0, peer_start), remote covers
         # [peer_start, peer_start + len(peer_reserved)).
         combined = [0] * (peer_start_block + len(peer_reserved))
