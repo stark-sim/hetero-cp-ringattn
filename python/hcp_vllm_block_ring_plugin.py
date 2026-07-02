@@ -363,8 +363,21 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
         peer_k = self._rope_delta_rotate_keys(
             peer_block.k, peer_block.global_seq_start
         )
+        peer_v = peer_block.v
+        total_peer_tokens = peer_block.global_seq_end - peer_block.global_seq_start
         for i, bid in enumerate(self._remote_block_table):
-            self.insert_block(layer_idx, bid, peer_k[i], peer_block.v[i])
+            k_blk = peer_k[i]
+            v_blk = peer_v[i]
+            # Zero out slots that do not contain real peer tokens so that any
+            # backend that reads the full physical block is not poisoned by
+            # uninitialized cache memory.
+            valid = min(self.block_size, total_peer_tokens - i * self.block_size)
+            if valid < self.block_size:
+                k_blk = k_blk.clone()
+                v_blk = v_blk.clone()
+                k_blk[valid:] = 0.0
+                v_blk[valid:] = 0.0
+            self.insert_block(layer_idx, bid, k_blk, v_blk)
 
     def _reserve_remote_blocks(self, num_blocks: int) -> List[int]:
         """Reserve free physical blocks for incoming peer KV."""
