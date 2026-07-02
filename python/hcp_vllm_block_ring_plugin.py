@@ -132,8 +132,10 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
             k, v tensors of shape [block_size, num_kv_heads, head_dim].
         """
         cache = self._gpu_cache(layer_idx)
+        print(f"[debug] cache layer={layer_idx} shape={cache.shape}")
         k = cache[0, physical_block_id].clone()
         v = cache[1, physical_block_id].clone()
+        print(f"[debug] extracted block {physical_block_id} k_shape={k.shape}")
         return k, v
 
     def insert_block(
