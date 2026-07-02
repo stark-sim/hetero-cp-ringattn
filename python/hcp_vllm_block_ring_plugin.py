@@ -325,13 +325,17 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
         peer_block_table = self._allocate_local_blocks(len(chunk))
         from vllm import SamplingParams
 
+        # Use a distinct sequence id so the peer prefill is independent of the
+        # local sequence state.  In a real cross-node setup each worker has its
+        # own vLLM instance; here we simulate the peer domain in-process.
+        peer_seq_id = 1
         seq_data = SequenceData.from_seqs(chunk)
         seq_group_metadata = SequenceGroupMetadata(
             request_id=f"{self._request_id}_peer_{seq_offset}",
             is_prompt=True,
-            seq_data={self._seq_id: seq_data},
+            seq_data={peer_seq_id: seq_data},
             sampling_params=SamplingParams(temperature=0, max_tokens=1),
-            block_tables={self._seq_id: peer_block_table},
+            block_tables={peer_seq_id: peer_block_table},
             do_sample=False,
         )
         execute_model_req = ExecuteModelRequest(
