@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-07-02] vLLM Block Ring 插件骨架与 PoC 修正
+
+type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.85 · source: `git commit 3467cb4`
+
+在 white 已可运行 vLLM 0.6.4 的基础上，继续完善插件实现并提交 commit 3467cb4。\n\n变更点：\n- python/hcp_vllm_block_ring_plugin.py：实现 VllmBlockRingPlugin.prefill / decode / get_kv_block / apply_peer_kv，直接调用 vLLM model_executor 绕过 scheduler。\n- 为 peer KV 在所有 attention 层复用同一组物理 block，避免 vLLM block table 跨层不一致。\n- 增加 _rope_delta_rotate_keys：对以 local position 预fill 的 peer key 做 RoPE delta 旋转，使其 global position 与 decode query 对齐。\n- scripts/poc_vllm_block_ring_2worker.py：修正 decode 输入为最后 prompt token，使用 set_global_tokens 同步完整序列，默认 prompt 长度满足 block_size 对齐断言。\n\n限制：\n- prefill() 目前返回 one-hot sampled token（非完整 last-token logits），与 HcpWorkerBackend 接口兼容但语义上是近似。\n- RoPE 校正目前只支持标准 Neox 配对 RoPE 与 rope_theta；尚未处理 rope_scaling / Yarn / NTK。\n- 需要等待 pearl 上 vLLM 源码编译完成后才能做真实 ROCm 硬件验证。
+
+_updated: 2026-07-02 14:58:04_
 ### [2026-07-01] 搜索 vLLM RDNA4/gfx1200 社区轮子结果
 
 type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.8 · source: `web search`

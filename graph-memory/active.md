@@ -32,11 +32,11 @@ type: `task` · status: `superseded` · confidence: 0.95 · importance: 0.95 · 
 _updated: 2026-06-29 06:01:28_
 ### Block KV cache + vLLM 集成：插件解耦 vs HCP 内联 PageAttention 双路线
 
-type: `hypothesis` · status: `ongoing` · confidence: 0.5 · importance: 0.9 · source: `user-direction`
+type: `hypothesis` · status: `ongoing` · confidence: 0.65 · importance: 0.9 · source: `user-direction`
 
-vLLM 与 HCP Ring Attention 的融合路线已确定为：不改 vLLM attention kernel，以 vLLM physical block 为粒度做跨节点 KV 交换（plugin 路线）。\n\n已完成：\n- 分析 vLLM 0.6.4 CacheEngine 结构。\n- PoC 验证 KV block 提取与重新写入可行。\n- 撰写 docs/VLLM_BLOCK_RING_PLUGIN.md 设计文档。\n- 搜索确认无现成 vLLM gfx1200 wheel；正在 pearl 上用 TheRock gfx120X-all nightly + 源码编译 vLLM 0.6.4。\n\n下一步：\n1. 等待 pearl 上 vLLM 源码编译完成并验证最小预fill。\n2. 实现 VllmBlockRingBackend.prefill + block 提取。\n3. 跨节点 2-worker PoC：white vLLM CUDA + pearl vLLM ROCm。
+vLLM 与 HCP Ring Attention 的融合路线已确定为：不改 vLLM attention kernel，以 vLLM physical block 为粒度做跨节点 KV 交换（plugin 路线）。\n\n已完成：\n1. 分析 vLLM 0.6.4 CacheEngine 结构。\n2. PoC 验证 KV block 提取与重新写入可行。\n3. 撰写 docs/VLLM_BLOCK_RING_PLUGIN.md 设计文档。\n4. 搜索确认无现成 vLLM gfx1200 wheel；正在 pearl 上用 TheRock gfx120X-all nightly + 源码编译 vLLM 0.6.4。\n5. 实现 VllmBlockRingPlugin 骨架：prefill/decode 直接调用 model_executor，block 提取/插入，combined block table。\n6. 修复 PoC decode 语义：使用最后 prompt token 作为 decode 输入，同步全局 tokens。\n7. 修复跨层 block id 一致性：为 peer KV 在所有层复用同一组物理 block。\n8. 增加 RoPE 位置校正：对 local-position 预fill 的 peer key 做 delta 旋转，使合并后 decode 的 RoPE 位置对齐。\n\n进行中：\n- pearl 上 vLLM 源码编译（当前在下载 rocm_sdk_libraries-gfx120X-all）。\n\n下一步：\n1. 等待编译完成，验证 `python -c "import vllm"`。\n2. 在 pearl 上运行单进程 PoC，确认 distributed decode token 与 reference 一致。\n3. 跨节点 2-worker PoC：white vLLM CUDA + pearl vLLM ROCm。
 
-_updated: 2026-07-02 14:15:47_
+_updated: 2026-07-02 14:58:04_
 ### 决策：以 Ring Attention 为 HCP 模型策略继续推进
 
 type: `decision` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `user direction`
