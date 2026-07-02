@@ -346,6 +346,8 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
             )
 
         # Correct RoPE positions from local (0-based) to global.
+        print(f"[debug] apply_peer_kv layer={layer_idx} k_shape={peer_block.k.shape} "
+              f"head_dim={self.head_dim} num_kv_heads={self.num_kv_heads}")
         peer_k = self._rope_delta_rotate_keys(
             peer_block.k, peer_block.global_seq_start
         )
