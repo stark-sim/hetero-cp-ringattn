@@ -30,11 +30,22 @@ def main():
     chunk_b = token_ids[args.chunk_len:]
     delta = len(chunk_a)
 
-    # Reference: full prefill.
+    # Reference: full prefill -> extract chunk B KV -> CPU -> free GPU.
     print("\n[ref] full prefill plugin")
     ref_plugin = VllmBlockRingPlugin(args.model_dir, dtype="float32", gpu_memory_utilization=args.gpu_mem)
     ref_plugin.prefill(token_ids, seq_offset=0)
     ref_btable = ref_plugin.get_local_block_table()
+    ref_kv_blocks = []
+    for layer in range(ref_plugin.num_layers):
+        kv = ref_plugin.get_kv_block_from_table(
+            layer, seq_start=delta, seq_end=len(token_ids), block_table=ref_btable
+        )
+        ref_kv_blocks.append((kv.k.cpu().clone(), kv.v.cpu().clone()))
+    ref_plugin.shutdown()
+    del ref_plugin
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
 
     # Peer: chunk A + chunk B prefilled locally, then chunk B extracted and rotated.
     print("\n[peer] chunk A + peer chunk B plugin")
@@ -43,20 +54,19 @@ def main():
     peer_btable = peer_plugin.prefill_peer_chunk(chunk_b, seq_offset=delta)
 
     for layer in range(peer_plugin.num_layers):
-        ref_kv = ref_plugin.get_kv_block_from_table(
-            layer, seq_start=delta, seq_end=len(token_ids), block_table=ref_btable
-        )
+        ref_k, ref_v = ref_kv_blocks[layer]
         peer_kv_raw = peer_plugin.get_kv_block_from_table(
             layer, seq_start=0, seq_end=len(chunk_b), block_table=peer_btable
         )
+        peer_k = peer_kv_raw.k.cpu()
+        peer_v = peer_kv_raw.v.cpu()
         # Try both signs and report which is closer.
         for sign_name, sign in [("+delta", 1), ("-delta", -1)]:
-            peer_k_rot = peer_plugin._rope_delta_rotate_keys(peer_kv_raw.k, sign * delta)
-            k_diff = (peer_k_rot - ref_kv.k).abs().max().item()
-            v_diff = (peer_kv_raw.v - ref_kv.v).abs().max().item()
+            peer_k_rot = peer_plugin._rope_delta_rotate_keys(peer_k, sign * delta)
+            k_diff = (peer_k_rot - ref_k).abs().max().item()
+            v_diff = (peer_v - ref_v).abs().max().item()
             print(f"layer={layer} sign={sign_name} k_max_diff={k_diff:.6f} v_max_diff={v_diff:.6f}")
 
-    ref_plugin.shutdown()
     peer_plugin.shutdown()
 
 
