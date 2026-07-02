@@ -431,11 +431,7 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
         device = k.device
         kf = k.to(torch.float32)
 
-        # Reshape to complex pairs (Neox/GPT-NeoX style RoPE).
         head_dim = self.head_dim
-        x = kf.reshape(*kf.shape[:-1], head_dim // 2, 2)
-        x_complex = torch.view_as_complex(x)
-
         inv_freq = 1.0 / (
             self.rope_base
             ** (
@@ -443,16 +439,23 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
                 / head_dim
             )
         )
-        # Rotate by -delta: the peer prefilled with local positions 0..L-1,
-        # but the key must appear at global positions delta..delta+L-1.
-        # Standard RoPE applies key rotation exp(-i*m*theta); shifting by
-        # +delta positions therefore multiplies by exp(-i*delta*theta).
-        angles = -delta * inv_freq  # [head_dim // 2]
-        rot = torch.exp(1j * angles)  # [head_dim // 2]
+        # Incremental rotation by ``delta`` positions.  The peer prefilled
+        # with local positions 0..L-1; we rotate by +delta so the keys appear
+        # at global positions delta..delta+L-1.  This follows vLLM/Qwen2's
+        # ``apply_rotary_pos_emb`` half-split-pair convention.
+        angles = delta * inv_freq  # [head_dim // 2]
+        cos = torch.cos(angles)
+        sin = torch.sin(angles)
+        cos = torch.cat([cos, cos], dim=-1)  # [head_dim]
+        sin = torch.cat([sin, sin], dim=-1)  # [head_dim]
 
-        x_rot = x_complex * rot[None, None, :]
-        x_out = torch.view_as_real(x_rot)  # [L, H, head_dim//2, 2]
-        return x_out.reshape(orig_shape).to(dtype)
+        def rotate_half(x: torch.Tensor) -> torch.Tensor:
+            x1 = x[..., : head_dim // 2]
+            x2 = x[..., head_dim // 2 :]
+            return torch.cat([-x2, x1], dim=-1)
+
+        k_rot = kf * cos + rotate_half(kf) * sin
+        return k_rot.reshape(orig_shape).to(dtype)
 
     def _build_combined_block_table(self, peer_seq_start: int) -> None:
         """
