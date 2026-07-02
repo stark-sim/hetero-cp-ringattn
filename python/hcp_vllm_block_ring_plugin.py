@@ -196,6 +196,13 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
         """Set the full global token sequence after KV exchange."""
         self._history = list(tokens)
 
+    def _zero_block(self, physical_block_id: int) -> None:
+        """Zero a physical block across all KV-cache layers."""
+        for layer_idx in range(self.num_layers):
+            cache = self._gpu_cache(layer_idx)
+            cache[0, physical_block_id] = 0
+            cache[1, physical_block_id] = 0
+
     def _allocate_local_blocks(self, num_tokens: int) -> List[int]:
         """Allocate physical blocks for a local token sequence."""
         from vllm.utils import Device
@@ -209,6 +216,7 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
                 prev_block=prev_block, device=Device.GPU
             )
             assert block.block_id is not None
+            self._zero_block(block.block_id)
             blocks.append(block.block_id)
             prev_block = block
         return blocks
@@ -393,6 +401,7 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
                 prev_block=prev_block, device=Device.GPU
             )
             assert block.block_id is not None
+            self._zero_block(block.block_id)
             reserved.append(block.block_id)
             prev_block = block
         return reserved
