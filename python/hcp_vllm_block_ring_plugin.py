@@ -216,6 +216,7 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
                 prev_block=prev_block, device=Device.GPU
             )
             assert block.block_id is not None
+            self._zero_block(block.block_id)
             blocks.append(block.block_id)
             prev_block = block
         return blocks
@@ -400,6 +401,7 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
                 prev_block=prev_block, device=Device.GPU
             )
             assert block.block_id is not None
+            self._zero_block(block.block_id)
             reserved.append(block.block_id)
             prev_block = block
         return reserved
