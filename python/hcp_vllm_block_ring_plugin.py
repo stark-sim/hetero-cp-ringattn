@@ -124,7 +124,14 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
             self.llm.llm_engine.parallel_config
         )
 
-    def extract_block(self, layer_idx: int, physical_block_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _cache_block_is_flat(self, cache: torch.Tensor) -> bool:
+        """Detect XFormers-style flat block layout."""
+        expected = self.block_size * self.num_kv_heads * self.head_dim
+        return cache.dim() == 3 and cache.shape[2] == expected
+
+    def extract_block(
+        self, layer_idx: int, physical_block_id: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Extract K/V for one physical block.
 
@@ -132,10 +139,12 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
             k, v tensors of shape [block_size, num_kv_heads, head_dim].
         """
         cache = self._gpu_cache(layer_idx)
-        print(f"[debug] cache layer={layer_idx} shape={cache.shape}")
         k = cache[0, physical_block_id].clone()
         v = cache[1, physical_block_id].clone()
-        print(f"[debug] extracted block {physical_block_id} k_shape={k.shape}")
+        if self._cache_block_is_flat(cache):
+            shape = (self.block_size, self.num_kv_heads, self.head_dim)
+            k = k.view(shape)
+            v = v.view(shape)
         return k, v
 
     def insert_block(
@@ -147,6 +156,9 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
     ) -> None:
         """Write K/V into a reserved physical block slot."""
         cache = self._gpu_cache(layer_idx)
+        if self._cache_block_is_flat(cache):
+            k = k.reshape(-1)
+            v = v.reshape(-1)
         cache[0, physical_block_id].copy_(k)
         cache[1, physical_block_id].copy_(v)
 
@@ -348,8 +360,6 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
             )
 
         # Correct RoPE positions from local (0-based) to global.
-        print(f"[debug] apply_peer_kv layer={layer_idx} k_shape={peer_block.k.shape} "
-              f"head_dim={self.head_dim} num_kv_heads={self.num_kv_heads}")
         peer_k = self._rope_delta_rotate_keys(
             peer_block.k, peer_block.global_seq_start
         )
