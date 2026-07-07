@@ -439,11 +439,11 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
                 / head_dim
             )
         )
-        # Incremental rotation by ``delta`` positions.  The peer prefilled
-        # with local positions 0..L-1; we rotate by +delta so the keys appear
-        # at global positions delta..delta+L-1.  This follows vLLM/Qwen2's
+        # Incremental rotation by ``-delta`` positions.  The peer prefilled
+        # with local positions 0..L-1; we rotate so the keys appear at global
+        # positions delta..delta+L-1.  This follows vLLM/Qwen2's
         # ``apply_rotary_pos_emb`` half-split-pair convention.
-        angles = delta * inv_freq  # [head_dim // 2]
+        angles = -delta * inv_freq  # [head_dim // 2]
         cos = torch.cos(angles)
         sin = torch.sin(angles)
         cos = torch.cat([cos, cos], dim=-1)  # [head_dim]
