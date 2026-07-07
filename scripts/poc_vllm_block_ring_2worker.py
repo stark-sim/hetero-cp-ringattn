@@ -33,7 +33,8 @@ def main():
         "The quick brown fox jumps over the lazy dog while the cat sleeps "
         "on the warm sunny afternoon near the old oak tree."
     ), help="Input prompt text")
-    parser.add_argument("--chunk-len", type=int, default=16, help="Tokens in the local chunk (multiple of vLLM block_size)")
+    parser.add_argument("--chunk-len", type=int, default=16, help="Tokens in the local chunk")
+    parser.add_argument("--block-size", type=int, default=16, help="vLLM KV-cache block size")
     parser.add_argument("--gpu-mem", type=float, default=0.5)
     parser.add_argument("--baseline", action="store_true",
                         help="Prefill the full prompt directly via the plugin and decode (no peer exchange)")
@@ -65,10 +66,12 @@ def main():
     )
     ref_out = ref_llm.generate(
         prompt_token_ids=token_ids,
-        sampling_params=SamplingParams(max_tokens=1, temperature=0),
+        sampling_params=SamplingParams(max_tokens=1, temperature=0, logprobs=10),
     )
     ref_token = ref_out[0].outputs[0].token_ids[0]
-    print(f"[ref] next token: {ref_token} ('{tokenizer.decode([ref_token])}')")
+    ref_top5 = sorted(ref_out[0].outputs[0].logprobs[0].items(), key=lambda kv: -kv[1].logprob)[:5]
+    print(f"[ref] next token: {ref_token} ('{tokenizer.decode([ref_token])}')  top5: " +
+          " | ".join(f"{tok}({tokenizer.decode([tok])!r}):{lp.logprob:.3f}" for tok, lp in ref_top5))
     del ref_llm
     import gc
     gc.collect()
@@ -82,22 +85,23 @@ def main():
         args.model_dir,
         dtype="float32",
         gpu_memory_utilization=args.gpu_mem,
-    )
-    assert args.chunk_len % plugin.block_size == 0, (
-        f"chunk-len ({args.chunk_len}) must be a multiple of "
-        f"vLLM block_size ({plugin.block_size}) so peer KV starts on a block boundary"
+        block_size=args.block_size,
     )
 
     # ------------------------------------------------------------------
     # Optional baseline: prefill the whole prompt directly, no peer exchange.
     # ------------------------------------------------------------------
+    def top5_text(logits):
+        vals, idxs = torch.topk(logits, 5)
+        return " | ".join(f"{int(idxs[i])}({tokenizer.decode([int(idxs[i])])!r}):{vals[i]:.3f}" for i in range(5))
+
     if args.baseline:
         print(f"[dist] baseline prefill full prompt ({len(token_ids)} tokens)")
         plugin.prefill(token_ids, seq_offset=0)
         plugin.set_global_tokens(token_ids)
         dist_logits = plugin.decode(token_ids[-1])
         dist_token = int(dist_logits.argmax())
-        print(f"[dist] baseline next token: {dist_token} ('{tokenizer.decode([dist_token])}')")
+        print(f"[dist] baseline next token: {dist_token} ('{tokenizer.decode([dist_token])}')  top5: {top5_text(dist_logits)}")
         match = dist_token == ref_token
         print(f"\n[result] tokens match: {match}")
         if not match:
@@ -138,7 +142,7 @@ def main():
     print(f"[dist] decode input token (last prompt token): {decode_input}")
     dist_logits = plugin.decode(decode_input)
     dist_token = int(dist_logits.argmax())
-    print(f"[dist] next token: {dist_token} ('{tokenizer.decode([dist_token])}')")
+    print(f"[dist] next token: {dist_token} ('{tokenizer.decode([dist_token])}')  top5: {top5_text(dist_logits)}")
 
     match = dist_token == ref_token
     print(f"\n[result] tokens match: {match}")

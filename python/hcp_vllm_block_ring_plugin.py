@@ -48,6 +48,7 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
         device: str = "cuda",
         dtype: Optional[str] = None,
         gpu_memory_utilization: float = 0.5,
+        block_size: int = 16,
     ):
         from vllm import LLM, SamplingParams
 
@@ -66,6 +67,7 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
             gpu_memory_utilization=gpu_memory_utilization,
             enforce_eager=True,
             max_num_seqs=1,
+            block_size=block_size,
         )
         engine = self.llm.llm_engine
         self.model_config = engine.model_config
@@ -439,11 +441,11 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
                 / head_dim
             )
         )
-        # Incremental rotation by ``-delta`` positions.  The peer prefilled
+        # Incremental rotation by ``+delta`` positions.  The peer prefilled
         # with local positions 0..L-1; we rotate so the keys appear at global
         # positions delta..delta+L-1.  This follows vLLM/Qwen2's
         # ``apply_rotary_pos_emb`` half-split-pair convention.
-        angles = -delta * inv_freq  # [head_dim // 2]
+        angles = delta * inv_freq  # [head_dim // 2]
         cos = torch.cos(angles)
         sin = torch.sin(angles)
         cos = torch.cat([cos, cos], dim=-1)  # [head_dim]
@@ -472,13 +474,16 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
         combined[peer_start_block:] = peer_reserved
         self._combined_block_table = combined
 
-    def decode(self, token: int) -> torch.Tensor:
+    def decode(self, token: int):
         """
         Decode one token using the combined block table.
 
         We bypass the scheduler and call model_executor.execute_model with a
         manually constructed SequenceGroupMetadata so that vLLM's
         PagedAttention kernel attends over local + remote KV blocks.
+
+        Returns the ``CompletionOutput`` object so callers can inspect the
+        sampled token and top-k logprobs.
         """
         from vllm import SamplingParams
         from vllm.sequence import (
@@ -499,7 +504,7 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
         seq_data.update_num_computed_tokens(seq_len - 1)
 
         block_tables = {seq_id: self._combined_block_table or self.get_local_block_table()}
-        sampling_params = SamplingParams(temperature=0, max_tokens=1)
+        sampling_params = SamplingParams(temperature=0, max_tokens=1, logprobs=10)
 
         seq_group_metadata = SequenceGroupMetadata(
             request_id=self._request_id,
@@ -514,11 +519,12 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
         )
 
         outputs = self.llm.llm_engine.model_executor.execute_model(execute_model_req)
-        # outputs[0] is a SamplerOutput for the batch.
-        token_id = outputs[0].outputs[0].samples[0].output_token
-
+        # outputs[0] is a SamplerOutput; its inner structure differs from the
+        # public RequestOutput produced by LLM.generate().
+        sample = outputs[0].outputs[0].samples[0]
         logits = torch.full((self.vocab_size,), -1e9, dtype=torch.float32)
-        logits[token_id] = 0.0
+        for token_id, lp in sample.logprobs.items():
+            logits[token_id] = lp.logprob
         return logits
 
     @property
