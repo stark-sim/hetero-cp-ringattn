@@ -30,6 +30,13 @@ type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.95 · sou
 首次实现 vLLM 跨节点 context-passing CP：white（RTX 4090 CUDA，vLLM 0.6.4 legacy 插件）作 domain 0，pearl（RX 9060 XT ROCm gfx1200，vLLM 0.23.1rc1 V1 插件）作 domain 1，经 Rust coordinator + QUIC KV ring 协作同一序列。关键设计：vLLM PagedAttention 的正确 CP 必须 context-passing——domain 1 先收 domain 0 的 chunk A KV 作 context 再 prefill chunk B（层 L 的 K/V 依赖层 L-1 的 context，先 prefill 再交换在数学上不正确）。新增：plugins 的 prefill_with_context_kv / set_global_seq_len / _local_seq_offset，decode/last_token 用 _global_seq_len（peer chunk 的 token id 不需要，早期 token 用占位符）；python/hcp_worker_sdk/cp_server.py（CpVllmWorkerServer，domain0 send-then-recv、domain1 recv-then-prefill-then-send）；python/hcp_vllm_cp_worker.py（自动识别 vLLM 0.6.x vs >=0.23）；scripts/run_cross_node_vllm_cp.sh。修复：domain 0 需按 prefill 时的 seq_len 上报，否则 coordinator 会错用其 chunk-local logits。验证：64-token 变化 prompt（alpha bravo ... qu），chunks 32+32，block_size 16，greedy 6 token，distributed 输出 ail rose rosemary rosewood 与单节点 vLLM 完全一致。已知限制：KvBlock 布局 [num_blocks, block_size, kv_heads, head_dim] 与 transformers/Rust 的 [batch, heads, seq, dim] 不同，故 vLLM worker 目前只能与 vLLM worker 组环。
 
 _updated: 2026-07-17_
+### [2026-07-17] HcpCpConnector（KVConnectorBase_V1）单机 2 实例验证通过
+
+type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.9 · source: `scripts/poc_hcp_cp_connector.py + /tmp/poc_conn.log`
+
+实现 vLLM 官方 KV connector 扩展点版本的 context-passing CP：hcp_vllm_plugin/ 包（pyproject + vllm.general_plugins 入口 + kv_connector_module_path），HcpCpConnector 以 ExampleConnector 为模板，producer 计算本 chunk 并共享存储 KV，consumer 把前序 chunk 标记为 external prefix（get_num_new_matched_tokens）只算本 chunk。关键修复：同步共享路径 load 必须返回 load_kv_async=False；get_finished 返回 (None,None) 避免 scheduler 断言。验证（pearl 单机 2 实例，vLLM 0.23.1rc1，Qwen2-0.5B-1M，64-token 变化 prompt，chunk 32+32）：consumer 首 token 604(ail) 与单节点参考一致，exit=0。该路线不打补丁、用官方稳定 API，故能跟进 vLLM 官方更新。注意：KV connector 仅 V1 引擎支持，跨节点异构需 white 也构建 V1 vLLM（当前 white 为 0.6.4）。
+
+_updated: 2026-07-17_
 ### [2026-07-02] vLLM Block Ring 插件骨架与 PoC 修正
 
 type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.85 · source: `git commit 3467cb4`
