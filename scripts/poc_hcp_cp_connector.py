@@ -54,6 +54,8 @@ def main():
     parser.add_argument("--chunk-a", type=int, default=32)
     parser.add_argument("--gpu-mem", type=float, default=0.3)
     parser.add_argument("--run-id", default="poc")
+    parser.add_argument("--http-port", type=int, default=0,
+                        help="if >0, producer serves KV over HTTP on this port and consumer pulls via http://127.0.0.1:port")
     args = parser.parse_args()
 
     from transformers import AutoTokenizer
@@ -93,16 +95,18 @@ def main():
             "cp_chunk_id": "chunk0",
             "cp_shared_path": shared_path,
             "cp_run_id": args.run_id,
+            "cp_serve_port": args.http_port,
         },
     }
     prod = make_llm(args.model_dir, args.gpu_mem, kv_transfer_config=prod_cfg)
     out = prod.generate([TokensPrompt(prompt_token_ids=chunk_a)], sp)
     prod_token = out[0].outputs[0].token_ids[0]
     print(f"[producer] chunk A next token (unused): {prod_token}")
-    free_llm(prod)
+    # Keep producer alive so its HTTP KV server stays up for the consumer.
 
     # 3. consumer: load chunk A KV, prefill chunk B with context
     print("[consumer] load chunk A KV, prefill chunk B with context ...")
+    peer_url = f"http://127.0.0.1:{args.http_port}" if args.http_port else ""
     cons_cfg = {
         "kv_connector": "HcpCpConnector",
         "kv_role": "kv_consumer",
@@ -114,6 +118,7 @@ def main():
             "cp_prefix_len": len(chunk_a),
             "cp_shared_path": shared_path,
             "cp_run_id": args.run_id,
+            "cp_peer_url": peer_url,
         },
     }
     cons = make_llm(args.model_dir, args.gpu_mem, kv_transfer_config=cons_cfg)
@@ -121,6 +126,7 @@ def main():
     cons_token = out[0].outputs[0].token_ids[0]
     print(f"[consumer] next token: {cons_token} ({tok.decode([cons_token])!r})")
     free_llm(cons)
+    free_llm(prod)
 
     match = cons_token == ref_token
     print(f"\n[result] consumer token matches reference: {match}")
