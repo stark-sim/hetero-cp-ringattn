@@ -35,11 +35,12 @@ echo "RUN_ID=${RUN_ID}  chunk_a=${CHUNK_A} decode=${DECODE} port=${SERVE_PORT}"
 
 # === Tokenize the 64-token varied prompt and split into chunk A / full ===
 TOK_DIR="/tmp/cpplug_${RUN_ID}"
+TOKENIZER_DIR="${TOKENIZER_DIR:-${REPO_ROOT}/models/Qwen2-0.5B}"
 mkdir -p "${TOK_DIR}"
-python3 - <<'PY'
+TOKENIZER_DIR="${TOKENIZER_DIR}" TOK_DIR="${TOK_DIR}" python3 - <<'PY'
 from transformers import AutoTokenizer
 import os
-tok = AutoTokenizer.from_pretrained(os.path.expanduser("~/models/Qwen2-0.5B"))
+tok = AutoTokenizer.from_pretrained(os.environ["TOKENIZER_DIR"])
 text = ("alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo "
         "lima mike november oscar papa quebec romeo sierra tango uniform "
         "victor whiskey xray yankee zulu apple banana cherry dragon eagle "
