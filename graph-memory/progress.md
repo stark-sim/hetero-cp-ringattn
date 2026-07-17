@@ -2,6 +2,27 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-07-17] vLLM 0.23.1rc1 源码编译补丁（gfx1200）
+
+type: `evidence` · status: `held` · confidence: 0.75 · importance: 0.8 · source: `bash-i3gxwyr5 build log`
+
+在 pearl（RX 9060 XT / gfx1200，ROCm 7.13，PyTorch 2.13.0a0+rocm7.13.0a20260416）上从 main 分支源码构建 vLLM 0.23.1rc1.dev905+g3f99883d9。为通过编译已打两个补丁：1) csrc/spinloop.cpp：将 <mwaitxintrin.h> 改为 <x86intrin.h>，修复 ROCm Clang 23 直接包含 mwaitxintrin 的编译错误；2) 禁用 GPTQ 路径：从 CMakeLists.txt 移除 csrc/libtorch_stable/quantization/gptq/q_gemm.cu，并在 csrc/libtorch_stable/torch_bindings.cpp 中注释 gptq_gemm/gptq_shuffle 的 ops.def/ops.impl，规避 HIP half2 atomicAdd 缺失导致的编译失败。当前构建仍在后台运行（task bash-i3gxwyr5），正在编译 HIP 对象。
+
+_updated: 2026-07-17_
+### [2026-07-17] vLLM 0.23.1rc1 源码编译成功并通过 ROCm gfx1200 prefill
+
+type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `bash-vjw890d3 build log + /tmp/test_vllm_prefill.py`
+
+在 pearl（RX 9060 XT / gfx1200，ROCm 7.13，PyTorch 2.13.0a0+rocm7.13.0a20260416）上完成 vLLM 0.23.1rc1.dev905+g3f99883d9 源码编译。关键修复：1) csrc/spinloop.cpp 用 <x86intrin.h> 替代 <mwaitxintrin.h>；2) 禁用 GPTQ（CMakeLists 移除 q_gemm.cu，torch_bindings 注释 gptq_gemm/gptq_shuffle）规避 HIP half2 atomicAdd 缺失；3) 在 conda env bin 下把 clang/clang++/clang-cpp 软链到 amdclang/amdclang++/amdclang-cpp，修复 hipcc_cmake_linker_helper 链接失败。运行时用 LD_LIBRARY_PATH 覆盖 torch/lib 与 _rocm_sdk_{core,devel}/lib{,/host-math/lib,/rocm_sysdeps/lib}。验证：从 /tmp 运行脚本（避免 cwd=/home/stark 时 repo 目录名 vllm 把 import 变成 namespace package），LLM(model=/home/stark/models/Qwen2-0.5B-1M, dtype=float16, enforce_eager=True) 成功初始化并在 ROCm gfx1200 上 prefill+decode，输出 I am 类 token。
+
+_updated: 2026-07-17_
+### [2026-07-17] vLLM 0.23 V1 Block-Ring 插件在 pearl(gfx1200) 验证通过
+
+type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `pearl /tmp/poc_out.log + scripts/poc_vllm_block_ring_v1.py`
+
+在 pearl（RX 9060 XT / gfx1200，自编译 vLLM 0.23.1rc1.dev905+g3f99883d9，ROCm 7.13）上实现并验证 V1 引擎版 Block-Ring 插件。实现：python/hcp_vllm_block_ring_plugin_v1.py 用 enable_multiprocessing=False 的 LLMEngine 同进程访问 model_executor/scheduler/KV cache，直接用 block_pool 分配物理块，手工构造 SchedulerOutput+NewRequestData 调 model_executor.execute_model（返回 None 时再 sample_tokens），KV cache 布局与 0.6.4 一致 [2, num_blocks, block_size, num_kv_heads, head_dim]。PoC：scripts/poc_vllm_block_ring_v1.py，Qwen2-0.5B-1M、fp32、block_size=16、chunk 16+16。结果：chunk A prefill + chunk B 带 context prefill + combined block table，最后位置 next token 与单节点 vLLM 参考一致（match=True），自回归 decode 第二个 token 也一致（match=True）。注意事项：1) ROCm attention 后端不支持 block_size=8，需用 16；2) 1M 模型默认 max_model_len=1048576 会导致 KV cache 初始化 OOM，插件/参考都需显式传 max_model_len（如 4096）；3) 运行 cwd 不能在含 vllm 子目录的路径（否则 import vllm 变 namespace package）；4) 运行需 LD_LIBRARY_PATH 覆盖 torch/lib 与 _rocm_sdk_{core,devel}/lib{,/host-math/lib,/rocm_sysdeps/lib}。
+
+_updated: 2026-07-17_
 ### [2026-07-02] vLLM Block Ring 插件骨架与 PoC 修正
 
 type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.85 · source: `git commit 3467cb4`
