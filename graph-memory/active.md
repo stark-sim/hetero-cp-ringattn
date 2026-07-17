@@ -215,13 +215,6 @@ type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.85 · sou
 HCP 的数学基础即来源于此。
 
 _updated: 2026-06-29 06:06:09_
-### 构建 white V1 引擎 vLLM（CUDA）用于跨节点插件验证
-
-type: `task` · status: `ongoing` · confidence: 0.7 · importance: 0.8 · source: `white build log /tmp/vllm_build_white.log`
-
-目标：在 white（RTX 4090，CUDA 12.6）构建 vLLM 0.23.1rc1.dev905+g3f99883d9（与 pearl 同 commit），使 white 也能跑 HcpCpConnector（KVConnectorBase_V1），从而做 white CUDA + pearl ROCm 的跨节点插件验证。进展：1) 新建 conda env vllm-v1（python 3.11），安装 torch 2.13.0+cu126（下载慢 ~1-2MB/s，约 50min）；2) clone vLLM 到 commit 3f99883d9；3) 安装 build 依赖（cmake 3.31<4、ninja、setuptools-rust 等，white 系统 cmake 4.2.3 太新需 pip cmake<4）；4) 正在后台编译 vLLM（bash-og8qvoca），目前在下载 Python 依赖（flashinfer 458MB）阶段。跨节点验证脚本已就绪：scripts/cp_producer.py、cp_consumer.py、run_cross_node_cp_plugin.sh。注意事项：KV connector 仅 V1 引擎支持；异构跨节点要求两端均为 V1。
-
-_updated: 2026-07-17_
 ### Ring Attention 衍生方案综述仅作为文献背景，不单独实现
 
 type: `claim` · status: `held` · confidence: 0.8 · importance: 0.8 · source: `user-direction + cost-benefit review`

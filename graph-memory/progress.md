@@ -44,6 +44,13 @@ type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.9 · sou
 为 HcpCpConnector 增加 HTTP 跨机 KV 传输：producer 端仅 worker-side 起 ThreadingHTTPServer 共享 KV store（cp_serve_port），consumer 端 cp_peer_url 拉取（HEAD 探活 _READY，GET 拉 layer safetensors），带 5 次重试解决 IncompleteRead。修复：connector 按 role 实例化两次（scheduler+worker），HTTP server 只能 worker-side 绑定否则端口冲突。验证（pearl 单机 2 实例经 loopback HTTP，64-token，chunk 32+32）：0 个 fetch 失败，consumer 604(ail) 与单节点一致。至此 HCP 已成为一个不依赖补丁、基于 vLLM 官方 KVConnectorBase_V1 稳定 API 的生态插件，可跨机做 context-passing CP。异构跨节点（white CUDA + pearl ROCm）仍需 white 构建 V1 引擎 vLLM（当前 white 为 0.6.4 legacy）。
 
 _updated: 2026-07-17_
+### [2026-07-17] HcpCpConnector 跨节点异构验证通过（white CUDA + pearl ROCm）
+
+type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.95 · source: `reports/cp-plugin-cpplug-201341 + scripts/run_cross_node_cp_plugin.sh`
+
+完成 HCP 作为 vLLM 生态插件的跨节点异构验证。先在 white（RTX 4090）构建 V1 引擎 vLLM 0.23.1rc1.dev905+g3f99883d9：新建 conda env vllm-v1，装 torch 2.13.0+cu126（下载慢约50min），clone 到 3f99883d9，装 build 依赖（cmake<4、ninja、setuptools-rust），关键是用 conda gcc-13 作为 nvcc host compiler 解决 Ubuntu 26.04 glibc 2.43 + CUDA 13.1 + gcc-15 的 rsqrt exception-spec 冲突；pip 装上 cu130 torch + torchvision 后 vLLM 0.23 在 white 跑通 prefill。随后跨节点：white producer（CUDA，HcpCpConnector，cp_serve_port=8899）算 chunk A 并经 HTTP 供 KV，pearl consumer（ROCm gfx1200，HcpCpConnector，cp_peer_url=http://white:8899）拉取 chunk A KV 作 external prefix 算 chunk B。验证（Qwen2-0.5B-1M，64-token 变化 prompt，chunk 32+32，greedy 4 token）：consumer [604,16009,16009,1534]=ail rose rosemary 与单节点参考完全一致。至此 HCP 是一个不打补丁、基于官方 KVConnectorBase_V1 稳定 API、可跨异构节点做 context-passing CP 的 vLLM 生态插件，能跟进 vLLM 官方更新。
+
+_updated: 2026-07-17_
 ### [2026-07-02] vLLM Block Ring 插件骨架与 PoC 修正
 
 type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.85 · source: `git commit 3467cb4`
