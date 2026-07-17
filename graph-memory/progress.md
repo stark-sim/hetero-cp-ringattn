@@ -23,6 +23,13 @@ type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.9 · sour
 在 pearl（RX 9060 XT / gfx1200，自编译 vLLM 0.23.1rc1.dev905+g3f99883d9，ROCm 7.13）上实现并验证 V1 引擎版 Block-Ring 插件。实现：python/hcp_vllm_block_ring_plugin_v1.py 用 enable_multiprocessing=False 的 LLMEngine 同进程访问 model_executor/scheduler/KV cache，直接用 block_pool 分配物理块，手工构造 SchedulerOutput+NewRequestData 调 model_executor.execute_model（返回 None 时再 sample_tokens），KV cache 布局与 0.6.4 一致 [2, num_blocks, block_size, num_kv_heads, head_dim]。PoC：scripts/poc_vllm_block_ring_v1.py，Qwen2-0.5B-1M、fp32、block_size=16、chunk 16+16。结果：chunk A prefill + chunk B 带 context prefill + combined block table，最后位置 next token 与单节点 vLLM 参考一致（match=True），自回归 decode 第二个 token 也一致（match=True）。注意事项：1) ROCm attention 后端不支持 block_size=8，需用 16；2) 1M 模型默认 max_model_len=1048576 会导致 KV cache 初始化 OOM，插件/参考都需显式传 max_model_len（如 4096）；3) 运行 cwd 不能在含 vllm 子目录的路径（否则 import vllm 变 namespace package）；4) 运行需 LD_LIBRARY_PATH 覆盖 torch/lib 与 _rocm_sdk_{core,devel}/lib{,/host-math/lib,/rocm_sysdeps/lib}。
 
 _updated: 2026-07-17_
+### [2026-07-17] 跨节点 vLLM Block-Ring CP 验证通过（white CUDA + pearl ROCm）
+
+type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.95 · source: `reports/vllm-cp-cuda-hip-20260717-134004 + scripts/run_cross_node_vllm_cp.sh`
+
+首次实现 vLLM 跨节点 context-passing CP：white（RTX 4090 CUDA，vLLM 0.6.4 legacy 插件）作 domain 0，pearl（RX 9060 XT ROCm gfx1200，vLLM 0.23.1rc1 V1 插件）作 domain 1，经 Rust coordinator + QUIC KV ring 协作同一序列。关键设计：vLLM PagedAttention 的正确 CP 必须 context-passing——domain 1 先收 domain 0 的 chunk A KV 作 context 再 prefill chunk B（层 L 的 K/V 依赖层 L-1 的 context，先 prefill 再交换在数学上不正确）。新增：plugins 的 prefill_with_context_kv / set_global_seq_len / _local_seq_offset，decode/last_token 用 _global_seq_len（peer chunk 的 token id 不需要，早期 token 用占位符）；python/hcp_worker_sdk/cp_server.py（CpVllmWorkerServer，domain0 send-then-recv、domain1 recv-then-prefill-then-send）；python/hcp_vllm_cp_worker.py（自动识别 vLLM 0.6.x vs >=0.23）；scripts/run_cross_node_vllm_cp.sh。修复：domain 0 需按 prefill 时的 seq_len 上报，否则 coordinator 会错用其 chunk-local logits。验证：64-token 变化 prompt（alpha bravo ... qu），chunks 32+32，block_size 16，greedy 6 token，distributed 输出 ail rose rosemary rosewood 与单节点 vLLM 完全一致。已知限制：KvBlock 布局 [num_blocks, block_size, kv_heads, head_dim] 与 transformers/Rust 的 [batch, heads, seq, dim] 不同，故 vLLM worker 目前只能与 vLLM worker 组环。
+
+_updated: 2026-07-17_
 ### [2026-07-02] vLLM Block Ring 插件骨架与 PoC 修正
 
 type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.85 · source: `git commit 3467cb4`
