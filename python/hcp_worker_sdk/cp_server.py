@@ -35,12 +35,12 @@ class CpVllmWorkerServer(QuicWorkerServer):
         self.seq_offset = cmd["seq_offset"]
 
         if self.domain_id == 0:
-            logits, _ = self.backend.prefill(chunk, self.seq_offset)
+            logits, seq_len = self.backend.prefill(chunk, self.seq_offset)
             await self._send_own_kv()
             await self._recv_and_apply_peer_kv()
         else:
             context_kv = await self._recv_all_context_kv()
-            logits, _ = self.backend.prefill_with_context_kv(
+            logits, seq_len = self.backend.prefill_with_context_kv(
                 chunk,
                 self.seq_offset,
                 context_kv,
@@ -48,7 +48,12 @@ class CpVllmWorkerServer(QuicWorkerServer):
             )
             await self._send_own_kv()
 
-        self.global_seq_len = self.backend._global_seq_len
+        # Report the seq_len this worker actually computed logits for.  The
+        # coordinator picks the worker with the max, which must be the *last*
+        # domain (its logits are the full-sequence next-token prediction).
+        # Domain 0 must NOT report the post-exchange full length, or its
+        # chunk-local logits would wrongly win.
+        self.global_seq_len = seq_len
         logits_bytes = logits.detach().cpu().numpy().astype("float32").tobytes()
         return {
             "kind": "PrefillDone",
