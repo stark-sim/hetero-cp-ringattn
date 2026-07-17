@@ -88,6 +88,10 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
         # Physical blocks reserved for the current peer chunk.  Shared across
         # all layers because one block table is used for every layer in vLLM.
         self._remote_block_table: List[int] = []
+        # Extra zeroed block appended to the combined block table so that the
+        # decode query token (position == seq_len) maps to its own slot instead
+        # of overwriting a context slot in the last peer/local block.
+        self._query_block: Optional[int] = None
 
         print(
             f"[vllm block ring] loaded, vocab_size={self.vocab_size}, "
@@ -230,6 +234,9 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
         We allocate physical blocks ourselves (so they stay resident) and
         pass them via SequenceGroupMetadata.  This avoids the high-level
         generate() path, which would finish the request and free the blocks.
+
+        Returns the full logits (top-k from the sampler) for the last token
+        of the chunk, matching the HCP ``prefill`` contract.
         """
         from vllm import SamplingParams
         from vllm.sequence import (
@@ -242,7 +249,9 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
         self._local_block_table = self._allocate_local_blocks(len(chunk))
 
         seq_data = SequenceData.from_seqs(self._history)
-        sampling_params = SamplingParams(temperature=0, max_tokens=1)
+        sampling_params = SamplingParams(
+            temperature=0, max_tokens=1, logprobs=10
+        )
         seq_group_metadata = SequenceGroupMetadata(
             request_id=self._request_id,
             is_prompt=True,
@@ -256,11 +265,16 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
         )
 
         outputs = self.llm.llm_engine.model_executor.execute_model(execute_model_req)
-        token_id = outputs[0].outputs[0].samples[0].output_token
-
-        logits = torch.full((self.vocab_size,), -1e9, dtype=torch.float32)
-        logits[token_id] = 0.0
+        sample = outputs[0].outputs[0].samples[0]
+        logits = self._logprobs_to_logits(sample.logprobs)
         return logits, seq_offset + len(self._history)
+
+    def _logprobs_to_logits(self, logprobs) -> torch.Tensor:
+        """Convert a vLLM sampler logprobs dict to a full vocab logits tensor."""
+        logits = torch.full((self.vocab_size,), -1e9, dtype=torch.float32)
+        for token_id, lp in logprobs.items():
+            logits[token_id] = lp.logprob
+        return logits
 
     def get_kv_block(self, layer_idx: int, seq_start: int, seq_end: int) -> KvBlock:
         """
@@ -346,7 +360,69 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
         self.llm.llm_engine.model_executor.execute_model(execute_model_req)
         return peer_block_table
 
-    def apply_peer_kv(self, layer_idx: int, peer_block: KvBlock) -> None:
+    def _copy_block_table(self, block_table: List[int]) -> List[int]:
+        """Allocate new physical blocks and copy K/V from a source table."""
+        new_blocks = self._reserve_remote_blocks(len(block_table))
+        for src_bid, dst_bid in zip(block_table, new_blocks):
+            for layer_idx in range(self.num_layers):
+                cache = self._gpu_cache(layer_idx)
+                cache[0, dst_bid].copy_(cache[0, src_bid])
+                cache[1, dst_bid].copy_(cache[1, src_bid])
+        return new_blocks
+
+    def prefill_peer_chunk_with_context(
+        self,
+        chunk: List[int],
+        seq_offset: int,
+        context_tokens: List[int],
+        context_block_table: List[int],
+    ) -> List[int]:
+        """
+        Prefill a peer chunk with prior context already resident in the cache.
+
+        ``context_tokens`` and ``context_block_table`` describe the tokens that
+        precede ``chunk`` in the global sequence.  The returned block table
+        contains only the *new* physical blocks for ``chunk``; their KV is
+        computed with global positions
+        (``len(context_tokens) .. len(context_tokens)+len(chunk)-1``).
+        """
+        from vllm import SamplingParams
+        from vllm.sequence import (
+            ExecuteModelRequest,
+            SequenceData,
+            SequenceGroupMetadata,
+        )
+
+        peer_block_table = self._allocate_local_blocks(len(chunk))
+        combined_block_table = list(context_block_table) + peer_block_table
+
+        peer_seq_id = 1
+        # Include the context tokens so vLLM knows the global length and can
+        # assign correct positions to the new tokens.  Their KV is read from
+        # context_block_table; the actual token ids are only used for position
+        # bookkeeping here because num_computed_tokens skips them.
+        seq_data = SequenceData.from_seqs(context_tokens + chunk)
+        seq_data.update_num_computed_tokens(len(context_tokens))
+        seq_group_metadata = SequenceGroupMetadata(
+            request_id=f"{self._request_id}_peer_ctx_{seq_offset}",
+            is_prompt=True,
+            seq_data={peer_seq_id: seq_data},
+            sampling_params=SamplingParams(temperature=0, max_tokens=1),
+            block_tables={peer_seq_id: combined_block_table},
+            do_sample=False,
+        )
+        execute_model_req = ExecuteModelRequest(
+            seq_group_metadata_list=[seq_group_metadata]
+        )
+        self.llm.llm_engine.model_executor.execute_model(execute_model_req)
+        return peer_block_table
+
+    def apply_peer_kv(
+        self,
+        layer_idx: int,
+        peer_block: KvBlock,
+        rotate_delta: Optional[int] = None,
+    ) -> None:
         """
         Insert peer KV blocks into reserved physical slots.
 
@@ -354,9 +430,12 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
         in global token order.  The same physical blocks are reused for every
         layer because vLLM's block table is shared across layers.
 
-        Peer workers prefill their chunk with local positions (0..chunk_len-1),
-        so we rotate the peer keys by the global start offset so that RoPE
-        positions match the global sequence during decode.
+        By default we assume peer workers prefilled their chunk with local
+        positions (0..chunk_len-1), so we rotate the peer keys by
+        ``peer_block.global_seq_start`` so that RoPE positions match the global
+        sequence during decode.  Pass ``rotate_delta=0`` when the peer KV was
+        already prefilled with global positions (e.g. after the peer received
+        the prior context).
         """
         if peer_block.k.numel() == 0:
             return
@@ -365,6 +444,10 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
         if layer_idx == 0:
             # Reserve once and reuse the same physical ids for all layers.
             self._remote_block_table = self._reserve_remote_blocks(num_blocks)
+            # Reserve a dedicated scratch block for the decode query token so
+            # it does not overwrite a context slot in the last physical block.
+            self._query_block = self._reserve_remote_blocks(1)[0]
+            self._zero_block(self._query_block)
             self._build_combined_block_table(peer_block.global_seq_start)
         else:
             # Sanity check: every layer must ship the same number of blocks.
@@ -374,9 +457,12 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
             )
 
         # Correct RoPE positions from local (0-based) to global.
-        peer_k = self._rope_delta_rotate_keys(
-            peer_block.k, peer_block.global_seq_start
+        delta = (
+            peer_block.global_seq_start
+            if rotate_delta is None
+            else rotate_delta
         )
+        peer_k = self._rope_delta_rotate_keys(peer_block.k, delta)
         peer_v = peer_block.v
         total_peer_tokens = peer_block.global_seq_end - peer_block.global_seq_start
         for i, bid in enumerate(self._remote_block_table):
@@ -462,7 +548,8 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
     def _build_combined_block_table(self, peer_seq_start: int) -> None:
         """
         Merge local and remote physical block ids into a single block table
-        in global token order.
+        in global token order.  This table contains *context* blocks only; the
+        decode scratch block is appended separately by decode().
         """
         local_table = self.get_local_block_table()
         peer_reserved = self._remote_block_table
@@ -481,9 +568,6 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
         We bypass the scheduler and call model_executor.execute_model with a
         manually constructed SequenceGroupMetadata so that vLLM's
         PagedAttention kernel attends over local + remote KV blocks.
-
-        Returns the ``CompletionOutput`` object so callers can inspect the
-        sampled token and top-k logprobs.
         """
         from vllm import SamplingParams
         from vllm.sequence import (
@@ -503,7 +587,12 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
         seq_data = SequenceData.from_seqs(full_token_ids)
         seq_data.update_num_computed_tokens(seq_len - 1)
 
-        block_tables = {seq_id: self._combined_block_table or self.get_local_block_table()}
+        block_table = list(self._combined_block_table or self.get_local_block_table())
+        if self._query_block is None:
+            self._query_block = self._reserve_remote_blocks(1)[0]
+            self._zero_block(self._query_block)
+        block_table.append(self._query_block)
+        block_tables = {seq_id: block_table}
         sampling_params = SamplingParams(temperature=0, max_tokens=1, logprobs=10)
 
         seq_group_metadata = SequenceGroupMetadata(
@@ -519,13 +608,85 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
         )
 
         outputs = self.llm.llm_engine.model_executor.execute_model(execute_model_req)
-        # outputs[0] is a SamplerOutput; its inner structure differs from the
-        # public RequestOutput produced by LLM.generate().
         sample = outputs[0].outputs[0].samples[0]
-        logits = torch.full((self.vocab_size,), -1e9, dtype=torch.float32)
-        for token_id, lp in sample.logprobs.items():
-            logits[token_id] = lp.logprob
-        return logits
+        return self._logprobs_to_logits(sample.logprobs)
+
+    def last_token_logits(self) -> torch.Tensor:
+        """
+        Compute logits for the last token of ``self._history`` using the
+        combined block table.  All earlier tokens are treated as already in
+        the KV cache.
+
+        This is useful for verifying the distributed prefill result against a
+        single-node reference: the reference's first output token comes from
+        the last prompt position, not from an extra decode step.
+        """
+        from vllm import SamplingParams
+        from vllm.sequence import (
+            ExecuteModelRequest,
+            SequenceData,
+            SequenceGroupMetadata,
+        )
+
+        seq_len = len(self._history)
+        seq_data = SequenceData.from_seqs(self._history)
+        seq_data.update_num_computed_tokens(seq_len - 1)
+
+        block_table = list(self._combined_block_table or self.get_local_block_table())
+        sampling_params = SamplingParams(temperature=0, max_tokens=1, logprobs=10)
+        seq_group_metadata = SequenceGroupMetadata(
+            request_id=self._request_id,
+            is_prompt=False,
+            seq_data={self._seq_id: seq_data},
+            sampling_params=sampling_params,
+            block_tables={self._seq_id: block_table},
+            do_sample=True,
+        )
+        execute_model_req = ExecuteModelRequest(
+            seq_group_metadata_list=[seq_group_metadata]
+        )
+
+        outputs = self.llm.llm_engine.model_executor.execute_model(execute_model_req)
+        sample = outputs[0].outputs[0].samples[0]
+        return self._logprobs_to_logits(sample.logprobs)
+
+    def last_token_logits_prefill(self) -> torch.Tensor:
+        """
+        Same as last_token_logits but uses is_prompt=True so vLLM treats the
+        last token as a one-token chunked prefill instead of a decode step.
+        """
+        from vllm import SamplingParams
+        from vllm.sequence import (
+            ExecuteModelRequest,
+            SequenceData,
+            SequenceGroupMetadata,
+        )
+
+        seq_len = len(self._history)
+        seq_data = SequenceData.from_seqs(self._history)
+        seq_data.update_num_computed_tokens(seq_len - 1)
+
+        block_table = list(
+            self._combined_block_table or self.get_local_block_table()
+        )
+        sampling_params = SamplingParams(
+            temperature=0, max_tokens=1, logprobs=10
+        )
+        seq_group_metadata = SequenceGroupMetadata(
+            request_id=self._request_id,
+            is_prompt=True,
+            seq_data={self._seq_id: seq_data},
+            sampling_params=sampling_params,
+            block_tables={self._seq_id: block_table},
+            do_sample=True,
+        )
+        execute_model_req = ExecuteModelRequest(
+            seq_group_metadata_list=[seq_group_metadata]
+        )
+
+        outputs = self.llm.llm_engine.model_executor.execute_model(execute_model_req)
+        sample = outputs[0].outputs[0].samples[0]
+        return self._logprobs_to_logits(sample.logprobs)
 
     @property
     def capacity_mb(self) -> int:

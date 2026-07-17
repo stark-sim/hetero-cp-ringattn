@@ -38,6 +38,10 @@ def main():
     parser.add_argument("--gpu-mem", type=float, default=0.5)
     parser.add_argument("--baseline", action="store_true",
                         help="Prefill the full prompt directly via the plugin and decode (no peer exchange)")
+    parser.add_argument("--prefill-path", action="store_true",
+                        help="Use is_prompt=True for the last-position verification step")
+    parser.add_argument("--decode", action="store_true",
+                        help="Also run one autoregressive decode step and compare the second token")
     args = parser.parse_args()
 
     # Load tokenizer to split prompt deterministically.
@@ -49,6 +53,15 @@ def main():
 
     chunk_a = token_ids[:args.chunk_len]
     chunk_b = token_ids[args.chunk_len:]
+
+    if not args.baseline:
+        if len(chunk_a) % args.block_size != 0 or len(chunk_b) % args.block_size != 0:
+            print(
+                f"ERROR: peer mode currently requires both chunk lengths to be "
+                f"multiples of --block-size ({args.block_size}). Got chunk_a="
+                f"{len(chunk_a)}, chunk_b={len(chunk_b)}."
+            )
+            sys.exit(1)
 
     # ------------------------------------------------------------------
     # Reference: full prefill + one decode with normal vLLM.
@@ -64,14 +77,20 @@ def main():
         enforce_eager=True,
         max_num_seqs=1,
     )
+    ref_max_tokens = 2 if args.decode else 1
     ref_out = ref_llm.generate(
         prompt_token_ids=token_ids,
-        sampling_params=SamplingParams(max_tokens=1, temperature=0, logprobs=10),
+        sampling_params=SamplingParams(max_tokens=ref_max_tokens, temperature=0, logprobs=10),
     )
     ref_token = ref_out[0].outputs[0].token_ids[0]
     ref_top5 = sorted(ref_out[0].outputs[0].logprobs[0].items(), key=lambda kv: -kv[1].logprob)[:5]
     print(f"[ref] next token: {ref_token} ('{tokenizer.decode([ref_token])}')  top5: " +
           " | ".join(f"{tok}({tokenizer.decode([tok])!r}):{lp.logprob:.3f}" for tok, lp in ref_top5))
+    if args.decode:
+        ref_token2 = ref_out[0].outputs[0].token_ids[1]
+        ref_top5_2 = sorted(ref_out[0].outputs[0].logprobs[1].items(), key=lambda kv: -kv[1].logprob)[:5]
+        print(f"[ref] second token: {ref_token2} ('{tokenizer.decode([ref_token2])}')  top5: " +
+              " | ".join(f"{tok}({tokenizer.decode([tok])!r}):{lp.logprob:.3f}" for tok, lp in ref_top5_2))
     del ref_llm
     import gc
     gc.collect()
@@ -97,9 +116,7 @@ def main():
 
     if args.baseline:
         print(f"[dist] baseline prefill full prompt ({len(token_ids)} tokens)")
-        plugin.prefill(token_ids, seq_offset=0)
-        plugin.set_global_tokens(token_ids)
-        dist_logits = plugin.decode(token_ids[-1])
+        dist_logits, _ = plugin.prefill(token_ids, seq_offset=0)
         dist_token = int(dist_logits.argmax())
         print(f"[dist] baseline next token: {dist_token} ('{tokenizer.decode([dist_token])}')  top5: {top5_text(dist_logits)}")
         match = dist_token == ref_token
@@ -116,10 +133,20 @@ def main():
     local_btable = plugin.get_local_block_table()
     print(f"[dist] local block table: {local_btable}")
 
-    # Prefill chunk B into its own physical blocks (simulating domain 1),
-    # then extract its KV and apply it as peer KV on domain 0.
-    print(f"[dist] prefill peer chunk B: {chunk_b}")
-    peer_btable = plugin.prefill_peer_chunk(chunk_b, seq_offset=len(chunk_a))
+    # Simulate the real ring-attention flow: domain 1 receives domain 0's KV,
+    # prefills chunk B with that prior context (so hidden states are correct),
+    # then domain 0 receives the chunk-B KV and inserts it.
+    print(f"[dist] copy local KV as prior context for peer prefill")
+    context_btable = plugin._copy_block_table(local_btable)
+    print(f"[dist] context block table: {context_btable}")
+
+    print(f"[dist] prefill peer chunk B with context: {chunk_b}")
+    peer_btable = plugin.prefill_peer_chunk_with_context(
+        chunk_b,
+        seq_offset=len(chunk_a),
+        context_tokens=chunk_a,
+        context_block_table=context_btable,
+    )
     print(f"[dist] peer block table: {peer_btable}")
 
     for layer_idx in range(plugin.num_layers):
@@ -130,25 +157,39 @@ def main():
             block_table=peer_btable,
             table_seq_offset=len(chunk_a),
         )
-        plugin.apply_peer_kv(layer_idx, peer_kv)
+        # Peer KV was already computed with global positions, so no rotation.
+        plugin.apply_peer_kv(layer_idx, peer_kv, rotate_delta=0)
 
     print(f"[dist] combined block table: {plugin._combined_block_table}")
 
-    # Set the full global sequence so the decode step sees the complete prompt.
+    # Set the full global sequence so the verification step sees the complete prompt.
     plugin.set_global_tokens(token_ids)
 
-    # Decode: the next token is generated from the last prompt token.
-    decode_input = token_ids[-1]
-    print(f"[dist] decode input token (last prompt token): {decode_input}")
-    dist_logits = plugin.decode(decode_input)
+    # Compute logits for the last prompt position using the combined KV cache.
+    # This is directly comparable to the reference single-node prefill output.
+    if args.prefill_path:
+        dist_logits = plugin.last_token_logits_prefill()
+    else:
+        dist_logits = plugin.last_token_logits()
     dist_token = int(dist_logits.argmax())
-    print(f"[dist] next token: {dist_token} ('{tokenizer.decode([dist_token])}')  top5: {top5_text(dist_logits)}")
+    print(f"[dist] last-position next token: {dist_token} ('{tokenizer.decode([dist_token])}')  top5: {top5_text(dist_logits)}")
 
     match = dist_token == ref_token
-    print(f"\n[result] tokens match: {match}")
+    print(f"\n[result] first token match: {match}")
     if not match:
-        print("WARNING: distributed decode disagrees with reference.")
+        print("WARNING: distributed last-position logits disagree with reference.")
         sys.exit(1)
+
+    if args.decode:
+        print("[dist] running one autoregressive decode step ...")
+        dist_logits2 = plugin.decode(ref_token)
+        dist_token2 = int(dist_logits2.argmax())
+        print(f"[dist] second token: {dist_token2} ('{tokenizer.decode([dist_token2])}')  top5: {top5_text(dist_logits2)}")
+        match2 = dist_token2 == ref_token2
+        print(f"[result] second token match: {match2}")
+        if not match2:
+            print("WARNING: distributed decode step disagrees with reference.")
+            sys.exit(1)
 
     plugin.shutdown()
 
