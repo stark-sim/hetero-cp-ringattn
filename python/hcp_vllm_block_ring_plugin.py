@@ -92,6 +92,11 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
         # decode query token (position == seq_len) maps to its own slot instead
         # of overwriting a context slot in the last peer/local block.
         self._query_block: Optional[int] = None
+        # Global sequence length across all ring domains; decode/last_token
+        # positions are derived from it (see V1 plugin for the same design).
+        self._global_seq_len: int = 0
+        # Global position of this worker's own chunk (seq_offset of its chunk).
+        self._local_seq_offset: int = 0
 
         print(
             f"[vllm block ring] loaded, vocab_size={self.vocab_size}, "
@@ -201,6 +206,11 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
     def set_global_tokens(self, tokens: List[int]) -> None:
         """Set the full global token sequence after KV exchange."""
         self._history = list(tokens)
+        self._global_seq_len = len(tokens)
+
+    def set_global_seq_len(self, length: int) -> None:
+        """Set the global sequence length when full token ids are unknown."""
+        self._global_seq_len = length
 
     def _zero_block(self, physical_block_id: int) -> None:
         """Zero a physical block across all KV-cache layers."""
@@ -246,6 +256,8 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
         )
 
         self._history = list(chunk)
+        self._global_seq_len = seq_offset + len(chunk)
+        self._local_seq_offset = seq_offset
         self._local_block_table = self._allocate_local_blocks(len(chunk))
 
         seq_data = SequenceData.from_seqs(self._history)
@@ -285,7 +297,8 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
         write them into matching positions in its combined block table.
         """
         return self.get_kv_block_from_table(
-            layer_idx, seq_start, seq_end, self.get_local_block_table()
+            layer_idx, seq_start, seq_end, self.get_local_block_table(),
+            table_seq_offset=self._local_seq_offset,
         )
 
     def get_kv_block_from_table(
@@ -416,6 +429,43 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
         )
         self.llm.llm_engine.model_executor.execute_model(execute_model_req)
         return peer_block_table
+
+    def prefill_with_context_kv(
+        self,
+        chunk: List[int],
+        seq_offset: int,
+        context_kv_blocks: List[KvBlock],
+        context_len: int,
+    ) -> Tuple[torch.Tensor, int]:
+        """
+        Insert prior-domain context KV, then prefill ``chunk`` against it.
+
+        Context-passing CP step for the later domain (see the V1 plugin for
+        the full rationale).  Returns (last_token_logits, global_seq_len).
+        """
+        if not context_kv_blocks:
+            return self.prefill(chunk, seq_offset)
+
+        num_ctx_blocks = context_kv_blocks[0].k.shape[0]
+        ctx_block_ids = self._allocate_local_blocks(num_ctx_blocks * self.block_size)
+        for kv in context_kv_blocks:
+            delta = kv.global_seq_start
+            rot_k = self._rope_delta_rotate_keys(kv.k, delta)
+            for i, bid in enumerate(ctx_block_ids):
+                self.insert_block(kv.layer_idx, bid, rot_k[i], kv.v[i])
+
+        # Context token ids are placeholders (never recomputed); only the count
+        # matters for positions and block-table mapping.
+        dummy_context = [0] * context_len
+        peer_block_table = self.prefill_peer_chunk_with_context(
+            chunk, seq_offset, dummy_context, ctx_block_ids
+        )
+        self._history = list(chunk)
+        self._local_block_table = peer_block_table
+        self._combined_block_table = list(ctx_block_ids) + peer_block_table
+        self._global_seq_len = context_len + len(chunk)
+        self._local_seq_offset = seq_offset
+        return self.last_token_logits(), self._global_seq_len
 
     def apply_peer_kv(
         self,
@@ -577,13 +627,14 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
         )
 
         self._history.append(token)
-        full_token_ids = self._history
-        seq_len = len(full_token_ids)
+        seq_len = self._global_seq_len + 1
+        self._global_seq_len = seq_len
         seq_id = self._seq_id
 
         # Build a SequenceData whose last token is the decode input and whose
-        # earlier tokens are marked as computed.  is_prompt=False tells the
-        # model runner to treat this as a decode step.
+        # earlier tokens are marked as computed.  Earlier token ids are
+        # placeholders (never recomputed); only the last decode token is real.
+        full_token_ids = [0] * (seq_len - 1) + [token]
         seq_data = SequenceData.from_seqs(full_token_ids)
         seq_data.update_num_computed_tokens(seq_len - 1)
 
@@ -628,8 +679,9 @@ class VllmBlockRingPlugin(HcpWorkerBackend):
             SequenceGroupMetadata,
         )
 
-        seq_len = len(self._history)
-        seq_data = SequenceData.from_seqs(self._history)
+        seq_len = self._global_seq_len
+        token_ids = [0] * (seq_len - 1) + [self._history[-1]]
+        seq_data = SequenceData.from_seqs(token_ids)
         seq_data.update_num_computed_tokens(seq_len - 1)
 
         block_table = list(self._combined_block_table or self.get_local_block_table())

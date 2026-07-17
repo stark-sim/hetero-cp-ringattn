@@ -97,6 +97,14 @@ class VllmBlockRingPluginV1(HcpWorkerBackend):
         self._remote_block_table: List[int] = []
         self._query_block: Optional[int] = None
         self._req_id = "ring_attn_v1"
+        # Global sequence length across all ring domains.  ``_history`` only
+        # holds the tokens this worker actually prefilled/decoded, so for
+        # cross-node CP we track the full length separately; decode/last_token
+        # positions are derived from it (earlier tokens are never recomputed,
+        # their KV comes from the combined block table).
+        self._global_seq_len: int = 0
+        # Global position of this worker's own chunk (seq_offset of its chunk).
+        self._local_seq_offset: int = 0
 
         print(
             f"[vllm v1 block ring] loaded, vocab_size={self.vocab_size}, "
@@ -217,10 +225,22 @@ class VllmBlockRingPluginV1(HcpWorkerBackend):
 
     def set_global_tokens(self, tokens: List[int]) -> None:
         self._history = list(tokens)
+        self._global_seq_len = len(tokens)
+
+    def set_global_seq_len(self, length: int) -> None:
+        """Set the global sequence length when the full token ids are unknown.
+
+        In cross-node CP a worker only holds its own chunk's tokens; decode
+        positions must still use the *global* length, so the coordinator's
+        SyncGlobalSeqLen drives this.
+        """
+        self._global_seq_len = length
 
     def prefill(self, chunk: List[int], seq_offset: int) -> Tuple[torch.Tensor, int]:
         """Prefill the local chunk into freshly allocated blocks."""
         self._history = list(chunk)
+        self._global_seq_len = seq_offset + len(chunk)
+        self._local_seq_offset = seq_offset
         self._local_block_table = self._allocate_blocks(len(chunk))
         logits = self._run_step(
             token_ids=self._history,
@@ -232,7 +252,8 @@ class VllmBlockRingPluginV1(HcpWorkerBackend):
 
     def get_kv_block(self, layer_idx: int, seq_start: int, seq_end: int) -> KvBlock:
         return self.get_kv_block_from_table(
-            layer_idx, seq_start, seq_end, self.get_local_block_table()
+            layer_idx, seq_start, seq_end, self.get_local_block_table(),
+            table_seq_offset=self._local_seq_offset,
         )
 
     def get_kv_block_from_table(
@@ -289,6 +310,57 @@ class VllmBlockRingPluginV1(HcpWorkerBackend):
             num_scheduled_tokens=len(chunk),
         )
         return peer_block_table
+
+    def prefill_with_context_kv(
+        self,
+        chunk: List[int],
+        seq_offset: int,
+        context_kv_blocks: List[KvBlock],
+        context_len: int,
+    ) -> Tuple[torch.Tensor, int]:
+        """
+        Insert prior-domain context KV, then prefill ``chunk`` against it.
+
+        This is the context-passing CP step for the *later* domain: earlier
+        domains ship their chunk's KV blocks, we write them into reserved
+        physical slots (with RoPE delta-rotation to their global positions),
+        and prefill our own chunk with those blocks as the block-table prefix.
+        Only our chunk's tokens are computed, but every layer sees the full
+        causal context, so the resulting K/V and last-token logits are correct.
+
+        ``context_len`` is the number of real context tokens (the chunks may
+        pad their last block).  Returns (last_token_logits, global_seq_len).
+        """
+        if not context_kv_blocks:
+            # No context: degenerate to a plain prefill.
+            return self.prefill(chunk, seq_offset)
+
+        num_ctx_blocks = context_kv_blocks[0].k.shape[0]
+        ctx_block_ids = self._allocate_blocks(num_ctx_blocks * self.block_size)
+        for kv in context_kv_blocks:
+            delta = kv.global_seq_start
+            rot_k = self._rope_delta_rotate_keys(kv.k, delta)
+            for i, bid in enumerate(ctx_block_ids):
+                self.insert_block(kv.layer_idx, bid, rot_k[i], kv.v[i])
+
+        peer_block_table = self._allocate_blocks(len(chunk))
+        combined = ctx_block_ids + peer_block_table
+        # Only the count of context tokens matters for positions; the actual
+        # ids are not recomputed (their KV is read from ctx_block_ids).
+        token_ids = [0] * context_len + list(chunk)
+        logits = self._run_step(
+            token_ids=token_ids,
+            num_computed_tokens=context_len,
+            block_table=combined,
+            num_scheduled_tokens=len(chunk),
+        )
+
+        self._history = list(chunk)
+        self._local_block_table = peer_block_table
+        self._combined_block_table = combined
+        self._global_seq_len = context_len + len(chunk)
+        self._local_seq_offset = seq_offset
+        return logits, self._global_seq_len
 
     def apply_peer_kv(
         self,
@@ -365,23 +437,28 @@ class VllmBlockRingPluginV1(HcpWorkerBackend):
 
     def decode(self, token: int) -> torch.Tensor:
         self._history.append(token)
-        seq_len = len(self._history)
+        seq_len = self._global_seq_len + 1
+        self._global_seq_len = seq_len
         block_table = list(self._combined_block_table or self.get_local_block_table())
         if self._query_block is None:
             self._query_block = self._allocate_blocks(self.block_size)[0]
         block_table.append(self._query_block)
+        # Earlier token ids are placeholders (never recomputed); only the last
+        # decode token is a real id.
+        token_ids = [0] * (seq_len - 1) + [token]
         return self._run_step(
-            token_ids=self._history,
+            token_ids=token_ids,
             num_computed_tokens=seq_len - 1,
             block_table=block_table,
             num_scheduled_tokens=1,
         )
 
     def last_token_logits(self) -> torch.Tensor:
-        seq_len = len(self._history)
+        seq_len = self._global_seq_len
         block_table = list(self._combined_block_table or self.get_local_block_table())
+        token_ids = [0] * (seq_len - 1) + [self._history[-1]]
         return self._run_step(
-            token_ids=self._history,
+            token_ids=token_ids,
             num_computed_tokens=seq_len - 1,
             block_table=block_table,
             num_scheduled_tokens=1,
