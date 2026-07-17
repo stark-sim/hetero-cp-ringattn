@@ -37,6 +37,13 @@ type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.9 · sou
 实现 vLLM 官方 KV connector 扩展点版本的 context-passing CP：hcp_vllm_plugin/ 包（pyproject + vllm.general_plugins 入口 + kv_connector_module_path），HcpCpConnector 以 ExampleConnector 为模板，producer 计算本 chunk 并共享存储 KV，consumer 把前序 chunk 标记为 external prefix（get_num_new_matched_tokens）只算本 chunk。关键修复：同步共享路径 load 必须返回 load_kv_async=False；get_finished 返回 (None,None) 避免 scheduler 断言。验证（pearl 单机 2 实例，vLLM 0.23.1rc1，Qwen2-0.5B-1M，64-token 变化 prompt，chunk 32+32）：consumer 首 token 604(ail) 与单节点参考一致，exit=0。该路线不打补丁、用官方稳定 API，故能跟进 vLLM 官方更新。注意：KV connector 仅 V1 引擎支持，跨节点异构需 white 也构建 V1 vLLM（当前 white 为 0.6.4）。
 
 _updated: 2026-07-17_
+### [2026-07-17] HcpCpConnector HTTP 跨机传输验证通过
+
+type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.9 · source: `scripts/poc_hcp_cp_connector.py --http-port + /tmp/poc_http.log`
+
+为 HcpCpConnector 增加 HTTP 跨机 KV 传输：producer 端仅 worker-side 起 ThreadingHTTPServer 共享 KV store（cp_serve_port），consumer 端 cp_peer_url 拉取（HEAD 探活 _READY，GET 拉 layer safetensors），带 5 次重试解决 IncompleteRead。修复：connector 按 role 实例化两次（scheduler+worker），HTTP server 只能 worker-side 绑定否则端口冲突。验证（pearl 单机 2 实例经 loopback HTTP，64-token，chunk 32+32）：0 个 fetch 失败，consumer 604(ail) 与单节点一致。至此 HCP 已成为一个不依赖补丁、基于 vLLM 官方 KVConnectorBase_V1 稳定 API 的生态插件，可跨机做 context-passing CP。异构跨节点（white CUDA + pearl ROCm）仍需 white 构建 V1 引擎 vLLM（当前 white 为 0.6.4 legacy）。
+
+_updated: 2026-07-17_
 ### [2026-07-02] vLLM Block Ring 插件骨架与 PoC 修正
 
 type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.85 · source: `git commit 3467cb4`
