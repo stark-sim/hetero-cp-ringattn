@@ -2,6 +2,32 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-07-21] 第 2 步完成：ring attention 换自研 Triton kernel(带 LSE) + merge_attn_states,双平台验证通过
+
+type: `evidence` · status: `held` · confidence: 0.95 · importance: 0.95 · source: `experiment`
+
+决策 decision-ring-paged-kernel-20260721 的实现(commit 0f7056c..18a1046)。
+设计：vLLM 原生 triton kernel 不输出 LSE 且 TRITON_ATTN 不支持 cascade => 插件内自研 ring_triton_attn.py(fork vllm triton_prefill_attention,加 LSE 输出 + Q_OFFSET causal 偏移);同一 Triton kernel 覆盖 CUDA 与 ROCm(不再按平台分叉);local(causal+offset)/peer(non-causal) 两段都走它,merge 默认用 vllm merge_attn_states(triton);HCP_RING_IMPL/HCP_RING_MERGE 可切回 plain-torch 兜底;IMPL_STATS 计数器证明真实路径。
+验证(全 PASS):
+1. 数值探针(pearl gfx1200):kernel vs fp32 参考 max|diff|~1e-3(fp16 舍入),LSE ~1e-6;merge_attn_states vs plain merge 6.1e-5(无 inf);端到端两段合并 vs 全量 ~1e-4;
+2. pearl 三件套(connector 单请求/并发/backend customst)triton 路径全 PASS,IMPL_STATS 216/408 次 triton 调用、0 torch 回退;
+3. pearl 16k/8k 长上下文:PASS(24 层×8192 token staging、overlap 0);对照 HCP_RING_IMPL=torch 同规模 OOM 于 score 矩阵物化(exp(scores) 单次 3.50 GiB 分配失败)——kernel 化动机被实证;
+4. white(RTX 4090 CUDA) 单请求+并发:PASS,同一 kernel,0 回退;
+5. 跨节点并发复验 ringconc-014233(white producer 2 chunk + pearl consumer 2 并发):PASS。
+过程修复:v load mask 转置 bug(Tk%BLOCK_N!=0 时越界键未清零,探针 Tq=37 暴露);validate_ring_backend customst 适配新 staging 签名(单 chunk 无映射回退)。
+意义:score 矩阵不再物化,长上下文显存天花板消除,为 128K+/1M 的 vLLM 线扫清自实现障碍。
+
+_updated: 2026-07-21 17:44:48_
+### [2026-07-21] fork kernel 时 mask 的维度语义要逐行核对;数值探针必须覆盖非整除/边界形状
+
+type: `lesson` · status: `held` · confidence: 0.9 · importance: 0.8 · source: `reflection`
+
+ring_triton_attn fork 自 vllm triton_prefill_attention 时,v load 的 mask 被误写成与 qk mask 同形([1, BLOCK_N],而 v 布局是 [BLOCK_N, BLOCK_D]),Tk 为 BLOCK_N 整数倍时恰好全真不暴露,Tk=37 时越界键未清零产生垃圾/nan。教训:
+1. fork kernel 时每一行 mask/stride 的维度语义都要与原布局核对,不能凭"形状能广播";
+2. 数值探针形状集必须含非整除(Tq=37)、极小(Tq=1)、偏置(offset≠0)案例——本 bug 只有非整除案例暴露,整齐形状全过;
+3. "LSE 全对但输出错"的定位价值:说明 online-softmax 记账正确,问题在数据装载(v mask)而非数学。
+
+_updated: 2026-07-21 17:44:48_
 ### [2026-07-21] 多请求并发 CP 路径验证通过：staging 按 chunk 键 + 每请求 kv_transfer_params
 
 type: `evidence` · status: `held` · confidence: 0.95 · importance: 0.9 · source: `experiment`

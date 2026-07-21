@@ -57,16 +57,6 @@ type: `preference` · status: `held` · confidence: 0.95 · importance: 0.9 · s
 全局沉淀：该方法论已融入 graph-memory skill 的 "Pre-Action Motivation Analysis" 一节(含六问→节点/边的映射：DEPENDS_ON 记顺序、belief+证据记外部做法、GOVERNS 关联规则与应用)。原 optimization-trade-off skill 已按用户决策退役(移入 _removed)，其牺牲四问作为扩展条款并入；项目 AGENTS.md 对应章节已同步改为动机剖析六问+牺牲扩展。
 
 _updated: 2026-07-21 13:48:11_
-### 步骤2(次做)：ring attention 从 plain-PyTorch 换成原生 paged kernel + cascade 式 LSE 合并
-
-type: `decision` · status: `held` · confidence: 0.85 · importance: 0.9 · source: `user-direction`
-
-【现状】ring_backend._attn_with_lse 为自写 plain PyTorch fp32：每请求每层把 K/V 从 paged cache gather 成连续张量，einsum 物化完整 score 矩阵 [H, Tq, Tk] 再手动 softmax+LSE。2048 token 可跑，但 score 矩阵显存 随长度平方增长，128K/1M(HCP 卖点)直接爆显存；fp32 无 kernel 融合，速度差原生一个量级。
-【动机】显存切分省下的显存会被自实现低效吃回去；不长上下文，跨节点能力无实用价值。
-【vLLM 怎么做】(a) PagedAttention：KV 按 block 分页，kernel 以 block table 为索引直接读分页内存，不 gather、不物化 score 矩阵，内部本即 online softmax 分块；(b) cascade attention：与 HCP merge 数学同构(见 belief-vllm-cascade-attn-20260721)；(c) FlashAttention kernel 支持输出 LSE。
-【目标态】chunk B 走 vLLM 原生 paged kernel(带 LSE)，chunk A 对 staging buffer 跑一次 flash kernel(带 LSE)，再一次 LSE merge。score 矩阵不再物化，长度天花板消失，速度接近原生。
-
-_updated: 2026-07-21 13:28:03_
 ### 步骤1(最后做)：从研究脚本收敛为标准 vLLM 生态插件
 
 type: `decision` · status: `held` · confidence: 0.85 · importance: 0.9 · source: `user-direction`
