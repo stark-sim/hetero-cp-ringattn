@@ -162,6 +162,17 @@ type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.9 · sou
 与 HCP 相关性：直接相关，可能缓解 pearl 等小/慢 domain 在 Phase 2 成为瓶颈的问题。
 
 _updated: 2026-06-29 06:06:09_
+### vLLM cascade/LSE 机制存在但平台分层：CUDA 有 vendored FA(含 LSE),ROCm/RDNA 走 Triton + merge_attn_states 算子
+
+type: `belief` · status: `held` · confidence: 0.8 · importance: 0.85 · source: `code-reading`
+
+vLLM 的 cascade attention(共享前缀与各请求私有后缀分别算 attention 再按 LSE 合并)与 HCP ring backend 的 local(chunk B) + peer(chunk A) LSE merge 数学同构。但[2026-07-21 源码核实]平台能力分层：
+1. "vLLM 内置 flash_attn" 仅覆盖 CUDA(vllm.vllm_flash_attn vendored kernel)与 XPU;ROCm 在 fa_utils.py 里是 try: from flash_attn import ...(依赖用户自装上游包),pearl 的 vllm-rocm env 无 flash_attn/aiter 包 => FLASH_ATTN 后端不可用;
+2. vLLM 官方对 ROCm 分层(rocm.py):gfx9(CDNA) 预期 AITER FA / 上游 flash_attn 包;RDNA(gfx11xx/gfx12xx, pearl 9060 XT 为 gfx1200) 官方预期路径即 Triton 实现(注释原文);有 kv_connector 时 ROCM_ATTN 因 KV layout 不兼容被排除 => pearl connector 场景后端只有 TRITON_ATTN/CUSTOM;
+3. TRITON_ATTN 后端 assert attn_metadata.use_cascade is False(不接 cascade),但 vllm.v1.attention.ops.merge_attn_states(含 triton 版)输入正是 (prefix_out, prefix_lse, suffix_out, suffix_lse),形状与 HCP merge 一致;
+4. 推论(第 2 步平台策略):white 复用 vendored FA 的 LSE;pearl 用 triton kernel 算两段 + merge_attn_states——但该算子在 gfx1200 上须先做数值稳定性验证(HCP 团队曾在 ROCm 见过 inf),不可靠则保留已验证的 plain-PyTorch merge(3e-7)兜底。
+
+_updated: 2026-07-21 16:42:06_
 ### 动机剖析六问能在行动前暴露顺序错误与现成轮子，值得作为默认动作
 
 type: `belief` · status: `held` · confidence: 0.8 · importance: 0.85 · source: `experiment`
@@ -172,13 +183,6 @@ type: `belief` · status: `held` · confidence: 0.8 · importance: 0.85 · sourc
 代价：每项工作启动前增加约一次剖析的固定开销。对多步骤、跨系统的工作收益大于开销；对单行修复类琐碎工作可从简。
 
 _updated: 2026-07-21 13:48:11_
-### vLLM cascade attention 与 HCP local+peer LSE merge 数学同构
-
-type: `belief` · status: `held` · confidence: 0.8 · importance: 0.85 · source: `code-reading`
-
-vLLM 的 cascade attention 在多请求共享前缀时，对共享前缀与各请求私有后缀分别算 attention，再用各自的 LSE(logsumexp) 合并。HCP ring backend 的 local(chunk B, causal) + peer(chunk A, non-causal) LSE merge 是同一种数学，只是合并的两段住在不同节点上。此外 FlashAttention kernel 本身支持输出 LSE(white 上 vendored FA 已验证含 LSE)。推论：HCP 的 ring merge 可以换成"两个原生 kernel + 一次 cascade 式合并"，不需要自写 attention 数学。
-
-_updated: 2026-07-21 13:28:03_
 ### vLLM 官方长上下文分布路线是 disaggregated prefill(全量 KV 搬移)
 
 type: `belief` · status: `held` · confidence: 0.85 · importance: 0.85 · source: `code-reading`
