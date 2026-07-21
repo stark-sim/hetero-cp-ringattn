@@ -11,8 +11,9 @@ type: `task` · status: `ongoing` · confidence: 0.85 · importance: 0.95 · sou
 1. 把 hetero-cp-ringattn 分布式调度框架整理成标准 vLLM 生态插件（entry points 注册、配置化、可随 vLLM 官方更新跟进），既有异构长上下文能力又不 fork 内核；
 2. 整合 PageAttn 与 hetero-cp-ringattn 的 block KV：现在 ring backend 用 plain-PyTorch fp32 逐请求算 attention，需评估与 vLLM paged attention/flash_attn 内核的融合路径；
 3. 解除 PoC 限制：PEER_KV_STAGING 按 layer 键限单并发(max_num_seqs=1)，consumer 必须关 prefix caching；工程化需支持多请求并发 staging（按 request 键）。
+[2026-07-21 更新] 执行顺序修正为 3→2→1(原记录 1→2→3)：per-request staging 是地基(数据结构正确性)；paged kernel 化建在其上(按请求取 staging)；插件化最后(对外配置面等二者定型再冻结)。三者动机剖析已落 decision 节点：decision-per-request-staging-20260721 / decision-ring-paged-kernel-20260721 / decision-vllm-plugin-packaging-20260721。
 
-_updated: 2026-07-21 13:08:24_
+_updated: 2026-07-21 13:28:03_
 ### 下一阶段：从 1M 可行性验证走向多条扩展线探索
 
 type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.95 · source: `user-direction`
@@ -41,6 +42,37 @@ type: `task` · status: `superseded` · confidence: 0.95 · importance: 0.95 · 
 1M v9（3:1 split）成功，prefill 24/24 + decode 5/5，exit=0。文档已同步：1M_CONTEXT_THUNDERBOLT_PLAN.md、SCALING_ARGUMENT.md、systemPatterns.md。当前无未完成的 1M 攻坚任务；下一步决定是否需要更大模型 / 更多 domain 验证。
 
 _updated: 2026-06-29 06:01:28_
+### 步骤3(先做)：peer KV staging 从全局 dict 改为按请求键，解除单并发限制
+
+type: `decision` · status: `held` · confidence: 0.85 · importance: 0.9 · source: `user-direction`
+
+【现状】PEER_KV_STAGING 是全局 dict，键为 layer 名 => 同一时刻全引擎只能有一份 peer KV，所有请求共享同一 peer chunk。故 PoC 强制 max_num_seqs=1，consumer 必须关 prefix caching。这是正确性限制，不是性能限制；第 2 步验证的连续批走的是非 CP 路径，CP 路径无并发能力。
+【动机】continuous batching 是 vLLM 存在的意义，单并发只是演示品；且这是 N 节点真 ring 的前提——N 个 chunk 时每请求要挂多个 peer 块，全局 dict 结构上不支持。
+【vLLM 怎么做】框架本就提供按请求携带状态的通道：build_connector_meta 产出的 connector metadata 按请求组织(RingReqMeta 已在其中)；AttentionMetadata(seq_lens/block_table/query_start_loc) 全是按请求索引的 batched 结构。PoC 用全局 dict 是抄近路，不是框架缺能力。
+【目标态】staging 键从 layer 改为 (request_id, layer)，metadata 携带每请求的 peer chunk 列表，forward 按请求取各自 peer KV。CP 路径进入连续批，max_num_seqs 不限 1，为 N 节点真 ring 铺平数据结构。
+
+_updated: 2026-07-21 13:28:03_
+### 步骤2(次做)：ring attention 从 plain-PyTorch 换成原生 paged kernel + cascade 式 LSE 合并
+
+type: `decision` · status: `held` · confidence: 0.85 · importance: 0.9 · source: `user-direction`
+
+【现状】ring_backend._attn_with_lse 为自写 plain PyTorch fp32：每请求每层把 K/V 从 paged cache gather 成连续张量，einsum 物化完整 score 矩阵 [H, Tq, Tk] 再手动 softmax+LSE。2048 token 可跑，但 score 矩阵显存 随长度平方增长，128K/1M(HCP 卖点)直接爆显存；fp32 无 kernel 融合，速度差原生一个量级。
+【动机】显存切分省下的显存会被自实现低效吃回去；不长上下文，跨节点能力无实用价值。
+【vLLM 怎么做】(a) PagedAttention：KV 按 block 分页，kernel 以 block table 为索引直接读分页内存，不 gather、不物化 score 矩阵，内部本即 online softmax 分块；(b) cascade attention：与 HCP merge 数学同构(见 belief-vllm-cascade-attn-20260721)；(c) FlashAttention kernel 支持输出 LSE。
+【目标态】chunk B 走 vLLM 原生 paged kernel(带 LSE)，chunk A 对 staging buffer 跑一次 flash kernel(带 LSE)，再一次 LSE merge。score 矩阵不再物化，长度天花板消失，速度接近原生。
+
+_updated: 2026-07-21 13:28:03_
+### 步骤1(最后做)：从研究脚本收敛为标准 vLLM 生态插件
+
+type: `decision` · status: `held` · confidence: 0.85 · importance: 0.9 · source: `user-direction`
+
+【现状】插件能工作但形态是研究脚本：pip install -e 本仓库、手写长 kv_transfer_config dict、环境变量控制行为；验证脚本硬编码模型路径与节点 IP；无版本兼容声明。
+【动机】KVConnectorBase_V1 是 experimental API(见 belief-connector-api-experimental-20260721)，不收敛插件边界则 vLLM 升级可能悄悄破坏兼容性；收敛后别人 pip install + 两个参数即可获得异构长上下文能力。
+【vLLM 怎么做】官方答案就是插件：两条标准扩展面(KV connector 接口 + attention backend 注册表)，NIXL connector / LMCache / Mooncake 均走同一 KVConnectorBase_V1 接口，无人 fork 内核；我们的 ring backend 注册在 CUSTOM，与官方后端机制平级。此步非发明新东西，是打磨已在正确接口上的代码。
+【目标态】entry points 自动注册、配置项收敛为文档化的少数键、声明兼容的 vLLM 版本区间、留最小可跑示例；vLLM 升级时跑兼容性验证脚本即知坏没坏。
+【为何最后】插件定义的对外配置面应等 staging(3)与 kernel(2)定型后再冻结，避免刚发布就改配置。
+
+_updated: 2026-07-21 13:28:03_
 ### 下一步顺序：1) 双平台 flash_attn 2) decode 充分验证(continuous batch+多步) 3) 异构跨节点切分 CP
 
 type: `decision` · status: `held` · confidence: 0.85 · importance: 0.9 · source: `user-direction`
@@ -125,6 +157,20 @@ type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.9 · sou
 与 HCP 相关性：直接相关，可能缓解 pearl 等小/慢 domain 在 Phase 2 成为瓶颈的问题。
 
 _updated: 2026-06-29 06:06:09_
+### vLLM cascade attention 与 HCP local+peer LSE merge 数学同构
+
+type: `belief` · status: `held` · confidence: 0.8 · importance: 0.85 · source: `code-reading`
+
+vLLM 的 cascade attention 在多请求共享前缀时，对共享前缀与各请求私有后缀分别算 attention，再用各自的 LSE(logsumexp) 合并。HCP ring backend 的 local(chunk B, causal) + peer(chunk A, non-causal) LSE merge 是同一种数学，只是合并的两段住在不同节点上。此外 FlashAttention kernel 本身支持输出 LSE(white 上 vendored FA 已验证含 LSE)。推论：HCP 的 ring merge 可以换成"两个原生 kernel + 一次 cascade 式合并"，不需要自写 attention 数学。
+
+_updated: 2026-07-21 13:28:03_
+### vLLM 官方长上下文分布路线是 disaggregated prefill(全量 KV 搬移)
+
+type: `belief` · status: `held` · confidence: 0.85 · importance: 0.85 · source: `code-reading`
+
+vLLM 官方对"长上下文分布式"的答案是 P/D 分离：prefill 节点算完全量 KV，整体搬给 decode 节点。该路线每个节点都必须容纳全量 KV；HCP 切分 CP 不需要——各节点只持有自己 chunk 的 KV，peer chunk 仅以瞬时 staging 参与计算。这是 HCP 相对 vLLM 官方路线的差异化价值，也是三步工程化值得做的原因：把差异化的正确性证明变成差异化的可用能力。
+
+_updated: 2026-07-21 13:28:03_
 ### 决策：flash_attn 用 vLLM 内置实现，不编独立 ROCm 包
 
 type: `decision` · status: `held` · confidence: 0.85 · importance: 0.85 · source: `user-direction + white/pearl flash_attn probe`
@@ -248,6 +294,13 @@ type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.85 · sou
 HCP 的数学基础即来源于此。
 
 _updated: 2026-06-29 06:06:09_
+### KVConnectorBase_V1 是 experimental API，插件边界收敛才能跟进 vLLM 升级
+
+type: `belief` · status: `held` · confidence: 0.9 · importance: 0.8 · source: `experiment`
+
+vLLM 运行日志明示 "KVConnectorBase_V1. This API is experimental and subject to change"。HCP 对 vLLM 的依赖面 = attention backend 注册表(CUSTOM) + KV connector 接口两个扩展点。不收敛成干净插件边界，vLLM 升级可能悄悄破坏兼容性且无人发现；收敛后每次升级跑一遍兼容性验证即可。
+
+_updated: 2026-07-21 13:28:03_
 ### Ring Attention 衍生方案综述仅作为文献背景，不单独实现
 
 type: `claim` · status: `held` · confidence: 0.8 · importance: 0.8 · source: `user-direction + cost-benefit review`
