@@ -51,6 +51,13 @@ type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.95 · sou
 完成 HCP 作为 vLLM 生态插件的跨节点异构验证。先在 white（RTX 4090）构建 V1 引擎 vLLM 0.23.1rc1.dev905+g3f99883d9：新建 conda env vllm-v1，装 torch 2.13.0+cu126（下载慢约50min），clone 到 3f99883d9，装 build 依赖（cmake<4、ninja、setuptools-rust），关键是用 conda gcc-13 作为 nvcc host compiler 解决 Ubuntu 26.04 glibc 2.43 + CUDA 13.1 + gcc-15 的 rsqrt exception-spec 冲突；pip 装上 cu130 torch + torchvision 后 vLLM 0.23 在 white 跑通 prefill。随后跨节点：white producer（CUDA，HcpCpConnector，cp_serve_port=8899）算 chunk A 并经 HTTP 供 KV，pearl consumer（ROCm gfx1200，HcpCpConnector，cp_peer_url=http://white:8899）拉取 chunk A KV 作 external prefix 算 chunk B。验证（Qwen2-0.5B-1M，64-token 变化 prompt，chunk 32+32，greedy 4 token）：consumer [604,16009,16009,1534]=ail rose rosemary 与单节点参考完全一致。至此 HCP 是一个不打补丁、基于官方 KVConnectorBase_V1 稳定 API、可跨异构节点做 context-passing CP 的 vLLM 生态插件，能跟进 vLLM 官方更新。
 
 _updated: 2026-07-17_
+### [2026-07-17] HcpRingAttentionBackend：vLLM 显存切分 online softmax ring attention 验证通过
+
+type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.9 · source: `hcp_vllm_plugin/hcp_vllm_plugin/ring_backend.py + validate_ring_backend.py + /tmp/ring_val.log`
+
+实现 vLLM 显存切分（memory-splitting）online softmax ring attention：自定义 attention backend HcpRingAttentionBackend（FlashAttentionBackend 子类，注册为 CUSTOM，vllm.general_plugins 入口）。每个 worker 只永久持有自己 chunk 的 KV，attention 时对 local chunk（causal）与 transient peer chunk（non-causal）分别计算 (O, LSE)，用 plain-PyTorch online softmax 合并，peer KV 经 PEER_KV_STAGING 瞬时暂存而不入 paged pool。RoPE 位置：单请求全 prompt，backend 按 HCP_RING_SPLIT_TOKENS 切分 peer/local，数学上等价 2-worker 分片。验证（pearl ROCm gfx1200，vLLM 0.23.1rc1，Qwen2-0.5B-1M，2048-token，split=1024，greedy）：ref/custom0/custom/customst 四种模式 sampled token 均 14579，top-5 集合一致，logits 差异在 fp16 噪声内（独立复跑通过）。ROCm 事实：flash_attn 未安装故用 plain-PyTorch attention（fp32 累加，correctness-grade）；merge_attn_states 未用（Triton 内核在 ROCm 有 inf 问题）。后续：KV connector 接线真实网络 peer KV、2 进程全局位置偏移、decode 阶段验证、性能优化。
+
+_updated: 2026-07-17_
 ### [2026-07-02] vLLM Block Ring 插件骨架与 PoC 修正
 
 type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.85 · source: `git commit 3467cb4`

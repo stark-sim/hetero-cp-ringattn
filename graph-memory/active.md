@@ -30,6 +30,14 @@ type: `task` · status: `superseded` · confidence: 0.95 · importance: 0.95 · 
 1M v9（3:1 split）成功，prefill 24/24 + decode 5/5，exit=0。文档已同步：1M_CONTEXT_THUNDERBOLT_PLAN.md、SCALING_ARGUMENT.md、systemPatterns.md。当前无未完成的 1M 攻坚任务；下一步决定是否需要更大模型 / 更多 domain 验证。
 
 _updated: 2026-06-29 06:01:28_
+### vLLM 线显存切分（online softmax ring attention）
+
+type: `task` · status: `ongoing` · confidence: 0.7 · importance: 0.9 · source: `user-direction`
+
+目标：让 vLLM 线的 CP 从 full-KV 复制升级为真正的显存切分 ring attention——每个 vLLM worker 只永久持有自己 chunk 的 KV，attention 时对 local KV 与 peer KV 分别计算 (O, LSE) 并用 online softmax 合并，peer KV 仅瞬时使用后即丢弃。技术约束（已确认）：stock vLLM PagedAttention 必须让 KV 落在 block table 才能算，无法直接做 online softmax；需研究 vLLM FlashAttention backend 是否暴露 LSE（log-sum-exp），或用自定义 attention backend / 模型层包装实现两遍 attention + 合并。前置已完成：HcpCpConnector（官方 KVConnectorBase_V1）跨节点 context-passing CP 已验证（white CUDA + pearl ROCm 匹配单节点），white V1 vLLM 0.23 已构建。下一步：调研 vLLM attention backend 的 LSE 输出与自定义 backend 可行性，设计 online softmax ring 实现。
+[进展] 核心 backend 已实现并在 pearl 单机验证（custom 匹配单节点）；peer KV 暂用 staging dict，待 KV connector 接线与 2 进程位置偏移。
+
+_updated: 2026-07-17_
 ### Block KV cache + vLLM 集成：插件解耦 vs HCP 内联 PageAttention 双路线
 
 type: `hypothesis` · status: `ongoing` · confidence: 0.65 · importance: 0.9 · source: `user-direction`
