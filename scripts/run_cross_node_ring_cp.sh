@@ -43,6 +43,8 @@ run_pearl() { ssh -o ConnectTimeout=20 "${PEARL_SSH}" "bash -lc $(shell_quote "$
 
 echo "=== HCP ring split-CP cross-node validation (white CUDA producer + pearl ROCm consumer) ==="
 echo "RUN_ID=${RUN_ID}  total=${TOTAL} split=${SPLIT} decode=${DECODE} port=${SERVE_PORT}"
+# Tee driver stdout/stderr into the report dir as audit evidence.
+exec > >(tee -a "${REPORT_DIR}/driver.log") 2>&1
 
 # === Pre-checks (per AGENTS.md hardware discipline) ===
 echo "=== pre-checks ==="
