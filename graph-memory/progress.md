@@ -9,6 +9,13 @@ type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.95 · sou
 按用户约束（KV connector 默认是全量搬移，HCP 是切分瞬时）实现 HcpRingKvConnector（KVConnectorBase_V1）：调度侧 get_num_new_matched_tokens 仅把前序 chunk 标记为 external，给本 chunk 提供全局 RoPE 位置并阻止重复计算；worker 侧 start_load_kv 经 HTTP 从 producer 拉取 peer chunk 每层 KV，写入 ring_backend 的 PEER_KV_STAGING（瞬时），绝不写入常驻 paged pool——与 stock disaggregated-prefill 全量复制语义明确区分。ring_backend 增加 WRITE_TRACK 证明显存切分。验证（pearl 单机 2 个 vLLM 0.23 实例，CUSTOM backend + ring connector，2048-token prompt 切 1024+1024，greedy decode 4）：consumer tokens [14579,220,22,21] 与单节点一致，max|logit diff| 0.027（argmax 处 0.016），chunk-A 常驻池本地写入=0，peer KV 1024 tokens/layer×24 层全部经 HTTP 拉取（独立复跑通过，exit 0）。后续：跨节点（white CUDA producer + pearl ROCm consumer）、decode 充分性、性能（ROCm 无 flash_attn，目前 plain-PyTorch）。
 
 _updated: 2026-07-21_
+### [2026-07-21] flash_attn 平台现状：white CUDA 已可用，pearl ROCm 构建中
+
+type: `evidence` · status: `held` · confidence: 0.7 · importance: 0.8 · source: `white/pearl flash_attn probe`
+
+flash_attn 双平台接通进展（下一步顺序第1步）：\n- white（CUDA，vLLM 0.23.1rc1）：无需单独装 flash_attn 包，vLLM vendored vllm_flash_attn 已可用，is_flash_attn_varlen_func_available()=True；实测 flash_attn_varlen_func(..., return_softmax_lse=True) 返回 (out [5,2,64], lse [2,5])，flash_attn+LSE 在 white 正常。\n- pearl（ROCm gfx1200，vLLM 0.23.1rc1）：is_flash_attn_varlen_func_available()=False（无 vendored ROCm flash_attn，也无 ROCm flash_attn 包，回退 Triton）。AMD 官方 index 无 gfx1200 预编译 flash-attn wheel。正在用 ROCm/flash-attention 的 main_perf 分支 + FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE（Triton 后端，硬件无关）源码构建，目标让 pearl 的 flash_attn 可用。\n注意：ROCm 的 flash_attn 是 ROCm/flash-attention fork，官方 flash-attn 为 CUDA-only；Triton 后端理论上可在 RDNA4 gfx1200 运行。
+
+_updated: 2026-07-21_
 ### [2026-07-17] vLLM 0.23.1rc1 源码编译补丁（gfx1200）
 
 type: `evidence` · status: `held` · confidence: 0.75 · importance: 0.8 · source: `bash-i3gxwyr5 build log`
