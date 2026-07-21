@@ -57,16 +57,6 @@ type: `preference` · status: `held` · confidence: 0.95 · importance: 0.9 · s
 全局沉淀：该方法论已融入 graph-memory skill 的 "Pre-Action Motivation Analysis" 一节(含六问→节点/边的映射：DEPENDS_ON 记顺序、belief+证据记外部做法、GOVERNS 关联规则与应用)。原 optimization-trade-off skill 已按用户决策退役(移入 _removed)，其牺牲四问作为扩展条款并入；项目 AGENTS.md 对应章节已同步改为动机剖析六问+牺牲扩展。
 
 _updated: 2026-07-21 13:48:11_
-### 步骤3(先做)：peer KV staging 从全局 dict 改为按请求键，解除单并发限制
-
-type: `decision` · status: `held` · confidence: 0.85 · importance: 0.9 · source: `user-direction`
-
-【现状】PEER_KV_STAGING 是全局 dict，键为 layer 名 => 同一时刻全引擎只能有一份 peer KV，所有请求共享同一 peer chunk。故 PoC 强制 max_num_seqs=1，consumer 必须关 prefix caching。这是正确性限制，不是性能限制；第 2 步验证的连续批走的是非 CP 路径，CP 路径无并发能力。
-【动机】continuous batching 是 vLLM 存在的意义，单并发只是演示品；且这是 N 节点真 ring 的前提——N 个 chunk 时每请求要挂多个 peer 块，全局 dict 结构上不支持。
-【vLLM 怎么做】框架本就提供按请求携带状态的通道：build_connector_meta 产出的 connector metadata 按请求组织(RingReqMeta 已在其中)；AttentionMetadata(seq_lens/block_table/query_start_loc) 全是按请求索引的 batched 结构。PoC 用全局 dict 是抄近路，不是框架缺能力。
-【目标态】staging 键从 layer 改为 (request_id, layer)，metadata 携带每请求的 peer chunk 列表，forward 按请求取各自 peer KV。CP 路径进入连续批，max_num_seqs 不限 1，为 N 节点真 ring 铺平数据结构。
-
-_updated: 2026-07-21 13:28:03_
 ### 步骤2(次做)：ring attention 从 plain-PyTorch 换成原生 paged kernel + cascade 式 LSE 合并
 
 type: `decision` · status: `held` · confidence: 0.85 · importance: 0.9 · source: `user-direction`
