@@ -57,8 +57,8 @@ fi
 run_white "/home/stark/miniconda3/envs/vllm-v1/bin/python -c \"import hcp_vllm_plugin.ring_connector, hcp_vllm_plugin.ring_backend\"" \
   || { echo "FATAL: hcp_vllm_plugin not importable on white" >&2; exit 2; }
 run_white "curl -sf -o /dev/null http://127.0.0.1:${SERVE_PORT}/ && exit 1 || true" # port must be free
-run_white "pgrep -f validate_ring_connector.py && exit 1 || true"
-run_pearl "pgrep -f validate_ring_connector.py && exit 1 || true"
+run_white "pgrep -f '[v]alidate_ring_connector.py' && exit 1 || true"
+run_pearl "pgrep -f '[v]alidate_ring_connector.py' && exit 1 || true"
 echo "pre-checks OK"
 
 WHITE_STORE="/tmp/hcp_ring_store_producer_${RUN_ID}"
