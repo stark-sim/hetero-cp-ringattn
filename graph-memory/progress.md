@@ -16,6 +16,13 @@ type: `evidence` · status: `closed` · confidence: 0.7 · importance: 0.8 · so
 flash_attn 双平台接通进展（下一步顺序第1步）：\n- white（CUDA，vLLM 0.23.1rc1）：无需单独装 flash_attn 包，vLLM vendored vllm_flash_attn 已可用，is_flash_attn_varlen_func_available()=True；实测 flash_attn_varlen_func(..., return_softmax_lse=True) 返回 (out [5,2,64], lse [2,5])，flash_attn+LSE 在 white 正常。\n- pearl（ROCm gfx1200，vLLM 0.23.1rc1）：is_flash_attn_varlen_func_available()=False（无 vendored ROCm flash_attn，也无 ROCm flash_attn 包，回退 Triton）。AMD 官方 index 无 gfx1200 预编译 flash-attn wheel。正在用 ROCm/flash-attention 的 main_perf 分支 + FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE（Triton 后端，硬件无关）源码构建，目标让 pearl 的 flash_attn 可用。\n注意：ROCm 的 flash_attn 是 ROCm/flash-attention fork，官方 flash-attn 为 CUDA-only；Triton 后端理论上可在 RDNA4 gfx1200 运行。
 
 _updated: 2026-07-21_
+### [2026-07-21] decode 充分验证：continuous batch + 多步 decode 全过（独立复跑）
+
+type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.9 · source: `hcp_vllm_plugin/validate_decode.py + /tmp/my_decode_val.log`
+
+第2步 decode 充分验证（validate_decode.py，主 Agent 独立复跑确认，exit 0）：\n1) no-peer 退化 + 多步 decode：CUSTOM backend、HCP_RING_SPLIT_TOKENS=0，2048-token prompt greedy 16 token，全部匹配单节点参考（[220,23,15,74459,...]，max|logit diff| 0.023）。\n2) continuous batching：6 个长度 [64,200,350,700,1000,1500] 的 prompt 一次 generate 提交，BATCH_STATS.max_reqs=6 证明真在同一 attention step 批处理（非串行），6 个请求各 16 token 全部匹配单节点（diff 0.019–0.035）。证明 vLLM 连续批处理基础能力在 CUSTOM ring backend 下正常。\n3) CP 路径多步 decode：2 进程 ring-connector 切分（producer chunk A + consumer 全 prompt，HTTP 拉 peer KV），decode=8 与 decode=16 均 PASS，consumer 16 token [14579,220,22,21,...] 逐步匹配单节点；显存切分保持——consumer 写 1039 pool slots（1024 chunk-B prefill + 15 decode），chunk-A 常驻池本地写入=0。\n已知限制：PEER_KV_STAGING 按 layer 键，多并发 consumer 请求若 peer chunk 不同会互相覆盖，故 CP 路径限单并发（max_num_seqs=1）；no-peer 批处理无此限制。正确修法：staging 按 (request_id, layer) 键并把 request 身份经 attn_metadata 传入 forward（后续）。
+
+_updated: 2026-07-21_
 ### [2026-07-17] vLLM 0.23.1rc1 源码编译补丁（gfx1200）
 
 type: `evidence` · status: `held` · confidence: 0.75 · importance: 0.8 · source: `bash-i3gxwyr5 build log`
