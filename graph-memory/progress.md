@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-07-21] HcpRingKvConnector：peer KV 以“切分瞬时”接入，2 进程显存切分验证通过
+
+type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.95 · source: `hcp_vllm_plugin/hcp_vllm_plugin/ring_connector.py + validate_ring_connector.py + /tmp/my_ring_val.log`
+
+按用户约束（KV connector 默认是全量搬移，HCP 是切分瞬时）实现 HcpRingKvConnector（KVConnectorBase_V1）：调度侧 get_num_new_matched_tokens 仅把前序 chunk 标记为 external，给本 chunk 提供全局 RoPE 位置并阻止重复计算；worker 侧 start_load_kv 经 HTTP 从 producer 拉取 peer chunk 每层 KV，写入 ring_backend 的 PEER_KV_STAGING（瞬时），绝不写入常驻 paged pool——与 stock disaggregated-prefill 全量复制语义明确区分。ring_backend 增加 WRITE_TRACK 证明显存切分。验证（pearl 单机 2 个 vLLM 0.23 实例，CUSTOM backend + ring connector，2048-token prompt 切 1024+1024，greedy decode 4）：consumer tokens [14579,220,22,21] 与单节点一致，max|logit diff| 0.027（argmax 处 0.016），chunk-A 常驻池本地写入=0，peer KV 1024 tokens/layer×24 层全部经 HTTP 拉取（独立复跑通过，exit 0）。后续：跨节点（white CUDA producer + pearl ROCm consumer）、decode 充分性、性能（ROCm 无 flash_attn，目前 plain-PyTorch）。
+
+_updated: 2026-07-21_
 ### [2026-07-17] vLLM 0.23.1rc1 源码编译补丁（gfx1200）
 
 type: `evidence` · status: `held` · confidence: 0.75 · importance: 0.8 · source: `bash-i3gxwyr5 build log`
