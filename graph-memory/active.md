@@ -42,6 +42,21 @@ type: `task` · status: `superseded` · confidence: 0.95 · importance: 0.95 · 
 1M v9（3:1 split）成功，prefill 24/24 + decode 5/5，exit=0。文档已同步：1M_CONTEXT_THUNDERBOLT_PLAN.md、SCALING_ARGUMENT.md、systemPatterns.md。当前无未完成的 1M 攻坚任务；下一步决定是否需要更大模型 / 更多 domain 验证。
 
 _updated: 2026-06-29 06:01:28_
+### 工作方式规则：任何工作开始前先做动机剖析六问
+
+type: `preference` · status: `held` · confidence: 0.95 · importance: 0.9 · source: `user-direction`
+
+用户确立的通用工作方式(2026-07-21，适用于优化工作与普通工作)：开始任何一项工作前，必须先能回答六个问题，并把答案写进对应 decision/task 节点的 content(或 commit message)：
+1. 面对什么问题——要解决的问题/缺口是什么；
+2. 现状是什么——当前代码/系统处于什么状态，为什么不够用；
+3. 做完能怎样——完成后的目标态与可验证标准；
+4. 其他人怎么做——生态/同行(特别是 vLLM)遇到同样或类似问题时的解法，能否直接复用；
+5. 我们怎么做——本项目采用的具体方案；
+6. 为什么我们要这么做——相对第 4 问的现成方案，我们的方案差异在哪、为什么差异是必要的。
+扩展规则：若工作属于优化/做减法类(丢弃现有行为换速度/显存/简洁)，在六问之外追加牺牲四问(为什么默认存在/牺牲了什么/被牺牲者的用途/对本项目的意义)，并给出 implement/defer/reject 结论；reject 也要记录，避免同一想法被重复提出。
+全局沉淀：该方法论已融入 graph-memory skill 的 "Pre-Action Motivation Analysis" 一节(含六问→节点/边的映射：DEPENDS_ON 记顺序、belief+证据记外部做法、GOVERNS 关联规则与应用)。原 optimization-trade-off skill 已按用户决策退役(移入 _removed)，其牺牲四问作为扩展条款并入；项目 AGENTS.md 对应章节已同步改为动机剖析六问+牺牲扩展。
+
+_updated: 2026-07-21 13:48:11_
 ### 步骤3(先做)：peer KV staging 从全局 dict 改为按请求键，解除单并发限制
 
 type: `decision` · status: `held` · confidence: 0.85 · importance: 0.9 · source: `user-direction`
@@ -157,6 +172,16 @@ type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.9 · sou
 与 HCP 相关性：直接相关，可能缓解 pearl 等小/慢 domain 在 Phase 2 成为瓶颈的问题。
 
 _updated: 2026-06-29 06:06:09_
+### 动机剖析六问能在行动前暴露顺序错误与现成轮子，值得作为默认动作
+
+type: `belief` · status: `held` · confidence: 0.8 · importance: 0.85 · source: `experiment`
+
+首次完整应用(2026-07-21，vLLM 线三个下一步)即产生两类实质收益：
+(a) 暴露顺序错误——原记录顺序 1→2→3(插件化→kernel→staging)，剖析依赖后修正为 3→2→1(staging 是数据结构地基，kernel 化需按请求取 staging，插件配置面最后冻结)，避免返工；
+(b) 暴露现成轮子——"别人怎么做"一问发现 vLLM cascade attention 与 HCP local+peer LSE merge 数学同构、AttentionMetadata/connector metadata 本就按请求组织，两步工作都可直接复用框架机制 而非自造。
+代价：每项工作启动前增加约一次剖析的固定开销。对多步骤、跨系统的工作收益大于开销；对单行修复类琐碎工作可从简。
+
+_updated: 2026-07-21 13:48:11_
 ### vLLM cascade attention 与 HCP local+peer LSE merge 数学同构
 
 type: `belief` · status: `held` · confidence: 0.8 · importance: 0.85 · source: `code-reading`

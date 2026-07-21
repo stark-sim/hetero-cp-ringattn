@@ -75,14 +75,25 @@ When running on heterogeneous hosts that mix libtorch, CUDA, ROCm, and conda, fo
 - `memory bank read` / `graph memory read` / `memory bank oku` -> Read blueprint + active + progress and present context
 - `export memory` / `regenerate markdown` -> Regenerate markdown views from `graph.db`
 
-### Optimization Trade-off Discipline:
-Whenever proposing an optimization, you MUST analyze the trade-off before implementing:
+### Pre-Action Motivation Analysis (动机剖析六问):
+Before starting any non-trivial work — optimization or ordinary — you MUST be able to answer six questions, and record the answers in the corresponding graph-memory `decision`/`task` node (or the commit message for trivial changes):
+1. **What problem**: what gap or pain does this work address?
+2. **Current state**: what does the code/system look like today, and why is it insufficient?
+3. **End state**: what does "done" look like, and how is it verified?
+4. **How others solve it**: how does the ecosystem (especially vLLM) solve the same or a similar problem? Can their mechanism be reused directly?
+5. **Our approach**: the concrete plan for this project.
+6. **Why ours**: how does it differ from the ready-made option in (4), and why is that difference necessary?
+
+The canonical home of this methodology is the `graph-memory` skill (Pre-Action Motivation Analysis section), which also defines how the analysis maps onto node/edge types (`DEPENDS_ON` for ordering, `belief`+evidence for external-world claims, `GOVERNS` from the rule node).
+
+### Sacrifice Extension (optimization / subtraction work):
+When the work discards existing behavior in exchange for speed, memory, or simplicity, append four more questions before implementing:
 1. **Why the default exists**: What problem does the current (non-optimized) approach solve?
 2. **What is sacrificed**: What capability, correctness guarantee, or flexibility does the optimization discard?
 3. **What the sacrificed thing does**: What is its intrinsic purpose in the general case?
 4. **What it means for this project**: Why does that sacrifice matter (or not matter) specifically here?
 
-Do NOT treat "faster / less memory" as an unqualified win. Record the analysis in the commit message or graph-memory.
+Do NOT treat "faster / less memory" as an unqualified win. End with a verdict (implement / defer / reject) and record the analysis in graph-memory — including rejections, so the same idea is not re-proposed later.
 
 **Example — "last token only" LM head optimization:**
 - **Why default computes full logits**: `LlamaModel::forward` returns `[batch, seq, vocab]` so that callers can inspect logits at *any* position (e.g., perplexity evaluation, contrastive search, speculative decoding verification, training loss). It is the canonical transformer output contract.
