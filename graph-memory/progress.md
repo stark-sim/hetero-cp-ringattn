@@ -2,6 +2,21 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-07-21] 异构跨节点切分 CP 验证通过：white(CUDA) producer + pearl(ROCm) consumer 经 HcpRingKvConnector
+
+type: `evidence` · status: `held` · confidence: 0.95 · importance: 0.95 · source: `experiment`
+
+run_id=ringx-210415，驱动 scripts/run_cross_node_ring_cp.sh，HEAD=cce069e（双机一致）。
+拓扑：white(RTX 4090, vllm-v1) 以 CUSTOM backend(HcpRingAttentionBackend)+HcpRingKvConnector(role=producer) 只算 chunk A(2048-token prompt 的前 1024 token)，24 层 KV 存 safetensors 并经 HTTP(0.0.0.0:8901) 供取；
+pearl(RX 9060 XT gfx1200, vllm-rocm) 以 CUSTOM backend+HcpRingKvConnector(role=consumer) 跑全 prompt，调度侧把 chunk A 标 external（全局 RoPE 位置、不重算），worker 侧经 HTTP 把 peer KV 拉进 ring backend 的 TRANSIENT PEER_KV_STAGING（不写 pearl 常驻 paged pool / block table），online softmax 合并 local(chunk B, causal)+peer(chunk A, transient)。
+结果：
+1. greedy 4 token 与 pearl 单节点参考完全一致：ref=[14579,220,22,21] cons=[14579,220,22,21]；
+2. 末步 logits max|diff|=0.037（阈值 0.1，argmax 处 0.0）；
+3. 显存切分证据：24/24 层 peer KV 经 HTTP 来自 white（producer 日志 GET 来自 100.111.242.55），1024 token/层；pearl 本地写 pool 槽位 1027（仅自身 chunk B），chunk-A 区域槽位本地写入 = 0；
+4. report: reports/ring-cross-ringx-210415/{consumer,producer}.log。
+意义：三步顺序（flash_attn→decode 充分验证→异构跨节点切分 CP）全部完成；vLLM worker 对 vLLM worker 组环 + KV connector 瞬时切分路线在真异构跨节点（CUDA↔ROCm）闭环。
+
+_updated: 2026-07-21 13:08:24_
 ### [2026-07-21] HcpRingKvConnector：peer KV 以“切分瞬时”接入，2 进程显存切分验证通过
 
 type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.95 · source: `hcp_vllm_plugin/hcp_vllm_plugin/ring_connector.py + validate_ring_connector.py + /tmp/my_ring_val.log`

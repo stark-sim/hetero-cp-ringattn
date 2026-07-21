@@ -2,6 +2,17 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 当前焦点：hetero-cp-ringattn 向 vLLM 生态插件收敛 + PageAttn/block KV 整合
+
+type: `task` · status: `ongoing` · confidence: 0.85 · importance: 0.95 · source: `user-direction`
+
+三步顺序完成后，vLLM 线已具备：CUSTOM ring backend(online softmax 显存切分) + HcpRingKvConnector(切分瞬时 peer KV) + 跨节点异构(CUDA↔ROCm)闭环。
+下一步（用户给定方向）：
+1. 把 hetero-cp-ringattn 分布式调度框架整理成标准 vLLM 生态插件（entry points 注册、配置化、可随 vLLM 官方更新跟进），既有异构长上下文能力又不 fork 内核；
+2. 整合 PageAttn 与 hetero-cp-ringattn 的 block KV：现在 ring backend 用 plain-PyTorch fp32 逐请求算 attention，需评估与 vLLM paged attention/flash_attn 内核的融合路径；
+3. 解除 PoC 限制：PEER_KV_STAGING 按 layer 键限单并发(max_num_seqs=1)，consumer 必须关 prefix caching；工程化需支持多请求并发 staging（按 request 键）。
+
+_updated: 2026-07-21 13:08:24_
 ### 下一阶段：从 1M 可行性验证走向多条扩展线探索
 
 type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.95 · source: `user-direction`
@@ -35,16 +46,9 @@ _updated: 2026-06-29 06:01:28_
 type: `decision` · status: `held` · confidence: 0.85 · importance: 0.9 · source: `user-direction`
 
 用户确定的 vLLM 线后续三步顺序：\n【第1步】flash_attn 在 CUDA 和 ROCm 都接通。理由：flash_attn2 算法本身不绑定特定硬件，CUDA 有官方实现，ROCm 有 ROCm/flash-attention fork。目标：white(CUDA) 与 pearl(ROCm gfx1200) 都能用 flash_attn（及其 LSE 输出），让 ring backend 的 attention 从 plain-PyTorch 升级到 flash_attn。\n【第2步】decode 阶段更充分验证：continuous batching（多并发请求）+ 多步 decode，证明在接入 ring backend / 插件后，vLLM 的常规基础能力（连续批处理、多步解码）仍正常。\n【第3步】异构跨节点切分 CP：white(CUDA producer) + pearl(ROCm consumer) 跑通显存切分 context-passing CP，这是整个 vLLM 线可行性的关键收尾点，必须做到异构跨节点。
+[2026-07-21 更新] 三步全部完成：1) flash_attn 双平台(white vendored FA 含 LSE / pearl TRITON_ATTN+CUSTOM)；2) decode 充分验证（连续批 6 请求、多步 decode=8/16 全过）；3) 异构跨节点切分 CP（ringx-210415 PASS，见 ev-ring-cross-node-split-cp-20260721）。
 
-_updated: 2026-07-21_
-### vLLM 线显存切分（online softmax ring attention）
-
-type: `task` · status: `ongoing` · confidence: 0.7 · importance: 0.9 · source: `user-direction`
-
-目标：让 vLLM 线的 CP 从 full-KV 复制升级为真正的显存切分 ring attention——每个 vLLM worker 只永久持有自己 chunk 的 KV，attention 时对 local KV 与 peer KV 分别计算 (O, LSE) 并用 online softmax 合并，peer KV 仅瞬时使用后即丢弃。技术约束（已确认）：stock vLLM PagedAttention 必须让 KV 落在 block table 才能算，无法直接做 online softmax；需研究 vLLM FlashAttention backend 是否暴露 LSE（log-sum-exp），或用自定义 attention backend / 模型层包装实现两遍 attention + 合并。前置已完成：HcpCpConnector（官方 KVConnectorBase_V1）跨节点 context-passing CP 已验证（white CUDA + pearl ROCm 匹配单节点），white V1 vLLM 0.23 已构建。下一步：调研 vLLM attention backend 的 LSE 输出与自定义 backend 可行性，设计 online softmax ring 实现。
-[进展] 核心 backend 已实现并在 pearl 单机验证（custom 匹配单节点）；peer KV 暂用 staging dict，待 KV connector 接线与 2 进程位置偏移。
-
-_updated: 2026-07-17_
+_updated: 2026-07-21 13:08:24_
 ### 决策：ring backend 接 KV connector 时必须区分“全量搬移”与“切分瞬时”
 
 type: `decision` · status: `held` · confidence: 0.85 · importance: 0.9 · source: `user-direction`
