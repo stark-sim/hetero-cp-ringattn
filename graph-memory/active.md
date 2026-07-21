@@ -38,6 +38,13 @@ type: `task` · status: `ongoing` · confidence: 0.7 · importance: 0.9 · sourc
 [进展] 核心 backend 已实现并在 pearl 单机验证（custom 匹配单节点）；peer KV 暂用 staging dict，待 KV connector 接线与 2 进程位置偏移。
 
 _updated: 2026-07-17_
+### 决策：ring backend 接 KV connector 时必须区分“全量搬移”与“切分瞬时”
+
+type: `decision` · status: `held` · confidence: 0.85 · importance: 0.9 · source: `user-direction`
+
+用户明确指出：KV connector 默认语义是 disaggregated prefill 的整段 KV 搬移（把某请求的完整 KV 从一处全量复制到另一处），而 HCP ring attention 的场景是切分后的 KV——每个 worker 只永久持有自己 chunk 的 KV，peer chunk KV 只是 attention 时瞬时借用、用完即弃。因此接线原则：1) connector 调度侧仅用 get_num_new_matched_tokens 把前序 chunk 标记为 external，从而给本 chunk 提供全局 RoPE 位置（并阻止本 worker 重复计算前序 chunk）；2) connector worker 侧 start_load_kv/wait_for_layer_load 把 peer chunk KV 拉取后写入 ring backend 的 PEER_KV_STAGING（瞬时），绝不写入常驻 paged pool；3) ring backend 用 online softmax 合并 local（本 chunk，causal）+ peer（前序 chunk，transient，non-causal）。这样 worker 常驻 KV 只有自己 chunk，peer KV 瞬时，实现显存切分而非全量复制。
+
+_updated: 2026-07-17_
 ### Block KV cache + vLLM 集成：插件解耦 vs HCP 内联 PageAttention 双路线
 
 type: `hypothesis` · status: `ongoing` · confidence: 0.65 · importance: 0.9 · source: `user-direction`
