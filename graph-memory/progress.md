@@ -11,7 +11,7 @@ type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.95 · sou
 _updated: 2026-07-21_
 ### [2026-07-21] flash_attn 平台现状：white CUDA 已可用，pearl ROCm 构建中
 
-type: `evidence` · status: `held` · confidence: 0.7 · importance: 0.8 · source: `white/pearl flash_attn probe`
+type: `evidence` · status: `closed` · confidence: 0.7 · importance: 0.8 · source: `white/pearl flash_attn probe`
 
 flash_attn 双平台接通进展（下一步顺序第1步）：\n- white（CUDA，vLLM 0.23.1rc1）：无需单独装 flash_attn 包，vLLM vendored vllm_flash_attn 已可用，is_flash_attn_varlen_func_available()=True；实测 flash_attn_varlen_func(..., return_softmax_lse=True) 返回 (out [5,2,64], lse [2,5])，flash_attn+LSE 在 white 正常。\n- pearl（ROCm gfx1200，vLLM 0.23.1rc1）：is_flash_attn_varlen_func_available()=False（无 vendored ROCm flash_attn，也无 ROCm flash_attn 包，回退 Triton）。AMD 官方 index 无 gfx1200 预编译 flash-attn wheel。正在用 ROCm/flash-attention 的 main_perf 分支 + FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE（Triton 后端，硬件无关）源码构建，目标让 pearl 的 flash_attn 可用。\n注意：ROCm 的 flash_attn 是 ROCm/flash-attention fork，官方 flash-attn 为 CUDA-only；Triton 后端理论上可在 RDNA4 gfx1200 运行。
 
