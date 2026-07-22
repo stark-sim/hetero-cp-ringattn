@@ -331,17 +331,6 @@ type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.85 · sou
 HCP 的数学基础即来源于此。
 
 _updated: 2026-06-29 06:06:09_
-### 待办:gfx1200 适配 repo 整理(等 pearl 恢复可达)
-
-type: `task` · status: `blocked` · confidence: 0.9 · importance: 0.8 · source: `user-direction`
-
-pearl(Tailscale 100.111.242.55 / LAN 192.168.8.176)当前不可达(ping 100% 丢包)。恢复后:
-1. 盘点 /home/stark/vllm 源码树的本地 patch(git status/diff vs upstream tag)及构建/运行脚本;
-2. 整理为 github.com/stark-sim/vllm-rocm-gfx1200(private):补丁、构建脚本、LD_LIBRARY_PATH wrapper、兼容性说明(torch 2.13+rocm7.13 / gfx1200);
-3. pearl 迁移插件 clone:/home/stark/hcp-vllm-plugin + pip install -e 重装 + import 验证;
-4. 双机跑 compat_check + 一次跨节点并发验证确认迁移无损。
-
-_updated: 2026-07-22 07:10:03_
 ### KVConnectorBase_V1 是 experimental API，插件边界收敛才能跟进 vLLM 升级
 
 type: `belief` · status: `held` · confidence: 0.9 · importance: 0.8 · source: `experiment`

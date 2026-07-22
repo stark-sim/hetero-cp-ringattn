@@ -2,6 +2,17 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-07-22] gfx1200 适配 repo 整理完成:vllm-rocm-gfx1200(private),解耦全部落地
+
+type: `evidence` · status: `held` · confidence: 0.95 · importance: 0.85 · source: `experiment`
+
+github.com/stark-sim/vllm-rocm-gfx1200(private)。
+内容:5 个补丁(从 pearl /home/stark/vllm 源码树 git diff 提取,base commit 3f99883d9 v0.23.1rc1.dev905):
+0001 spinloop.cpp 改 x86intrin(ROCm Clang 23 编译错误);0002 禁用 GPTQ(HIP 缺 half2 atomicAdd);0003 ROCm 平台识别 torch.version.hip 兜底(amdsmi 不可用);0004 _get_gcn_arch 走 torch.cuda + HCP_ROCM_GCN_ARCH 覆盖;0005 pyproject 解除 torch==2.11.0 钉版。外加构建脚本(clone→checkout→apply→pip install -e)、LD_LIBRARY_PATH 运行 wrapper、README 兼容性矩阵。
+pearl 迁移:插件 clone /home/stark/hcp-vllm-plugin + pip install -e 重装,compat_check 6/6 PASS;pearl GitHub 访问走已有用户 SSH key(known_hosts 补齐),跨网段 ssh 不稳时经 white(192.168.8.176)跳转。
+两个产品 repo 至此全部独立: hcp-vllm-plugin + vllm-rocm-gfx1200;主仓=研究/驱动/知识库。
+
+_updated: 2026-07-22 10:01:16_
 ### [2026-07-22] 第 1 步完成:vLLM 生态插件 v0.1 包装(entry point 自动注册双平台验证)
 
 type: `evidence` · status: `held` · confidence: 0.95 · importance: 0.9 · source: `experiment`
