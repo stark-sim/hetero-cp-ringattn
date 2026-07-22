@@ -30,6 +30,20 @@ type: `task` · status: `superseded` · confidence: 0.95 · importance: 0.95 · 
 1M v9（3:1 split）成功，prefill 24/24 + decode 5/5，exit=0。文档已同步：1M_CONTEXT_THUNDERBOLT_PLAN.md、SCALING_ARGUMENT.md、systemPatterns.md。当前无未完成的 1M 攻坚任务；下一步决定是否需要更大模型 / 更多 domain 验证。
 
 _updated: 2026-06-29 06:01:28_
+### 后续路线:N>2 真 ring(三机:white CUDA + pearl ROCm + laptop CPU)
+
+type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.9 · source: `user-direction`
+
+基于三步收官后的现状,N>2 ring 的技术改动已定位为三处小改:
+1. connector 加 ring_role=relay:中间节点同时标前序 external(get_num_new_matched_tokens)并存自己 chunk(build_connector_meta 的 store/load 两条路径本来就分开),就绪状态级联;
+2. backend 多 peer 合并:N-1 个 peer chunk 是全局连续前缀,cat 成一段连续 KV 做一次 peer pass (线性拷贝,数学等价),merge_attn_states 调用不变;
+3. hcp_ring 每请求参数加 chunk_ids(复数,向后兼容追加);staging 已按 chunk 键,请求→chunk 映射从单值变列表。
+验证拓扑两步走:
+(a) white 当 relay(吃 c0 产 c1) + pearl 当 consumer(2 前缀 chunk)——证明 N>2 机制,不依赖 Mac;
+(b) 三机真异构:laptop(Mac)需自建 vLLM CPU(无 macOS wheel,VLLM_TARGET_DEVICE=cpu),担任 chunk0 producer(不吃前缀、计算量最小)——满足"每平台必须跑 worker"纪律的最小可行角色。
+前置:pearl 恢复可达,完成 task-gfx1200-repo-extraction。
+
+_updated: 2026-07-22 07:12:14_
 ### 决策：两个产品级产出解耦为独立 GitHub repo(private),主仓保留研究/驱动/知识库
 
 type: `decision` · status: `held` · confidence: 0.95 · importance: 0.9 · source: `user-direction`
