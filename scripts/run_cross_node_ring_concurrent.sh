@@ -19,10 +19,12 @@ cd "${REPO_ROOT}"
 WHITE_HOST="${WHITE_HOST:-100.118.253.68}"
 WHITE_SSH="${WHITE_USER:-stark}@${WHITE_HOST}"
 WHITE_REPO="${WHITE_REPO:-/home/stark/hetero-cp-ringattn}"
+WHITE_PLUGIN_REPO="${WHITE_PLUGIN_REPO:-/home/stark/hcp-vllm-plugin}"
 
 PEARL_HOST="${PEARL_HOST:-100.111.242.55}"
 PEARL_SSH="${PEARL_USER:-stark}@${PEARL_HOST}"
 PEARL_REPO="${PEARL_REPO:-/home/stark/hetero-cp-ringattn}"
+PEARL_PLUGIN_REPO="${PEARL_PLUGIN_REPO:-/home/stark/hcp-vllm-plugin}"
 
 SERVE_PORT="${SERVE_PORT:-8902}"
 TOTAL="${TOTAL:-1024}"
@@ -59,7 +61,7 @@ echo "pre-checks OK"
 WHITE_STORE="/tmp/hcp_ring_conc_producer_${RUN_ID}"
 PEARL_STORE="/tmp/hcp_ring_conc_consumer_${RUN_ID}"
 DONE_FILE="/tmp/hcp_ring_conc_done_${RUN_ID}"
-SCRIPT="hcp_vllm_plugin/validate_ring_concurrent.py"
+SCRIPT="validate_ring_concurrent.py"
 
 cleanup() {
   run_white "touch ${DONE_FILE}; pkill -f '[v]alidate_ring_concurrent.py' || true" >/dev/null 2>&1 || true
@@ -70,7 +72,7 @@ trap cleanup EXIT
 # === Launch producer on white ===
 echo "=== launching producer on white (CUDA, 2 chunks c0/c1) ==="
 prod_cmd="cd /tmp && source /home/stark/miniconda3/etc/profile.d/conda.sh && conda activate vllm-v1 && \
-  python ${WHITE_REPO}/${SCRIPT} --mode producer \
+  python ${WHITE_PLUGIN_REPO}/${SCRIPT} --mode producer \
     --total ${TOTAL} --split ${SPLIT} --run-id ${RUN_ID} \
     --port ${SERVE_PORT} --producer-store ${WHITE_STORE} \
     --consumer-store /tmp/unused_${RUN_ID} --done-file ${DONE_FILE} \
@@ -103,7 +105,7 @@ echo "=== launching consumer on pearl (ROCm, 2 concurrent requests) ==="
 SP=/home/stark/miniconda3/envs/vllm-rocm/lib/python3.11/site-packages
 cons_cmd="cd /tmp && source /home/stark/miniconda3/etc/profile.d/conda.sh && conda activate vllm-rocm && \
   export LD_LIBRARY_PATH=${SP}/torch/lib:${SP}/_rocm_sdk_core/lib:${SP}/_rocm_sdk_core/lib/host-math/lib:${SP}/_rocm_sdk_core/lib/rocm_sysdeps/lib:${SP}/_rocm_sdk_devel/lib:${SP}/_rocm_sdk_devel/lib/host-math/lib:${SP}/_rocm_sdk_devel/lib/rocm_sysdeps/lib:\${LD_LIBRARY_PATH:-} && \
-  python ${PEARL_REPO}/${SCRIPT} --mode consumer \
+  python ${PEARL_PLUGIN_REPO}/${SCRIPT} --mode consumer \
     --total ${TOTAL} --split ${SPLIT} --run-id ${RUN_ID} \
     --port ${SERVE_PORT} --producer-store /tmp/unused_${RUN_ID} \
     --consumer-store ${PEARL_STORE} --done-file ${DONE_FILE} \
