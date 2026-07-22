@@ -152,6 +152,18 @@ type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.9 · sou
 与 HCP 相关性：直接相关，可能缓解 pearl 等小/慢 domain 在 Phase 2 成为瓶颈的问题。
 
 _updated: 2026-06-29 06:06:09_
+### kernel-hardening backlog(性能/规模,非正确性;128K+ 启动时按序做)
+
+type: `task` · status: `ongoing` · confidence: 0.85 · importance: 0.85 · source: `analysis`
+
+第 2 步 kernel 化完成后,正确性层面无遗留;以下均为性能/规模项,128K+/1M 规模测试启动时按此顺序做:
+1. local 段 paged 直读(中-高):现 forward 每请求每层先把本地 KV 从分页池 gather 成连续张量再进 kernel,128K/1M 规模下每层每步多出上百 MB 线性拷贝流量;应让 ring_triton_attn 直接吃 block_table 对 local 段直读(peer 段连续 staging 不变)。这是 PagedAttention 整合未完成的一半。
+2. 长上下文 decode split-KV(中-高):decode(Tq=1) 现走 prefill 风格 kernel 沿 KV 串行扫;参照 vllm unified_attention 的 softmax_segm split-K 分段并行。1M 教训中 decode 本是瓶颈。
+3. 批量 kernel 启动(中):per-request Python 循环,每请求每层 2 次 launch;local 段按 batch 合并 (cu_seqlens + block table) 一次 launch。纯性能。
+4. N>2 真 ring 多路合并(将来):merge_attn_states 两路迭代可行;connector 每请求限一个 peer chunk (PoC 限制),配置面可向后兼容地追加 chunk_ids。v0.1 插件明确声明不支持。
+不做这些的理由(当下):均为 kernel 内部实现或配置追加项,不影响 v0.1 插件对外配置面冻结;正确性已由三件套 + 16k + 跨节点验证覆盖。
+
+_updated: 2026-07-22 06:05:13_
 ### TRITON_ATTN 是 ROCm/RDNA 上 flash attention 算法的原生路径(非降级替代)
 
 type: `fact` · status: `held` · confidence: 0.9 · importance: 0.85 · source: `code-reading`
