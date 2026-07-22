@@ -2,18 +2,6 @@
 
 当前活跃的任务、决策、风险和假设。
 
-### 当前焦点：hetero-cp-ringattn 向 vLLM 生态插件收敛 + PageAttn/block KV 整合
-
-type: `task` · status: `ongoing` · confidence: 0.85 · importance: 0.95 · source: `user-direction`
-
-三步顺序完成后，vLLM 线已具备：CUSTOM ring backend(online softmax 显存切分) + HcpRingKvConnector(切分瞬时 peer KV) + 跨节点异构(CUDA↔ROCm)闭环。
-下一步（用户给定方向）：
-1. 把 hetero-cp-ringattn 分布式调度框架整理成标准 vLLM 生态插件（entry points 注册、配置化、可随 vLLM 官方更新跟进），既有异构长上下文能力又不 fork 内核；
-2. 整合 PageAttn 与 hetero-cp-ringattn 的 block KV：现在 ring backend 用 plain-PyTorch fp32 逐请求算 attention，需评估与 vLLM paged attention/flash_attn 内核的融合路径；
-3. 解除 PoC 限制：PEER_KV_STAGING 按 layer 键限单并发(max_num_seqs=1)，consumer 必须关 prefix caching；工程化需支持多请求并发 staging（按 request 键）。
-[2026-07-21 更新] 执行顺序修正为 3→2→1(原记录 1→2→3)：per-request staging 是地基(数据结构正确性)；paged kernel 化建在其上(按请求取 staging)；插件化最后(对外配置面等二者定型再冻结)。三者动机剖析已落 decision 节点：decision-per-request-staging-20260721 / decision-ring-paged-kernel-20260721 / decision-vllm-plugin-packaging-20260721。
-
-_updated: 2026-07-21 13:28:03_
 ### 下一阶段：从 1M 可行性验证走向多条扩展线探索
 
 type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.95 · source: `user-direction`
@@ -57,17 +45,6 @@ type: `preference` · status: `held` · confidence: 0.95 · importance: 0.9 · s
 全局沉淀：该方法论已融入 graph-memory skill 的 "Pre-Action Motivation Analysis" 一节(含六问→节点/边的映射：DEPENDS_ON 记顺序、belief+证据记外部做法、GOVERNS 关联规则与应用)。原 optimization-trade-off skill 已按用户决策退役(移入 _removed)，其牺牲四问作为扩展条款并入；项目 AGENTS.md 对应章节已同步改为动机剖析六问+牺牲扩展。
 
 _updated: 2026-07-21 13:48:11_
-### 步骤1(最后做)：从研究脚本收敛为标准 vLLM 生态插件
-
-type: `decision` · status: `held` · confidence: 0.85 · importance: 0.9 · source: `user-direction`
-
-【现状】插件能工作但形态是研究脚本：pip install -e 本仓库、手写长 kv_transfer_config dict、环境变量控制行为；验证脚本硬编码模型路径与节点 IP；无版本兼容声明。
-【动机】KVConnectorBase_V1 是 experimental API(见 belief-connector-api-experimental-20260721)，不收敛插件边界则 vLLM 升级可能悄悄破坏兼容性；收敛后别人 pip install + 两个参数即可获得异构长上下文能力。
-【vLLM 怎么做】官方答案就是插件：两条标准扩展面(KV connector 接口 + attention backend 注册表)，NIXL connector / LMCache / Mooncake 均走同一 KVConnectorBase_V1 接口，无人 fork 内核；我们的 ring backend 注册在 CUSTOM，与官方后端机制平级。此步非发明新东西，是打磨已在正确接口上的代码。
-【目标态】entry points 自动注册、配置项收敛为文档化的少数键、声明兼容的 vLLM 版本区间、留最小可跑示例；vLLM 升级时跑兼容性验证脚本即知坏没坏。
-【为何最后】插件定义的对外配置面应等 staging(3)与 kernel(2)定型后再冻结，避免刚发布就改配置。
-
-_updated: 2026-07-21 13:28:03_
 ### 下一步顺序：1) 双平台 flash_attn 2) decode 充分验证(continuous batch+多步) 3) 异构跨节点切分 CP
 
 type: `decision` · status: `held` · confidence: 0.85 · importance: 0.9 · source: `user-direction`
