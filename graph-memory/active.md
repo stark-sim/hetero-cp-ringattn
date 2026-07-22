@@ -30,6 +30,19 @@ type: `task` · status: `superseded` · confidence: 0.95 · importance: 0.95 · 
 1M v9（3:1 split）成功，prefill 24/24 + decode 5/5，exit=0。文档已同步：1M_CONTEXT_THUNDERBOLT_PLAN.md、SCALING_ARGUMENT.md、systemPatterns.md。当前无未完成的 1M 攻坚任务；下一步决定是否需要更大模型 / 更多 domain 验证。
 
 _updated: 2026-06-29 06:01:28_
+### 决策：两个产品级产出解耦为独立 GitHub repo(private),主仓保留研究/驱动/知识库
+
+type: `decision` · status: `held` · confidence: 0.95 · importance: 0.9 · source: `user-direction`
+
+用户方向(2026-07-22):HCP vLLM 插件与 gfx1200 适配是两个不同生命周期的产出,独立成 repo 比保留子文件夹更清晰。
+执行:
+1. hcp_vllm_plugin/ 经 git subtree split 带全部 23 个 commit 历史切出 => github.com/stark-sim/hcp-vllm-plugin(private, main);clone 验证(文件/历史/语法)通过;
+2. 主仓删除 hcp_vllm_plugin/ 避免双源漂移,新增根 README.md 仓库地图;跨节点驱动脚本改为读 *_PLUGIN_REPO(默认 /home/stark/hcp-vllm-plugin);
+3. white 已迁移:/home/stark/hcp-vllm-plugin clone + pip install -e 重装,import 验证通过;
+4. 第二 repo(gfx1200 适配)待 pearl 恢复后从 /home/stark/vllm 源码树整理补丁。
+主仓定位:Rust/Python 调度核心、transformers 线、跨节点驱动、graph-memory、docs/reports。
+
+_updated: 2026-07-22 07:10:03_
 ### 工作方式规则：任何工作开始前先做动机剖析六问
 
 type: `preference` · status: `held` · confidence: 0.95 · importance: 0.9 · source: `user-direction`
@@ -304,6 +317,17 @@ type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.85 · sou
 HCP 的数学基础即来源于此。
 
 _updated: 2026-06-29 06:06:09_
+### 待办:gfx1200 适配 repo 整理(等 pearl 恢复可达)
+
+type: `task` · status: `blocked` · confidence: 0.9 · importance: 0.8 · source: `user-direction`
+
+pearl(Tailscale 100.111.242.55 / LAN 192.168.8.176)当前不可达(ping 100% 丢包)。恢复后:
+1. 盘点 /home/stark/vllm 源码树的本地 patch(git status/diff vs upstream tag)及构建/运行脚本;
+2. 整理为 github.com/stark-sim/vllm-rocm-gfx1200(private):补丁、构建脚本、LD_LIBRARY_PATH wrapper、兼容性说明(torch 2.13+rocm7.13 / gfx1200);
+3. pearl 迁移插件 clone:/home/stark/hcp-vllm-plugin + pip install -e 重装 + import 验证;
+4. 双机跑 compat_check + 一次跨节点并发验证确认迁移无损。
+
+_updated: 2026-07-22 07:10:03_
 ### KVConnectorBase_V1 是 experimental API，插件边界收敛才能跟进 vLLM 升级
 
 type: `belief` · status: `held` · confidence: 0.9 · importance: 0.8 · source: `experiment`
