@@ -44,8 +44,9 @@ type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.9 · sourc
 前置:pearl 恢复可达,完成 task-gfx1200-repo-extraction。
 [2026-07-24 更新] 前置已清(gfx1200 repo 完成,双机迁移复验 PASS)。用户确认下一步:laptop 节点并入 HCP ring,进入真 ring 阶段;三节点 worker 同级(peer),coordinator 默认 white 但位置解耦(见 decision-coordinator-placement-20260724)。实施顺序仍按 (a) 双机 relay 机制验证 → (b) 三机真异构。laptop 侧工作:自建 vLLM CPU(VLLM_TARGET_DEVICE=cpu) + 安装 hcp-vllm-plugin,担任 chunk0 producer。
 [2026-07-24 修订] 用户更正 laptop 硬件:RTX 4060 Laptop 真 CUDA,非 Mac/CPU-only,"自建 vLLM CPU 担任 chunk0 producer"的最小可行角色方案作废(见 decision-n3-direct-20260724)。两步走 (a)→(b) 同时作废:直接三机真 ring,relay/多 peer 机制按通用 N 实现,N=2 为退化兼容。三处插件改动定位不变。
+[2026-07-25 更新] laptop 环境就绪(ev-laptop-env-ready-20260725):vllm 0.23.1rc1 源码编译 + 插件 compat 6/6 + GPU smoke 通过,模型已同步。三节点环境条件齐备,可开始插件侧通用 N 实现(relay role/多 peer 前缀合并/chunk_ids 复数)。
 
-_updated: 2026-07-24 08:43:31_
+_updated: 2026-07-24 17:52:14_
 ### 决策:laptop 实为 RTX 4060 Laptop 真 CUDA 节点;直接做三机真 ring,框架按通用 N 实现
 
 type: `decision` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `user-direction`

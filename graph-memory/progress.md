@@ -2,6 +2,30 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-07-25] laptop vLLM+CUDA 环境按 white 配方对齐完成,compat 6/6 + GPU smoke 通过
+
+type: `evidence` · status: `held` · confidence: 0.95 · importance: 0.9 · source: `experiment`
+
+laptop(100.96.154.1, RTX 4060 Laptop 8GB sm_89, Ubuntu 24.04)环境搭建完成并验证:
+配方:miniconda + conda env vllm-v1(python 3.11)+ conda gcc/g++ 13.4 + torch 2.13.0+cu130/torchvision 0.28.0(pip 清华源)+ vllm 0.23.1rc1@3f99883d9 源码编译(应用 white 的 torch-unpin patch,与 white/pearl 同基线)。
+验证:1) hcp-vllm-plugin pip install -e + compat_check 6/6 PASS(0 warnings);2) GPU smoke:Qwen2-0.5B-1M fp16 enforce_eager 生成连贯文本。注意 8GB 卡需 gpu_memory_utilization=0.75(默认 0.9 会在 KV 池预分配后激活 OOM)。
+模型:/home/stark/models/Qwen2-0.5B-1M 已从 white 同步(md5 一致)。
+GitHub:2 枚 read-only deploy key(插件仓 + 主仓走 github-main 别名),pip 走清华源。
+laptop 至此具备 HCP ring 第三节点(真 CUDA worker)全部条件。
+
+_updated: 2026-07-24 17:52:14_
+### [2026-07-25] 无系统 CUDA 机器用 pip nvidia/cu13 工具链编译 vLLM 的四个坑 + OOM 教训
+
+type: `lesson` · status: `held` · confidence: 0.9 · importance: 0.85 · source: `reflection`
+
+laptop 无 /usr/local/cuda,纯 pip 工具链编译 vLLM 踩坑记录(white 有系统 cuda-13.1 所以没踩过):
+1. pip 包装库只有带版本号文件(libcudart.so.13),缺无版本 dev 链接(libcudart.so),CMake find_library 找不到 => 批量 ln -s 建 dev 链接 + lib64→lib;
+2. nvidia-cuda-nvcc 必须与 nvidia-nvvm/nvidia-cuda-crt 同版本,否则 ptxas 与 cicc 的 PTX ISA 不匹配(9.2 vs 9.3) => 三件统一 13.0.88,与 nvidia-cuda-runtime 头(13.0)一致,FindCUDA 的 nvcc/头版本检查才过;
+3. CCCL 头(nv/thrust/cub/cuda)在独立包 nvidia-cuda-cccl-cu12 的 nvidia/cuda_cccl/include,要软链进 cu13/include(nvidia-cuda-cccl-cu13 只是 0.0.1 空壳);
+4. laptop→GitHub HTTPS GnuTLS 抖动 => git config --global url."git@github.com:".insteadOf "https://github.com/",CMake FetchContent(cutlass/deepgemm/qutlass)全走 SSH;
+5. 15GB 内存 + MAX_JOBS=8 => 编译 OOM(exit 137)且 tailscaled 被拖死整机掉线;MAX_JOBS=4 + nice -n 19 后 load 稳定 4.0,编译 ~2.5h 完成。教训:小内存机器编译先降并发保系统响应,CPU 限额非真凶、内存才是。
+
+_updated: 2026-07-24 17:52:14_
 ### [2026-07-24] Mac 本地三仓同级布局落地,解耦在本机可开发
 
 type: `evidence` · status: `held` · confidence: 0.95 · importance: 0.8 · source: `experiment`
