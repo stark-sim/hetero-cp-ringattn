@@ -2,6 +2,18 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-07-25] 通用 N ring 插件实现:N=2 回归 + 单卡 3 实例 relay 全 PASS
+
+type: `evidence` · status: `held` · confidence: 0.95 · importance: 0.95 · source: `experiment`
+
+task-generic-n-ring-impl-20260725 的实现(plugin commits 0a90c19 + cd83a5b)。
+实现:1) connector ring_role=relay(消费前序+生产自己 chunk,kv_role=kv_both,store 侧 slot_mapping 跳过 external 前缀,就绪级联);2) backend PEER_REQ_MAP 改有序列表,多 chunk 连续前缀 cat 后单次 peer pass;3) hcp_ring 参数加 chunk_ids/peer_urls 复数(单数自动转单元素列表)。
+验证(white RTX 4090,vllm 0.23.1rc1):
+1. N=2 三件套回归全 PASS(向后兼容):validate_ring_backend/connector/concurrent,token 一致,memsplit 保持;
+2. 新增 validate_ring_relay.py(3 实例:A producer c0=512 + B relay c1=512 + C consumer c2=512):就绪级联 A(8s)→B(8s);B 存储恰好 c1(512tok×24层);C 经复数参数从两个 peer stage 2 chunk×24 层并发,backend cat 连续前缀;C token 与单节点参考完全一致[220,20,22,29514],max|logit diff|=0.027;前缀区域本地写入=0;staging 用后释放;triton 216 次 0 回退。PASS。
+下一步:三机真 ring(laptop A + white B relay + pearl C)。
+
+_updated: 2026-07-24 19:26:53_
 ### [2026-07-25] laptop vLLM+CUDA 环境按 white 配方对齐完成,compat 6/6 + GPU smoke 通过
 
 type: `evidence` · status: `held` · confidence: 0.95 · importance: 0.9 · source: `experiment`
