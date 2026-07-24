@@ -2,19 +2,6 @@
 
 当前活跃的任务、决策、风险和假设。
 
-### 实施:插件通用 N ring(relay 角色 + 多 peer 前缀合并 + chunk_ids 复数)
-
-type: `task` · status: `ongoing` · confidence: 0.9 · importance: 0.95 · source: `user-direction`
-
-动机剖析六问(2026-07-25):
-1. 面对什么问题:插件当前只支持 2 节点切分(producer+consumer,每请求单 peer chunk);HCP 真 ring 需要 N>=3——中间节点既要消费前序 chunk 又要生产自己 chunk,末端 consumer 要从多个不同 peer 拉多个前缀 chunk。
-2. 现状:ring_connector.py 仅 producer/consumer 两角色,每请求单 chunk_id/单 peer_url;backend PEER_REQ_MAP 单值映射;N=2 已跨节点验证(ringx-210415/ringconc)。
-3. 做完能怎样:通用 N——relay 角色(前缀 external + 存自己 chunk,就绪级联);多 peer chunk 连续前缀 cat 后一次 peer pass(数学等价);chunk_ids/peer_urls 复数参数向后兼容。验证:N=2 三件套回归 PASS + 单卡 3 实例 relay 测试 + 三机真 ring token 一致。
-4. 其他人怎么做:vLLM 官方 KV connector 是 P/D 全量搬移,无 ring/relay 概念;cascade attention(共享前缀 LSE 合并)数学同构但限单节点;ring-flash-attention 用 NCCL process group(同构)。连接器机制(get_num_new_matched_tokens external + start_load_kv)本身按请求组织,直接复用框架机制,不新造传输层。
-5. 我们怎么做:三处改动——(a) connector 加 ring_role=relay,store/load 两路径对同一请求同时激活,store 侧 slot_mapping 跳过 external 前缀;(b) backend PEER_REQ_MAP 单值变有序列表,forward 按序 cat 多 chunk 做一次 peer pass;(c) hcp_ring 参数加 chunk_ids/peer_urls 复数(单数自动转单元素列表,向后兼容);就绪检查从单 chunk 变全前缀 chunk 就绪才标 external,staged 总长校验。
-6. 为什么我们要这么做:现成 P/D connector 是全量复制,违背 HCP 显存切分(每节点只常驻自己 chunk);relay 是 ring 拓扑在 connector 语义上的最小扩展(复用已分离的 store/load 路径),用户已明确 KV connector 承担 ring-attn 的 KV 传输工作。
-
-_updated: 2026-07-24 19:10:10_
 ### 下一阶段：从 1M 可行性验证走向多条扩展线探索
 
 type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.95 · source: `user-direction`
@@ -58,8 +45,9 @@ type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.9 · sourc
 [2026-07-24 更新] 前置已清(gfx1200 repo 完成,双机迁移复验 PASS)。用户确认下一步:laptop 节点并入 HCP ring,进入真 ring 阶段;三节点 worker 同级(peer),coordinator 默认 white 但位置解耦(见 decision-coordinator-placement-20260724)。实施顺序仍按 (a) 双机 relay 机制验证 → (b) 三机真异构。laptop 侧工作:自建 vLLM CPU(VLLM_TARGET_DEVICE=cpu) + 安装 hcp-vllm-plugin,担任 chunk0 producer。
 [2026-07-24 修订] 用户更正 laptop 硬件:RTX 4060 Laptop 真 CUDA,非 Mac/CPU-only,"自建 vLLM CPU 担任 chunk0 producer"的最小可行角色方案作废(见 decision-n3-direct-20260724)。两步走 (a)→(b) 同时作废:直接三机真 ring,relay/多 peer 机制按通用 N 实现,N=2 为退化兼容。三处插件改动定位不变。
 [2026-07-25 更新] laptop 环境就绪(ev-laptop-env-ready-20260725):vllm 0.23.1rc1 源码编译 + 插件 compat 6/6 + GPU smoke 通过,模型已同步。三节点环境条件齐备,可开始插件侧通用 N 实现(relay role/多 peer 前缀合并/chunk_ids 复数)。
+[2026-07-25 里程碑] 三机真 ring 验证通过(ring3-033045):laptop A + white B relay + pearl C,token 与单节点参考一致。本任务的核心目标达成。后续开放项:capacity-aware 不均等三档分片(4060 8GB/9060XT 16GB/4090 24GB)、更长 seq(16k+)、多并发 CP 在 N=3 下的复验、coordinator 与插件 ring 的关系统一。
 
-_updated: 2026-07-24 17:52:14_
+_updated: 2026-07-24 19:33:45_
 ### 决策:laptop 实为 RTX 4060 Laptop 真 CUDA 节点;直接做三机真 ring,框架按通用 N 实现
 
 type: `decision` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `user-direction`

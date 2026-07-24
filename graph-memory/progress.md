@@ -2,6 +2,21 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-07-25] 三机真 ring 验证通过:laptop(4060 CUDA) + white(4090 CUDA relay) + pearl(9060XT ROCm)
+
+type: `evidence` · status: `held` · confidence: 0.95 · importance: 1.0 · source: `experiment`
+
+run_id=ring3-033045,驱动 scripts/run_3node_ring.sh(主仓 commit ffab6c6),插件 HEAD=cd83a5b 三机一致。
+拓扑:laptop(100.96.154.1, RTX 4060 Laptop CUDA)=A producer(c0=512);white(100.118.253.68, RTX 4090 CUDA)=B relay(c1=512,吃 laptop c0 产自己 c1,kv_both);pearl(100.111.242.55, RX 9060 XT gfx1200 ROCm)=C consumer(c2=512,复数 chunk_ids/peer_urls 从两个 peer stage)。
+结果:1) C greedy 4 token 与 pearl 单节点参考完全一致 ref=cons=[220,20,22,29514](与单机 3 实例验证同 token,跨平台数值一致);max|logit diff|=0.023;
+2) 显存切分:C 只写 528 池槽(自己 chunk+decode),前缀区域本地写入=0;
+3) 2 前缀 chunk×24 层并发 staging,HTTP 日志证实跨节点传输(pearl 从 laptop GET c0 全部 24 层、从 white GET c1 全部 24 层);
+4) staging 用后释放;triton kernel 216 次 0 回退(ROCm);
+5) 就绪级联跨节点成立(B 的 _READY 依赖其完成 c0 staging+c1 计算)。
+报告:reports/ring3node-ring3-033045/{driver,producer_a,relay_b,consumer_c}.log。
+意义:HCP 首次实现 N=3 异构真 ring——三节点 worker 同级 peer,每节点只常驻自己 chunk,peer KV 瞬时借用;通用 N 框架下 N=2 是退化情形(回归全 PASS)。
+
+_updated: 2026-07-24 19:33:45_
 ### [2026-07-25] 通用 N ring 插件实现:N=2 回归 + 单卡 3 实例 relay 全 PASS
 
 type: `evidence` · status: `held` · confidence: 0.95 · importance: 0.95 · source: `experiment`
