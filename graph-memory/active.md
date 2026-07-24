@@ -42,8 +42,16 @@ type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.9 · sourc
 (a) white 当 relay(吃 c0 产 c1) + pearl 当 consumer(2 前缀 chunk)——证明 N>2 机制,不依赖 Mac;
 (b) 三机真异构:laptop(Mac)需自建 vLLM CPU(无 macOS wheel,VLLM_TARGET_DEVICE=cpu),担任 chunk0 producer(不吃前缀、计算量最小)——满足"每平台必须跑 worker"纪律的最小可行角色。
 前置:pearl 恢复可达,完成 task-gfx1200-repo-extraction。
+[2026-07-24 更新] 前置已清(gfx1200 repo 完成,双机迁移复验 PASS)。用户确认下一步:laptop 节点并入 HCP ring,进入真 ring 阶段;三节点 worker 同级(peer),coordinator 默认 white 但位置解耦(见 decision-coordinator-placement-20260724)。实施顺序仍按 (a) 双机 relay 机制验证 → (b) 三机真异构。laptop 侧工作:自建 vLLM CPU(VLLM_TARGET_DEVICE=cpu) + 安装 hcp-vllm-plugin,担任 chunk0 producer。
 
-_updated: 2026-07-22 07:12:14_
+_updated: 2026-07-24 08:34:57_
+### 决策:三节点 worker 同级;coordinator 默认放 white,但位置与 worker 拓扑解耦
+
+type: `decision` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `user-direction`
+
+用户方向(2026-07-24):laptop(Mac)节点并入 HCP ring 后即进入"真正的 ring"阶段。拓扑原则:三个节点(white CUDA / pearl ROCm / laptop CPU)上的 worker 是同级别 peer,无主次之分,各自持有自己 chunk 并参与 ring 交换。coordinator(控制面:tokenizer 分片、token 广播、chunk 分配)默认部署在 white——考虑其 CPU 与内存资源最丰富;但 coordinator 只做控制面、不做模型计算,架构上可放任意节点(包括 laptop),位置选择是部署问题而非拓扑约束。与既有纪律一致:每个平台必须跑至少一个 worker,coordinator 不计入异构计算能力验证。
+
+_updated: 2026-07-24 08:34:57_
 ### 决策：两个产品级产出解耦为独立 GitHub repo(private),主仓保留研究/驱动/知识库
 
 type: `decision` · status: `held` · confidence: 0.95 · importance: 0.9 · source: `user-direction`

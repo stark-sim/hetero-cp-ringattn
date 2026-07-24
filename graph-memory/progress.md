@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-07-24] Mac 本地三仓同级布局落地,解耦在本机可开发
+
+type: `evidence` · status: `held` · confidence: 0.95 · importance: 0.8 · source: `experiment`
+
+decision-repo-decoupling-20260722 的收尾动作:本地 Mac 此前没有两个产品 repo 的 clone(只有主仓 + ~/VSCodeProjects/vllm 上游参考树)。现已在 ~/VSCodeProjects/ 下三仓同级:hetero-cp-ringattn(主仓)、hcp-vllm-plugin(HEAD 4c95561,与 GitHub 一致)、vllm-rocm-gfx1200(HEAD fbda49d,与 GitHub 一致)。清理主仓内拆仓遗留的 hcp_vllm_plugin/__pycache__ 陈旧缓存;主仓 README 新增三仓标准布局与边界说明(white/pearl 在 /home/stark/,Mac 在 ~/VSCodeProjects/;插件功能只在 hcp-vllm-plugin 改,gfx1200 兼容性只在 vllm-rocm-gfx1200 改,主仓只做调度核心/驱动/知识库),commit 1bf9b0c 已推送。后续 N>2 ring 的插件改动在 Mac 本地 hcp-vllm-plugin clone 进行,走 git 同步到 white/pearl。
+
+_updated: 2026-07-24 08:34:57_
 ### [2026-07-22] gfx1200 适配 repo 整理完成:vllm-rocm-gfx1200(private),解耦全部落地
 
 type: `evidence` · status: `held` · confidence: 0.95 · importance: 0.85 · source: `experiment`
