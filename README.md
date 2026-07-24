@@ -18,7 +18,21 @@ HCP(Heterogeneous Context Parallelism)研究主仓:异构节点(不同显卡/显
 
 ## 机器上的标准布局
 
+white/pearl(`/home/stark/` 下):
+
 ```
 /home/stark/hetero-cp-ringattn   # 本仓(研究/驱动)
 /home/stark/hcp-vllm-plugin      # 插件 clone(pip install -e 从这里装)
+/home/stark/vllm                 # vLLM 源码树(pearl 上由 vllm-rocm-gfx1200 的补丁构建)
 ```
+
+本地 Mac(`~/VSCodeProjects/` 下,三仓同级):
+
+```
+~/VSCodeProjects/hetero-cp-ringattn   # 本仓(研究/驱动/知识库)
+~/VSCodeProjects/hcp-vllm-plugin      # 插件(功能开发在这里做)
+~/VSCodeProjects/vllm-rocm-gfx1200    # gfx1200 补丁/构建脚本
+```
+
+解耦原则:插件功能(N>2 ring、kernel hardening)只在 hcp-vllm-plugin 仓改;
+gfx1200 兼容性只在 vllm-rocm-gfx1200 仓改;本仓只做调度核心、跨节点驱动与知识库。
