@@ -30,7 +30,7 @@ type: `task` · status: `superseded` · confidence: 0.95 · importance: 0.95 · 
 1M v9（3:1 split）成功，prefill 24/24 + decode 5/5，exit=0。文档已同步：1M_CONTEXT_THUNDERBOLT_PLAN.md、SCALING_ARGUMENT.md、systemPatterns.md。当前无未完成的 1M 攻坚任务；下一步决定是否需要更大模型 / 更多 domain 验证。
 
 _updated: 2026-06-29 06:01:28_
-### 后续路线:N>2 真 ring(三机:white CUDA + pearl ROCm + laptop CPU)
+### 后续路线:N>2 真 ring(三机:white CUDA + pearl ROCm + laptop 4060 CUDA)
 
 type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.9 · source: `user-direction`
 
@@ -43,8 +43,20 @@ type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.9 · sourc
 (b) 三机真异构:laptop(Mac)需自建 vLLM CPU(无 macOS wheel,VLLM_TARGET_DEVICE=cpu),担任 chunk0 producer(不吃前缀、计算量最小)——满足"每平台必须跑 worker"纪律的最小可行角色。
 前置:pearl 恢复可达,完成 task-gfx1200-repo-extraction。
 [2026-07-24 更新] 前置已清(gfx1200 repo 完成,双机迁移复验 PASS)。用户确认下一步:laptop 节点并入 HCP ring,进入真 ring 阶段;三节点 worker 同级(peer),coordinator 默认 white 但位置解耦(见 decision-coordinator-placement-20260724)。实施顺序仍按 (a) 双机 relay 机制验证 → (b) 三机真异构。laptop 侧工作:自建 vLLM CPU(VLLM_TARGET_DEVICE=cpu) + 安装 hcp-vllm-plugin,担任 chunk0 producer。
+[2026-07-24 修订] 用户更正 laptop 硬件:RTX 4060 Laptop 真 CUDA,非 Mac/CPU-only,"自建 vLLM CPU 担任 chunk0 producer"的最小可行角色方案作废(见 decision-n3-direct-20260724)。两步走 (a)→(b) 同时作废:直接三机真 ring,relay/多 peer 机制按通用 N 实现,N=2 为退化兼容。三处插件改动定位不变。
 
-_updated: 2026-07-24 08:34:57_
+_updated: 2026-07-24 08:43:31_
+### 决策:laptop 实为 RTX 4060 Laptop 真 CUDA 节点;直接做三机真 ring,框架按通用 N 实现
+
+type: `decision` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `user-direction`
+
+用户更正与方向(2026-07-24):
+1. 硬件更正:laptop 节点具备 RTX 4060 Laptop 显卡,可运行官方 vLLM+CUDA。此前"laptop=Mac、无 macOS wheel、只能自建 vLLM CPU"的假设作废;任何设备都不再需要 vLLM CPU 路径。
+2. 路线修正:跳过原 (a) 双机 relay 先行验证步骤,直接做三机真 ring(white CUDA + pearl ROCm + laptop CUDA)。
+3. 通用性要求:N>2 框架按通用 N 实现,双机(N=2)只是退化情形——现有双机配置(white producer + pearl consumer)在通用框架下应保持可用,不另开专用代码路径。
+不变的部分:插件三处改动定位不变(connector ring_role=relay、backend 多 peer 连续前缀合并做一次 peer pass、每请求 chunk_ids 复数),但 relay/多 peer 路径直接按通用 N 写。chunk 分配按 capacity-aware 三档(white 4090 24GB / pearl 9060XT 16GB / laptop 4060 8GB),具体比例实施时定。
+
+_updated: 2026-07-24 08:43:31_
 ### 决策:三节点 worker 同级;coordinator 默认放 white,但位置与 worker 拓扑解耦
 
 type: `decision` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `user-direction`
