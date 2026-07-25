@@ -179,6 +179,17 @@ type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.9 · sou
 与 HCP 相关性：直接相关，可能缓解 pearl 等小/慢 domain 在 Phase 2 成为瓶颈的问题。
 
 _updated: 2026-06-29 06:06:09_
+### decode 通信策略分析:当前 owner 汇聚(0 跳/全量 KV 常驻) vs 累积器绕环(L×P 跳/语义保持),选择由互联延迟决定
+
+type: `belief` · status: `held` · confidence: 0.85 · importance: 0.85 · source: `user-direction + analysis`
+
+用户提出的 decode 纯 P2P 方案(累积器 (o,m,l) 绕环归并,双向减半,树形 log P)分析确认:
+1. 插件现状:前缀 KV prefill 时一次 stage 后按请求生命周期常驻,decode 每 token 0 网络跳——属"decode 降级回单卡"家族的隐式版本,延迟最优;代价是 owner 在 decode 期持有全量前缀 KV,显存切分在 decode 阶段失效(PoC 规模无碍,1M 规模撞墙)。
+2. 累积器绕环方案语义保持(每节点只持自己 chunk),原语已齐(ring_attn_with_lse 的 LSE + merge_attn_states 两路归并),缺 per-token per-layer 绕环编排。但跳数是 L×P 而非 P:第 L 层 Q 依赖 L-1 层全局归并完成,归并无法跨层流水(24层×3节点=72跳/token;双向 36;树形 ~48)。
+3. 延迟测算:tailscale 125ms RTT → ~9s/token(不可用);2.5G 有线 ~0.2ms → ~14ms/token≈70tok/s(小模型可用);CXL/RDMA μs 级 → 可忽略。
+4. 结论:prefill 带宽敏感、decode 延迟敏感,两角度同证 CXL/类 RDMA 是异构 CP 的前置条件(主线论据+1)。当前 staging 策略不变;accumulator-ring decode 列为开放实现项,触发条件=decode 期 owner 显存不足 + 互联足够快。
+
+_updated: 2026-07-25 18:35:58_
 ### kernel-hardening backlog(性能/规模,非正确性;128K+ 启动时按序做)
 
 type: `task` · status: `ongoing` · confidence: 0.85 · importance: 0.85 · source: `analysis`
