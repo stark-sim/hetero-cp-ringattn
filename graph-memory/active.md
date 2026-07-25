@@ -2,20 +2,6 @@
 
 当前活跃的任务、决策、风险和假设。
 
-### 决策:环闭合全做——角色统一 + 邻接累积转发 + 请求轮转放置
-
-type: `decision` · status: `held` · confidence: 0.9 · importance: 0.95 · source: `user-direction`
-
-用户指出(2026-07-25):现状 A→B→C 是一条线不是环;"N 是 producer 时,(N+1)%N 就是对应的 consumer,要形成一个循环"。并选择 1+2+3 全做。
-动机剖析:
-1. 问题:角色三态(producer/consumer/relay)不对称;传输星型直拉;(N+1)%N 消费关系不成立。
-2. 现状:通用 N 已验证(relay/复数 staging/cat peer pass),拓扑是线。
-3. 目标态:单一 ring 角色(环序推导前缀/peer);邻接累积转发(每节点只与物理前驱 (i-1+N)%N 通信,staged chunk 写 _READY 即 re-serve);3 并发请求轮转起始节点,(N+1)%N 消费关系字面成立,token 全对,显存切分保持。
-4. 别人怎么做:Ring Attention 原论文即 KV 沿环轮转、全节点同级;星型直拉是我们的 PoC 简化;vLLM 无此概念。
-5. 我们怎么做:ring 角色统一(relay 语义,producer=空前缀退化、consumer=末位退化,旧角色保留兼容);start_load_kv 完成 staging 后写 _READY(re-serve 累积前缀);复数参数天然涵盖邻接(peer_url 单数自动 pad 到所有前缀 chunk);驱动轮转放置。
-6. 为什么:因果硬约束下单条序列数据面无法闭合到 node0(chunk0 不能 attend 未来)——环只能在角色/传输/负载面闭合;轮转放置是唯一不违反因果的字面闭合,且顺带负载均衡。
-
-_updated: 2026-07-25 02:42:56_
 ### 下一阶段：从 1M 可行性验证走向多条扩展线探索
 
 type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.95 · source: `user-direction`
@@ -60,8 +46,9 @@ type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.9 · sourc
 [2026-07-24 修订] 用户更正 laptop 硬件:RTX 4060 Laptop 真 CUDA,非 Mac/CPU-only,"自建 vLLM CPU 担任 chunk0 producer"的最小可行角色方案作废(见 decision-n3-direct-20260724)。两步走 (a)→(b) 同时作废:直接三机真 ring,relay/多 peer 机制按通用 N 实现,N=2 为退化兼容。三处插件改动定位不变。
 [2026-07-25 更新] laptop 环境就绪(ev-laptop-env-ready-20260725):vllm 0.23.1rc1 源码编译 + 插件 compat 6/6 + GPU smoke 通过,模型已同步。三节点环境条件齐备,可开始插件侧通用 N 实现(relay role/多 peer 前缀合并/chunk_ids 复数)。
 [2026-07-25 里程碑] 三机真 ring 验证通过(ring3-033045):laptop A + white B relay + pearl C,token 与单节点参考一致。本任务的核心目标达成。后续开放项:capacity-aware 不均等三档分片(4060 8GB/9060XT 16GB/4090 24GB)、更长 seq(16k+)、多并发 CP 在 N=3 下的复验、coordinator 与插件 ring 的关系统一。
+[2026-07-25 环闭合里程碑] 统一 ring 角色 + 邻接累积转发 + 轮转放置三机验证通过(ringc-160010):(N+1)%N 消费关系字面成立,真环成型。后续开放项:capacity-aware 不均等分片、更长 seq、compute/comm overlap(邻接传输已铺路)、N>3 扩展。
 
-_updated: 2026-07-24 19:33:45_
+_updated: 2026-07-25 08:04:18_
 ### 决策:laptop 实为 RTX 4060 Laptop 真 CUDA 节点;直接做三机真 ring,框架按通用 N 实现
 
 type: `decision` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `user-direction`

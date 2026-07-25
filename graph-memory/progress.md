@@ -2,6 +2,29 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-07-25] 环闭合三机验证通过:统一 ring 角色 + 邻接累积转发 + 轮转放置,(N+1)%N 字面成立
+
+type: `evidence` · status: `held` · confidence: 0.95 · importance: 1.0 · source: `experiment`
+
+decision-ring-closure-123-20260725 的完整落地(插件 cefff57,主仓驱动 c77cb67)。
+验证阶梯全 PASS:
+1. N=2 回归 4 验证器(backend/connector/concurrent/relay)——环改动后向后兼容;
+2. 单卡 3 实例闭合(white):3 引擎统一 ring_role=ring,3 请求轮转起始节点,position-2 token 全对,slots_written 1523/1552/1552(≤1604,各自只持有自己 chunk);
+3. 三机环闭合(ringc-160010):laptop(4060 CUDA)=node0、white(4090 CUDA)=node1、pearl(9060XT ROCm)=node2,物理环 laptop→white→pearl→laptop,每节点只从物理前驱拉累积前缀(邻接 re-serve),3 并发请求轮转——node0 req1=[220,20,18,84253]、node1 req2=[220,20,18,84253]、node2 req0=[15,25009,220,20] 与各自单节点参考全对;staging 用后释放;triton 288 次 0 回退(三平台)。
+语义:producer N 的 consumer 字面是 (N+1)%N(每节点在一个请求中生产、在另一个请求中从前驱消费);单序列数据面受因果约束不闭合,环在负载面闭合。
+报告:reports/ring-closure-ringc-160010/。
+
+_updated: 2026-07-25 08:04:18_
+### [2026-07-25] 环闭合排障:stall 轮询风暴、url 补齐语义、块复用探针误报
+
+type: `lesson` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `reflection`
+
+1. stall 轮询风暴:vLLM 调度器对 stalled 请求全速重试 get_num_new_matched_tokens(~1.6 万次/s/请求),每调用一次 HEAD 轮询 => 20 分钟 600 万连接打爆 loopback 临时端口,urlopen 失败后永远 stall(livelock)。修法:_prefix_ready 就绪结果永久缓存 + 失败按 chunk 0.5s 退避(插件 0cca5b8)。
+2. url 补齐语义:_chunks_and_urls 短 url 列表原来补 ""(=全局/本地回退),邻接模型下第二个前缀 chunk 的就绪检查落到本地存储永远 False。修法:短列表补【最后一个 url】(前驱服务全部累积前缀,c85eff5)。教训:复数参数的默认值语义要逐组合(单 url×多 chunk)测试。
+3. WRITE_TRACK 全局槽位集合 vs 每请求 block table 在并发下误报:释放块被分配器复用为后续请求的前缀区,旧主写入与新请求前缀区相交 => 假污染(61128/98304/110592)。并发下无法区分合法旧主与违规写入,改判据为 slots_written 核算(每节点≈自己 chunk token 数);token 匹配才是正确性主证据。
+4. 排障方法论的胜处:先证 poll 计数(600 万 vs 0),再上 py-spy(被拒),最后 GNMT 探针计数定位到"第二个 chunk 从未被检查"——证据分级推进,不猜。
+
+_updated: 2026-07-25 08:04:18_
 ### [2026-07-25] 三机真 ring 验证通过:laptop(4060 CUDA) + white(4090 CUDA relay) + pearl(9060XT ROCm)
 
 type: `evidence` · status: `held` · confidence: 0.95 · importance: 1.0 · source: `experiment`
