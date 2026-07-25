@@ -2,6 +2,49 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-07-25] decode 显存切分(累积器绕环)验证通过(dsplit4):五项判据全过,decode 期 owner 只持自己 chunk
+
+type: `evidence` · status: `held` · confidence: 0.95 · importance: 0.95 · source: `experiment`
+
+decision-memory-split-decode-20260725 的实现落地与验证(插件 2ad6aca 实现 + efe0bb0/4b92172 两枚修复)。
+white RTX 4090, vllm 0.23.1rc1, HCP_RING_DECODE_RING=1, validate_ring_decode_split.py --mode all:A producer(c0=512) + B relay(c1=512) + C owner(c2=512, full prompt 1536, decode 8)。
+五项判据全过:
+1) C greedy 8 token 与单节点参考完全一致 [220,20,22,29514,84253,916,16301,220],max|logit diff|=0.0234(argmax 处 0.0);
+2) MEMSPLIT DECODE:generate 返回即 PEER_KV_STAGING=0/PEER_REQ_MAP=0——前缀 KV 在 decode 开始释放而非请求结束;DECODE_RING_MAP 至 finish 才清(生命周期分离);
+3) C 只写 528 池槽(c2 512+decode 8+slack≤584),前缀 chunk 从不进 owner 常驻池;
+4) triton kernel 路径 attn 240/0、merge 24/0,0 回退;
+5) A/B 各服务 168 次 POST /partial_attn 全 HTTP 200(7 decode 步×24 层,与预期精确吻合)。
+Reviewer 独立复核 APPROVE(归档日志与 white 实时副本一致,无 fallback/错误迹象;保留意见:HCP_RING_DECODE_RING 环境变量未入日志、释放时点为单采样点推断)。
+过程修复两个实现 bug:
+①safetensors 0.8 load() 只收 bytes 不收 BytesIO——/partial_attn 每跳 HTTP 500(efe0bb0;既有 connector 走 load_file 所以未暴露);
+②staging 释放回调被后初始化的调度侧 connector 实例覆盖(EngineCore 先建 model executor 后建 scheduler,core.py:118 vs :146),空 _live 静默空转,改 WORKER 角色门控(4b92172)。
+排障弯路记录:dsplit2 曾据"served"日志 0 行误判 ring 分支未触发,实际分支一直在工作(HTTP 日志 168+168),探针不可见≠事件未发生。
+报告:reports/ring-decode-split-dsplit4-032527/{driver,a,b,c}.log。
+意义:decode 显存切分语义闭合——prefill/decode 对称,owner 全程只持自己 chunk+decode 增长;decode 每 token L×(P-1) RPC 跳的延迟代价即 CXL/类 RDMA 必要性论据。
+
+_updated: 2026-07-25 19:32:22_
+### [2026-07-25] 进程级全局回调被多实例"后初始化者"覆盖:静默失效,结果仍正确但语义判据失败
+
+type: `lesson` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `reflection`
+
+ring connector 的 staging 释放回调(set_staging_release_fn)在 worker/scheduler 两个实例的 __init__ 无条件注册;vLLM EngineCore 先建 model executor 后建 scheduler(vllm/v1/engine/core.py:118 vs :146),调度侧实例后初始化,用自己空 _live 的绑定方法覆盖回调→_release_request_staging 永远空转→staging 全程不释放。危险之处:token 仍正确(旧 staged 路径兜底),只有显存切分语义判据能抓到。
+教训:
+1) 进程级全局 + 多实例注册必须考虑初始化顺序,谁后谁赢;按角色门控(WORKER only)或改实例无关的模块级函数;
+2) "结果正确但语义判据失败"是定位信号——正确性路径与生命周期路径是两套代码,token 全对不能证明资源管理对;
+3) 框架初始化顺序属于事实性前提,读源码确认,不靠记忆。
+
+_updated: 2026-07-25 19:32:22_
+### [2026-07-25] 插件 logger 输出不进捕获日志:探针不可见≠事件未发生,计数探针优先用服务侧 HTTP 请求行
+
+type: `lesson` · status: `held` · confidence: 0.9 · importance: 0.85 · source: `reflection`
+
+插件模块用 vllm init_logger(__name__)(非 vllm 命名空间),其 INFO 输出不会进 driver 捕获的日志文件(连既有的 "HcpRingKvConnector init"/"staged peer chunk" 也不出现)。dsplit2 据 "PartialAttentionService: served" 0 行误判 ring 分支未触发,实际 A/B 的 SimpleHTTPRequestHandler 请求行(stderr,必被捕获)显示 168+168 次 POST /partial_attn 全 200——观测通道不可见导致的假阴性。
+教训:
+1) 计数/计数率探针优先用服务侧 HTTP 请求行或 print(flush=True),不依赖 vllm logger;
+2) 下"未发生"结论前,先验证观测通道本身可见(加一行启动必打印的校准日志);
+3) 与 lesson-closure-livelock-20260725 同源:探针的假设(这里是"日志可达")也要被核对。
+
+_updated: 2026-07-25 19:32:22_
 ### [2026-07-25] 环闭合三机验证通过:统一 ring 角色 + 邻接累积转发 + 轮转放置,(N+1)%N 字面成立
 
 type: `evidence` · status: `held` · confidence: 0.95 · importance: 1.0 · source: `experiment`
