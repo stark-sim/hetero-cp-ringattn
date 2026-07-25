@@ -2,6 +2,20 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 决策:环闭合全做——角色统一 + 邻接累积转发 + 请求轮转放置
+
+type: `decision` · status: `held` · confidence: 0.9 · importance: 0.95 · source: `user-direction`
+
+用户指出(2026-07-25):现状 A→B→C 是一条线不是环;"N 是 producer 时,(N+1)%N 就是对应的 consumer,要形成一个循环"。并选择 1+2+3 全做。
+动机剖析:
+1. 问题:角色三态(producer/consumer/relay)不对称;传输星型直拉;(N+1)%N 消费关系不成立。
+2. 现状:通用 N 已验证(relay/复数 staging/cat peer pass),拓扑是线。
+3. 目标态:单一 ring 角色(环序推导前缀/peer);邻接累积转发(每节点只与物理前驱 (i-1+N)%N 通信,staged chunk 写 _READY 即 re-serve);3 并发请求轮转起始节点,(N+1)%N 消费关系字面成立,token 全对,显存切分保持。
+4. 别人怎么做:Ring Attention 原论文即 KV 沿环轮转、全节点同级;星型直拉是我们的 PoC 简化;vLLM 无此概念。
+5. 我们怎么做:ring 角色统一(relay 语义,producer=空前缀退化、consumer=末位退化,旧角色保留兼容);start_load_kv 完成 staging 后写 _READY(re-serve 累积前缀);复数参数天然涵盖邻接(peer_url 单数自动 pad 到所有前缀 chunk);驱动轮转放置。
+6. 为什么:因果硬约束下单条序列数据面无法闭合到 node0(chunk0 不能 attend 未来)——环只能在角色/传输/负载面闭合;轮转放置是唯一不违反因果的字面闭合,且顺带负载均衡。
+
+_updated: 2026-07-25 02:42:56_
 ### 下一阶段：从 1M 可行性验证走向多条扩展线探索
 
 type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.95 · source: `user-direction`
