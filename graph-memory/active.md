@@ -2,6 +2,25 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 决策:decode 也必须显存切分(累积器绕环),decode 慢作为 CXL 论据接受
+
+type: `decision` · status: `held` · confidence: 0.9 · importance: 0.95 · source: `user-direction`
+
+用户方向(2026-07-25):decode 若有一个 worker 常驻全部 KV,ring-attn CP 的根本目的就被破坏;decode 要和 prefill 一样显存切分,显存压力才可计算、capacity-aware 分配才成立;带宽压力(慢 decode)正好作为异构高带宽(CXL)需求论据,实验阶段可接受。
+动机剖析六问:
+1. 问题:decode 阶段 owner 常驻全量前缀 KV(staging 按请求生命周期持有),显存切分失效,显存压力不可计算,capacity-aware 无法成立。
+2. 现状:prefill 显存切分(relay 链+瞬时 staging)已三机验证;decode 塌缩为 owner 单节点(0 跳/全量常驻),语义不对称。
+3. 目标态:decode 全程显存切分——owner 只持自己 chunk+decode 增长;各节点从 store 加载本 chunk 快照,服务部分 attention;online-softmax 累积器沿环归并(L×(P-1) 跳/token);token 与单节点参考一致;decode 慢可接受。
+4. 别人怎么做:真实 CP 系统压小 P、NVLink 域内环、或 decode 降级并行度(重分片/切回单卡)——多数是绕开而非保持切分;vLLM P/D 分离是全量搬移,无此语义。
+5. 我们怎么做:prefill 不变;owner prefill 后释放 staging;decode 各节点用 store 快照(免 pool 生命周期问题)起 partial-attention 服务;owner 每层先算本地部分(含 decode 增长,causal)再沿环 RPC peer 归并(ring_attn_with_lse/merge_attn_states 原语复用);HCP_RING_DECODE_RING=1 开关,默认关保持兼容。
+6. 为什么:语义完整性优先——显存切分在 prefill/decode 对称,显存压力才可计算;慢是论据不是缺陷。
+牺牲四问:
+1. 默认为什么存在(owner 汇聚):decode 0 跳最快、省网络,是 latency-bound 阶段的工程直觉解。
+2. 牺牲什么:decode 延迟(L×(P-1) RTT/token,比单机慢几个数量级)。
+3. 被牺牲者的用途:低 decode 延迟是生产服务质量指标(TTFT/TBT)。
+4. 对本项目意义:HCP 处于研究/论据阶段,语义完整性与 capacity-aware 可计算性优先;decode 慢本身即 CXL 必要性证据。结论:implement。
+
+_updated: 2026-07-25 18:47:17_
 ### 下一阶段：从 1M 可行性验证走向多条扩展线探索
 
 type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.95 · source: `user-direction`
