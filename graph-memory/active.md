@@ -2,6 +2,24 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 决策:decode 增长按全局位置轮转分片(p mod N),RPC 捎带保序;策略函数作为计划层可换缝
+
+type: `decision` · status: `held` · confidence: 0.9 · importance: 0.95 · source: `user-direction`
+
+动机剖析六问:
+1. 问题:decode 增长 KV 全部落在 owner(dsplit4 的 528=c2 512+增长 8),请求内增长非均衡;长 decode 下 owner 显存先撞墙,"显存压力可计算"只覆盖 prefill 不覆盖增长,全局显存切分语义不完整。
+2. 现状:dsplit4 已验证 decode 期前缀显存切分(staging 于 decode 开始释放+累积器绕环 RPC,168+168 跳);但 engine 无条件把每个新 token 的 KV 写进 owner 池,其他节点增长份额为 0。
+3. 目标态:decode 增长也按环分片——每节点持久 KV=自己 chunk+自己增长份额(token 按全局位置轮转指派 p mod N);owner 池只写 c2,增长走 backend 紧凑 buffer,非自有 token 仅本步瞬时参与(causal 要求)后捎带给指派节点;token 与单节点参考一致;可验证:slots_written≈c2 级、A/B growth 计数符合轮转、token 一致。
+4. 别人怎么做:Ring Attention 论文/Striped/ZigZag 面向静态序列无增长概念;TP 按头分片天然均衡(代价每层 all-reduce,绑 NVLink);vLLM P/D 全量搬移无切分语义;推理 CP 多在 NVLink 域内绕开。慢互联+序列维切分的 decode 增长放置是主流空白,无可直接复用机制。
+5. 我们怎么做:复用 decode-ring 累积器 RPC 通道捎带上一步增长 KV(append-then-serve 一次 RPC 保序,边际跳数为 0);owner 本地 partial=池内 c2+紧凑 growth buffer+当前 token(瞬时);指派策略默认 p mod N 轮转,HCP_RING_DECODE_GROWTH=rr|owner 策略函数独立作为计划层可换缝(owner=退化为旧行为,供对照);HCP_RING_DECODE_RING=1 仍为总开关(0=legacy owner-collapse 保留)。
+6. 为什么:语义统一优先——prefill/decode/增长全程每节点只持自有份额,显存压力全程可计算(chunk+growth/N);捎带保序使额外跳数为零;慢 decode 本身即 CXL 论据,局部性不是本项目目标。
+牺牲四问:
+1. 默认为什么存在(增长留 owner):engine 无条件写池最自然,decode 局部性最好、零额外通信、实现最简。
+2. 牺牲什么:owner 的 decode 局部性——非自有 token 的 KV 需外流(捎带在已有 RPC 上,边际跳数≈0),owner 每步多一次小 cat。
+3. 被牺牲者的用途:局部性省通信、省代码,是 latency 优先系统的直觉解。
+4. 对本项目意义:实验级研究项目,语义完整性(全局显存切分)优先于 decode 局部性;捎带设计使代价近似为零;保留 owner 策略开关可随时退化对照。结论:implement。
+
+_updated: 2026-07-26 05:10:16_
 ### 决策:decode 也必须显存切分(累积器绕环),decode 慢作为 CXL 论据接受
 
 type: `decision` · status: `held` · confidence: 0.9 · importance: 0.95 · source: `user-direction`

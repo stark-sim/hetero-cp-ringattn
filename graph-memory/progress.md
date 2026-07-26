@@ -2,6 +2,32 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-07-25] decode 增长分片验证通过(dsplit6):prefill/decode/增长全局显存切分语义闭合
+
+type: `evidence` · status: `held` · confidence: 0.95 · importance: 0.95 · source: `experiment`
+
+decision-decode-growth-shard-20260725 的实现与验证(插件 cb424ad 实现 + a751de8 判据强化)。
+white RTX 4090, vllm 0.23.1rc1, HCP_RING_DECODE_RING=1(默认 rr 轮转策略), validate_ring_decode_split --mode all:A producer(c0=512) + B relay(c1=512) + C owner(c2=512, full prompt 1536, decode 8)。
+判据全过:
+1) token 8/8 与单节点参考一致 [220,20,22,29514,84253,916,16301,220],max|logit diff|=0.0293(argmax 处 0);
+2) MEMSPLIT DECODE 保持:generate 返回即 staging=0/0(前缀 decode 开始释放),ring map finish 才清;
+3) 增长分片 peer 侧:A/B 各 calls=168(7 步×24 层) RPC 全 200,growth_appends=48(2 token×24 层),growth_tokens_per_layer=2——精确命中轮转预测(A={1536,1539},B={1537,1540});
+4) 增长分片 owner 侧:decode 池写跳过 168/168((decode-1)×24 层)——增长不走 owner 池,自有份额在 backend 紧凑 buffer(owner={1538,1541});
+5) slots 528≤552(c2+flush);triton 240/0、merge 24/0。
+Reviewer 独立复核 APPROVE(8 项声明均有日志原文;A/B 统计行在各自日志原文中存在非 driver 转述;反证扫描 0 fallback/0 非 200;保留项:peer growth 未做落盘字节比对,单节点模拟拓扑)。
+实现要点:append-then-serve 捎带保序(增长 KV 搭下一步 RPC,零额外跳);当前 token 始终瞬时参与本地段(因果尾);own_chunk_len 首 decode 步惰性捕获;HCP_RING_DECODE_GROWTH=rr|owner 策略缝(owner 退化供对照);HCP_RING_DECODE_RING 总开关不变。
+报告:reports/ring-decode-growth-dsplit6-132831/。
+意义:任何节点任何时刻只持久持有自己的 KV 份额(prefill chunk + 增长份额)——全局真正 KVCache 显存压力切分;显存压力全程可计算(chunk+growth/N);decode 慢(L×(P-1) RTT/token + 捎带)即 CXL 论据。后续开放:跨节点增长分片复验、capacity 加权指派策略、多请求并发 decode-ring、策略退化(owner)对照实验。
+
+_updated: 2026-07-26 05:33:53_
+### [2026-07-25] 槽位集合计数证明不了"未写入":释放槽位被复用后行为差异塌缩,计数型判据要直接测目标行为
+
+type: `lesson` · status: `held` · confidence: 0.9 · importance: 0.85 · source: `reflection`
+
+dsplit4(增长写池)与 dsplit5(增长跳池)的 WRITE_TRACK 槽位集合都是 528——主请求释放的槽位被 flush 请求复用,集合去重使两种相反行为数值相同,slots 核算无法区分。修法:WRITE_TRACK["skipped"] 显式计数被跳过的写((decode-1)×24 层=168 精确断言),行为判据直接测行为本身而非其副作用投影。
+教训:1) 用"集合/计数投影"做判据时,先问复用/去重/缓存是否会让相反行为产生相同投影;2) 能直接计数目标行为(跳过次数、调用次数)就不用间接量;3) 与 lesson-plugin-logger-probe-20260725、lesson-closure-livelock-20260725 同族:探针有效性本身必须被质疑——这已经是第三次同族教训,验证脚本评审时应把"探针能否区分相反行为"列为固定检查项。
+
+_updated: 2026-07-26 05:33:53_
 ### [2026-07-25] decode 显存切分(累积器绕环)验证通过(dsplit4):五项判据全过,decode 期 owner 只持自己 chunk
 
 type: `evidence` · status: `held` · confidence: 0.95 · importance: 0.95 · source: `experiment`
