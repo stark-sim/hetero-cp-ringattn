@@ -1,0 +1,36 @@
+id: "ISSUE-005"
+timestamp: "2026-07-27T15:02:09Z"
+
+type: "limitation"
+severity: "high"
+
+# 问题描述
+description: |
+  从未实现真 ring 模式 compute/comm overlap:prefill 是 staging-then-compute(传输与计算串行),Ring Attention 论文的核心优势域(逐层 KV block 轮转与计算重叠)在 vLLM 线缺失,kernel-hardening backlog 第1项(local paged 直读)也未做
+
+# 根本原因分析（待补充）
+root_cause: |
+  TODO: 分析根本原因
+
+# 影响评估（待补充）
+impact:
+  tokens_wasted: 0
+  time_wasted_minutes: 0
+  steps_wasted: 0
+  other: |
+    TODO: 评估影响
+
+# 解决方案（待补充）
+resolution: |
+  TODO: 记录解决方案
+
+# 预防措施（待补充）
+prevention: |
+  TODO: 记录预防措施
+
+status: "active"
+related_issues: []
+tags: []
+
+# 复盘记录
+retrospectives: []

@@ -2,6 +2,32 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 用户裁定:当前显存切分是工程欺骗,必须彻底修复后才继续;vLLM/Rust 两线同查同修
+
+type: `decision` · status: `held` · confidence: 0.95 · importance: 1.0 · source: `user-direction`
+
+用户方向(2026-07-27,最高优先级):语义边界现状被定性为"工程欺骗"——一直强调真正的显存切分,现状不达标:
+1. 尾节点 prefill 前拉取全量前缀 KV(瞬时),仍承担全部显存压力,违背 CP 核心目标(ISSUE-003 critical);
+2. 并发 decode 增长落回 owner 池,显存压力无 CP 分担(ISSUE-004 critical);PoC 最小要求=2 请求并发;
+3. 从未做真 ring 模式 overlap(Ring Attention 优势域)(ISSUE-005 high);
+4. owner/peer 角色不对称,设计范式要求所有 worker 同等地位(ISSUE-006 high;LoongServe 转化的对等化设计另行探讨,不在本轮修复范围);
+5. vLLM 与 Rust 是同一设计控制层的两个数据实现层,问题要两线同查同修。
+Rust 线审查结论(explore 复核,file:line 证据):
+- prefill 流式逐块+overlap+worker 对称:Rust 线领先,无 003/005/006 对应问题(ring.rs:665-733 流式、636-663 overlap、worker 对称+coordinator 集中采样);
+- 但 decode 同病不同机制:增长 KV 全节点复制(ring.rs:457-466+cache.rs:55-69,ISSUE-007 critical)、decode 仍逐 token 重发 prefill KV 分区而非 Q+LSE 环(ring.rs:399,ISSUE-008 high)、全 worker 冗余算 logits(coordinator.rs:344)。
+修复范围(LoongServe 对等化探讨除外):
+A. vLLM prefill 真 ring 化:按层/按块流式 staging+compute/comm overlap,单节点任意时刻持有量有界(修 003+005,Rust 线为参照实现);
+B. vLLM decode ≥2 并发+增长分片保持(修 004,PoC 最小要求);
+C. Rust decode 移植 Q+LSE 累积器环+增长分片(修 007+008)。
+
+_updated: 2026-07-27 15:10:25_
+### 任务A:vLLM prefill 真 ring 化(流式 staging+overlap,有界瞬态显存)
+
+type: `task` · status: `ongoing` · confidence: 0.9 · importance: 0.95 · source: `user-direction`
+
+修 ISSUE-003+ISSUE-005。目标:prefill 不再一次性 stage 全量前缀;参照 Rust 线 micro-block 流式模型(ring.rs:665-733),按层或按块流水线:拉取块 i+1 与计算块 i 重叠,任一时刻瞬态持有=本 chunk+少量 in-flight 块(有界,与 seq 无关)。验证:token 一致+瞬态 staging 峰值有界探针+三机复验。动机剖析随实施记录。
+
+_updated: 2026-07-27 15:10:25_
 ### 决策:decode 增长按全局位置轮转分片(p mod N),RPC 捎带保序;策略函数作为计划层可换缝
 
 type: `decision` · status: `held` · confidence: 0.9 · importance: 0.95 · source: `user-direction`
@@ -67,6 +93,13 @@ type: `task` · status: `superseded` · confidence: 0.95 · importance: 0.95 · 
 1M v9（3:1 split）成功，prefill 24/24 + decode 5/5，exit=0。文档已同步：1M_CONTEXT_THUNDERBOLT_PLAN.md、SCALING_ARGUMENT.md、systemPatterns.md。当前无未完成的 1M 攻坚任务；下一步决定是否需要更大模型 / 更多 domain 验证。
 
 _updated: 2026-06-29 06:01:28_
+### 任务B:vLLM decode ≥2 请求并发+增长分片保持
+
+type: `task` · status: `ongoing` · confidence: 0.9 · importance: 0.9 · source: `user-direction`
+
+修 ISSUE-004。跳池门 n==1 启发式改为按请求判定;PEER_REQ_MAP/DECODE_RING_MAP/growth buffer/pending_growth 全部按请求键隔离;并发 decode 步每请求独立 accumulator 绕环。PoC 最小:2 请求并发 token 与各自单节点参考一致+各自显存切分判据成立。
+
+_updated: 2026-07-27 15:10:25_
 ### 后续路线:N>2 真 ring(三机:white CUDA + pearl ROCm + laptop 4060 CUDA)
 
 type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.9 · source: `user-direction`
@@ -216,6 +249,13 @@ type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.9 · sou
 与 HCP 相关性：直接相关，可能缓解 pearl 等小/慢 domain 在 Phase 2 成为瓶颈的问题。
 
 _updated: 2026-06-29 06:06:09_
+### 任务C:Rust 线 decode 移植 Q+LSE 累积器环+增长分片
+
+type: `task` · status: `ongoing` · confidence: 0.9 · importance: 0.85 · source: `user-direction`
+
+修 ISSUE-007+ISSUE-008。Rust decode 从"逐 token 重发 prefill KV 分区+增长全节点复制"改为 plugin 线已验证的 Q+LSE 累积器绕环(protocol/node.rs 的 SoftmaxState 预留语义可复用);增长 KV 按 p mod N 分片,不再全节点复制;顺带评估 logits 冗余(worker 只算自己需要的部分或仅 owner/coordinator 采样)。
+
+_updated: 2026-07-27 15:10:25_
 ### decode 通信策略分析:当前 owner 汇聚(0 跳/全量 KV 常驻) vs 累积器绕环(L×P 跳/语义保持),选择由互联延迟决定
 
 type: `belief` · status: `held` · confidence: 0.85 · importance: 0.85 · source: `user-direction + analysis`

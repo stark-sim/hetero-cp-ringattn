@@ -1,0 +1,36 @@
+id: "ISSUE-006"
+timestamp: "2026-07-27T15:02:09Z"
+
+type: "limitation"
+severity: "high"
+
+# 问题描述
+description: |
+  worker 角色不对称(owner vs peer):decode 由 owner 单点驱动(完整 forward+采样),peer 只做 attention partial;与设计范式'所有 worker 同等地位'不符。LoongServe 式转化的对等化设计待与用户探讨后定案
+
+# 根本原因分析（待补充）
+root_cause: |
+  TODO: 分析根本原因
+
+# 影响评估（待补充）
+impact:
+  tokens_wasted: 0
+  time_wasted_minutes: 0
+  steps_wasted: 0
+  other: |
+    TODO: 评估影响
+
+# 解决方案（待补充）
+resolution: |
+  TODO: 记录解决方案
+
+# 预防措施（待补充）
+prevention: |
+  TODO: 记录预防措施
+
+status: "active"
+related_issues: []
+tags: []
+
+# 复盘记录
+retrospectives: []

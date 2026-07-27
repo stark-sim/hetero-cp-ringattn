@@ -1,0 +1,36 @@
+id: "ISSUE-008"
+timestamp: "2026-07-27T15:09:29Z"
+
+type: "bug"
+severity: "high"
+
+# 问题描述
+description: |
+  Rust线 decode 仍传 KV 未传 Q+LSE:每个 decode token 每层把整个 prefill 分区重新切块在环上重发(ring.rs:399 kv_chunk_size=2048, ring.rs:457-466),通信 O(prefill_len×d)/层/token,正是 Q-ring 设计要消除的模式;Q+LSE 累积器环已在 plugin 线三机验证(p2p3n)但尚未移植 Rust 线。附带:所有 worker 冗余计算全量 logits,coordinator 只用 worker 0(coordinator.rs:344)
+
+# 根本原因分析（待补充）
+root_cause: |
+  TODO: 分析根本原因
+
+# 影响评估（待补充）
+impact:
+  tokens_wasted: 0
+  time_wasted_minutes: 0
+  steps_wasted: 0
+  other: |
+    TODO: 评估影响
+
+# 解决方案（待补充）
+resolution: |
+  TODO: 记录解决方案
+
+# 预防措施（待补充）
+prevention: |
+  TODO: 记录预防措施
+
+status: "active"
+related_issues: []
+tags: []
+
+# 复盘记录
+retrospectives: []

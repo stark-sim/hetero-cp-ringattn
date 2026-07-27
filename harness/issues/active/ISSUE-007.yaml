@@ -1,0 +1,36 @@
+id: "ISSUE-007"
+timestamp: "2026-07-27T15:09:29Z"
+
+type: "bug"
+severity: "critical"
+
+# 问题描述
+description: |
+  Rust线 decode 增长 KV 全节点复制:decode 时每个 worker 把新 token KV append 进本地 cache(cache.rs:55-69),环上只重发 prefill 分区(ring.rs:457-466),每节点 KV=prefill/N+全部增长——增长部分零切分,长 decode 下显存切分失效,与 ISSUE-004 同族但机制不同
+
+# 根本原因分析（待补充）
+root_cause: |
+  TODO: 分析根本原因
+
+# 影响评估（待补充）
+impact:
+  tokens_wasted: 0
+  time_wasted_minutes: 0
+  steps_wasted: 0
+  other: |
+    TODO: 评估影响
+
+# 解决方案（待补充）
+resolution: |
+  TODO: 记录解决方案
+
+# 预防措施（待补充）
+prevention: |
+  TODO: 记录预防措施
+
+status: "active"
+related_issues: []
+tags: []
+
+# 复盘记录
+retrospectives: []
