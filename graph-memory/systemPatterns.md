@@ -59,8 +59,9 @@ type: `decision` · status: `held` · confidence: 0.9 · importance: 0.95 · sou
 落地状态:dsplit4(前缀切分)+dsplit6(增长分片)在星形 HTTP 上验证了数学语义;ce70afc(+41cdcd1/8696639 修复)把 decode 传输改为真 P2P TCP 环(task-d39 计划),prefill HTTP KV store 保留不变。
 
 [2026-07-27 验证闭环] p2p3:真 P2P TCP 环 decode 全项 PASS(ev-decode-p2p-ring-p2p3-20260727),Reviewer APPROVE。架构端到端成立。
+[2026-07-27 三机闭环] p2p3n-175719:laptop(4060 CUDA)+white(4090 CUDA)+pearl(9060XT ROCm) 三机真异构 P2P decode Q-ring PASS(ev-decode-p2p-3node-p2p3n-20260727),Reviewer APPROVE。
 
-_updated: 2026-07-27 09:25:44_
+_updated: 2026-07-27 10:19:39_
 ### 架构决策：采用原始论文 P2P 而非 PyTorch CP Collective
 
 type: `decision` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `memory-bank/systemPatterns.md`

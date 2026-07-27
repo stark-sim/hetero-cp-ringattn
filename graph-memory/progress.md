@@ -2,6 +2,25 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-07-27] 三机异构 P2P decode Q-ring 验证通过(p2p3n-175719):CUDA+CUDA+ROCm 真环,Q+累积器跨机逐跳
+
+type: `evidence` · status: `held` · confidence: 0.95 · importance: 1.0 · source: `experiment`
+
+blueprint-two-phase-ring-20260727 的跨节点闭环。驱动 scripts/run_3node_decode_p2p.sh(主仓 7f67b28),插件 HEAD=7bfe24b 三机一致。
+拓扑:laptop(100.96.154.1, RTX 4060 Laptop CUDA)=A producer(c0=512, 环 idx1);white(100.118.253.68, RTX 4090 CUDA)=B relay(c1=512, 环 idx2);pearl(100.111.242.55, RX 9060 XT gfx1200 ROCm)=C owner(c2=512, 环 idx0)。prefill:C 经 HTTP 从 laptop 拉 c0、从 white 拉 c1(日志真实 IP 佐证);decode:TCP 环 C→A→B→C,Q+累积器逐跳,growth 捎带轮转。
+判据全过(pearl 单节点参考对照):
+1) token 8/8 一致 [220,20,22,29514,84253,916,16301,220],max|logit diff|=0.0215;
+2) MEMSPLIT:staging 0/0(decode 开始释放),ring map finish 清;
+3) owner ring transport sent=168 recv=168(7 步×24 层,跨 tailscale 真网络);
+4) A(laptop)/B(white) RingDecodeNode 各 calls=168、growth_appends=48、growth=2 token/层——轮转预测跨机精确命中;
+5) decode 零 HTTP(partial_attn 全日志 0 次);
+6) pool-skip 168/168;slots 528≤552;triton 240/0。
+延迟特征:owner generate 46.2s/8 token(~6s/token)——24 层×2 跳×~125ms tailscale RTT 与模型预测一致,decode 延迟完全由互联主导,CXL/类 RDMA 论据的实测定量点。
+Reviewer 独立复核 APPROVE(8 项全有日志原文;保留:三机 vLLM dev build 日期略异 laptop d20260724 vs white/pearl d20260717、TCP 逐跳为三角印证证据)。
+报告:reports/ring-decode-p2p-3node-p2p3n-175719/。
+意义:两阶段统一 ring 架构在三机真异构(CUDA 两代 + ROCm)上端到端成立——prefill 传 KV、decode 传 Q+LSE,每节点只连 2 个 peer、只持自己 KV 份额,无 collective。后续开放:capacity-aware 不均等三档分片复验、更长 seq、decode 并发、owner 策略对照。
+
+_updated: 2026-07-27 10:19:39_
 ### [2026-07-27] Decode Q-Ring 真 P2P 环拓扑验证通过(p2p3):Q+累积器逐跳绕环,decode 零 HTTP
 
 type: `evidence` · status: `held` · confidence: 0.95 · importance: 0.95 · source: `experiment`
@@ -35,8 +54,9 @@ _updated: 2026-07-27 09:25:44_
 type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.8 · source: `user-direction + plan file`
 
 计划文件:~/Library/Application Support/QoderCN/SharedClientCache/cache/plans/Decode_Ring_P2P_Transport_task-d39.md。内容:动机剖析六问+牺牲分析+算法设计(Q+累积器逐跳绕环,growth 捎带)+六阶段实现步骤(transport/ring node/backend/connector/validator/三机)。定位:只补充 decode 部分的传输拓扑目标,整体框架设计以 blueprint-two-phase-ring-20260727 为准。实现已落地:插件 ce70afc(ring_transport.py + RingDecodeNode + validate_ring_decode_p2p.py),审查修复 41cdcd1(单例探针)+8696639(后台连接 successor)。
+[2026-07-27 更新] decode Q-ring P2P 已完成:单节点 p2p3 + 三机 p2p3n-175719 双 PASS。该任务的 decode 传输拓扑目标达成。
 
-_updated: 2026-07-27 09:10:04_
+_updated: 2026-07-27 10:19:39_
 ### [2026-07-25] decode 增长分片验证通过(dsplit6):prefill/decode/增长全局显存切分语义闭合
 
 type: `evidence` · status: `held` · confidence: 0.95 · importance: 0.95 · source: `experiment`
