@@ -1,12 +1,12 @@
-id: "ISSUE-003"
+id: "ISSUE-005"
 timestamp: "2026-07-27T15:02:09Z"
 
-type: "bug"
-severity: "critical"
+type: "limitation"
+severity: "high"
 
 # 问题描述
 description: |
-  vLLM线 prefill 瞬时全量前缀 staging:尾节点 prefill 前把全量前缀 KV(所有层)一次性拉入本地瞬时 staging,pre-fill 期间显存峰值=本 chunk+全量前缀,显存切分只在持久态成立、瞬态失效,违背 CP 核心目标(用户定性为工程欺骗)。修复方向:按层/按块流水线 staging 或与计算重叠的真 ring prefill,任何时刻单节点持有量有界
+  从未实现真 ring 模式 compute/comm overlap:prefill 是 staging-then-compute(传输与计算串行),Ring Attention 论文的核心优势域(逐层 KV block 轮转与计算重叠)在 vLLM 线缺失,kernel-hardening backlog 第1项(local paged 直读)也未做
 
 # 根本原因分析（待补充）
 root_cause: |
@@ -28,7 +28,7 @@ resolution: |
 prevention: |
   TODO: 记录预防措施
 
-status: "active"
+status: "resolved"
 related_issues: []
 tags: []
 

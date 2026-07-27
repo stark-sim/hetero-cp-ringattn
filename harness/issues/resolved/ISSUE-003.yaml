@@ -1,0 +1,36 @@
+id: "ISSUE-003"
+timestamp: "2026-07-27T15:02:09Z"
+
+type: "bug"
+severity: "critical"
+
+# 问题描述
+description: |
+  vLLM线 prefill 瞬时全量前缀 staging:尾节点 prefill 前把全量前缀 KV(所有层)一次性拉入本地瞬时 staging,pre-fill 期间显存峰值=本 chunk+全量前缀,显存切分只在持久态成立、瞬态失效,违背 CP 核心目标(用户定性为工程欺骗)。修复方向:按层/按块流水线 staging 或与计算重叠的真 ring prefill,任何时刻单节点持有量有界
+
+# 根本原因分析（待补充）
+root_cause: |
+  TODO: 分析根本原因
+
+# 影响评估（待补充）
+impact:
+  tokens_wasted: 0
+  time_wasted_minutes: 0
+  steps_wasted: 0
+  other: |
+    TODO: 评估影响
+
+# 解决方案（待补充）
+resolution: |
+  TODO: 记录解决方案
+
+# 预防措施（待补充）
+prevention: |
+  TODO: 记录预防措施
+
+status: "resolved"
+related_issues: []
+tags: []
+
+# 复盘记录
+retrospectives: []

@@ -21,13 +21,35 @@ B. vLLM decode ≥2 并发+增长分片保持(修 004,PoC 最小要求);
 C. Rust decode 移植 Q+LSE 累积器环+增长分片(修 007+008)。
 
 _updated: 2026-07-27 15:10:25_
-### 任务A:vLLM prefill 真 ring 化(流式 staging+overlap,有界瞬态显存)
+### 决策:禁止星形传输——decode 只走 ring;prefill 只走邻接累积转发;拓扑成本必须线性
 
-type: `task` · status: `ongoing` · confidence: 0.9 · importance: 0.95 · source: `user-direction`
+type: `decision` · status: `held` · confidence: 0.95 · importance: 0.95 · source: `user-direction`
 
-修 ISSUE-003+ISSUE-005。目标:prefill 不再一次性 stage 全量前缀;参照 Rust 线 micro-block 流式模型(ring.rs:665-733),按层或按块流水线:拉取块 i+1 与计算块 i 重叠,任一时刻瞬态持有=本 chunk+少量 in-flight 块(有界,与 seq 无关)。验证:token 一致+瞬态 staging 峰值有界探针+三机复验。动机剖析随实施记录。
+用户方向(2026-07-27):N>3 时设备间可能互相不可直达,星形传输(owner 直连全部 peer)要求全连通,拓扑成本 O(N) 连接/节点且依赖直达性;ring 模式每节点只连 2 个 peer,拓扑成本线性,不可直达的节点经环上中继可达。
+执行:
+1. decode 删除星形 HTTP 路径(PartialAttentionService/merge_remote_partial/transport=http),P2P TCP 环成为唯一 decode 传输;validate_ring_decode_split.py(星形验证器)退役删除,p2p 验证器覆盖全部判据;
+2. prefill 保持并强化邻接累积转发(ringc 机制):consumer 只从物理前驱拉取累积前缀(url 列表可全指向前驱),不直连远端 producer——三机驱动改为 C 仅从 white 拉 c0+c1(laptop→white→pearl 中继);
+3. belief-two-peers-topology-20260727 从"最小充分"升级为"硬约束":不只省连接,更是部分可达网络下的唯一可行拓扑。
 
-_updated: 2026-07-27 15:10:25_
+_updated: 2026-07-27 15:43:05_
+### 决策:vLLM prefill 改逐层流式 staging(窗口 W=2)+decode-ring 在有前缀时成为默认;legacy owner-collapse 须显式开启
+
+type: `decision` · status: `held` · confidence: 0.9 · importance: 0.95 · source: `user-direction`
+
+动机剖析六问(任务A,修 ISSUE-003+005):
+1. 问题:尾节点 prefill 前一次性 stage 全量前缀(24层×全部 chunk),瞬态显存峰值=本 chunk+全量前缀,显存切分瞬态失效,被用户定性为工程欺骗。
+2. 现状:connector start_load_kv 在 forward 前 bulk 循环拉取所有层入 GPU staging,wait_for_layer_load 空实现;staging 按请求生命周期常驻(legacy)或 decode 开始才释放(decode-ring)。vLLM 调用时序已核实:start_load_kv 在 forward 前调一次(kv_connector_model_runner_mixin.py:102),wait_for_layer_load(layer) 在每层 attention 入口(kv_transfer_utils.py:51)——逐层流水线是 API 设计意图。
+3. 目标态:任一时刻 GPU 瞬态 staging ≤ W×num_chunks 层(W=2);拉层 L+W 与算层 L 重叠(connector 后台 fetch 线程+按层 event);STAGING_STATS.max_staged_layers ≤4(2层×2chunk)作为有界探针;token 与参考一致;dsplit6/p2p3/p2p3n 回归全过。
+4. 别人怎么做:vLLM connector API 注释明示 "useful for layer-by-layer pipelining"(base.py:317);Rust 线 micro-block 流式(ring.rs:665-733)是同族参照;OffloadingConnector 等官方 connector 也用异步分层加载。
+5. 我们怎么做:connector 后台 fetch 线程按层序拉取(层内多 chunk 同层同批),wait_for_layer_load(L) 等 event[L] 并释放所有 <L 的 GPU staging(磁盘 store 不动,re-serve/partial 服务不受影响);decode-ring 在有前缀 chunk 时默认开启(env 默认改 1);HCP_RING_DECODE_RING=0 显式选择时保留 bulk staging+警告(对照用,明确标注非显存切分)。
+6. 为什么:语义完整性——瞬态也有界才是真显存切分;vLLM API 的逐层钩子本就是为此设计,顺 API 意图而非对抗。
+牺牲四问:
+1. 默认为什么存在(bulk staging):实现最简,一次拉取后任何时刻可用;decode 复用 staging 零重取。
+2. 牺牲什么:legacy owner-collapse decode 成为显式选项(默认路径改变);流式引入 fetch 线程/事件同步复杂度;若网络慢于单层计算,prefill 会 stall 在 wait(暴露真实网络下限,这正是论据)。
+3. 被牺牲者用途:bulk 模式在快网络下延迟最优、代码最少。
+4. 对本项目意义:正确性语义 > 实现简洁;stall 暴露正是 CXL 论据;legacy 保留为显式对照。结论:implement。
+
+_updated: 2026-07-27 15:26:00_
 ### 决策:decode 增长按全局位置轮转分片(p mod N),RPC 捎带保序;策略函数作为计划层可换缝
 
 type: `decision` · status: `held` · confidence: 0.9 · importance: 0.95 · source: `user-direction`

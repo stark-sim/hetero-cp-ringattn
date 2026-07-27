@@ -2,6 +2,30 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-07-27] 流式 prefill+ring-only+邻接拉取三机验证通过(p2p3n-000004):瞬态显存有界,星形传输灭绝
+
+type: `evidence` · status: `held` · confidence: 0.95 · importance: 1.0 · source: `experiment`
+
+decision-prefill-streaming-20260727 + decision-no-star-transport-20260727 的实现与验证(插件 6eacec3 流式 + fb4a2b0 删星形 + 7c059e1 验证器对齐;主仓驱动 190636d)。
+验证阶梯全 PASS:
+1. 单机 p2p4/p2p5(white):peak staged layers 5→6(旧=48 全量前缀);token 8/8 一致;decode-ring 默认开启(无 env 也跑);
+2. 三机 p2p3n-000004(laptop A 4060 + white B 4090 + pearl C 9060XT,HEAD=7c059e1 三机一致):peak staged 4(≤6);token 8/8 一致(max diff 0.0215);memsplit/staging 0-0/pool-skip 168/168/slots 528≤552/triton 240-0;ring transport sent=recv=168;A/B RingDecodeNode 各 calls=168、growth 48/2 层;
+3. 邻接 prefill 实证:pearl 只从 white 拉 c0+c1(48 GET),laptop 的 HTTP 客户端只有 white——无任何跨环直连,N>3 部分可达网络拓扑成立;
+4. decode 零 HTTP(partial_attn 全日志 0 次),星形代码已删除(831 行)。
+Reviewer 流程:p2p3n-235241 得 WARN(归档缺 A/B decode 统计,pkill 竞态)→ 驱动改优雅关停+stats 门(190636d)→ p2p3n-000004 复审 APPROVE(8 项全过)。
+报告:reports/ring-decode-p2p-3node-p2p3n-000004/(对照 reports/ring-decode-p2p-3node-p2p3n-235241/)。
+ISSUE-003(prefill 瞬态全量前缀)与 ISSUE-005(staging-then-compute 无重叠)已 resolve。
+意义:真显存切分的最后一块瞬态缺口闭合——任何节点任何时刻(含 prefill 瞬态)持有的他人 KV ≤ (W+1) 层×chunks;decode 只剩 P2P 环;拓扑全程线性。剩余:ISSUE-004(decode 并发,任务B)、ISSUE-006(对等化,待探讨)、ISSUE-007/008(Rust decode,任务C)。
+
+_updated: 2026-07-27 16:05:48_
+### [2026-07-27] 归档证据必须自足:verdict 依赖的每项证据都要被门控,异步证据源要先优雅关停再归档
+
+type: `lesson` · status: `held` · confidence: 0.9 · importance: 0.85 · source: `reflection`
+
+p2p3n-235241 复审 WARN:驱动 cleanup 的 pkill 与 A/B 进程"打印 decode 统计→退出"竞态,归档日志缺 RingDecodeNode 统计行,verdict 实际只靠 C 侧证据。修法:1) 优雅关停(done-file 通知+等待退出,pkill 仅兜底);2) verdict 前对 A/B 日志 grep RingDecodeNode 门控,缺失即 FAIL(190636d)。
+教训:1) 异步证据源(远程进程、后台线程)的生命周期结束动作(打印统计)必须先于归档/判定完成;2) verdict 引用的每一项证据都要有可机器检查的存在性门控,不能靠"应该在";3) Reviewer 的 WARN 价值——这是探针族之外的第四类观测缺陷:证据归档完整性,与"探针不可见/投影塌缩/通道不匹配"并列加入验证检查清单。
+
+_updated: 2026-07-27 16:05:48_
 ### [2026-07-27] 三机异构 P2P decode Q-ring 验证通过(p2p3n-175719):CUDA+CUDA+ROCm 真环,Q+累积器跨机逐跳
 
 type: `evidence` · status: `held` · confidence: 0.95 · importance: 1.0 · source: `experiment`
