@@ -2,6 +2,31 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-07-28] decode ≥2 请求并发验证通过(conc2b):按请求全隔离,增长分片在批量 decode 下保持
+
+type: `evidence` · status: `held` · confidence: 0.95 · importance: 0.95 · source: `experiment`
+
+decision-decode-concurrent-20260727 的实现与验证(插件 cc733dd 并发隔离 + 453fa1f 流下载竞态修复)。
+white RTX 4090 单卡 3 实例,2 并发 CP 请求(不同 prompt 变体,各 1536 token,chunks 512/512/512,decode 8):
+1) 两请求 token 序列不同且各自与单节点参考全对(req0=[220,20,22,29514,...],req1=[220,17,323,279,...]);
+2) 真并发:BATCH_STATS.max_reqs=2(同一 attention step 批量);
+3) 跳池门精确化(get_forward_context 元数据逐请求判定):skipped=336/336(2×7×24),slots 1040≤1064;
+4) 增长按请求隔离:ring packet 带 req tag(first_block_id:uuid,块 id 会被回收复用故需 uuid),A/B 各 calls=336、growth_appends=96(每请求每 peer 2 token×24 层=48,两请求共 96),per_req={tag1:2, tag2:2} 清晰隔离;
+5) 流式窗口 6≤12(N×6);staging 0/0;ring map=2 后清空;triton 456/0、merge 48/0;decode 零 HTTP。
+过程 bug:首次 conc2 死于两流并发下载同一 chunk 文件(safetensors "header too small")——加 per-(chunk,layer) stage lock+已 staged 去重(453fa1f)。
+Reviewer 独立复核 APPROVE(8 项全过;答疑:growth_appends=96 语义为每请求每 peer 轮转分得 2 token,非滚动覆盖)。
+报告:reports/ring-decode-conc2b-013813/。ISSUE-004 resolved。
+意义:PoC 最小并发要求达成——多请求连续批下显存切分(prefill 流式+decode 增长分片)与按请求正确性同时成立。剩余:ISSUE-006(对等化,待探讨)、ISSUE-007/008(Rust decode,任务C)。
+
+_updated: 2026-07-27 17:44:15_
+### [2026-07-28] 从 N=1 到 N≥2 是竞态高发相变点:凡按"单实例/单请求/单下载者"假设写的路径都要重审
+
+type: `lesson` · status: `held` · confidence: 0.9 · importance: 0.85 · source: `reflection`
+
+conc2 首跑即死:两条 prefill 流并发下载同一 chunk 文件到同一本地路径,一方读到对方写了一半的文件(safetensors header too small)。单请求时代该路径天然无竞态,bug 潜伏。同类潜伏点清单(本轮已处理):n==1 启发式跳池门(批量失效)、peer growth 按层键(请求间混叠)、共享文件无锁下载。
+教训:1) 单实例验证 PASS 后,把代码里所有"隐含的 1"列出来(键空间、启发式、文件路径、全局缓冲)逐一追问 N≥2 时怎样;2) 共享资源(文件/staging/buffer)的并发规则要在第一版就写明,不是等竞态发生再补;3) token 级正确性验证仍是最终裁判——混叠类 bug 在相同 prompt 下可能不可见,并发验证必须用不同 prompt 变体。
+
+_updated: 2026-07-27 17:44:15_
 ### [2026-07-27] 流式 prefill+ring-only+邻接拉取三机验证通过(p2p3n-000004):瞬态显存有界,星形传输灭绝
 
 type: `evidence` · status: `held` · confidence: 0.95 · importance: 1.0 · source: `experiment`

@@ -115,13 +115,20 @@ type: `task` · status: `superseded` · confidence: 0.95 · importance: 0.95 · 
 1M v9（3:1 split）成功，prefill 24/24 + decode 5/5，exit=0。文档已同步：1M_CONTEXT_THUNDERBOLT_PLAN.md、SCALING_ARGUMENT.md、systemPatterns.md。当前无未完成的 1M 攻坚任务；下一步决定是否需要更大模型 / 更多 domain 验证。
 
 _updated: 2026-06-29 06:01:28_
-### 任务B:vLLM decode ≥2 请求并发+增长分片保持
+### 决策:decode 并发按请求全隔离——跳池门走 forward_context 元数据,growth packet 带 req id,peer growth buffer 按 (req,layer) 键
 
-type: `task` · status: `ongoing` · confidence: 0.9 · importance: 0.9 · source: `user-direction`
+type: `decision` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `user-direction`
 
-修 ISSUE-004。跳池门 n==1 启发式改为按请求判定;PEER_REQ_MAP/DECODE_RING_MAP/growth buffer/pending_growth 全部按请求键隔离;并发 decode 步每请求独立 accumulator 绕环。PoC 最小:2 请求并发 token 与各自单节点参考一致+各自显存切分判据成立。
+动机剖析六问(任务B,修 ISSUE-004):
+1. 问题:decode 并发(≥2 请求)时增长分片失效——跳池门是 n==1 启发式(批量 decode 步 n>1 时增长写回 owner 池);更隐蔽的是 peer 的 RingDecodeNode._growth 只按层键,两请求的增长 KV 混在同一 buffer,partial attention 会吃进别的请求的增长 token(正确性 bug,不只是显存问题)。
+2. 现状:DECODE_RING_MAP/dr/growth/pending 已按 first_block_id 隔离(forward 逐行查 dr);但跳池门无请求身份;ring packet 无请求标识,peer 无法区分增长归属。
+3. 目标态:2 请求并发 decode(同 chunk 集,不同 prompt)token 与各自单节点参考一致;skipped=2×168(每请求每步每层都跳);BATCH_STATS.max_reqs=2 证明真同批;peer growth 按 req 统计隔离;staging 窗口上界随流数线性(2 流≤12);streaming prefill 双流并行。
+4. 别人怎么做:vLLM 原生 per-request KV 天然按请求隔离(block table);LoongServe/TP 的 decode 批处理同样按请求组织 KV;无直接可复用的"按请求跳池"先例(这是 HCP 特有的显存切分记账)。
+5. 我们怎么做:do_kv_cache_update 经 vllm.forward_context.get_forward_context() 取 attn_metadata(query_start_loc/seq_lens/block_table),逐请求判定 tq==1 且 first_block 已注册 → 按 qsl 索引精确跳过该请求的槽位(废除 n==1 启发式);ring packet 增加 req 字段(first_block_id 字符串),RingDecodeNode._growth 改 (req, layer) 键,统计按 req 输出;dr/growth/pending 维持 per-request 不变;ring 遍历天然串行化(backend 逐行处理,ring_decode_step 阻塞),wire 上无交错。
+6. 为什么:按请求隔离是并发 CP 的唯一正确语义;用框架已有的 forward_context 元数据而非自创启发式(教训:n==1 这类启发式在批量场景必破)。
+牺牲四问:1) 默认为什么存在(n==1 门):单请求 PoC 时最简;2) 牺牲什么:do_kv_cache_update 每次多一次 metadata 解析(小);3) 被牺牲者用途:启发式省一次上下文查找;4) 对本项目:并发是 PoC 最小要求,精确性必须。结论:implement。
 
-_updated: 2026-07-27 15:10:25_
+_updated: 2026-07-27 17:24:11_
 ### 后续路线:N>2 真 ring(三机:white CUDA + pearl ROCm + laptop 4060 CUDA)
 
 type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.9 · source: `user-direction`
