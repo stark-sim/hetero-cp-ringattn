@@ -80,9 +80,26 @@ STORE_C="/tmp/hcp_p2p3n_store_c_${RUN_ID}"
 DONE_FILE="/tmp/hcp_p2p3n_done_${RUN_ID}"
 SCRIPT="validate_ring_decode_p2p.py"
 
+graceful_ab_shutdown() {
+  # Signal A/B via the done file, then WAIT for them to print their
+  # RingDecodeNode decode-phase stats and exit gracefully (they poll every
+  # 2s); pkill is only the straggler fallback.  Killing first would lose
+  # the decode-phase evidence from the archive (Reviewer WARN, p2p3n-235241).
+  run_laptop "touch ${DONE_FILE}" >/dev/null 2>&1 || true
+  run_white  "touch ${DONE_FILE}" >/dev/null 2>&1 || true
+  for i in $(seq 1 20); do
+    local a_alive=false b_alive=false
+    kill -0 "${A_PID:-0}" 2>/dev/null && a_alive=true
+    kill -0 "${B_PID:-0}" 2>/dev/null && b_alive=true
+    $a_alive || $b_alive || break
+    sleep 3
+  done
+}
+
 cleanup() {
-  run_laptop "touch ${DONE_FILE}; pkill -f validate_ring_decode_p2p || true" >/dev/null 2>&1 || true
-  run_white  "touch ${DONE_FILE}; pkill -f validate_ring_decode_p2p || true" >/dev/null 2>&1 || true
+  graceful_ab_shutdown
+  run_laptop "pkill -f validate_ring_decode_p2p || true" >/dev/null 2>&1 || true
+  run_white  "pkill -f validate_ring_decode_p2p || true" >/dev/null 2>&1 || true
   run_pearl  "pkill -f validate_ring_decode_p2p || true" >/dev/null 2>&1 || true
   wait "${A_PID:-0}" 2>/dev/null || true
   wait "${B_PID:-0}" 2>/dev/null || true
@@ -136,14 +153,17 @@ B_PID=$!
 echo "B ssh pid=${B_PID}"
 wait_ready_http "${WHITE_HOST}" "c1" "${B_PID}" "B(white)" || { tail -20 "${REPORT_DIR}/relay_b.log" >&2 || true; exit 1; }
 
-# === C: owner on pearl (c2, ring idx 0; stages c0+c1, drives decode ring) ===
-echo "=== C: owner on pearl (c2=$((TOTAL-SPLIT0-SPLIT1)), ring idx 0, TCP :${DECODE_PORT_C}) ==="
+# === C: owner on pearl (c2, ring idx 0; stages the ACCUMULATED prefix from
+# its physical predecessor white only — neighbor accumulate-forward keeps
+# every node's connections ring-adjacent even for N>3 topologies where not
+# all devices are directly reachable) ===
+echo "=== C: owner on pearl (c2=$((TOTAL-SPLIT0-SPLIT1)), ring idx 0, TCP :${DECODE_PORT_C}; prefix via white only) ==="
 SP=/home/stark/miniconda3/envs/vllm-rocm/lib/python3.11/site-packages
 c_cmd="cd /tmp && source /home/stark/miniconda3/etc/profile.d/conda.sh && conda activate vllm-rocm && \
   export LD_LIBRARY_PATH=${SP}/torch/lib:${SP}/_rocm_sdk_core/lib:${SP}/_rocm_sdk_core/lib/host-math/lib:${SP}/_rocm_sdk_core/lib/rocm_sysdeps/lib:${SP}/_rocm_sdk_devel/lib:${SP}/_rocm_sdk_devel/lib/host-math/lib:${SP}/_rocm_sdk_devel/lib/rocm_sysdeps/lib:\${LD_LIBRARY_PATH:-} && \
   ${RING_ENV} python ${PEARL_PLUGIN_REPO}/${SCRIPT} --mode consumer \
     --total ${TOTAL} --split0 ${SPLIT0} --split1 ${SPLIT1} --run-id ${RUN_ID} \
-    --url-a http://${LAPTOP_HOST}:${SERVE_PORT} --url-b http://${WHITE_HOST}:${SERVE_PORT} \
+    --url-a http://${WHITE_HOST}:${SERVE_PORT} --url-b http://${WHITE_HOST}:${SERVE_PORT} \
     --decode-port-c ${DECODE_PORT_C} --ring-order ${RING_ORDER} \
     --store-a /tmp/u1_${RUN_ID} --store-b /tmp/u2_${RUN_ID} --store-c ${STORE_C} \
     --done-file ${DONE_FILE} --decode ${DECODE} --gpu-mem-c 0.35"
@@ -152,6 +172,10 @@ run_pearl "${c_cmd}" >"${REPORT_DIR}/consumer_c.log" 2>&1
 CONS_RC=$?
 set -e
 
+# Graceful A/B shutdown FIRST so their decode-phase RingDecodeNode stats
+# reach the archive before we gate on them.
+graceful_ab_shutdown
+
 echo "=== consumer log (tail) ==="
 tail -30 "${REPORT_DIR}/consumer_c.log" || true
 echo "=== relay log (tail) ==="
@@ -159,10 +183,20 @@ tail -6 "${REPORT_DIR}/relay_b.log" || true
 echo "=== producer log (tail) ==="
 tail -6 "${REPORT_DIR}/producer_a.log" || true
 
-echo "RUN_ID=${RUN_ID}  report=${REPORT_DIR}"
-if [ "${CONS_RC}" = 0 ]; then
-  echo "=== VERDICT: PASS — 3-node heterogeneous P2P decode Q-ring validated ==="
-else
-  echo "=== VERDICT: FAIL (consumer exit=${CONS_RC}) ==="
+# Gate: A/B decode-phase stats must be in the archive (self-sufficient
+# evidence — the verdict must not rest on C-side checks alone).
+STATS_OK=0
+grep -q "RingDecodeNode" "${REPORT_DIR}/producer_a.log" && \
+grep -q "RingDecodeNode" "${REPORT_DIR}/relay_b.log" && STATS_OK=1
+if [ "${STATS_OK}" != 1 ]; then
+  echo "FATAL: A/B RingDecodeNode decode-phase stats missing from archive" >&2
 fi
-exit "${CONS_RC}"
+
+echo "RUN_ID=${RUN_ID}  report=${REPORT_DIR}"
+if [ "${CONS_RC}" = 0 ] && [ "${STATS_OK}" = 1 ]; then
+  echo "=== VERDICT: PASS — 3-node heterogeneous P2P decode Q-ring validated ==="
+  exit 0
+else
+  echo "=== VERDICT: FAIL (consumer exit=${CONS_RC}, stats_ok=${STATS_OK}) ==="
+  exit 1
+fi
