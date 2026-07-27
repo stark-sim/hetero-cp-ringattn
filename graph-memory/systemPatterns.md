@@ -9,6 +9,13 @@ type: `belief` · status: `held` · confidence: 0.8 · importance: 0.85 · sourc
 BF16 场景下，跨平台 BLAS 差异导致 logits 数值对比不是有意义的 correctness 指标。Correctness 应分层：L1 float32 数学正确性（cargo test synthetic weights）、L2 工程正确性（argmax 一致性/文本任务指标）、L3 端到端冒烟。强证据：同构分布式 BF16 也有 ~0.3-0.4 logits 差异，证明差异主要来自 BF16 online softmax block-wise 处理顺序，而非跨平台 bug。
 
 _updated: 2026-06-29 05:34:19_
+### P2P 约束下 ring 是数据面最小充分拓扑:每 worker 只需 2 个 peer 连接
+
+type: `belief` · status: `held` · confidence: 0.85 · importance: 0.85 · source: `user-direction + validated runs`
+
+不考虑 controller/scheduler 控制面时,HCP 数据面(prefill KV ring + decode Q/LSE 累积器环)的全部通信都是与环上相邻两节点的 send/recv;无需 all-to-all/broadcast/reduce/gather。这使异构消费级硬件(以太网/tailscale/未来 CXL)即可组成 CP 系统,是"异构是常态"核心信念在拓扑层的直接推论。证据:三机真环 ringc-160010、decode dsplit4/dsplit6 均只使用邻接连接。
+
+_updated: 2026-07-27 09:10:04_
 ### 产品问题：异构设备协作支撑超长 context
 
 type: `blueprint` · status: `held` · confidence: 0.85 · importance: 0.9 · source: `memory-bank/productContext.md`
@@ -33,6 +40,27 @@ QUIC: quinn 0.11 + rustls 0.23 + rcgen 0.13。
 模型权重：safetensors, tokenizers, half。
 
 _updated: 2026-06-29 05:34:19_
+### HCP 两阶段统一 ring 架构:prefill 传 KV、decode 传 Q+LSE,全程 P2P 逐跳,每节点只需 2 个连接
+
+type: `decision` · status: `held` · confidence: 0.9 · importance: 0.95 · source: `user-direction`
+
+用户阐述的框架设计与成因链(2026-07-27,落实自其口述;decode 部分由 Decode_Ring_P2P_Transport_task-d39.md 补充):
+
+【成因 1:P2P 网络约束决定拓扑】异构节点间无 collective 原语可用(无 NCCL/RCCL/NVLink),P2P send/recv 是唯一通信模型。ring 拓扑下每个 worker 节点只需连接 2 个 peer(predecessor + successor)即满足全部数据面需求(不含 controller/scheduler 控制面)。
+
+【成因 2:prefill 学 Ring Attention 原论文】prefill 是 compute-bound:ring 逐跳传 KV block + 本地 Q 计算 + online softmax 累积,通信被计算隐藏,且天然切分显存压力。HCP 在论文均分假设上扩展了 capacity-aware 不均等切分(按设备显存/算力分配 chunk)。
+
+【成因 3:显存可控性要求 decode 也必须切分】若 decode 退化为"全量 KV 复制到单 worker"(vLLM P/D 式)或 TP decode(按头分片但需同构互联+collective),显存切分在 decode 阶段失效,显存压力不可计算,capacity-aware 不成立。两条业界主流路线都被排除。
+
+【成因 4:decode 学 LoongServe——传 Q+LSE 不传 KV】decode 是 memory-bound:每步只有 1 个新 Q,计算极小但必须遍历全部历史 KV;继续传 KV 则每 hop 每层 O(seq_len×d)(128K 下 ~64MB),通信完全主导。改传 Q + 累积器 (O, LSE) 做 online-softmax 归并,每 hop 每层仅 O(d)(~4KB,128K 下差 ~1000x),同时 Q 仍与全量 KV 分布式计算,数学精确。
+
+【成因 5:LoongServe 依赖 collective,HCP 改 P2P 绕环与 prefill 统一】LoongServe 是同构集群,用 broadcast Q + reduce 结果(collective 原语);HCP 把同一数学改为沿 ring 逐跳传递累积器——与 prefill 的 KV ring 共享同一网络架构(每节点仍只有 2 个连接),simple and effective。
+
+落地状态:dsplit4(前缀切分)+dsplit6(增长分片)在星形 HTTP 上验证了数学语义;ce70afc(+41cdcd1/8696639 修复)把 decode 传输改为真 P2P TCP 环(task-d39 计划),prefill HTTP KV store 保留不变。
+
+[2026-07-27 验证闭环] p2p3:真 P2P TCP 环 decode 全项 PASS(ev-decode-p2p-ring-p2p3-20260727),Reviewer APPROVE。架构端到端成立。
+
+_updated: 2026-07-27 09:25:44_
 ### 架构决策：采用原始论文 P2P 而非 PyTorch CP Collective
 
 type: `decision` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `memory-bank/systemPatterns.md`

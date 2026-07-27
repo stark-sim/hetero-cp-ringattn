@@ -2,6 +2,41 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-07-27] Decode Q-Ring 真 P2P 环拓扑验证通过(p2p3):Q+累积器逐跳绕环,decode 零 HTTP
+
+type: `evidence` · status: `held` · confidence: 0.95 · importance: 0.95 · source: `experiment`
+
+task-d39 计划(blueprint-two-phase-ring-20260727)的实现落地:插件 ce70afc(实现)+41cdcd1(单例探针)+8696639(后台连接)+63852cd(就绪等待入 relay 线程)三枚审查/排障修复。
+white RTX 4090 单卡 3 实例,vllm 0.23.1rc1,HCP_RING_DECODE_RING=1 + HCP_RING_DECODE_TRANSPORT=ring:环序 C(owner,0)→A(1)→B(2)→C,TCP 8950/8951/8952;prompt 1536 切 512/512/512,decode 8。
+判据全过:
+1) token 8/8 与单节点参考一致 [220,20,22,29514,84253,916,16301,220],max|logit diff|=0.0293(argmax 处 0);
+2) MEMSPLIT 保持:staging decode 开始即释放(0/0),ring map finish 才清;
+3) ring transport 真实承载:owner sent=168 recv=168(7 步×24 层,每包绕环一周);
+4) A/B RingDecodeNode relay:calls=168,growth_appends=48(2 token×24 层),growth_tokens=2/层——轮转预测精确命中,且统计行在 A/B 自身日志(非 driver 转述);
+5) decode 零 HTTP:POST /partial_attn 在全部日志中 0 次;prefill KV store 仍走 HTTP(GET /p2p3/* 符合预期)——两阶段传输对象分离成立;
+6) pool-skip 168/168;slots 528≤552;triton 240/0、merge 24/0。
+Reviewer 独立复核 APPROVE(7 项全有日志原文,反证扫描干净;保留:无字面 connect-ack 日志/主机名不在日志/driver 日志薄)。
+报告:reports/ring-decode-p2p-p2p3-171607/。
+意义:HCP 两阶段统一 ring 架构(blueprint-two-phase-ring-20260727)端到端闭环——prefill 传 KV、decode 传 Q+LSE,全程 P2P 逐跳,每节点仅 2 个连接,无任何 collective;显存切分(prefill chunk+growth 份额)与通信拓扑统一同时成立。下一步:三机真环 P2P decode(laptop A + white B + pearl C,inventory 拓扑)。
+
+_updated: 2026-07-27 09:25:44_
+### [2026-07-27] 环拓扑顺序启动下,init 期任何阻塞等待都可能死锁:连接/就绪等待一律后置到工作线程
+
+type: `lesson` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `reflection`
+
+p2p1/p2p2 两连发同族 bug:
+①p2p1:RingTransport.start() 同步阻塞连 successor(120s 超时),但环节点顺序启动(B 要等 A 就绪才拉起),A 连 B 必然超时,引擎 init 崩溃——修法:连接放后台线程,send 等待 connected 事件(8696639)。
+②p2p2:connector __init__ 里 wait_ready 等 store _READY,但标记要 prefill 后才写、prefill 要引擎 init 完才跑——自死锁,A 挂到 driver 600s 强杀——修法:就绪等待移入 relay 线程(packet 只在 owner decode 时才来,store 早已就绪,63852cd)。
+教训:1) 顺序启动是环/链拓扑的必然模式,init 期能拿到的只有自己的配置;对 peer 可达性、对"运行后才产生的数据"的等待必须后置到使用点或工作线程;2) 两次都是"验证脚本先跑起来才暴露"——纸面审查难以发现时序死锁,单节点 smoke 先行仍然必要;3) 与 lesson-decode-ring-callback-override-20260725(后初始化者覆盖回调)同属 init 顺序/生命周期族:框架初始化顺序是事实性前提,设计时先画出"谁在何时产生什么"。
+
+_updated: 2026-07-27 09:25:44_
+### [2026-07-27] Decode Q-Ring P2P 计划文档(task-d39,QoderCN):decode 传输从星形 HTTP 改为真 P2P TCP 环
+
+type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.8 · source: `user-direction + plan file`
+
+计划文件:~/Library/Application Support/QoderCN/SharedClientCache/cache/plans/Decode_Ring_P2P_Transport_task-d39.md。内容:动机剖析六问+牺牲分析+算法设计(Q+累积器逐跳绕环,growth 捎带)+六阶段实现步骤(transport/ring node/backend/connector/validator/三机)。定位:只补充 decode 部分的传输拓扑目标,整体框架设计以 blueprint-two-phase-ring-20260727 为准。实现已落地:插件 ce70afc(ring_transport.py + RingDecodeNode + validate_ring_decode_p2p.py),审查修复 41cdcd1(单例探针)+8696639(后台连接 successor)。
+
+_updated: 2026-07-27 09:10:04_
 ### [2026-07-25] decode 增长分片验证通过(dsplit6):prefill/decode/增长全局显存切分语义闭合
 
 type: `evidence` · status: `held` · confidence: 0.95 · importance: 0.95 · source: `experiment`
