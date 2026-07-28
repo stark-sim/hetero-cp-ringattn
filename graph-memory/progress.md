@@ -2,6 +2,27 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### 固定 sampler 不增加 durable KV,额外显存仅 O(batch*vocab) 瞬时 logits
+
+type: `evidence` · status: `held` · confidence: 0.98 · importance: 0.9 · source: `analysis-2026-07-29`
+
+在模型权重全节点复制且 kv_assignee(position) 独立 round-robin 的前提下,sampler 节点不新增 LM-head 权重,也不持有额外历史 KV。其额外状态是 final norm/LM-head/sampling 的临时激活与 logits:[batch,vocab]。152K vocab 的单个 fp32 logits row 约 0.58 MiB,与 context length 无关。风险是多请求 LM-head queue/算力热点,不是 KV 容量热点。
+
+_updated: 2026-07-28 17:26:22_
+### 自驱动环角色递推证明:层内自然轮转,token 间可能模数共振
+
+type: `evidence` · status: `held` · confidence: 0.99 · importance: 0.95 · source: `docs/plans/2026-07-29-self-driving-ring-theory.md`
+
+若每层结果停在 starter 的 predecessor 且 finisher 直接成为下一层 starter,则 s(t,l+1)=s(t,l)-1 mod N;若末层 finisher 直接启动下一 token,则 s(t+1,0)=s(t,0)-L mod N。当 L mod N=0 时,token starter/logits/sampler 永久落在同一节点。要满足 sampler 跨 token 轮转,至少需要一次 token 边界 phase shift;最小实现是 sampled token ID 沿 successor 多走 1 跳。
+
+_updated: 2026-07-28 17:19:59_
+### 插件 owner-return 单向环的物理下限是 N 跳,不是 N-1
+
+type: `evidence` · status: `held` · confidence: 0.99 · importance: 1.0 · source: `docs/plans/2026-07-29-self-driving-ring-decode-revision.md`
+
+代码证据:ring_transport.py 的拓扑固定为 i->(i+1)%N,owner(index 0)在 ring_decode_step 中先 send_packet,再从 predecessor recv_packet;所有 N-1 peer 的 RingDecodeNode 逐个 handle+forward。路径必为 0->1->...->N-1->0,恰 N 条物理边。N=3 时是 owner->A->B->owner=3 跳。把 owner local partial 从种子移到最后归并只改变计算顺序,不会删除任何边。N-1 只在结果可停在 predecessor finisher 时成立。
+
+_updated: 2026-07-28 17:11:06_
 ### [2026-07-28] Rust 线 decode Q-ring 验证通过:Q+LSE 累积器环+增长零传输分片,跨节点 CUDA+HIP 闭环
 
 type: `evidence` · status: `held` · confidence: 0.95 · importance: 1.0 · source: `experiment`

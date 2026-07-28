@@ -2,6 +2,13 @@
 
 产品问题、目标用户、成功标准与产品决策。
 
+### 固定 owner-return 的单向 ring decode 至少需要 N 条网络边
+
+type: `belief` · status: `held` · confidence: 0.98 · importance: 0.95 · source: `docs/plans/2026-07-29-self-driving-ring-decode-revision.md`
+
+前提:Q 只在 owner 产生;仅允许 successor 链路;全局 attention 结果必须回到同一个 owner forward 栈。在这些前提下,访问其余 N-1 节点并回到 owner 的唯一环路含 N 条边。若允许结果停在 finisher,下限才降为 N-1。
+
+_updated: 2026-07-28 17:11:06_
 ### 异构分布式推理的数值验证策略
 
 type: `belief` · status: `held` · confidence: 0.8 · importance: 0.85 · source: `memory-bank/systemPatterns.md`
@@ -16,10 +23,11 @@ type: `belief` · status: `held` · confidence: 0.85 · importance: 0.85 · sour
 不考虑 controller/scheduler 控制面时,HCP 数据面(prefill KV ring + decode Q/LSE 累积器环)的全部通信都是与环上相邻两节点的 send/recv;无需 all-to-all/broadcast/reduce/gather。这使异构消费级硬件(以太网/tailscale/未来 CXL)即可组成 CP 系统,是"异构是常态"核心信念在拓扑层的直接推论。证据:三机真环 ringc-160010、decode dsplit4/dsplit6 均只使用邻接连接。
 
 _updated: 2026-07-27 09:10:04_
-### 决策:自驱动环(self-driving ring)——decode forward 整体骑在环上,无 owner 无冗余,每层 N-1 跳
+### 旧决策(已修订):自驱动环 decode 无 owner/无冗余/N-1 hops
 
-type: `decision` · status: `held` · confidence: 0.9 · importance: 1.0 · source: `user-direction`
+type: `decision` · status: `revised` · confidence: 0.9 · importance: 1.0 · source: `user-direction`
 
+[2026-07-29 状态] 本节点的自驱动 Rust 核心方向保留,但 plugin successor-seeded、sampler 必然逐 token 轮转等子结论已被新理论裁定修订。当前规范见 decision-self-driving-ring-theory-20260729。
 用户方向(2026-07-28,ISSUE-006 收口方案):自驱动环是关键。子环弹性已否决(环外 KV 必然集中,违反切分);Rust 线 N× 冗余 forward 同样不可接受。
 
 【核心机制】包不回家:层 L 的包从 S 出发(S 以本地 partial 做种子),经 N-1 跳到达 S 的前驱时 N 份 partial 已齐——前驱就地做 finisher(W_o+MLP+LayerNorm→h_{L+1})并以发起者身份发出层 L+1 的包;末层 finisher 算 logits、采样、embed 新 token,直接发起下一步第一圈。decode 全程无中心驱动,coordinator 只做准入/释放。
@@ -65,8 +73,24 @@ E(plugin successor-seeded,小步先行)→ D1(Rust 单包轮转 attention,ring.r
 risk-1(中):D2 把 model.rs 从一次调用栈改为事件驱动,侵入面大——缓解:decode 期与 prefill 期代码路径分离,prefill 不动;
 risk-2(低):单包在大 head_dim 模型下带宽饱和场景损失并发——KB 级包下不构成;
 risk-3(低):首个 finisher 的等待编排冷启动(prefill 后第一包从 owner 发出)——从既有 decode-ring 注册状态推导。
+[2026-07-29 可行性修订] 总体 Rust 自驱动方向保持;plugin successor-seeded N-1 子结论被 topology proof 推翻,task E rejected。Rust D1 不能作为独立生产 checkpoint,必须与最小 model continuation 合并。见 revision-self-driving-ring-plan-20260729。
+[2026-07-29 理论深化] 在抽象掉既有 plugin/owner 实现后,自驱动 ring 与 HCP 总设计适配:每层 N-1 attention hops、KV 互斥完备分区、单逻辑 forward、P2P-only 线性拓扑。修正:若 L mod N=0,sampler 不会自然跨 token 轮转;需 +1 token-ID phase-shift hop。详见 decision-self-driving-ring-theory-20260729。
 
-_updated: 2026-07-28 16:45:20_
+_updated: 2026-07-28 17:41:07_
+### 理论裁定:自驱动 ring 适合 HCP decode,严格 KV 分区优先于 sampler 形式轮转
+
+type: `decision` · status: `held` · confidence: 0.95 · importance: 1.0 · source: `docs/plans/2026-07-29-self-driving-ring-theory.md`
+
+【结论】适合。它在不依赖 collective/全连通网络的条件下同时实现:每节点仅 predecessor+successor 两条 peer 关系;每层 N-1 attention packet 边;durable KV 按位置互斥完备分区;单个逻辑 distributed forward;非 attention continuation 唯一执行。
+【核心不变量】对任意 request/layer,各节点 durable KV 位置集合两两不交且并集为全部历史位置;round-robin 下每节点位置数属于 floor(T/N) 或 ceil(T/N),有限 token 下不可能严格等于 T/N,最大只差 1 token。环上 packet 为 O(model_width),不随 context 增长。所有 N 节点各算一次本地 attention partial;Q 只由 starter 算一次;当前 token K/V 只由 assignee 算/存/参与一次;W_o+residual+MLP 只由 finisher 算一次;最终 logits/sample 只算一次。
+【packet 状态机】starter 持 h_L 并只算 norm+Q。若 starter!=kv_assignee,seed 只含本地 durable history partial;若 starter==kv_assignee,starter 唯一计算 current K/V,直接形成 history+current 的单一 seed,partial 后 durable append,首跳前置 kv_committed=true,不得再次计算 history。普通 relay 只合并 durable history;assignee relay(含 finisher 重合)唯一计算 current K/V,形成 history+current 的单一 partial,随后 append 并置 commit。第 N-1 跳抵达 finisher时 N 份 partial 齐全;finisher 完成本地 assignee 分支后必须断言 kv_committed,再做 W_o/MLP 得 h_(L+1)。R0 必测 assignee==starter、middle relay、finisher 三种重合。online-softmax merge 可交换结合,所以 decode 单 query 不要求 KV token 顺序与物理 ring 顺序一致。
+【动机六问】1问题:在异构、P2P-only、每节点仅两个 peer、KV 严格切分下消除 owner 与全 forward 冗余。2现状:owner-return 多 1 跳且集中;全节点 full forward 有 N 倍非 attention 冗余。3目标:N-1 attention hops/layer,ceil(T/N) KV 上界,单 continuation/单 logits producer,机器可验证 exact-once。4他者机制:TP/collective 要同构高速互联;pipeline parallel 切层不切 KV;经典 Ring Attention 未提供 serving decode 的层间 ownership 状态机,无法直接复用。5本方案:Q+O+LSE+h 小包环行,finisher 续层,KV assignee exact-once,control plane 仅准入释放。6为什么:它是同时满足部分可达拓扑、KV 容量聚合、无 collective 与线性网络成本的最小形态。
+【牺牲四问】默认冗余/owner-return提供简单同步、任意节点可取全局结果和多包并发;本方案放弃全节点结果复制、单请求多包并发与节点故障容忍。它们在通用系统中服务简单性、吞吐和容灾;对当前 inference PoC,严格 KV 容量和拓扑约束优先,环断即请求失败可接受。结论:implement。
+【token 边界策略】角色并非必然跨 token 轮转。零 handoff 时 s(t+1,0)=s(t,0)-L mod N;L mod N=0 时 sampler 对单请求固定,但不增加 durable KV。默认用 request 初始 phase 做请求间均衡,保留 L*(N-1) attention hops;异构时 sampler 可偏向更快节点。若实测出现 LM-head/sampling queue 瓶颈,可选 k-hop token phase shift,跨 token 位移为 k-L mod N;遍历所有节点需 gcd(k-L,N)=1。目标 L=24,N=3 时 k=1 有效,但不是通用固定规则。
+【异构边界】严格 1/N KV 是 memory correctness policy,但总容量受最小显存节点约束且单 token 延迟包含所有节点。capacity/speed weighted placement 可提高利用率,却必然让部分节点超过 1/N,必须作为显式替代策略,不能暗中弱化默认保证。多请求 packet pipeline 可提高吞吐,但需 bounded queue/backpressure/request ordering,不得复制 durable KV。
+[2026-07-29 用户裁定] 不为形式上的无 owner 强制 sampler 逐 token 轮转。固定 sampler 不增加 durable KV;默认用 request phase 做请求间均衡并保留 L*(N-1) attention hops。+1 token-ID phase shift 降为实测 sampler 计算/队列瓶颈后的可选策略。
+
+_updated: 2026-07-28 18:04:28_
 ### HCP 两阶段统一 ring 架构:prefill 传 KV、decode 传 Q+LSE,全程 P2P 逐跳,每节点只需 2 个连接
 
 type: `decision` · status: `held` · confidence: 0.9 · importance: 0.95 · source: `user-direction`
