@@ -115,6 +115,20 @@ type: `task` · status: `superseded` · confidence: 0.95 · importance: 0.95 · 
 1M v9（3:1 split）成功，prefill 24/24 + decode 5/5，exit=0。文档已同步：1M_CONTEXT_THUNDERBOLT_PLAN.md、SCALING_ARGUMENT.md、systemPatterns.md。当前无未完成的 1M 攻坚任务；下一步决定是否需要更大模型 / 更多 domain 验证。
 
 _updated: 2026-06-29 06:01:28_
+### 决策:Rust decode 改 Q+LSE 累积器环;增长按 p mod N 分片且零传输(全节点同算 forward,非自有即弃)
+
+type: `decision` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `user-direction`
+
+动机剖析六问(任务C,修 ISSUE-007+008):
+1. 问题:Rust 线 decode 每 token 每层把整个 prefill KV 分区重发一遍(O(seq×d)/层/token,ring.rs:399/457-466),且增长 KV 全节点复制(cache.rs:55-69)——显存切分对增长失效,通信模式正是 Q-ring 要消除的。
+2. 现状:coordinator 广播 token,所有 worker 对称跑完整 1-token forward;ring.rs 复用 prefill 的 KV-block 环(seq_len==1 时只发 prefill 分区,2048/块);增长 append 到每节点本地 cache;logits 全节点冗余,coordinator 取 worker 0。
+3. 目标态:decode 每 token 每层每节点只传 (Q,O,LSE)(O(d));增长 KV 按全局位置 p mod N 指派,因所有节点本就同算 forward,新 K/V 各节点自算自留(自有即留,非自有即弃)——增长零传输;token 与单节点参考一致;1M 式显存切分对增长成立(每节点 prefill/N + growth/N)。
+4. 别人怎么做:与 plugin 线同源(LoongServe 式传 Q 不传 KV);Rust 线协议 protocol/node.rs 已预留 SoftmaxState 消息语义(未使用);plugin 线 p2p3n/conc2b 已三机+并发验证该数学。
+5. 我们怎么做:ring.rs 增加 seq_len==1 的 Q-ring 路径:本地 partial(本 chunk+本增长+当前 token,因果尾)后,按既有环收发 N-1 轮"收(Q,acc)→本地 partial 归并→转发"(与 KV-block 环同构的控制流,payload 换 (Q,O,LSE));tch_backend/cache 按 p mod N 决定 append/丢弃;新消息类型(3 张量+scale)。
+6. 为什么:与 plugin 线共享同一设计控制层语义;Rust 线全节点同算 forward 使增长分片零传输(比 plugin 线的捎带更简),这是该架构的独有红利。
+牺牲四问:1) 默认为什么存在(decode 重发 KV):复用 prefill 环控制流,改动最小;2) 牺牲什么:无正确性牺牲;冗余 logits 计算保留(另行评估);3) 被牺牲者用途:省一次消息类型设计;4) 对本项目:decode 通信是 CXL 论据核心变量,必须最小化。结论:implement。
+
+_updated: 2026-07-27 18:36:34_
 ### 决策:decode 并发按请求全隔离——跳池门走 forward_context 元数据,growth packet 带 req id,peer growth buffer 按 (req,layer) 键
 
 type: `decision` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `user-direction`
@@ -278,13 +292,6 @@ type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.9 · sou
 与 HCP 相关性：直接相关，可能缓解 pearl 等小/慢 domain 在 Phase 2 成为瓶颈的问题。
 
 _updated: 2026-06-29 06:06:09_
-### 任务C:Rust 线 decode 移植 Q+LSE 累积器环+增长分片
-
-type: `task` · status: `ongoing` · confidence: 0.9 · importance: 0.85 · source: `user-direction`
-
-修 ISSUE-007+ISSUE-008。Rust decode 从"逐 token 重发 prefill KV 分区+增长全节点复制"改为 plugin 线已验证的 Q+LSE 累积器绕环(protocol/node.rs 的 SoftmaxState 预留语义可复用);增长 KV 按 p mod N 分片,不再全节点复制;顺带评估 logits 冗余(worker 只算自己需要的部分或仅 owner/coordinator 采样)。
-
-_updated: 2026-07-27 15:10:25_
 ### decode 通信策略分析:当前 owner 汇聚(0 跳/全量 KV 常驻) vs 累积器绕环(L×P 跳/语义保持),选择由互联延迟决定
 
 type: `belief` · status: `held` · confidence: 0.85 · importance: 0.85 · source: `user-direction + analysis`

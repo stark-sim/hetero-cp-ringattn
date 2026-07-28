@@ -2,6 +2,22 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-07-28] Rust 线 decode Q-ring 验证通过:Q+LSE 累积器环+增长零传输分片,跨节点 CUDA+HIP 闭环
+
+type: `evidence` · status: `held` · confidence: 0.95 · importance: 1.0 · source: `experiment`
+
+decision-rust-decode-qring-20260728 的实现与验证(主仓 c4a3e7f,8 文件;subagent 实现+主 Agent 亲验+Reviewer APPROVE)。
+实现:ring.rs 新增 seq_len==1 的 Q-ring 路径(decode_local_partial/decode_merge_packet/ring_decode_attention,复用既有 max-shifted 归并与 Phase 0/1/2 控制流);RingPacket 消息+QUIC/TCP 序列化;cache.update_sharded(keep/discard);五条件门(seq_len==1 && decode_ring && N>1 && prefill done && transport 支持 packet);legacy HCP_RING_DECODE_RING=0 保留。
+验证阶梯:
+1. cargo test --features tch-backend 68/68(主 Agent 亲跑;+6 新测试:3 域不均 chunk 正确性<1e-4、2 域线程化 forward 逐步对参考、legacy 回退、cache 分片精确计数);
+2. Mac MPS 双 worker QUIC A/B:生成文本逐字相同;Q-ring 288/288 decode 事件(24层×2域×6步),packet 3640B(Qwen2-0.5B),decode 流量 5.68MB→1.05MB(11-token prompt,比值 O(seq) 增长);
+3. 跨节点 white CUDA + pearl HIP(Qwen2.5-3B,SEQ=64,decode 6):两节点各 216/216 decode 事件(36层×6步),packet 8256B(16×128×4+64)精确 O(d);legacy 复跑同文本;
+4. Reviewer APPROVE(自跑测试+自析 JSONL+diff 抽查不变量;判定 LinkedMock=false 为诚实工程非 test-rigging;保留项:coordinator exit code 未落盘、"+7"实为+6、perf 字段跨事件不同名)。
+增长分片语义:全节点同算 forward → 新 KV 各节点自算,按 global_pos%N 自有即留/非自有即弃,零传输(plugin 线需捎带是因只有 owner 算 forward)——Rust 架构独有红利。
+报告:reports/2domain-cuda-hip-20260728-115253/(含 perf JSONL×4 与 A/B 日志)。
+ISSUE-007/008 resolved。遗留:全节点冗余 logits 计算(worker 0 以外被丢弃)列为后续评估项。
+
+_updated: 2026-07-28 04:00:05_
 ### [2026-07-28] decode ≥2 请求并发验证通过(conc2b):按请求全隔离,增长分片在批量 decode 下保持
 
 type: `evidence` · status: `held` · confidence: 0.95 · importance: 0.95 · source: `experiment`
