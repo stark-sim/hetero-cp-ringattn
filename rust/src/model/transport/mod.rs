@@ -19,9 +19,9 @@ pub mod tcp;
 pub mod mock;
 
 #[cfg(feature = "tch-backend")]
-pub use block::KvBlock;
+pub use block::{KvBlock, RingPacket};
 #[cfg(feature = "tch-backend")]
-pub use r#trait::KvTransport;
+pub use r#trait::{KvTransport, RingMessage};
 #[cfg(feature = "tch-backend")]
 #[allow(unused_imports)]
 pub use tcp::TcpKvTransport;

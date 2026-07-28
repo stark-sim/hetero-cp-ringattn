@@ -5,7 +5,7 @@ use super::strategy::RingSchedulingStrategy;
 #[cfg(feature = "tch-backend")]
 use tch::{Device, Kind, Tensor};
 #[cfg(feature = "tch-backend")]
-use crate::model::transport::{KvBlock, KvTransport};
+use crate::model::transport::{KvBlock, KvTransport, RingPacket};
 
 #[cfg(feature = "tch-backend")]
 use std::time::Instant;
@@ -60,6 +60,18 @@ pub struct HcpRingAttentionBackend {
     /// 【本地 KV cache 的全局起始位置】用于 micro-block 元数据。
     /// 对于非连续分片，等于 position_ids 的第一个元素。
     kv_base_global_start: usize,
+    /// 【decode Q-ring 开关】true 时 decode（seq_len == 1）走 (Q, O, LSE) 累加器环，
+    /// 不再把 prefill KV 分区绕环重发；false 保持 legacy KV-resend 行为。
+    /// 由 HCP_RING_DECODE_RING 控制（默认 "1"，"0" 回退 legacy）。
+    decode_ring: bool,
+}
+
+/// 【解析 HCP_RING_DECODE_RING】默认启用 decode Q-ring；仅 "0" 回退 legacy KV-resend。
+#[cfg(feature = "tch-backend")]
+fn decode_ring_enabled_from_env() -> bool {
+    std::env::var("HCP_RING_DECODE_RING")
+        .map(|v| v != "0")
+        .unwrap_or(true)
 }
 
 #[cfg(feature = "tch-backend")]
@@ -91,6 +103,7 @@ impl Default for HcpRingAttentionBackend {
             position_ids: None,
             strategy: RingSchedulingStrategy::default(),
             kv_base_global_start: 0,
+            decode_ring: true,
         }
     }
 }
@@ -137,6 +150,7 @@ impl HcpRingAttentionBackend {
             position_ids: None,
             strategy: RingSchedulingStrategy::default(),
             kv_base_global_start: 0,
+            decode_ring: decode_ring_enabled_from_env(),
         })
     }
 
@@ -330,6 +344,159 @@ impl HcpRingAttentionBackend {
         // 更新 running max 和 running sum，供下一个 KV block 使用。
         *rm = new_max;
         *rs = new_sum;
+    }
+
+    /// 【decode 局部 partial】单 token 的 q 对本地 KV segment 做非因果 attention，
+    /// 输出 (O, LSE)：O 是归一化输出 [B,H,1,D]，LSE 是 fp32 的 log-sum-exp [B,H,1]。
+    ///
+    /// 直接复用 process_kv_block 的 max-shifted online softmax（rm/rs/obh），
+    /// 末尾按 lse = rm + log(rs) 换算回 log-sum-exp 形式。
+    /// 单 query 的 causal mask 是平凡的（所有历史 KV 都可见），统一走非因果路径，
+    /// 位置 tensor 仅用于传递长度。
+    fn decode_local_partial(&self, q: &Tensor, k: &Tensor, v: &Tensor) -> (Tensor, Tensor) {
+        let batch = q.size()[0];
+        let num_heads = q.size()[1];
+        let head_dim = q.size()[3];
+        let q_kind = q.kind();
+        let device = q.device();
+        let mut rm = Tensor::full([batch, num_heads, 1], -1e4_f64, (q_kind, device));
+        let mut rs = Tensor::zeros([batch, num_heads, 1], (q_kind, device));
+        let mut obh = Tensor::zeros([batch, num_heads, 1, head_dim], (q_kind, device));
+        let q_pos = Tensor::zeros([1], (Kind::Int64, Device::Cpu));
+        let k_pos = Tensor::zeros([k.size()[2]], (Kind::Int64, Device::Cpu));
+        self.process_kv_block(q, &q_pos, k, v, &k_pos, &mut rm, &mut rs, &mut obh, false);
+        let lse = (&rm + rs.log()).to_kind(Kind::Float);
+        (obh, lse)
+    }
+
+    /// 【packet merge】把环上 packet 的 (O, LSE) 累加器与 q 对本地 segment 的 partial 合并。
+    ///
+    /// 把 (O, LSE) 转成 rm = lse / rs = 1 / obh = o 的形式
+    ///（此时 Σexp(s - lse) = 1，obh 即归一化输出），复用 process_kv_block 的 merge 数学：
+    ///   m = max(lse_acc, lse_loc), lse' = m + log(exp(lse_acc - m) + exp(lse_loc - m))
+    /// 空 segment 时 packet 原样通过（lse + log(1) = lse）。
+    fn decode_merge_packet(&self, q: &Tensor, o: &Tensor, lse: &Tensor, k: &Tensor, v: &Tensor) -> (Tensor, Tensor) {
+        let mut rm = lse.to_kind(q.kind());
+        let mut rs = Tensor::ones_like(&rm);
+        let mut obh = o.shallow_clone();
+        let q_pos = Tensor::zeros([1], (Kind::Int64, Device::Cpu));
+        let k_pos = Tensor::zeros([k.size()[2]], (Kind::Int64, Device::Cpu));
+        self.process_kv_block(q, &q_pos, k, v, &k_pos, &mut rm, &mut rs, &mut obh, false);
+        let new_lse = (&rm + rs.log()).to_kind(Kind::Float);
+        (obh, new_lse)
+    }
+
+    /// 【Decode Q-ring：LoongServe 风格 (Q, O, LSE) 累加器环】
+    ///
+    /// 与 KV-block pipeline 数学完全等价（同一套 max-shifted online softmax merge），
+    /// 区别在于环上流动的不再是 KV block，而是 (q, o_acc, lse_acc) 小包：
+    /// 通信量从 O(prefill_len × d) 降为 O(d)，与 prefill 长度无关。
+    ///
+    /// 控制流与既有 Phase 0/1/2 KV-block pipeline 相同：
+    /// - Phase 0: 每个节点用本地 segment（durable KV + 当前 token）计算 seed partial
+    ///   (o_loc, lse_loc)，把 packet (q, o_loc, lse_loc, scale) 发往 successor；
+    /// - Phase 2: N-1 轮：收 predecessor 的 packet → 用本地 durable segment
+    ///   （不含当前 token，当前 token 已在每个 packet 的 seed 里服务过一次，
+    ///   再算会重复计数）对 packet.q 计算 partial 并 merge → 转发 successor
+    ///   （最后一轮不转发）；
+    /// - 所有节点对同一 token 算出的 q 完全相同（全节点冗余 forward 是有意保留的），
+    ///   因此最后一轮收到的全合并 packet 就是本层全局 attention 输出。
+    ///
+    /// `k` / `v`：本地 segment [durable KV; 当前 token]（forward 保证末位是当前 token）。
+    fn ring_decode_attention(&mut self, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor, ModelError> {
+        let ring_start = Instant::now();
+        let local_len = k.size()[2];
+        let peer_len = local_len.saturating_sub(1);
+        let k_peer = k.narrow(2, 0, peer_len);
+        let v_peer = v.narrow(2, 0, peer_len);
+
+        let elem_bytes = match q.kind() {
+            Kind::Float => 4,
+            Kind::Half => 2,
+            Kind::BFloat16 => 2,
+            Kind::Double => 8,
+            _ => 4,
+        };
+        let packet_bytes = (q.numel() * 2) * elem_bytes + q.size()[0] as usize * q.size()[1] as usize * 4;
+        let mut perf_sent_bytes = 0usize;
+        let mut perf_recv_bytes = 0usize;
+
+        // Phase 0: 本地 partial 作为种子，发往 successor
+        let (o_loc, lse_loc) = self.decode_local_partial(q, k, v);
+        {
+            let transport = self.kv_transport.as_mut().unwrap();
+            transport
+                .submit_send_packet(&RingPacket {
+                    layer_idx: self.layer_idx,
+                    q: q.shallow_clone(),
+                    o: o_loc,
+                    lse: lse_loc,
+                    scale: self.scale,
+                })
+                .map_err(|e| ModelError::Backend(format!("submit_send_packet: {e}")))?;
+            perf_sent_bytes += packet_bytes;
+        } // transport borrow 结束
+
+        // Phase 2: N-1 轮 recv → 本地 durable segment partial → merge → 转发
+        let num_rounds = self.num_domains.saturating_sub(1);
+        let mut out: Option<Tensor> = None;
+        for round in 0..num_rounds {
+            let pkt = {
+                let transport = self.kv_transport.as_mut().unwrap();
+                let pkt = match transport
+                    .poll_recv_packet()
+                    .map_err(|e| ModelError::Backend(format!("poll_recv_packet: {e}")))?
+                {
+                    Some(pkt) => Some(pkt),
+                    None => transport
+                        .recv_packet()
+                        .map_err(|e| ModelError::Backend(format!("recv_packet: {e}")))?,
+                };
+                pkt.ok_or_else(|| ModelError::Backend("ring decode: packet stream closed".to_string()))?
+            }; // transport borrow 结束
+            perf_recv_bytes += packet_bytes;
+
+            let (o_merged, lse_merged) =
+                self.decode_merge_packet(&pkt.q, &pkt.o, &pkt.lse, &k_peer, &v_peer);
+
+            // 转发（最后一轮不需要）
+            if round + 1 < num_rounds {
+                let transport = self.kv_transport.as_mut().unwrap();
+                transport
+                    .submit_send_packet(&RingPacket {
+                        layer_idx: self.layer_idx,
+                        q: pkt.q.shallow_clone(),
+                        o: o_merged.shallow_clone(),
+                        lse: lse_merged,
+                        scale: pkt.scale,
+                    })
+                    .map_err(|e| ModelError::Backend(format!("forward submit_send_packet: {e}")))?;
+                perf_sent_bytes += packet_bytes;
+            }
+            out = Some(o_merged);
+        }
+
+        // Phase 3: Flush
+        {
+            let transport = self.kv_transport.as_mut().unwrap();
+            transport
+                .flush_send()
+                .map_err(|e| ModelError::Backend(format!("flush_send: {e}")))?;
+        }
+
+        let total_ms = ring_start.elapsed().as_secs_f64() * 1000.0;
+        self.emit_perf_event(
+            "ring_decode",
+            &[
+                ("total_ms", &format!("{:.3}", total_ms)),
+                ("rounds", &num_rounds.to_string()),
+                ("packet_sent_bytes", &perf_sent_bytes.to_string()),
+                ("packet_recv_bytes", &perf_recv_bytes.to_string()),
+                ("num_domains", &self.num_domains.to_string()),
+            ],
+        );
+
+        out.ok_or_else(|| ModelError::Backend("ring decode: no rounds executed".to_string()))
     }
 
     /// 将单个 perf event 以 JSONL 格式追加到 `HCP_PERF_LOG` 指定的文件。
@@ -1151,10 +1318,29 @@ impl AttentionBackend for HcpRingAttentionBackend {
         // ====== 第四步：更新 KV Cache（可选）======
         // 在自回归生成时，每次只输入一个新 token，但需要看到之前所有 token 的 K/V。
         // KV Cache 把之前的 K/V 存起来，新 token 的 K/V append 到后面，避免重复计算。
-        // 
+        //
         // 在 prefill 阶段（第一次处理完整 prompt），kv_cache 为 None，直接返回当前 K/V。
+        //
+        // 【decode Q-ring gate】seq_len == 1 且启用 Q-ring 且 transport 支持 packet 时，
+        // 本 step 走 (Q, O, LSE) 累加器环：growth KV 按 global_pos % num_domains 分片，
+        // 归属节点持久化新 token，其余节点直接丢弃（零传输）。
+        let use_decode_ring = seq_len == 1
+            && self.decode_ring
+            && self.num_domains > 1
+            && self.is_prefill_done
+            && self
+                .kv_transport
+                .as_ref()
+                .map(|t| t.supports_ring_packets())
+                .unwrap_or(false);
         let (k, v) = if let Some(cache) = kv_cache {
-            cache.update(&k, &v)?
+            if use_decode_ring {
+                let global_pos = position_ids.max().int64_value(&[]) as usize;
+                let keep = global_pos % self.num_domains == self.local_domain_id;
+                cache.update_sharded(&k, &v, keep)?
+            } else {
+                cache.update(&k, &v)?
+            }
         } else {
             (k.shallow_clone(), v.shallow_clone())
         };
@@ -1209,7 +1395,12 @@ impl AttentionBackend for HcpRingAttentionBackend {
 
         // ====== 第七步：Ring Attention（核心分布式注意力计算）======
         // 把 Q 切成多个 chunk，逐个处理本地 KV 和 peer KV，用 online softmax 合并结果。
-        let attn_output = self.ring_attention(&q, &k, &v, attention_mask, global_seq_start)?;
+        // decode Q-ring 路径：环上只流 (Q, O, LSE) 小包，不传 KV。
+        let attn_output = if use_decode_ring {
+            self.ring_decode_attention(&q, &k, &v)?
+        } else {
+            self.ring_attention(&q, &k, &v, attention_mask, global_seq_start)?
+        };
 
         // ====== 第八步：输出投影（O-projection）======
         // attn_output 的 shape: [batch, num_heads, seq_len, head_dim]
@@ -2059,5 +2250,443 @@ mod tests {
             let recv = row.get("recv_ms").cloned().unwrap_or_default();
             println!("domain {}: total={}ms local_compute={}ms peer_compute={}ms recv={}ms", domain, total, local, peer, recv);
         }
+    }
+
+    /// 【Decode Q-ring 正确性：3 domain × 4 decode step】
+    ///
+    /// 手工模拟 ring 循环（用同一组 helper 计算 predecessor 会发来的 packet），验证：
+    /// (a) 每个节点的输出与 full-KV 单节点参考一致；
+    /// (b) 每个节点的 durable segment 只有 prefill chunk + 自己的 p%N growth 份额；
+    /// (c) 节点实际发送（seed / 转发）的 packet 内容与手工 merge 一致。
+    #[test]
+    #[cfg(feature = "tch-backend")]
+    fn test_ring_decode_qring_three_domains() {
+        use crate::model::transport::{MockKvTransport, RingPacket};
+
+        let device = tch::Device::Cpu;
+        let num_heads = 4i64;
+        let head_dim = 8i64;
+        let num_domains = 3usize;
+        let prefill_len = 7usize;
+        let decode_steps = 4usize;
+        let total_len = prefill_len + decode_steps; // 11
+        let scale = 1.0 / (head_dim as f64).sqrt();
+
+        tch::manual_seed(20260727);
+        let k_all = Tensor::randn([1, num_heads, total_len as i64, head_dim], (Kind::Float, device));
+        let v_all = Tensor::randn([1, num_heads, total_len as i64, head_dim], (Kind::Float, device));
+        let q_steps: Vec<Tensor> = (0..decode_steps)
+            .map(|_| Tensor::randn([1, num_heads, 1, head_dim], (Kind::Float, device)))
+            .collect();
+
+        // prefill chunks（不均分）：node0 [0,3), node1 [3,5), node2 [5,7)
+        let chunks = [(0usize, 3usize), (3, 5), (5, 7)];
+
+        let make_backend = |domain: usize, transport: MockKvTransport| -> HcpRingAttentionBackend {
+            HcpRingAttentionBackend {
+                q_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+                k_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+                v_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+                o_proj: Tensor::randn([1, 1], (Kind::Float, device)),
+                q_bias: None, k_bias: None, v_bias: None,
+                rope: crate::model::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device),
+                num_heads: num_heads as usize,
+                num_kv_heads: num_heads as usize,
+                head_dim: head_dim as usize,
+                scale,
+                num_domains,
+                layer_idx: 0,
+                kv_transport: Some(Box::new(transport)),
+                local_domain_id: domain,
+                seq_offset: chunks[domain].0,
+                decode_ring: true,
+                ..Default::default()
+            }
+        };
+
+        // durable segments（不含当前 token；growth 按 p%N 逐步累积）
+        let mut dur_k: Vec<Tensor> = chunks
+            .iter()
+            .map(|(s, e)| k_all.narrow(2, *s as i64, (e - s) as i64))
+            .collect();
+        let mut dur_v: Vec<Tensor> = chunks
+            .iter()
+            .map(|(s, e)| v_all.narrow(2, *s as i64, (e - s) as i64))
+            .collect();
+
+        let scratch = make_backend(0, MockKvTransport::new());
+
+        for t in 0..decode_steps {
+            let pos = prefill_len + t;
+            let cur_k = k_all.narrow(2, pos as i64, 1);
+            let cur_v = v_all.narrow(2, pos as i64, 1);
+            let q = &q_steps[t];
+
+            // 参考：full-KV 单节点 attention
+            let k_ref = k_all.narrow(2, 0, pos as i64 + 1);
+            let v_ref = v_all.narrow(2, 0, pos as i64 + 1);
+            let scores = q.matmul(&k_ref.transpose(2, 3)) * scale;
+            let expected = scores.softmax(-1, Kind::Float).matmul(&v_ref);
+
+            // 每个节点的本地 segment = [durable; 当前 token]
+            let seg_k: Vec<Tensor> = dur_k.iter().map(|d| Tensor::cat(&[d, &cur_k], 2)).collect();
+            let seg_v: Vec<Tensor> = dur_v.iter().map(|d| Tensor::cat(&[d, &cur_v], 2)).collect();
+
+            // 手工模拟 ring：每个节点的 seed partial
+            let seeds: Vec<(Tensor, Tensor)> = (0..num_domains)
+                .map(|j| scratch.decode_local_partial(q, &seg_k[j], &seg_v[j]))
+                .collect();
+
+            // 预置每个节点会收到的 packet（round 0: predecessor seed；
+            // round 1: i-2 的 seed 被 i-1 用其 durable segment merge 后的 packet）
+            let mut backends: Vec<HcpRingAttentionBackend> = Vec::new();
+            for i in 0..num_domains {
+                let pred = (i + num_domains - 1) % num_domains;
+                let pred2 = (i + 1) % num_domains;
+                let mut transport = MockKvTransport::new();
+                transport.push_packet(RingPacket {
+                    layer_idx: 0,
+                    q: q.shallow_clone(),
+                    o: seeds[pred].0.shallow_clone(),
+                    lse: seeds[pred].1.shallow_clone(),
+                    scale,
+                });
+                let (o1, lse1) = scratch.decode_merge_packet(
+                    q, &seeds[pred2].0, &seeds[pred2].1, &dur_k[pred], &dur_v[pred],
+                );
+                transport.push_packet(RingPacket {
+                    layer_idx: 0,
+                    q: q.shallow_clone(),
+                    o: o1,
+                    lse: lse1,
+                    scale,
+                });
+                backends.push(make_backend(i, transport));
+            }
+
+            for (i, backend) in backends.iter_mut().enumerate() {
+                let pred = (i + num_domains - 1) % num_domains;
+                let out = backend.ring_decode_attention(q, &seg_k[i], &seg_v[i]).unwrap();
+                let diff = (&expected - &out).abs().mean(Kind::Float).double_value(&[]);
+                assert!(diff < 1e-4, "step {t} node {i} decode Q-ring diff: {diff}");
+
+                // (c) 发送内容断言：N=3 → sent = [seed_i, merge(seed_pred, dur_i)]
+                let mock = backend
+                    .kv_transport
+                    .as_ref()
+                    .unwrap()
+                    .as_any()
+                    .unwrap()
+                    .downcast_ref::<MockKvTransport>()
+                    .unwrap();
+                let sent = mock.sent_packets();
+                assert_eq!(sent.len(), 2, "step {t} node {i} sent packet count");
+                let diff_seed_o = (&seeds[i].0 - &sent[0].o).abs().max().double_value(&[]);
+                let diff_seed_lse = (&seeds[i].1 - &sent[0].lse).abs().max().double_value(&[]);
+                assert!(diff_seed_o < 1e-6, "step {t} node {i} seed o mismatch: {diff_seed_o}");
+                assert!(diff_seed_lse < 1e-6, "step {t} node {i} seed lse mismatch: {diff_seed_lse}");
+                let (exp_o, exp_lse) = scratch.decode_merge_packet(
+                    q, &seeds[pred].0, &seeds[pred].1, &dur_k[i], &dur_v[i],
+                );
+                let diff_fwd_o = (&exp_o - &sent[1].o).abs().max().double_value(&[]);
+                let diff_fwd_lse = (&exp_lse - &sent[1].lse).abs().max().double_value(&[]);
+                assert!(diff_fwd_o < 1e-6, "step {t} node {i} forwarded o mismatch: {diff_fwd_o}");
+                assert!(diff_fwd_lse < 1e-6, "step {t} node {i} forwarded lse mismatch: {diff_fwd_lse}");
+            }
+
+            // growth 分片：当前 token 归属 pos % N，只有归属节点累积
+            let assignee = pos % num_domains;
+            dur_k[assignee] = Tensor::cat(&[&dur_k[assignee], &cur_k], 2);
+            dur_v[assignee] = Tensor::cat(&[&dur_v[assignee], &cur_v], 2);
+        }
+
+        // (b) 每个节点 durable = prefill chunk + 自己的 p%N 份额（无缺口、无重复）
+        let mut total = 0usize;
+        for i in 0..num_domains {
+            let share = (0..decode_steps)
+                .filter(|t| (prefill_len + t) % num_domains == i)
+                .count();
+            let expect_len = (chunks[i].1 - chunks[i].0) + share;
+            assert_eq!(dur_k[i].size()[2] as usize, expect_len, "node {i} durable len");
+            total += expect_len;
+        }
+        assert_eq!(total, total_len, "durable segments must partition all tokens");
+    }
+
+    /// 【forward 级 decode Q-ring 集成：2 domain × 4 decode step】
+    ///
+    /// 真实走 AttentionBackend::forward：projection → RoPE → update_sharded（growth 分片）
+    /// → ring_decode_attention。两节点各起一个线程，用 mpsc channel transport 同步。
+    /// 验证：(a) 每步输出与 full-KV 单节点参考一致；(b) cache 只含 prefill chunk + p%N 份额。
+    #[test]
+    #[cfg(feature = "tch-backend")]
+    fn test_forward_decode_qring_two_domains() {
+        use crate::model::transport::{KvBlock, RingPacket};
+        use std::sync::mpsc;
+
+        /// 【测试用 rendezvous packet transport】KV 接口空实现（prefill 已手动准备），
+        /// packet 通过 mpsc channel 跨线程投递，recv 带超时阻塞。
+        struct ChanPacketTransport {
+            tx: mpsc::Sender<RingPacket>,
+            rx: mpsc::Receiver<RingPacket>,
+        }
+        impl KvTransport for ChanPacketTransport {
+            fn submit_send(&mut self, _block: &KvBlock) -> Result<(), String> {
+                Ok(())
+            }
+            fn poll_recv(&mut self) -> Result<Option<KvBlock>, String> {
+                Ok(None)
+            }
+            fn flush_send(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            fn supports_ring_packets(&self) -> bool {
+                true
+            }
+            fn submit_send_packet(&mut self, packet: &RingPacket) -> Result<(), String> {
+                self.tx.send(packet.clone()).map_err(|e| e.to_string())
+            }
+            fn poll_recv_packet(&mut self) -> Result<Option<RingPacket>, String> {
+                match self.rx.try_recv() {
+                    Ok(p) => Ok(Some(p)),
+                    Err(_) => Ok(None),
+                }
+            }
+            fn recv_packet(&mut self) -> Result<Option<RingPacket>, String> {
+                self.rx
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .map(Some)
+                    .map_err(|e| format!("recv_packet timeout: {e}"))
+            }
+        }
+
+        let device = tch::Device::Cpu;
+        let hidden_size = 32i64;
+        let num_heads = 4usize;
+        let head_dim = 8usize;
+        let num_domains = 2usize;
+        let prefill_len = 7i64;
+        let decode_steps = 4i64;
+        let scale = 1.0 / (head_dim as f64).sqrt();
+
+        tch::manual_seed(31337);
+        // 共享权重（num_kv_heads == num_heads，避开 GQA repeat 的干扰）
+        let q_proj = Tensor::randn([(num_heads * head_dim) as i64, hidden_size], (Kind::Float, device));
+        let k_proj = Tensor::randn([(num_heads * head_dim) as i64, hidden_size], (Kind::Float, device));
+        let v_proj = Tensor::randn([(num_heads * head_dim) as i64, hidden_size], (Kind::Float, device));
+        let o_proj = Tensor::randn([hidden_size, (num_heads * head_dim) as i64], (Kind::Float, device));
+        let rope = crate::model::layers::RotaryEmbedding::new(head_dim, 128, 10000.0, device);
+
+        // 共享 "prefill" KV（直接写入 cache，绕过 prefill forward；node0 [0,4), node1 [4,7)）
+        let k_pre = Tensor::randn([1, num_heads as i64, prefill_len, head_dim as i64], (Kind::Float, device));
+        let v_pre = Tensor::randn([1, num_heads as i64, prefill_len, head_dim as i64], (Kind::Float, device));
+
+        // 共享 decode 输入（所有节点对同一 token 计算完全相同的 Q/K/V）
+        let hiddens: Vec<Tensor> = (0..decode_steps)
+            .map(|_| Tensor::randn([1, 1, hidden_size], (Kind::Float, device)))
+            .collect();
+
+        let make_backend = |domain: usize,
+                            transport: Option<Box<dyn KvTransport>>,
+                            n_domains: usize,
+                            prefill_kv_len: usize|
+         -> HcpRingAttentionBackend {
+            HcpRingAttentionBackend {
+                q_proj: q_proj.shallow_clone(),
+                k_proj: k_proj.shallow_clone(),
+                v_proj: v_proj.shallow_clone(),
+                o_proj: o_proj.shallow_clone(),
+                q_bias: None, k_bias: None, v_bias: None,
+                rope: rope.clone(),
+                num_heads,
+                num_kv_heads: num_heads,
+                head_dim,
+                scale,
+                num_domains: n_domains,
+                layer_idx: 0,
+                kv_transport: transport,
+                local_domain_id: domain,
+                seq_offset: 0,
+                prefill_kv_len,
+                is_prefill_done: true,
+                decode_ring: true,
+                ..Default::default()
+            }
+        };
+
+        let (tx01, rx01) = mpsc::channel::<RingPacket>();
+        let (tx10, rx10) = mpsc::channel::<RingPacket>();
+        let mut backend0 = make_backend(
+            0,
+            Some(Box::new(ChanPacketTransport { tx: tx01, rx: rx10 })),
+            num_domains,
+            4,
+        );
+        let mut backend1 = make_backend(
+            1,
+            Some(Box::new(ChanPacketTransport { tx: tx10, rx: rx01 })),
+            num_domains,
+            3,
+        );
+
+        let mut cache0 = crate::model::cache::ContiguousKvCache::new();
+        let _ = cache0.update(&k_pre.narrow(2, 0, 4), &v_pre.narrow(2, 0, 4)).unwrap();
+        let mut cache1 = crate::model::cache::ContiguousKvCache::new();
+        let _ = cache1.update(&k_pre.narrow(2, 4, 3), &v_pre.narrow(2, 4, 3)).unwrap();
+
+        let hiddens0: Vec<Tensor> = hiddens.iter().map(|t| t.shallow_clone()).collect();
+        let hiddens1: Vec<Tensor> = hiddens.iter().map(|t| t.shallow_clone()).collect();
+
+        let run_node = move |backend: &mut HcpRingAttentionBackend,
+                             cache: &mut crate::model::cache::ContiguousKvCache,
+                             hiddens: &[Tensor]| {
+            let mut outs = Vec::new();
+            for (t, h) in hiddens.iter().enumerate() {
+                let pos = Tensor::from_slice(&[prefill_len + t as i64]).unsqueeze(0);
+                let out = backend.forward(h, &pos, Some(cache), None).unwrap();
+                outs.push(out);
+            }
+            outs
+        };
+
+        let handle0 = std::thread::spawn({
+            let mut backend = std::mem::replace(&mut backend0, HcpRingAttentionBackend::default());
+            let mut cache = cache0;
+            let hiddens = hiddens0;
+            let run_node = run_node;
+            move || {
+                let outs = run_node(&mut backend, &mut cache, &hiddens);
+                (outs, cache.seq_len())
+            }
+        });
+        let handle1 = std::thread::spawn({
+            let mut backend = std::mem::replace(&mut backend1, HcpRingAttentionBackend::default());
+            let mut cache = cache1;
+            let hiddens = hiddens1;
+            move || {
+                let outs = run_node(&mut backend, &mut cache, &hiddens);
+                (outs, cache.seq_len())
+            }
+        });
+
+        // 参考：单节点 full KV
+        let mut ref_backend = make_backend(0, None, 1, prefill_len as usize);
+        let mut ref_cache = crate::model::cache::ContiguousKvCache::new();
+        let _ = ref_cache.update(&k_pre, &v_pre).unwrap();
+        let mut ref_outs = Vec::new();
+        for (t, h) in hiddens.iter().enumerate() {
+            let pos = Tensor::from_slice(&[prefill_len + t as i64]).unsqueeze(0);
+            ref_outs.push(ref_backend.forward(h, &pos, Some(&mut ref_cache), None).unwrap());
+        }
+
+        let (outs0, len0) = handle0.join().unwrap();
+        let (outs1, len1) = handle1.join().unwrap();
+
+        for t in 0..decode_steps as usize {
+            let diff0 = (&ref_outs[t] - &outs0[t]).abs().mean(Kind::Float).double_value(&[]);
+            let diff1 = (&ref_outs[t] - &outs1[t]).abs().mean(Kind::Float).double_value(&[]);
+            println!("step {t} decode Q-ring forward diff0={diff0} diff1={diff1}");
+            assert!(diff0 < 1e-4, "step {t} node0 differs from reference: {diff0}");
+            assert!(diff1 < 1e-4, "step {t} node1 differs from reference: {diff1}");
+        }
+
+        // (b) cache 只含 prefill chunk + p%N 份额：
+        // 位置 7,8,9,10 → node0 得 8,10（2 个）；node1 得 7,9（2 个）
+        assert_eq!(len0, 4 + 2, "node0 cache must be prefill chunk + its growth share");
+        assert_eq!(len1, 3 + 2, "node1 cache must be prefill chunk + its growth share");
+    }
+
+    /// 【legacy decode 回退】decode_ring = false 时保持旧的 KV-resend decode 行为，
+    /// 且 HCP_RING_DECODE_RING=0 能正确关闭 Q-ring（默认 / "1" 启用）。
+    #[test]
+    #[cfg(feature = "tch-backend")]
+    fn test_forward_decode_legacy_when_ring_disabled() {
+        use crate::model::transport::MockKvTransport;
+
+        // env 解析：默认 / "1" 启用 Q-ring，"0" 回退 legacy
+        std::env::set_var("HCP_RING_DECODE_RING", "0");
+        assert!(!decode_ring_enabled_from_env());
+        std::env::set_var("HCP_RING_DECODE_RING", "1");
+        assert!(decode_ring_enabled_from_env());
+        std::env::remove_var("HCP_RING_DECODE_RING");
+        assert!(decode_ring_enabled_from_env());
+
+        let device = tch::Device::Cpu;
+        let hidden_size = 32i64;
+        let num_heads = 4usize;
+        let head_dim = 8usize;
+        let prefill_len = 7i64;
+        let scale = 1.0 / (head_dim as f64).sqrt();
+
+        tch::manual_seed(777);
+        let q_proj = Tensor::randn([(num_heads * head_dim) as i64, hidden_size], (Kind::Float, device));
+        let k_proj = Tensor::randn([(num_heads * head_dim) as i64, hidden_size], (Kind::Float, device));
+        let v_proj = Tensor::randn([(num_heads * head_dim) as i64, hidden_size], (Kind::Float, device));
+        let o_proj = Tensor::randn([hidden_size, (num_heads * head_dim) as i64], (Kind::Float, device));
+        let rope = crate::model::layers::RotaryEmbedding::new(head_dim, 128, 10000.0, device);
+
+        let k_pre = Tensor::randn([1, num_heads as i64, prefill_len, head_dim as i64], (Kind::Float, device));
+        let v_pre = Tensor::randn([1, num_heads as i64, prefill_len, head_dim as i64], (Kind::Float, device));
+        let hidden = Tensor::randn([1, 1, hidden_size], (Kind::Float, device));
+
+        let make_backend = |transport: Option<Box<dyn KvTransport>>,
+                            n_domains: usize,
+                            prefill_kv_len: usize,
+                            decode_ring: bool|
+         -> HcpRingAttentionBackend {
+            HcpRingAttentionBackend {
+                q_proj: q_proj.shallow_clone(),
+                k_proj: k_proj.shallow_clone(),
+                v_proj: v_proj.shallow_clone(),
+                o_proj: o_proj.shallow_clone(),
+                q_bias: None, k_bias: None, v_bias: None,
+                rope: rope.clone(),
+                num_heads,
+                num_kv_heads: num_heads,
+                head_dim,
+                scale,
+                num_domains: n_domains,
+                layer_idx: 0,
+                kv_transport: transport,
+                local_domain_id: 0,
+                seq_offset: 0,
+                prefill_kv_len,
+                is_prefill_done: true,
+                decode_ring,
+                ..Default::default()
+            }
+        };
+
+        // node0（legacy）：Mock 预置 peer 的 prefill 分区 [4,7)，
+        // legacy decode 会把它作为 peer KV block 消费掉
+        let mut transport0 = MockKvTransport::new();
+        transport0.push(crate::model::transport::KvBlock {
+            layer_idx: 0,
+            global_seq_start: 4,
+            global_seq_end: 7,
+            k: k_pre.narrow(2, 4, 3),
+            v: v_pre.narrow(2, 4, 3),
+            micro_block_idx: 0,
+            total_micro_blocks: 1,
+            position_ids: None,
+        });
+        let mut backend0 = make_backend(Some(Box::new(transport0)), 2, 4, false);
+        let mut cache0 = crate::model::cache::ContiguousKvCache::new();
+        let _ = cache0.update(&k_pre.narrow(2, 0, 4), &v_pre.narrow(2, 0, 4)).unwrap();
+
+        // 参考：单节点 full KV
+        let mut ref_backend = make_backend(None, 1, prefill_len as usize, true);
+        let mut ref_cache = crate::model::cache::ContiguousKvCache::new();
+        let _ = ref_cache.update(&k_pre, &v_pre).unwrap();
+
+        let pos = Tensor::from_slice(&[prefill_len]).unsqueeze(0);
+        let out0 = backend0.forward(&hidden, &pos, Some(&mut cache0), None).unwrap();
+        let out_ref = ref_backend.forward(&hidden, &pos, Some(&mut ref_cache), None).unwrap();
+
+        let diff = (&out_ref - &out0).abs().mean(Kind::Float).double_value(&[]);
+        println!("legacy decode diff = {diff}");
+        assert!(diff < 1e-4, "legacy decode differs from reference: {diff}");
+        // legacy 行为：growth KV 复制到每个节点
+        assert_eq!(cache0.seq_len(), 5, "legacy decode replicates growth KV on every node");
     }
 }

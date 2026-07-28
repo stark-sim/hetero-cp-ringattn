@@ -15,7 +15,7 @@
 //! 主线程在 `process_kv_block()` 计算的同时，send task 在后台把下一个 block
 //! 写入网络，recv task 在后台等待接收 peer block。
 #[cfg(feature = "tch-backend")]
-use crate::model::transport::{KvBlock, KvTransport};
+use crate::model::transport::{KvBlock, KvTransport, RingMessage, RingPacket};
 #[cfg(feature = "tch-backend")]
 use quinn::SendStream;
 use quinn::{ClientConfig, Endpoint, RecvStream, ServerConfig};
@@ -177,8 +177,12 @@ enum SendCmd {
 pub struct QuicKvTransport {
     /// 向 send task 发送命令（序列化 frame 或 flush marker）
     send_tx: mpsc::Sender<SendCmd>,
-    /// 从 recv task 接收反序列化后的 KvBlock
-    recv_rx: mpsc::Receiver<KvBlock>,
+    /// 从 recv task 接收反序列化后的消息（KV block 或 Q-ring packet）
+    recv_rx: mpsc::Receiver<RingMessage>,
+    /// 【交叉暂存】同一 stream 复用两类 frame：poll_recv 只取 KV、
+    /// poll_recv_packet 只取 packet，另一类先暂存等对应调用取出。
+    pending_kv: std::collections::VecDeque<KvBlock>,
+    pending_packets: std::collections::VecDeque<RingPacket>,
     /// send task 的 JoinHandle（Drop 时需要 abort）
     #[allow(dead_code)]
     send_task: tokio::task::JoinHandle<()>,
@@ -202,7 +206,7 @@ impl QuicKvTransport {
             .and_then(|s| s.parse().ok())
             .unwrap_or(512);
         let (send_tx, send_rx) = mpsc::channel::<SendCmd>(buffer_size);
-        let (recv_tx, recv_rx) = mpsc::channel::<KvBlock>(buffer_size);
+        let (recv_tx, recv_rx) = mpsc::channel::<RingMessage>(buffer_size);
 
         let send_task = rt.spawn(send_task_loop(send, send_rx));
         let recv_task = rt.spawn(recv_task_loop(recv, recv_tx, device));
@@ -210,10 +214,22 @@ impl QuicKvTransport {
         Self {
             send_tx,
             recv_rx,
+            pending_kv: std::collections::VecDeque::new(),
+            pending_packets: std::collections::VecDeque::new(),
             send_task,
             recv_task,
             rt,
             device,
+        }
+    }
+
+    /// 【排空 recv channel】把已到达的消息按类型放入对应暂存队列。
+    fn drain_recv_channel(&mut self) {
+        while let Ok(msg) = self.recv_rx.try_recv() {
+            match msg {
+                RingMessage::KvBlock(block) => self.pending_kv.push_back(block),
+                RingMessage::RingPacket(packet) => self.pending_packets.push_back(packet),
+            }
         }
     }
 }
@@ -245,14 +261,14 @@ async fn send_task_loop(mut send: SendStream, mut cmd_rx: mpsc::Receiver<SendCmd
 /// 【Recv Task】从 QUIC recv stream 读取 frame，反序列化后推入 channel。
 ///
 /// 这个 task 独立运行，即使主线程在进行 attention 计算，它也在后台
-/// 等待接收 peer block，一有数据就推入 channel 供 poll_recv() 消费。
+/// 等待接收 peer 消息（KV block 或 Q-ring packet），一有数据就推入 channel 供 poll 消费。
 #[cfg(feature = "tch-backend")]
-async fn recv_task_loop(mut recv: RecvStream, block_tx: mpsc::Sender<KvBlock>, device: Device) {
+async fn recv_task_loop(mut recv: RecvStream, msg_tx: mpsc::Sender<RingMessage>, device: Device) {
     let mut handshake_done = false;
     loop {
-        match recv_kv_block_from_stream(&mut recv, &mut handshake_done, device).await {
-            Ok(Some(block)) => {
-                if block_tx.send(block).await.is_err() {
+        match recv_frame_from_stream(&mut recv, &mut handshake_done, device).await {
+            Ok(Some(msg)) => {
+                if msg_tx.send(msg).await.is_err() {
                     break; // 主线程已 drop recv_rx，不需要继续接收
                 }
             }
@@ -263,7 +279,7 @@ async fn recv_task_loop(mut recv: RecvStream, block_tx: mpsc::Sender<KvBlock>, d
             }
         }
     }
-    // block_tx 在这里被 drop，recv_rx.recv() 会返回 None，通知主线程 stream 已关闭
+    // msg_tx 在这里被 drop，recv_rx.recv() 会返回 None，通知主线程 stream 已关闭
 }
 
 /// 【序列化 KV block 为 Vec<u8> frame】
@@ -298,13 +314,52 @@ fn serialize_kv_block(block: &KvBlock) -> Result<Vec<u8>, String> {
     Ok(frame)
 }
 
-/// 【接收一个 KV block 从 QUIC recv stream】（async，可被 recv task 调用）
+/// 【序列化 Q-ring packet 为 Vec<u8> frame】
+///
+/// 与 KV block 共用同一 framing 约定（length-prefixed JSON meta + raw f32 bytes），
+/// meta 中 "type": "ring_packet" 用于区分 payload 类型。
 #[cfg(feature = "tch-backend")]
-async fn recv_kv_block_from_stream(
+fn serialize_ring_packet(packet: &RingPacket) -> Result<Vec<u8>, String> {
+    let (q_bytes, q_dtype) = tensor_to_bytes(&packet.q)?;
+    let (o_bytes, o_dtype) = tensor_to_bytes(&packet.o)?;
+    let (lse_bytes, lse_dtype) = tensor_to_bytes(&packet.lse)?;
+
+    let meta = serde_json::json!({
+        "type": "ring_packet",
+        "layer_idx": packet.layer_idx,
+        "scale": packet.scale,
+        "q_shape": packet.q.size(),
+        "o_shape": packet.o.size(),
+        "lse_shape": packet.lse.size(),
+        "q_bytes": q_bytes.len(),
+        "o_bytes": o_bytes.len(),
+        "lse_bytes": lse_bytes.len(),
+        "q_dtype": q_dtype,
+        "o_dtype": o_dtype,
+        "lse_dtype": lse_dtype,
+    });
+    let meta_bytes = meta.to_string().into_bytes();
+    let meta_len = meta_bytes.len() as u32;
+
+    let mut frame = Vec::with_capacity(4 + meta_bytes.len() + q_bytes.len() + o_bytes.len() + lse_bytes.len());
+    frame.extend_from_slice(&meta_len.to_be_bytes());
+    frame.extend_from_slice(&meta_bytes);
+    frame.extend_from_slice(&q_bytes);
+    frame.extend_from_slice(&o_bytes);
+    frame.extend_from_slice(&lse_bytes);
+    Ok(frame)
+}
+
+/// 【接收一个 frame 从 QUIC recv stream】（async，可被 recv task 调用）
+///
+/// 按 meta["type"] 分发：无 "type" 字段的 frame 一律按 KV block 解析（向后兼容），
+/// "ring_packet" 解析为 Q-ring packet。
+#[cfg(feature = "tch-backend")]
+async fn recv_frame_from_stream(
     recv: &mut RecvStream,
     handshake_done: &mut bool,
     device: Device,
-) -> Result<Option<KvBlock>, String> {
+) -> Result<Option<RingMessage>, String> {
     // Skip the 1-byte dummy written during stream setup (once per stream)
     if !*handshake_done {
         let mut dummy = [0u8; 1];
@@ -334,6 +389,38 @@ async fn recv_kv_block_from_stream(
         .map_err(|e| format!("quic parse meta failed: {e}"))?;
 
     let layer_idx = meta["layer_idx"].as_u64().ok_or("missing layer_idx")? as usize;
+
+    if meta["type"].as_str() == Some("ring_packet") {
+        let scale = meta["scale"].as_f64().ok_or("missing scale")?;
+        let read_tensor = |prefix: &str| -> Result<(Vec<u8>, Vec<i64>, String), String> {
+            let bytes_len = meta[format!("{prefix}_bytes")]
+                .as_u64()
+                .ok_or_else(|| format!("missing {prefix}_bytes"))? as usize;
+            let shape: Vec<i64> = meta[format!("{prefix}_shape")]
+                .as_array()
+                .ok_or_else(|| format!("missing {prefix}_shape"))?
+                .iter()
+                .map(|v| v.as_i64().ok_or("invalid shape"))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e: &str| e.to_string())?;
+            let dtype = meta[format!("{prefix}_dtype")].as_str().unwrap_or("float32").to_string();
+            Ok((vec![0u8; bytes_len], shape, dtype))
+        };
+        let (mut q_bytes, q_shape, q_dtype) = read_tensor("q")?;
+        read_exact(recv, &mut q_bytes).await
+            .map_err(|e| format!("quic recv q_bytes failed: {e}"))?;
+        let (mut o_bytes, o_shape, o_dtype) = read_tensor("o")?;
+        read_exact(recv, &mut o_bytes).await
+            .map_err(|e| format!("quic recv o_bytes failed: {e}"))?;
+        let (mut lse_bytes, lse_shape, lse_dtype) = read_tensor("lse")?;
+        read_exact(recv, &mut lse_bytes).await
+            .map_err(|e| format!("quic recv lse_bytes failed: {e}"))?;
+        let q = bytes_to_tensor(&q_bytes, &q_shape, device, &q_dtype)?;
+        let o = bytes_to_tensor(&o_bytes, &o_shape, device, &o_dtype)?;
+        let lse = bytes_to_tensor(&lse_bytes, &lse_shape, device, &lse_dtype)?;
+        return Ok(Some(RingMessage::RingPacket(RingPacket { layer_idx, q, o, lse, scale })));
+    }
+
     let global_seq_start = meta["global_seq_start"].as_u64().ok_or("missing global_seq_start")? as usize;
     let global_seq_end = meta["global_seq_end"].as_u64().ok_or("missing global_seq_end")? as usize;
     let micro_block_idx = meta["micro_block_idx"].as_u64().unwrap_or(0) as usize;
@@ -359,7 +446,7 @@ async fn recv_kv_block_from_stream(
     let k = bytes_to_tensor(&k_bytes, &k_shape, device, k_dtype)?;
     let v = bytes_to_tensor(&v_bytes, &v_shape, device, v_dtype)?;
 
-    Ok(Some(KvBlock { layer_idx, global_seq_start, global_seq_end, k, v, micro_block_idx, total_micro_blocks, position_ids: None }))
+    Ok(Some(RingMessage::KvBlock(KvBlock { layer_idx, global_seq_start, global_seq_end, k, v, micro_block_idx, total_micro_blocks, position_ids: None })))
 }
 
 #[cfg(feature = "tch-backend")]
@@ -382,12 +469,10 @@ impl KvTransport for QuicKvTransport {
     ///
     /// - Some(block): peer block 已到达
     /// - None: 暂时没有数据（主线程应继续做其他计算，稍后重试 poll）
+    /// 交叉到达的 Q-ring packet 会被暂存，等 poll_recv_packet / recv_packet 取出。
     fn poll_recv(&mut self) -> Result<Option<KvBlock>, String> {
-        match self.recv_rx.try_recv() {
-            Ok(block) => Ok(Some(block)),
-            Err(mpsc::error::TryRecvError::Empty) => Ok(None),
-            Err(mpsc::error::TryRecvError::Disconnected) => Ok(None),
-        }
+        self.drain_recv_channel();
+        Ok(self.pending_kv.pop_front())
     }
 
     /// 【刷新发送】等待所有已 submit 的数据被 send task 处理。
@@ -409,18 +494,73 @@ impl KvTransport for QuicKvTransport {
     /// 默认 600s 超时防止永久挂起，可通过 HCP_QUIC_TIMEOUT_SECS 覆盖。
     /// 大 KV block（4K+ seq）在跨 VPN 慢网络下传输可能超过 120s，需要更长的超时。
     fn recv_kv_block(&mut self) -> Result<Option<KvBlock>, String> {
+        if let Some(block) = self.pending_kv.pop_front() {
+            return Ok(Some(block));
+        }
         let timeout_secs = std::env::var("HCP_QUIC_TIMEOUT_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(600);
         self.rt.block_on(async {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs),
-                self.recv_rx.recv()
-            ).await {
-                Ok(Some(block)) => Ok(Some(block)),
-                Ok(None) => Ok(None), // channel closed（stream 已关闭）
-                Err(_) => Err(format!("recv_kv_block timeout after {timeout_secs}s")),
+            loop {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(timeout_secs),
+                    self.recv_rx.recv()
+                ).await {
+                    Ok(Some(RingMessage::KvBlock(block))) => return Ok(Some(block)),
+                    // 交叉流量：packet 暂存，继续等 KV block
+                    Ok(Some(RingMessage::RingPacket(packet))) => {
+                        self.pending_packets.push_back(packet);
+                    }
+                    Ok(None) => return Ok(None), // channel closed（stream 已关闭）
+                    Err(_) => return Err(format!("recv_kv_block timeout after {timeout_secs}s")),
+                }
+            }
+        })
+    }
+
+    fn supports_ring_packets(&self) -> bool {
+        true
+    }
+
+    /// 【提交异步发送 Q-ring packet】与 KV block 共用 send channel / send task。
+    fn submit_send_packet(&mut self, packet: &RingPacket) -> Result<(), String> {
+        let frame = serialize_ring_packet(packet)?;
+        self.rt.block_on(async {
+            self.send_tx.send(SendCmd::Data(frame)).await
+                .map_err(|e| format!("quic send channel closed: {e}"))
+        })
+    }
+
+    /// 【轮询接收 packet】非阻塞；交叉到达的 KV block 会被暂存。
+    fn poll_recv_packet(&mut self) -> Result<Option<RingPacket>, String> {
+        self.drain_recv_channel();
+        Ok(self.pending_packets.pop_front())
+    }
+
+    /// 【阻塞接收 packet】与 recv_kv_block 相同的超时语义。
+    fn recv_packet(&mut self) -> Result<Option<RingPacket>, String> {
+        if let Some(packet) = self.pending_packets.pop_front() {
+            return Ok(Some(packet));
+        }
+        let timeout_secs = std::env::var("HCP_QUIC_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(600);
+        self.rt.block_on(async {
+            loop {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(timeout_secs),
+                    self.recv_rx.recv()
+                ).await {
+                    Ok(Some(RingMessage::RingPacket(packet))) => return Ok(Some(packet)),
+                    // 交叉流量：KV block 暂存，继续等 packet
+                    Ok(Some(RingMessage::KvBlock(block))) => {
+                        self.pending_kv.push_back(block);
+                    }
+                    Ok(None) => return Ok(None),
+                    Err(_) => return Err(format!("recv_packet timeout after {timeout_secs}s")),
+                }
             }
         })
     }

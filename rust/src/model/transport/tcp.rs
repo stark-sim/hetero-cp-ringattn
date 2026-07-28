@@ -7,8 +7,8 @@ use std::net::TcpStream;
 #[cfg(feature = "tch-backend")]
 use tch::{Device, Tensor};
 
-use super::block::KvBlock;
-use super::r#trait::KvTransport;
+use super::block::{KvBlock, RingPacket};
+use super::r#trait::{KvTransport, RingMessage};
 
 /// 【基于 TCP 的 KV Block 传输】
 ///
@@ -19,6 +19,12 @@ use super::r#trait::KvTransport;
 ///
 /// meta_json 包含：layer_idx, global_seq_start/end, k/v shape, k/v bytes 长度, k/v dtype。
 /// raw bytes 是 f32 的小端序二进制表示（支持 Float/Half/BFloat16/Double，传输时统一为 f32）。
+///
+/// 【decode Q-ring packet 帧】同一 stream 复用，meta 中 "type": "ring_packet"：
+/// ```text
+/// [meta_len: u32 BE] [meta_json] [q_raw_bytes] [o_raw_bytes] [lse_raw_bytes]
+/// ```
+/// 缺省（无 "type" 字段）一律按 KV block 解析，向后兼容。
 ///
 /// 【为什么不直接用 bincode 序列化整个 KvBlock？】
 /// - JSON meta 便于人工调试和抓包分析
@@ -36,6 +42,11 @@ pub struct TcpKvTransport {
     /// TCP 本身是同步流，submit_send 会把完整 frame 先序列化到 buffer，
     /// 在 flush_send 时才一次性写入 stream。
     send_buffer: Vec<u8>,
+    /// 【交叉暂存】同一 stream 复用 KV block 和 Q-ring packet 两类 frame，
+    /// recv_kv_block 收到 packet（或 recv_packet 收到 KV）时先暂存，
+    /// 等对应的 recv 调用再取出。
+    pending_kv: std::collections::VecDeque<KvBlock>,
+    pending_packets: std::collections::VecDeque<RingPacket>,
 }
 
 #[cfg(feature = "tch-backend")]
@@ -47,7 +58,13 @@ impl TcpKvTransport {
         stream
             .set_write_timeout(Some(std::time::Duration::from_secs(30)))
             .map_err(|e| format!("set_write_timeout failed: {e}"))?;
-        Ok(Self { stream, device, send_buffer: Vec::new() })
+        Ok(Self {
+            stream,
+            device,
+            send_buffer: Vec::new(),
+            pending_kv: std::collections::VecDeque::new(),
+            pending_packets: std::collections::VecDeque::new(),
+        })
     }
 
     fn tensor_to_bytes(t: &Tensor) -> Result<(Vec<u8>, String), String> {
@@ -129,6 +146,43 @@ fn serialize_block_to_buffer(
     Ok(())
 }
 
+/// 【把序列化 Q-ring packet 追加到 buffer，但不实际写入网络】
+///
+/// Frame: [meta_len: u32 BE] [meta_bytes("type":"ring_packet")] [q_bytes] [o_bytes] [lse_bytes]
+#[cfg(feature = "tch-backend")]
+fn serialize_packet_to_buffer(
+    send_buffer: &mut Vec<u8>,
+    packet: &RingPacket,
+) -> Result<(), String> {
+    let (q_bytes, q_dtype) = TcpKvTransport::tensor_to_bytes(&packet.q)?;
+    let (o_bytes, o_dtype) = TcpKvTransport::tensor_to_bytes(&packet.o)?;
+    let (lse_bytes, lse_dtype) = TcpKvTransport::tensor_to_bytes(&packet.lse)?;
+
+    let meta = serde_json::json!({
+        "type": "ring_packet",
+        "layer_idx": packet.layer_idx,
+        "scale": packet.scale,
+        "q_shape": packet.q.size(),
+        "o_shape": packet.o.size(),
+        "lse_shape": packet.lse.size(),
+        "q_bytes": q_bytes.len(),
+        "o_bytes": o_bytes.len(),
+        "lse_bytes": lse_bytes.len(),
+        "q_dtype": q_dtype,
+        "o_dtype": o_dtype,
+        "lse_dtype": lse_dtype,
+    });
+    let meta_bytes = meta.to_string().into_bytes();
+    let meta_len = meta_bytes.len() as u32;
+
+    send_buffer.extend_from_slice(&meta_len.to_be_bytes());
+    send_buffer.extend_from_slice(&meta_bytes);
+    send_buffer.extend_from_slice(&q_bytes);
+    send_buffer.extend_from_slice(&o_bytes);
+    send_buffer.extend_from_slice(&lse_bytes);
+    Ok(())
+}
+
 #[cfg(feature = "tch-backend")]
 impl KvTransport for TcpKvTransport {
     fn submit_send(&mut self, block: &KvBlock) -> Result<(), String> {
@@ -167,12 +221,53 @@ impl KvTransport for TcpKvTransport {
 
     /// 【保留阻塞接收实现】避免 trait 默认实现的 1ms 忙等。
     fn recv_kv_block(&mut self) -> Result<Option<KvBlock>, String> {
+        if let Some(block) = self.pending_kv.pop_front() {
+            return Ok(Some(block));
+        }
+        loop {
+            match self.recv_frame()? {
+                Some(RingMessage::KvBlock(block)) => return Ok(Some(block)),
+                // 交叉流量：packet frame 暂存，等 recv_packet 消费
+                Some(RingMessage::RingPacket(packet)) => self.pending_packets.push_back(packet),
+                None => return Ok(None),
+            }
+        }
+    }
+
+    fn supports_ring_packets(&self) -> bool {
+        true
+    }
+
+    fn submit_send_packet(&mut self, packet: &RingPacket) -> Result<(), String> {
+        serialize_packet_to_buffer(&mut self.send_buffer, packet)
+    }
+
+    fn recv_packet(&mut self) -> Result<Option<RingPacket>, String> {
+        if let Some(packet) = self.pending_packets.pop_front() {
+            return Ok(Some(packet));
+        }
+        loop {
+            match self.recv_frame()? {
+                Some(RingMessage::RingPacket(packet)) => return Ok(Some(packet)),
+                // 交叉流量：KV frame 暂存，等 recv_kv_block 消费
+                Some(RingMessage::KvBlock(block)) => self.pending_kv.push_back(block),
+                None => return Ok(None),
+            }
+        }
+    }
+}
+
+#[cfg(feature = "tch-backend")]
+impl TcpKvTransport {
+    /// 【读取一个 frame】按 meta["type"] 分发 KV block / Q-ring packet。
+    /// 无 "type" 字段的 frame 一律按 KV block 解析（向后兼容）。
+    fn recv_frame(&mut self) -> Result<Option<RingMessage>, String> {
         // Read meta_len
         let mut len_bytes = [0u8; 4];
         match self.stream.read_exact(&mut len_bytes) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(format!("recv_kv_block read meta_len failed: {e}")),
+            Err(e) => return Err(format!("recv_frame read meta_len failed: {e}")),
         }
         let meta_len = u32::from_be_bytes(len_bytes) as usize;
 
@@ -180,13 +275,42 @@ impl KvTransport for TcpKvTransport {
         let mut meta_bytes = vec![0u8; meta_len];
         self.stream
             .read_exact(&mut meta_bytes)
-            .map_err(|e| format!("recv_kv_block read meta failed: {e}"))?;
+            .map_err(|e| format!("recv_frame read meta failed: {e}"))?;
         let meta: serde_json::Value = serde_json::from_slice(&meta_bytes)
-            .map_err(|e| format!("recv_kv_block parse meta failed: {e}"))?;
+            .map_err(|e| format!("recv_frame parse meta failed: {e}"))?;
 
         let layer_idx = meta["layer_idx"]
             .as_u64()
             .ok_or("missing layer_idx")? as usize;
+
+        if meta["type"].as_str() == Some("ring_packet") {
+            let scale = meta["scale"].as_f64().ok_or("missing scale")?;
+            let device = self.device;
+            let read_tensor = |stream: &mut TcpStream, prefix: &str| -> Result<Tensor, String> {
+                let bytes_len = meta[format!("{prefix}_bytes")]
+                    .as_u64()
+                    .ok_or_else(|| format!("missing {prefix}_bytes"))? as usize;
+                let shape: Vec<i64> = meta[format!("{prefix}_shape")]
+                    .as_array()
+                    .ok_or_else(|| format!("missing {prefix}_shape"))?
+                    .iter()
+                    .map(|v| v.as_i64().ok_or("invalid shape"))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e: &str| e.to_string())?;
+                let mut bytes = vec![0u8; bytes_len];
+                stream
+                    .read_exact(&mut bytes)
+                    .map_err(|e| format!("recv_frame read {prefix}_bytes failed: {e}"))?;
+                let dtype = meta[format!("{prefix}_dtype")].as_str().unwrap_or("float32");
+                Self::bytes_to_tensor(&bytes, &shape, device, dtype)
+            };
+            // 拆分 stream 借用：依次读 q / o / lse
+            let q = read_tensor(&mut self.stream, "q")?;
+            let o = read_tensor(&mut self.stream, "o")?;
+            let lse = read_tensor(&mut self.stream, "lse")?;
+            return Ok(Some(RingMessage::RingPacket(RingPacket { layer_idx, q, o, lse, scale })));
+        }
+
         let global_seq_start = meta["global_seq_start"]
             .as_u64()
             .ok_or("missing global_seq_start")? as usize;
@@ -216,20 +340,20 @@ impl KvTransport for TcpKvTransport {
         let mut k_bytes = vec![0u8; k_bytes_len];
         self.stream
             .read_exact(&mut k_bytes)
-            .map_err(|e| format!("recv_kv_block read k_bytes failed: {e}"))?;
+            .map_err(|e| format!("recv_frame read k_bytes failed: {e}"))?;
 
         // Read v_bytes
         let mut v_bytes = vec![0u8; v_bytes_len];
         self.stream
             .read_exact(&mut v_bytes)
-            .map_err(|e| format!("recv_kv_block read v_bytes failed: {e}"))?;
+            .map_err(|e| format!("recv_frame read v_bytes failed: {e}"))?;
 
         let k_dtype = meta["k_dtype"].as_str().unwrap_or("float32");
         let v_dtype = meta["v_dtype"].as_str().unwrap_or("float32");
         let k = Self::bytes_to_tensor(&k_bytes, &k_shape, self.device, k_dtype)?;
         let v = Self::bytes_to_tensor(&v_bytes, &v_shape, self.device, v_dtype)?;
 
-        Ok(Some(KvBlock {
+        Ok(Some(RingMessage::KvBlock(KvBlock {
             layer_idx,
             global_seq_start,
             global_seq_end,
@@ -238,6 +362,6 @@ impl KvTransport for TcpKvTransport {
             micro_block_idx,
             total_micro_blocks,
             position_ids: None,
-        }))
+        })))
     }
 }

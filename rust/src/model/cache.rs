@@ -19,6 +19,18 @@ pub trait KvCache: Send {
     /// Current cached sequence length.
     fn seq_len(&self) -> usize;
 
+    /// 【分片更新（decode Q-ring growth 分片用）】
+    ///
+    /// `keep = true`：与 `update` 完全相同（新 token 持久化到缓存）。
+    /// `keep = false`：新 token 不写入缓存（本节点不是该 token 的归属节点，直接丢弃），
+    /// 但返回值仍然是 [缓存内容; 新 token]，供当前 step 的 attention 使用。
+    ///
+    /// 默认实现忽略 `keep`（退化为全量复制的旧行为），保证未适配的缓存实现行为不变。
+    fn update_sharded(&mut self, new_k: &Tensor, new_v: &Tensor, keep: bool) -> Result<(Tensor, Tensor), ModelError> {
+        let _ = keep;
+        self.update(new_k, new_v)
+    }
+
     /// Reset to empty state.
     fn clear(&mut self);
 
@@ -70,6 +82,21 @@ impl KvCache for ContiguousKvCache {
 
     fn seq_len(&self) -> usize {
         self.seq_len
+    }
+
+    /// 【分片更新】keep=false 时不持久化新 token，仅返回 [缓存内容; 新 token]。
+    fn update_sharded(&mut self, new_k: &Tensor, new_v: &Tensor, keep: bool) -> Result<(Tensor, Tensor), ModelError> {
+        if keep {
+            return self.update(new_k, new_v);
+        }
+        // 【非归属节点】丢弃新 token，返回拼接结果供本 step attention 使用
+        match self.k.as_ref() {
+            Some(k) => Ok((
+                Tensor::cat(&[k, new_k], 2),
+                Tensor::cat(&[self.v.as_ref().unwrap(), new_v], 2),
+            )),
+            None => Ok((new_k.shallow_clone(), new_v.shallow_clone())),
+        }
     }
 
     fn clear(&mut self) {
@@ -195,6 +222,22 @@ impl KvCache for BlockTableKvCache {
         self.seq_len
     }
 
+    /// 【分片更新】keep=false 时不持久化新 token，仅返回 [所有 block; 新 token]。
+    fn update_sharded(&mut self, new_k: &Tensor, new_v: &Tensor, keep: bool) -> Result<(Tensor, Tensor), ModelError> {
+        if keep {
+            return self.update(new_k, new_v);
+        }
+        // 【非归属节点】丢弃新 token，返回拼接结果供本 step attention 使用
+        if self.k_blocks.is_empty() {
+            return Ok((new_k.shallow_clone(), new_v.shallow_clone()));
+        }
+        let mut k_parts: Vec<Tensor> = self.k_blocks.iter().map(|t| t.shallow_clone()).collect();
+        k_parts.push(new_k.shallow_clone());
+        let mut v_parts: Vec<Tensor> = self.v_blocks.iter().map(|t| t.shallow_clone()).collect();
+        v_parts.push(new_v.shallow_clone());
+        Ok((Tensor::cat(&k_parts, 2), Tensor::cat(&v_parts, 2)))
+    }
+
     fn clear(&mut self) {
         self.k_blocks.clear();
         self.v_blocks.clear();
@@ -252,6 +295,13 @@ impl KvCache for KvCacheImpl {
         match self {
             KvCacheImpl::Contiguous(c) => c.update(new_k, new_v),
             KvCacheImpl::BlockTable(c) => c.update(new_k, new_v),
+        }
+    }
+
+    fn update_sharded(&mut self, new_k: &Tensor, new_v: &Tensor, keep: bool) -> Result<(Tensor, Tensor), ModelError> {
+        match self {
+            KvCacheImpl::Contiguous(c) => c.update_sharded(new_k, new_v, keep),
+            KvCacheImpl::BlockTable(c) => c.update_sharded(new_k, new_v, keep),
         }
     }
 
@@ -391,5 +441,102 @@ mod tests {
         assert!(cache.is_empty());
         assert_eq!(cache.seq_len(), 0);
         assert!(cache.k_blocks().is_empty());
+    }
+
+    /// 【update_sharded keep=true 与 update 行为一致】
+    #[test]
+    fn test_update_sharded_keep_matches_update() {
+        let device = Device::Cpu;
+        let k1 = Tensor::randn([1, 2, 3, 8], (Kind::Float, device));
+        let v1 = Tensor::randn([1, 2, 3, 8], (Kind::Float, device));
+        let k2 = Tensor::randn([1, 2, 1, 8], (Kind::Float, device));
+        let v2 = Tensor::randn([1, 2, 1, 8], (Kind::Float, device));
+
+        let mut a = ContiguousKvCache::new();
+        let mut b = ContiguousKvCache::new();
+        let _ = a.update(&k1, &v1).unwrap();
+        let _ = b.update(&k1, &v1).unwrap();
+
+        let (ka, va) = a.update(&k2, &v2).unwrap();
+        let (kb, vb) = b.update_sharded(&k2, &v2, true).unwrap();
+
+        assert_eq!(a.seq_len(), 4);
+        assert_eq!(b.seq_len(), 4);
+        let diff_k = (&ka - &kb).abs().max().double_value(&[]);
+        let diff_v = (&va - &vb).abs().max().double_value(&[]);
+        assert_eq!(diff_k, 0.0);
+        assert_eq!(diff_v, 0.0);
+    }
+
+    /// 【growth 分片不变量】3 节点按 global_pos % 3 分片：
+    /// - keep=false 的节点不持久化（seq_len 不变），但返回值仍包含当前 token；
+    /// - 每个节点最终 durable = prefill chunk + 自己的 p%N 份额（无缺口、无重复）。
+    #[test]
+    fn test_update_sharded_growth_sharding() {
+        let device = Device::Cpu;
+        let num_nodes = 3usize;
+        let prefill_chunk_len = 2usize; // 每节点 prefill chunk 长度
+        let global_prefill_len = prefill_chunk_len * num_nodes; // 6
+        let decode_steps = 5usize;
+
+        // 每个节点先写入自己的 prefill chunk
+        let mut caches: Vec<ContiguousKvCache> = (0..num_nodes)
+            .map(|_| {
+                let mut c = ContiguousKvCache::new();
+                let k = Tensor::randn([1, 2, prefill_chunk_len as i64, 8], (Kind::Float, device));
+                let v = Tensor::randn([1, 2, prefill_chunk_len as i64, 8], (Kind::Float, device));
+                let _ = c.update(&k, &v).unwrap();
+                c
+            })
+            .collect();
+
+        for step in 0..decode_steps {
+            let global_pos = global_prefill_len + step;
+            let new_k = Tensor::randn([1, 2, 1, 8], (Kind::Float, device));
+            let new_v = Tensor::randn([1, 2, 1, 8], (Kind::Float, device));
+            for (node, cache) in caches.iter_mut().enumerate() {
+                let keep = global_pos % num_nodes == node;
+                let before = cache.seq_len();
+                let (k_full, v_full) = cache.update_sharded(&new_k, &new_v, keep).unwrap();
+                // 返回值始终包含当前 token（供本 step attention）
+                assert_eq!(k_full.size()[2] as usize, before + 1);
+                assert_eq!(v_full.size()[2] as usize, before + 1);
+                // 非归属节点不持久化
+                assert_eq!(cache.seq_len(), if keep { before + 1 } else { before });
+            }
+        }
+
+        // 每个节点 durable = prefill chunk + 自己的 p%N 份额
+        let mut total = 0usize;
+        for (node, cache) in caches.iter().enumerate() {
+            let share = (0..decode_steps)
+                .filter(|s| (global_prefill_len + s) % num_nodes == node)
+                .count();
+            assert_eq!(cache.seq_len(), prefill_chunk_len + share, "node {} durable len", node);
+            total += cache.seq_len();
+        }
+        // 无缺口、无重复：所有节点 durable 之和 = 全局 token 数
+        assert_eq!(total, global_prefill_len + decode_steps);
+    }
+
+    /// 【BlockTable 分片更新】keep=false 时返回完整 KV 但不持久化。
+    #[test]
+    fn test_update_sharded_block_table() {
+        let device = Device::Cpu;
+        let k1 = Tensor::randn([1, 2, 3, 8], (Kind::Float, device));
+        let v1 = Tensor::randn([1, 2, 3, 8], (Kind::Float, device));
+        let k2 = Tensor::randn([1, 2, 1, 8], (Kind::Float, device));
+        let v2 = Tensor::randn([1, 2, 1, 8], (Kind::Float, device));
+
+        let mut cache = BlockTableKvCache::new(4);
+        let _ = cache.update(&k1, &v1).unwrap();
+
+        let (k_full, _) = cache.update_sharded(&k2, &v2, false).unwrap();
+        assert_eq!(k_full.size()[2], 4);
+        assert_eq!(cache.seq_len(), 3); // 未持久化
+
+        let (k_full, _) = cache.update_sharded(&k2, &v2, true).unwrap();
+        assert_eq!(k_full.size()[2], 4);
+        assert_eq!(cache.seq_len(), 4); // 已持久化
     }
 }

@@ -55,3 +55,35 @@ impl Clone for KvBlock {
         }
     }
 }
+
+/// 【Decode Q-ring Packet】decode 阶段绕环传输的 (Q, O, LSE) 累加器包。
+///
+/// LoongServe 风格：decode 时不传 KV，改传单 token 的 Q 和 online softmax
+/// 累加器 (O, LSE)。每个节点收到后用本地 KV segment 对 packet.q 计算 partial
+/// 并 merge，再转发给 successor；N-1 轮后 packet 完成全环合并。
+/// - q: [batch, num_heads, 1, head_dim]
+/// - o: [batch, num_heads, 1, head_dim]（已归一化的累加输出）
+/// - lse: [batch, num_heads, 1] fp32（log-sum-exp 累加器）
+/// - scale: 1/sqrt(head_dim)（协议完整性字段，所有节点取值相同）
+#[cfg(feature = "tch-backend")]
+#[derive(Debug)]
+pub struct RingPacket {
+    pub layer_idx: usize,
+    pub q: Tensor,
+    pub o: Tensor,
+    pub lse: Tensor,
+    pub scale: f64,
+}
+
+#[cfg(feature = "tch-backend")]
+impl Clone for RingPacket {
+    fn clone(&self) -> Self {
+        Self {
+            layer_idx: self.layer_idx,
+            q: self.q.shallow_clone(),
+            o: self.o.shallow_clone(),
+            lse: self.lse.shallow_clone(),
+            scale: self.scale,
+        }
+    }
+}

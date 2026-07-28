@@ -1,6 +1,15 @@
 #![allow(dead_code)]
 
-use super::block::KvBlock;
+use super::block::{KvBlock, RingPacket};
+
+/// 【环上消息】传输层线上复用同一组 stream 承载两类 payload：
+/// KV block（prefill / legacy decode）和 decode Q-ring packet。
+#[cfg(feature = "tch-backend")]
+#[derive(Debug)]
+pub enum RingMessage {
+    KvBlock(KvBlock),
+    RingPacket(RingPacket),
+}
 
 /// 【KV 传输层 Trait】定义分布式 worker 之间交换 KV block 的接口。
 ///
@@ -65,5 +74,41 @@ pub trait KvTransport: Send {
         let result = self.recv_kv_block();
         self.flush_send()?;
         result
+    }
+
+    // ====== Decode Q-ring packet API ======
+    // decode 阶段（seq_len == 1）环上改传 (Q, O, LSE) 累加器包，不再传 KV。
+    // 与 KV API 同样按 split-phase 设计：submit_send_packet / poll_recv_packet / flush_send。
+
+    /// 【是否支持 Q-ring packet】
+    /// 返回 false 的 transport（如顺序驱动的 LinkedMockKvTransport）会让
+    /// decode 自动回退到 legacy KV-resend 路径，保持既有行为不变。
+    fn supports_ring_packets(&self) -> bool {
+        false
+    }
+
+    /// 【提交异步发送 packet】默认不支持，调用方应先检查 supports_ring_packets()。
+    fn submit_send_packet(&mut self, _packet: &RingPacket) -> Result<(), String> {
+        Err("ring packets not supported by this transport".to_string())
+    }
+
+    /// 【轮询接收 packet】非阻塞；None 表示暂时没有数据。
+    fn poll_recv_packet(&mut self) -> Result<Option<RingPacket>, String> {
+        Ok(None)
+    }
+
+    /// 【阻塞接收 packet】默认实现：轮询 poll_recv_packet 直到有数据（忙等，1ms 间隔）。
+    fn recv_packet(&mut self) -> Result<Option<RingPacket>, String> {
+        loop {
+            match self.poll_recv_packet()? {
+                Some(packet) => return Ok(Some(packet)),
+                None => std::thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        }
+    }
+
+    /// 【测试用 downcast】让测试可以检查 transport 内部状态（如 Mock 记录的发送包）。
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
     }
 }

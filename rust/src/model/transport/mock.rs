@@ -1,13 +1,17 @@
 #![allow(dead_code)]
 
 #[cfg(feature = "tch-backend")]
-use super::block::KvBlock;
+use super::block::{KvBlock, RingPacket};
 use super::r#trait::KvTransport;
 
 /// In-memory transport for unit testing distributed attention logic.
 #[cfg(feature = "tch-backend")]
 pub struct MockKvTransport {
     queue: std::collections::VecDeque<KvBlock>,
+    /// 【packet 接收队列】测试预置 peer 会发来的 (Q, O, LSE) 包。
+    packet_queue: std::collections::VecDeque<RingPacket>,
+    /// 【已发送 packet 记录】供测试断言本节点 seed / 转发的内容。
+    sent_packets: Vec<RingPacket>,
 }
 
 #[cfg(feature = "tch-backend")]
@@ -15,11 +19,23 @@ impl MockKvTransport {
     pub fn new() -> Self {
         Self {
             queue: std::collections::VecDeque::new(),
+            packet_queue: std::collections::VecDeque::new(),
+            sent_packets: Vec::new(),
         }
     }
 
     pub fn push(&mut self, block: KvBlock) {
         self.queue.push_back(block);
+    }
+
+    /// 【预置 packet】模拟 ring 上 predecessor 会发来的 (Q, O, LSE) 包。
+    pub fn push_packet(&mut self, packet: RingPacket) {
+        self.packet_queue.push_back(packet);
+    }
+
+    /// 【读取已发送 packet】用于断言 seed / 转发内容是否正确。
+    pub fn sent_packets(&self) -> &[RingPacket] {
+        &self.sent_packets
     }
 }
 
@@ -42,14 +58,42 @@ impl KvTransport for MockKvTransport {
     fn recv_kv_block(&mut self) -> Result<Option<KvBlock>, String> {
         Ok(self.queue.pop_front())
     }
+
+    fn supports_ring_packets(&self) -> bool {
+        true
+    }
+
+    /// 【提交发送 packet】记录到 sent_packets，供测试断言。
+    fn submit_send_packet(&mut self, packet: &RingPacket) -> Result<(), String> {
+        self.sent_packets.push(packet.clone());
+        Ok(())
+    }
+
+    fn poll_recv_packet(&mut self) -> Result<Option<RingPacket>, String> {
+        Ok(self.packet_queue.pop_front())
+    }
+
+    /// 【覆盖默认 recv_packet】预置队列为空即表示无数据，直接返回 None。
+    fn recv_packet(&mut self) -> Result<Option<RingPacket>, String> {
+        Ok(self.packet_queue.pop_front())
+    }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
 }
 
 /// 【双向内存传输通道】用于单进程测试中模拟两个分布式 worker 交换 KV block。
-/// 
+///
 /// 在真实的分布式环境里，domain0 和 domain1 运行在两台不同的机器上，通过网络互相发送 KV。
 /// 在单进程测试里，我们用这个结构模拟网络：
 /// - domain0 发送的 KV block 会进入 domain1 的接收队列
 /// - domain1 发送的 KV block 会进入 domain0 的接收队列
+///
+/// 【不支持 decode Q-ring packet】该 transport 的既有测试是单线程顺序驱动的
+///（domain0 的 forward 完整跑完后才跑 domain1），无法满足 Q-ring 的
+/// "本 step 内 rendezvous" 语义；supports_ring_packets() 保持默认 false，
+/// decode 自动回退 legacy KV-resend 路径，既有测试行为不变。
 #[cfg(feature = "tch-backend")]
 #[derive(Clone)]
 pub struct LinkedMockKvTransport {
