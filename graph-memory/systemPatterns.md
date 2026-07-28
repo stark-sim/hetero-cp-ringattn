@@ -40,6 +40,35 @@ QUIC: quinn 0.11 + rustls 0.23 + rcgen 0.13。
 模型权重：safetensors, tokenizers, half。
 
 _updated: 2026-06-29 05:34:19_
+### 决策:自驱动环(self-driving ring)——decode forward 整体骑在环上,无 owner 无冗余,每层 N-1 跳
+
+type: `decision` · status: `held` · confidence: 0.9 · importance: 1.0 · source: `user-direction`
+
+用户方向(2026-07-28,ISSUE-006 收口方案):自驱动环是关键。子环弹性已否决(环外 KV 必然集中,违反切分);Rust 线 N× 冗余 forward 同样不可接受。
+
+【核心机制】包不回家:层 L 的包从 S 出发(S 以本地 partial 做种子),经 N-1 跳到达 S 的前驱时 N 份 partial 已齐——前驱就地做 finisher(W_o+MLP+LayerNorm→h_{L+1})并以发起者身份发出层 L+1 的包;末层 finisher 算 logits、采样、embed 新 token,直接发起下一步第一圈。decode 全程无中心驱动,coordinator 只做准入/释放。
+
+【五个目标】
+1. 无 owner:starter/finisher/sampler 全部逐层逐 token 轮转,任何节点可在任意层接替;
+2. 无冗余:单 token 单 forward,non-attention 计算(MLP/投影/logits/采样)随包逐层轮转分布——同时消除 Rust 线 N× 冗余和 plugin 线 owner 集中;
+3. 显存切分保持:每节点持久持有=本 chunk+growth/N;当前 token 在种子侧瞬时;
+4. 拓扑不变:每节点恰 2 连接,线性成本,部分可达(N>3 非全连通)网络可用;
+5. 跳数最优:每层 N-1 跳(非 N 跳,无需回程),每 token 24×(N-1)——层间依赖决定这是 ring decode 的下限,单 token 压不成一圈。
+
+【关键点】
+1. 增长分片不变:包经过全节点,携带 h_L(或当前 token KV),assignee(p%N)自算自留,零额外传输;当前 token 永远只在种子侧瞬时参与本步(causal 尾);
+2. 正确性不变量:每位置 KV 恰好一个节点持有;online softmax 归并可交换可结合,归并顺序无关;
+3. 与 attention 的 online softmax 环上归并是同一数学——forward 整体骑环是 attention 环的自然延伸(用户原话:两者契合);
+4. 与 Rust 线现状的差异:现状每节点发起自己的包(N 包×(N-1) 跳,N× 冗余);自驱动环单包 (N-1) 跳,零冗余;
+5. 与 plugin 线现状的差异:现状 owner 种子+N 跳回程;改 successor-seeded 即同样 N-1 跳(见下)。
+
+【vLLM plugin 线:不抛弃,受限形态最优】
+全自驱动需在层间接管 forward(MLP/norm/logits 在 vLLM model 代码里,attention backend 与 KV connector 两个扩展点都不够;自写 model runner=fork,违背插件跟随上游原则)。改为两步:
+(a) successor-seeded 优化:包从 owner 后继出发、owner 最后归并,同样达到每层 N-1 跳(省 1/3 跳,今天即可做);
+(b) driver 角色分散:请求级 owner 轮转(ringc 已验证的轮转放置)使 driver 负载在多请求间均摊。
+边界声明:plugin 线 driver 钉死是 vLLM 嵌入架构税,非语义缺陷;若未来 vLLM 提供层间扩展点,再评估全自驱动。
+
+_updated: 2026-07-28 16:36:22_
 ### HCP 两阶段统一 ring 架构:prefill 传 KV、decode 传 Q+LSE,全程 P2P 逐跳,每节点只需 2 个连接
 
 type: `decision` · status: `held` · confidence: 0.9 · importance: 0.95 · source: `user-direction`

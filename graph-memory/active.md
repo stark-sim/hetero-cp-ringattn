@@ -21,6 +21,13 @@ B. vLLM decode ≥2 并发+增长分片保持(修 004,PoC 最小要求);
 C. Rust decode 移植 Q+LSE 累积器环+增长分片(修 007+008)。
 
 _updated: 2026-07-27 15:10:25_
+### 任务D:Rust 线实现自驱动环 decode(单包 N-1 跳/层,角色全轮转,零冗余)
+
+type: `task` · status: `ongoing` · confidence: 0.9 · importance: 0.95 · source: `user-direction`
+
+decision-self-driving-ring-20260728 的 Rust 落地。改动面:ring.rs decode 路径从"每节点发起 N 包"改为"单包轮转+finisher 就地续层";model.rs 层间允许 finisher 节点就地应用 W_o/MLP/norm 并续发;采样/logits 移到末层 finisher;coordinator 退为准入/释放。验证:既有 68 测试回归+新正确性测试(token 对单节点参考、角色轮转计数、零冗余证明=每节点每 token 恰好 1 次 forward 份额)+MPS 双节点+跨节点 CUDA+HIP 冒烟。前置:无(任务C已闭环)。
+
+_updated: 2026-07-28 16:36:22_
 ### 决策:禁止星形传输——decode 只走 ring;prefill 只走邻接累积转发;拓扑成本必须线性
 
 type: `decision` · status: `held` · confidence: 0.95 · importance: 0.95 · source: `user-direction`
@@ -292,6 +299,13 @@ type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.9 · sou
 与 HCP 相关性：直接相关，可能缓解 pearl 等小/慢 domain 在 Phase 2 成为瓶颈的问题。
 
 _updated: 2026-06-29 06:06:09_
+### 任务E:plugin 线 successor-seeded 优化(owner 最后归并,每层 N 跳→N-1 跳)
+
+type: `task` · status: `ongoing` · confidence: 0.85 · importance: 0.85 · source: `user-direction`
+
+decision-self-driving-ring-20260728 的 plugin 受限落地。改动:ring_decode_step 种子改为 q-only(中性累积器或首跳播种标志),owner 在收包后本地 partial 最后归并;hop 数每层 3→2(N=3),每 token 72→48。验证:p2p 单机+三机回归(判据不变,token 一致,hop 计数变为 N-1)。小改动,不动 vLLM 行为。
+
+_updated: 2026-07-28 16:36:22_
 ### decode 通信策略分析:当前 owner 汇聚(0 跳/全量 KV 常驻) vs 累积器绕环(L×P 跳/语义保持),选择由互联延迟决定
 
 type: `belief` · status: `held` · confidence: 0.85 · importance: 0.85 · source: `user-direction + analysis`
