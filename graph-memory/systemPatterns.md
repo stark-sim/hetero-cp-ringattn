@@ -68,7 +68,29 @@ type: `decision` · status: `held` · confidence: 0.9 · importance: 1.0 · sour
 (b) driver 角色分散:请求级 owner 轮转(ringc 已验证的轮转放置)使 driver 负载在多请求间均摊。
 边界声明:plugin 线 driver 钉死是 vLLM 嵌入架构税,非语义缺陷;若未来 vLLM 提供层间扩展点,再评估全自驱动。
 
-_updated: 2026-07-28 16:36:22_
+【动机剖析六问(规范版,2026-07-28 计划冻结前)】
+1. 问题:decode 期三类非对等/浪费并存——plugin 线 owner 钉死(driver+全 forward+采样集中)、Rust 线 N× 冗余 forward(每节点全量重算,仅 worker 0 被采用)、每层 N 跳(含一次纯回程)。
+2. 现状:任务C 的 Q-ring 已验证(传 Q+LSE 不传 KV),但 Rust 线每节点发起 N 包且全节点冗余,plugin 线 owner 种子+N 跳回程;增长分片、显存切分、ring-only 拓扑已闭环。
+3. 目标态:单包轮转;角色(starter/finisher/sampler)逐层逐 token 轮转;每层 N-1 跳;零冗余(单 token 单 forward);token 与单节点参考一致;hop 计数、轮转计数、零冗余证明可机器验证。
+4. 别人怎么做:LoongServe 弹性 DoP+KV 迁移(已否决:需全连通+破坏切分);TP 按头分片(需 NVLink/collective);流水线并行(切层不切 KV,不解决 KV 显存);Ring Attention 原论文不管 decode serving。无现成轮子——自驱动环=attention KV 环归并(既有)×层间流水轮转(新)的复合。
+5. 我们怎么做:包不回家(第 N-1 跳 N 份 partial 已齐,前驱就地 finisher 续层);末层 finisher 采样+embed 续发;增长分片照旧(assignee 自算自留)。关键架构领悟:decode 期 worker 无 forward 调用栈,是纯事件循环(收包→partial→完整则 MLP 续发/否则转发),比现状更简单而非更复杂。
+6. 为什么:P2P-only+部分可达+显存切分三重约束下,这是唯一同时满足无 owner/无冗余/拓扑线性的形态;且与 attention online softmax 环归并同一数学(用户判定:两者契合)。
+
+【牺牲四问】
+1. 默认为什么存在:Rust 冗余=复用 prefill 环控制流最省事+全节点状态一致随便挑节点采样;N 跳回程=发起者收回结果的直觉写法;plugin owner=vLLM 单引擎语义最自然。
+2. 牺牲什么:(a) 放弃"每节点每步都持全局结果"——任一时刻只有 finisher 链上的节点持有中间态;(b) 放弃 N 包并发——单包串行,带宽利用降为一路;(c) plugin successor-seeded 把 owner 本地计算从"与传输重叠"变为"发包后与绕环重叠"(严格分析:现=本地计算+N跳;新=发包+本地计算‖(N-2)跳+收包,仍省 1 跳,本地重叠性不损失)。
+3. 被牺牲者用途:冗余提供简单性与状态一致性;并发包在带宽饱和时利用多链路。
+4. 对本项目意义:包为 KB 级,链路远未饱和,RTT 主导,(b) 无实际损失;(a) 状态一致性改由包不变量保证(每位置 KV 恰一节点持有);宕机语义不变(环断即死,与现状同,PoC 接受)。结论:implement。
+
+【实施排序(DEPENDS_ON 见边)】
+E(plugin successor-seeded,小步先行)→ D1(Rust 单包轮转 attention,ring.rs)→ D2(finisher 就地续层,model.rs 事件循环化,最大工程风险点)→ D3(采样轮转+coordinator 退位)→ D4(验证阶梯:mock→MPS 双节点→跨节点 CUDA+HIP,判据=token 一致+轮转计数+零冗余证明+hop 计数)。
+
+【风险登记】
+risk-1(中):D2 把 model.rs 从一次调用栈改为事件驱动,侵入面大——缓解:decode 期与 prefill 期代码路径分离,prefill 不动;
+risk-2(低):单包在大 head_dim 模型下带宽饱和场景损失并发——KB 级包下不构成;
+risk-3(低):首个 finisher 的等待编排冷启动(prefill 后第一包从 owner 发出)——从既有 decode-ring 注册状态推导。
+
+_updated: 2026-07-28 16:45:20_
 ### HCP 两阶段统一 ring 架构:prefill 传 KV、decode 传 Q+LSE,全程 P2P 逐跳,每节点只需 2 个连接
 
 type: `decision` · status: `held` · confidence: 0.9 · importance: 0.95 · source: `user-direction`
