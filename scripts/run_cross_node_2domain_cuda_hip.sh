@@ -89,7 +89,8 @@ scp -o ConnectTimeout=30 "${PROMPT_FILE}" "${PEARL_SSH}:~/hcp_prompt_${RUN_ID}.t
 # === Launch Coordinator (white) ===
 echo "=== Launching Coordinator (white) ==="
 coordinator_cmd="cd ${WHITE_REPO_DIR} && export HCP_TCH_DEVICE=cuda:0 && export LD_LIBRARY_PATH=/home/stark/libtorch/lib:\${LD_LIBRARY_PATH:-} && \
-  ./rust/target/release/hcp-ringattn-rust \
+export HCP_RING_DECODE_RING=${HCP_RING_DECODE_RING:-1} && export HCP_PERF_LOG=${HCP_PERF_LOG:-} && \
+    ./rust/target/release/hcp-ringattn-rust \
     --distributed-role coordinator \
     --model-dir ${WHITE_MODEL_DIR} \
     --prompt-file ~/hcp_prompt_${RUN_ID}.txt \
@@ -105,7 +106,8 @@ sleep 3
 # === Launch Worker 1 (pearl, domain 1) ===
 echo "=== Launching Worker 1 (pearl, domain 1) ==="
 pearl_worker_cmd="cd ${PEARL_REPO_DIR} && export LD_PRELOAD=/home/stark/libtorch/lib/libtorch_hip.so && export HCP_TCH_DEVICE=cuda:0 && export LD_LIBRARY_PATH=/home/stark/libtorch/lib:\${LD_LIBRARY_PATH:-} && \
-  ./rust/target/release/hcp-ringattn-rust \
+export HCP_RING_DECODE_RING=${HCP_RING_DECODE_RING:-1} && export HCP_PERF_LOG=${HCP_PERF_LOG:-} && \
+    ./rust/target/release/hcp-ringattn-rust \
     --distributed-role worker \
     --domain-id 1 \
     --model-dir ${PEARL_MODEL_DIR} \
@@ -122,7 +124,8 @@ sleep 5
 # === Launch Worker 0 (white, domain 0) ===
 echo "=== Launching Worker 0 (white, domain 0) ==="
 white_worker_cmd="cd ${WHITE_REPO_DIR} && export HCP_TCH_DEVICE=cuda:0 && export LD_LIBRARY_PATH=/home/stark/libtorch/lib:\${LD_LIBRARY_PATH:-} && \
-  ./rust/target/release/hcp-ringattn-rust \
+export HCP_RING_DECODE_RING=${HCP_RING_DECODE_RING:-1} && export HCP_PERF_LOG=${HCP_PERF_LOG:-} && \
+    ./rust/target/release/hcp-ringattn-rust \
     --distributed-role worker \
     --domain-id 0 \
     --model-dir ${WHITE_MODEL_DIR} \
