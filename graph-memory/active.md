@@ -32,6 +32,16 @@ B. vLLM decode ≥2 并发+增长分片保持(修 004,PoC 最小要求);
 C. Rust decode 移植 Q+LSE 累积器环+增长分片(修 007+008)。
 
 _updated: 2026-07-27 15:10:25_
+### 任务D:Rust 线实现自驱动环 decode(单包 N-1 跳/层,角色全轮转,零冗余)
+
+type: `task` · status: `ongoing` · confidence: 0.9 · importance: 0.95 · source: `docs/plans/2026-07-29-self-driving-ring-decode-implementation.md`
+
+decision-self-driving-ring-20260728 的 Rust 落地。改动面:ring.rs decode 路径从"每节点发起 N 包"改为"单包轮转+finisher 就地续层";model.rs 层间允许 finisher 节点就地应用 W_o/MLP/norm 并续发;采样/logits 移到末层 finisher;coordinator 退为准入/释放。验证:既有 68 测试回归+新正确性测试(token 对单节点参考、角色轮转计数、零冗余证明=每节点每 token 恰好 1 次 forward 份额)+MPS 双节点+跨节点 CUDA+HIP 冒烟。前置:无(任务C已闭环)。
+[2026-07-28 细化] 子步分解:D1 单包轮转 attention(ring.rs,不动 model 层间)→ D2 finisher 就地续层(model.rs decode 期事件循环化,最大风险点)→ D3 采样轮转+coordinator 退位 → D4 验证阶梯(mock→MPS→跨节点 CUDA+HIP)。前置:任务E(plugin successor-seeded)先行预演 owner-最后归并。
+[2026-07-29 计划修订] task E 已因 owner-return N-hop 下限被拒绝,不再作为前置。D1 单包 attention 与最小 D2 层间 continuation 合并为首个可运行垂直切片:coordinator 暂保留 token 广播,所有 worker 进入 collective decode;环内单包 N-1 hops,finisher 续层,末层唯一 logits producer。之后再做 batch 隔离、采样自治和 coordinator 退位。
+[2026-07-29 最终策略与实施计划] KV placement 改为显存 hard bound 内 bounded compute balance，容量墙处退化 pure capacity；二维 assignee=(request phase+position+layer)；每 request 独立异步 packet pipeline；详细 TDD 计划见 docs/plans/2026-07-29-self-driving-ring-decode-implementation.md，按 Task 1-14 和 R1/R2/R3/R4 checkpoint 执行。
+
+_updated: 2026-07-29 05:05:41_
 ### 不为形式上的无 owner 强制轮转 sampler;以 KV/计算瓶颈为判据
 
 type: `preference` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `user-direction-2026-07-29`
@@ -39,15 +49,6 @@ type: `preference` · status: `held` · confidence: 1.0 · importance: 0.95 · s
 用户确认:若 L mod N=0 导致末层 sampler 对单请求固定,只要它不造成显存或关键计算瓶颈即可接受。设计含义:kv_assignee 必须与 sampler 解耦;默认保持零 token-boundary handoff 和 L*(N-1) attention hops。多请求用 request phase 分散 sampler;异构时可把 sampler 偏向更快节点。仅在实测 LM-head/sampling queue 成为吞吐瓶颈时启用 +1 token-ID phase shift。
 
 _updated: 2026-07-28 17:26:22_
-### 任务D:Rust 线实现自驱动环 decode(单包 N-1 跳/层,角色全轮转,零冗余)
-
-type: `task` · status: `ongoing` · confidence: 0.9 · importance: 0.95 · source: `user-direction`
-
-decision-self-driving-ring-20260728 的 Rust 落地。改动面:ring.rs decode 路径从"每节点发起 N 包"改为"单包轮转+finisher 就地续层";model.rs 层间允许 finisher 节点就地应用 W_o/MLP/norm 并续发;采样/logits 移到末层 finisher;coordinator 退为准入/释放。验证:既有 68 测试回归+新正确性测试(token 对单节点参考、角色轮转计数、零冗余证明=每节点每 token 恰好 1 次 forward 份额)+MPS 双节点+跨节点 CUDA+HIP 冒烟。前置:无(任务C已闭环)。
-[2026-07-28 细化] 子步分解:D1 单包轮转 attention(ring.rs,不动 model 层间)→ D2 finisher 就地续层(model.rs decode 期事件循环化,最大风险点)→ D3 采样轮转+coordinator 退位 → D4 验证阶梯(mock→MPS→跨节点 CUDA+HIP)。前置:任务E(plugin successor-seeded)先行预演 owner-最后归并。
-[2026-07-29 计划修订] task E 已因 owner-return N-hop 下限被拒绝,不再作为前置。D1 单包 attention 与最小 D2 层间 continuation 合并为首个可运行垂直切片:coordinator 暂保留 token 广播,所有 worker 进入 collective decode;环内单包 N-1 hops,finisher 续层,末层唯一 logits producer。之后再做 batch 隔离、采样自治和 coordinator 退位。
-
-_updated: 2026-07-28 17:19:59_
 ### 决策:禁止星形传输——decode 只走 ring;prefill 只走邻接累积转发;拓扑成本必须线性
 
 type: `decision` · status: `held` · confidence: 0.95 · importance: 0.95 · source: `user-direction`
@@ -142,13 +143,13 @@ type: `task` · status: `superseded` · confidence: 0.95 · importance: 0.95 · 
 1M v9（3:1 split）成功，prefill 24/24 + decode 5/5，exit=0。文档已同步：1M_CONTEXT_THUNDERBOLT_PLAN.md、SCALING_ARGUMENT.md、systemPatterns.md。当前无未完成的 1M 攻坚任务；下一步决定是否需要更大模型 / 更多 domain 验证。
 
 _updated: 2026-06-29 06:01:28_
-### 层数与节点数模数共振可能形成 sampler 计算热点,但不破坏 KV 1/N 分区
+### 层数与节点数模数共振可能形成 sampler 计算热点,但不破坏冻结 KV quota
 
 type: `risk` · status: `open` · confidence: 0.98 · importance: 0.9 · source: `docs/plans/2026-07-29-self-driving-ring-theory.md`
 
 当 L mod N=0,finisher->next starter 的零额外跳策略使单请求 token sampler 固定。它不改变 kv_assignee,因此不增加 durable KV;只固定承担 final norm/LM-head/sampling 与 O(batch*vocab) 瞬时 logits。默认缓解:request 初始 phase 在节点间分散;异构时可偏向更快节点。只有实测 sampler queue/利用率成为吞吐瓶颈时才启用 k-hop token phase shift;要求全节点轮转时选择 gcd(k-L,N)=1 的 k。L=24,N=3 可用 k=1。验证覆盖 L mod N=0,统计每请求与全局 sampler 分布、LM-head 时间和 queue wait。
 
-_updated: 2026-07-28 17:41:07_
+_updated: 2026-07-29 05:05:41_
 ### 决策:Rust decode 改 Q+LSE 累积器环;增长按 p mod N 分片且零传输(全节点同算 forward,非自有即弃)
 
 type: `decision` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `user-direction`

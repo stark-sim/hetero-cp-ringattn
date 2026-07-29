@@ -2,6 +2,55 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### Harness Auditor 拒绝第一版自驱动 decode 实施计划发布
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `harness-review-2026-07-29`
+
+Pre-action verdict REJECTED。阻断点:1) H_i 只有公式，没有 resource profile/wire 来源及 zero/nonzero/concurrent 计费测试；2) cache.rs 的 Contiguous/BlockTable 路径使用 Tensor::cat，产生 O(local context) 临时整 shard，固定 H_i 无法覆盖；3) mode 由 worker 本地分支而非 coordinator 全员 capability/version 协商，mixed configuration 可能造成 response 合同不一致或 ring deadlock。要求修订计划与 graph memory 后重审。
+
+_updated: 2026-07-29 06:03:41_
+### 修订自驱动 decode 计划:reserved KV slab、完整 memory ledger 与全员 mode negotiation
+
+type: `revision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `docs/plans/2026-07-29-self-driving-ring-decode-implementation.md`
+
+响应 Auditor REJECTED:resource profile 新增 B_i^K/B_i^V/G_i/H_i/W_i；C_i 来自模型加载后的可靠 device-free telemetry 与显式 KV budget 保守值，K/V 两个 slab 分别按 allocator granularity round。ledger 对 active requests 的持久 slab+metadata 求和、单线程 executor workspace 取 max；Task 1 覆盖 zero/nonzero share、并发重复计费、granularity 和 workspace release。Task 5 在 AdmitRequest 内物理预分配 ReservedKvCache，成功后才 ack；append copy 到 reserved slot、history narrow view，self-driving 禁止全 shard Tensor::cat。Task 3/8 使用 versioned WorkerHello 和 coordinator-only mode selection；先完成 control negotiation，再建立两个 peer data-plane streams，收齐 DataPlaneReady 后才 prefill，mixed-mode 提前拒绝。计划状态 ongoing，待重新审查。
+
+_updated: 2026-07-29 06:24:21_
+### 第一轮自驱动 decode 计划复核修正 overhead、prompt placement 和 feature gate
+
+type: `evidence` · status: `superseded` · confidence: 1.0 · importance: 0.95 · source: `docs/plans/2026-07-29-self-driving-ring-decode-implementation.md`
+
+数学复核发现 fixed allocator/request overhead 若放进整请求 payload 后再乘份额，会在小份额节点低估精确 reservation；修正为先从 free KV bytes 整笔扣除 H_i，再计算 payload 上界并在整数计划后逐节点复核。长 prompt 的 durable history 决定整个 decode 的 attention scan，因此 prompt contiguous chunk 必须与 decode growth calendar 共享 bounded compute-balanced target。代码复核确认 worker_sdk 整体受 tch-backend gate，纯 scheduler 应放 distributed::decode_scheduler；model::decode 的纯 contract 可无条件编译，tensor driver 单独 feature gate。 后续 Auditor 指出该轮复核仍遗漏 context-sized 本地 Tensor::cat workspace、resource profile 字段来源和全员 mode negotiation，因此本节点只保留为阶段性证据，不作为计划安全闭环。
+
+_updated: 2026-07-29 06:03:41_
+### 修订 strict equal 1/N 默认:改为显存硬上界内 compute-balanced placement
+
+type: `revision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-07-29`
+
+用户澄清 1/N 只强调显存压力可控和无 owner-collapse；异构设备必须按容量上界分配，并在上界内按 attention throughput 优化。旧 decision-self-driving-ring-theory-20260729 的 strict equal 默认与此冲突，现由 decision-self-driving-ring-v2-20260729 supersede。保留的部分:单 packet、N-1 hops、两 peer、exact-once、固定 sampler 可接受。改变的部分:equal 只在容量/吞吐相同时成立；默认 planner 使用 bounded water-filling，容量墙处退化为 pure capacity。
+
+_updated: 2026-07-29 05:05:41_
+### 用户确认显存 hard bound + bound 内 compute balance + 容量墙退化
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-07-29`
+
+用户明确确认:显存容量是 hard bound；在 hard bound 内按 attention throughput 做 compute-balanced 优化；请求逼近总容量时自然退化为纯 capacity 比例。并再次确认多请求各自异步跑 packet、request_id 分散初始 phase。
+
+_updated: 2026-07-29 05:05:41_
+### 实现计划代码审计:真正多请求 pipeline 必须替换阻塞 decode_request runtime
+
+type: `evidence` · status: `held` · confidence: 0.98 · importance: 0.95 · source: `docs/plans/2026-07-29-self-driving-ring-decode-implementation.md`
+
+代码审计确认:RingPacket 仅 layer/Q/O/LSE/scale；LlamaModel.forward 同步执行 embedding->全部层->final norm->LM head；HcpRingAttentionBackend.forward 耦合 Q/K/V/O；WorkerRuntime 在 backend.decode_request 内阻塞；WorkerResponse.DecodeDone 默认每 worker 返回 logits；QUIC 已有 per-layer split-phase packet transport可复用。因此 R1 必须同时接 packet/projection/layer continuation/unique outcome；R2 必须新增 packet ingress、bounded ready queue、single-device executor、backpressure/fairness，单靠 coordinator DecodeBatch 不能证明 ring 内 pipeline。 计划可执行性复核补充: model 顶层可在 no-default 构建，纯 route/header 放无 Tensor 的 model::decode，tensor driver 后续用 tch feature gate；worker_sdk 整体受 tch-backend gate，纯 fairness/backpressure scheduler 必须放 distributed::decode_scheduler，再由 worker_sdk adapter 持有 Tensor。 第二轮代码复核:ContiguousKvCache.update 与 BlockTableKvCache.update/get_kv 都通过 Tensor::cat 物化本地完整 shard；当前 WorkerHandshake 固定 16 bytes，仅含 domain_id/capacity_mb；WorkerRuntime 无 negotiated mode 状态。这要求 reserved slab 和 versioned cluster negotiation 成为 R1 前置。
+
+_updated: 2026-07-29 06:03:41_
+### 准备并审查自驱动 decode ring 详细 TDD 实施计划
+
+type: `task` · status: `ongoing` · confidence: 0.98 · importance: 0.95 · source: `docs/plans/2026-07-29-self-driving-ring-decode-implementation.md`
+
+已生成 docs/plans/2026-07-29-self-driving-ring-decode-implementation.md。计划含动机六问/牺牲四问、bounded water-filling、冻结二维 calendar、14 个依赖 checkpoint、每步 red-green 命令、focused commit、R1/R2/R3/R4 审查门，以及 MPS/CUDA+HIP/三节点异构完成条件。本任务只准备计划，未修改生产代码。 第一轮复核补充:prompt contiguous chunk 与 decode calendar 共享 bounded target；fixed KV overhead 先整笔扣除再求 payload cap；纯 scheduler 放 ungated distributed 模块；已修正 sampler recurrence 测试参数和无效多 filter cargo 命令。 补充合同:throughput 缺失时 capacity-only 明确定义为 x_i=u_i/sum(u)，不混合猜测 rate；sampler logits 在同一 compute quantum 内消费释放，不进入 packet/ready queue/backlog。 [Auditor pre-action REJECTED] 计划需补齐:H_i/G_i/W_i 的 profile/wire 来源与计费测试；self-driving cache 改为 reservation-backed slab，禁止现有 Tensor::cat 全 shard 临时副本；coordinator 全员 version/mode/capability 协商并在 mixed-mode 时于 prefill 前拒绝。修订后重新审查。 [第二轮修订完成待审] K/V slab 分别按 allocator granularity 计费；C_i 不再从 capacity_mb 粗略换算；AdmitRequest 物理分配成功后才 ack；bootstrap 改为 control hello/negotiation -> peer streams -> DataPlaneReady -> admission/prefill。
+
+_updated: 2026-07-29 06:26:48_
 ### 固定 sampler 不增加 durable KV,额外显存仅 O(batch*vocab) 瞬时 logits
 
 type: `evidence` · status: `held` · confidence: 0.98 · importance: 0.9 · source: `analysis-2026-07-29`

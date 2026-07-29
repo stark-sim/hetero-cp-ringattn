@@ -79,7 +79,7 @@ risk-3(低):首个 finisher 的等待编排冷启动(prefill 后第一包从 own
 _updated: 2026-07-28 17:41:07_
 ### 理论裁定:自驱动 ring 适合 HCP decode,严格 KV 分区优先于 sampler 形式轮转
 
-type: `decision` · status: `held` · confidence: 0.95 · importance: 1.0 · source: `docs/plans/2026-07-29-self-driving-ring-theory.md`
+type: `decision` · status: `superseded` · confidence: 0.95 · importance: 1.0 · source: `docs/plans/2026-07-29-self-driving-ring-theory.md`
 
 【结论】适合。它在不依赖 collective/全连通网络的条件下同时实现:每节点仅 predecessor+successor 两条 peer 关系;每层 N-1 attention packet 边;durable KV 按位置互斥完备分区;单个逻辑 distributed forward;非 attention continuation 唯一执行。
 【核心不变量】对任意 request/layer,各节点 durable KV 位置集合两两不交且并集为全部历史位置;round-robin 下每节点位置数属于 floor(T/N) 或 ceil(T/N),有限 token 下不可能严格等于 T/N,最大只差 1 token。环上 packet 为 O(model_width),不随 context 增长。所有 N 节点各算一次本地 attention partial;Q 只由 starter 算一次;当前 token K/V 只由 assignee 算/存/参与一次;W_o+residual+MLP 只由 finisher 算一次;最终 logits/sample 只算一次。
@@ -90,7 +90,20 @@ type: `decision` · status: `held` · confidence: 0.95 · importance: 1.0 · sou
 【异构边界】严格 1/N KV 是 memory correctness policy,但总容量受最小显存节点约束且单 token 延迟包含所有节点。capacity/speed weighted placement 可提高利用率,却必然让部分节点超过 1/N,必须作为显式替代策略,不能暗中弱化默认保证。多请求 packet pipeline 可提高吞吐,但需 bounded queue/backpressure/request ordering,不得复制 durable KV。
 [2026-07-29 用户裁定] 不为形式上的无 owner 强制 sampler 逐 token 轮转。固定 sampler 不增加 durable KV;默认用 request phase 做请求间均衡并保留 L*(N-1) attention hops。+1 token-ID phase shift 降为实测 sampler 计算/队列瓶颈后的可选策略。
 
-_updated: 2026-07-28 18:04:28_
+_updated: 2026-07-29 05:05:41_
+### 理论裁定 v2:自驱动 decode ring 采用显存硬上界内 compute-balanced KV placement
+
+type: `decision` · status: `held` · confidence: 0.98 · importance: 1.0 · source: `docs/plans/2026-07-29-self-driving-ring-decode-review.md`
+
+【结论】自驱动 ring 适合 HCP decode。数据面保持单 packet、每层 N-1 hops、每 worker 仅 predecessor/successor、无 collective；durable KV 互斥完备无复制，Q/current K/V/W_o+MLP/LM-head 各有唯一执行者。1/N 只表示无 owner-collapse、无 context-sized 远端临时 KV 和显存压力可计算，不是异构设备的 equal-placement 合同。
+【placement 裁定】admission 先扣除模型/runtime/safety/active-request reservation，得到每节点 free KV bytes；按该节点实际 KV dtype/layout 的 per-layer bytes 计算请求份额上界 u_i。若 sum(u_i)<1 拒绝。可行域内解 min max_i(x_i/attention_rate_i)，约束 sum(x)=1 且 x_i<=u_i；解为 x_i=min(u_i,lambda*s_i)。容量富余时降低慢节点份额；请求逼近聚合容量墙时 sum(u)->1，唯一可行解 x->u，退化为纯 capacity。任一参与节点 throughput 缺失时保守回退 x_i=u_i/sum(u) 的 capacity-only 目标，不混用实测 rate 和猜测值。
+【冻结与 memory ledger】versioned worker profile 显式提供 per-layer/position 的 B_i^K 与 B_i^V、allocator granularity G_i、非零份额整笔计费的 request overhead H_i，以及 W_i(0)=0 的本地 shard attention workspace bound。C_i 取模型加载后可靠 device-free telemetry 与显式 KV budget 的较小值，再扣 static/packet reserve；不能从 coarse capacity_mb 直接换算。K/V 两个物理 slab 分别按 G_i round。单线程 executor 下 ledger 约束=sum(active persistent slab+H)+max(active W)<=C_i；u_i 由该单调 hard bound 求出，再做 bounded water-filling。prompt contiguous chunk 与 decode calendar tickets 都由同一 bounded target x_i 量化；整数计划逐节点复核。self-driving v1 使用预分配 reserved KV slab + narrow view，禁止现有 Tensor::cat 全 shard 临时副本。kv_phase 与 starter/sampler phase 分离；已 admission plan 冻结。
+【协议协商】只有 coordinator 选择集群 mode；worker 加载模型后先只连 control plane，hello 上报 version/capability/profile。全员 ack 同一 mode/version/ring_epoch 后才建立 predecessor/successor data-plane streams；收齐 DataPlaneReady 后才可 admission/prefill，mixed-mode 提前拒绝。
+【多请求与 sampler】每个 request 是独立异步 packet 流，不要求同 token index、等速或 lockstep；stable request_id 分散 starter/sampler 初始 phase。L mod N=0 时允许单请求 sampler 固定，因为它不新增 durable KV；logits 必须在同一 compute quantum 内采样并释放，不进入 packet/ready queue/backlog。只有 LM-head/sample queue 成为实测瓶颈才启用 token handoff。
+【六问】1问题:严格 equal 1/N 浪费异构大显存，纯 capacity 又可能让大显存慢设备成为每层瓶颈。2现状:旧理论节点把 strict 1/N 当默认，代码仍用 capacity_mb 比例且无 active-request reservation/throughput 维度。3目标:显存绝不越界，在可行域内最小化 attention 串行关键路径，并用精确 reservation、ownership、hop/exact-once 和硬件 trace 验证。4他者:TP/collective 依赖同构互联；vLLM paged scheduler 做 per-request 容量管理但不提供 HCP 序列维跨异构 ring placement；可复用 reservation/continuous scheduling 思想，不能直接复用数据面。5本方案:bounded water-filling + 冻结二维 weighted calendar + packet pipeline。6为什么:同时保留聚合 KV 容量、两 peer 部分可达拓扑和异构算力利用，是 HCP 约束下的最小可计算策略。
+【牺牲四问】默认 equal 便于证明和均匀计数，纯 capacity 最大化可装 context；新策略牺牲 equal 的简单性，并在有容量余量时暂不使用慢节点的全部可存空间。equal 在同构系统提供简单确定性，纯 capacity 在极限 context 提供最大可行性；对 HCP，两者分别作为同构特例和容量墙退化路径保留。结论:implement。
+
+_updated: 2026-07-29 06:26:48_
 ### HCP 两阶段统一 ring 架构:prefill 传 KV、decode 传 Q+LSE,全程 P2P 逐跳,每节点只需 2 个连接
 
 type: `decision` · status: `held` · confidence: 0.9 · importance: 0.95 · source: `user-direction`
