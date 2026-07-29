@@ -11,11 +11,11 @@ Pre-action verdict REJECTED。阻断点:1) H_i 只有公式，没有 resource pr
 _updated: 2026-07-29 06:03:41_
 ### 修订自驱动 decode 计划:reserved KV slab、完整 memory ledger 与全员 mode negotiation
 
-type: `revision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `docs/plans/2026-07-29-self-driving-ring-decode-implementation.md`
+type: `revision` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `docs/plans/2026-07-29-self-driving-ring-decode-implementation.md`
 
 响应 Auditor REJECTED:resource profile 新增 B_i^K/B_i^V/G_i/H_i/W_i；C_i 来自模型加载后的可靠 device-free telemetry 与显式 KV budget 保守值，K/V 两个 slab 分别按 allocator granularity round。ledger 对 active requests 的持久 slab+metadata 求和、单线程 executor workspace 取 max；Task 1 覆盖 zero/nonzero share、并发重复计费、granularity 和 workspace release。Task 5 在 AdmitRequest 内物理预分配 ReservedKvCache，成功后才 ack；append copy 到 reserved slot、history narrow view，self-driving 禁止全 shard Tensor::cat。Task 3/8 使用 versioned WorkerHello 和 coordinator-only mode selection；先完成 control negotiation，再建立两个 peer data-plane streams，收齐 DataPlaneReady 后才 prefill，mixed-mode 提前拒绝。计划状态 ongoing，待重新审查。
 
-_updated: 2026-07-29 06:24:21_
+_updated: 2026-07-29 17:24:29_
 ### 第一轮自驱动 decode 计划复核修正 overhead、prompt placement 和 feature gate
 
 type: `evidence` · status: `superseded` · confidence: 1.0 · importance: 0.95 · source: `docs/plans/2026-07-29-self-driving-ring-decode-implementation.md`
@@ -46,11 +46,11 @@ type: `evidence` · status: `held` · confidence: 0.98 · importance: 0.95 · so
 _updated: 2026-07-29 06:03:41_
 ### 准备并审查自驱动 decode ring 详细 TDD 实施计划
 
-type: `task` · status: `ongoing` · confidence: 0.98 · importance: 0.95 · source: `docs/plans/2026-07-29-self-driving-ring-decode-implementation.md`
+type: `task` · status: `superseded` · confidence: 0.98 · importance: 0.95 · source: `docs/plans/2026-07-29-self-driving-ring-decode-implementation.md`
 
 已生成 docs/plans/2026-07-29-self-driving-ring-decode-implementation.md。计划含动机六问/牺牲四问、bounded water-filling、冻结二维 calendar、14 个依赖 checkpoint、每步 red-green 命令、focused commit、R1/R2/R3/R4 审查门，以及 MPS/CUDA+HIP/三节点异构完成条件。本任务只准备计划，未修改生产代码。 第一轮复核补充:prompt contiguous chunk 与 decode calendar 共享 bounded target；fixed KV overhead 先整笔扣除再求 payload cap；纯 scheduler 放 ungated distributed 模块；已修正 sampler recurrence 测试参数和无效多 filter cargo 命令。 补充合同:throughput 缺失时 capacity-only 明确定义为 x_i=u_i/sum(u)，不混合猜测 rate；sampler logits 在同一 compute quantum 内消费释放，不进入 packet/ready queue/backlog。 [Auditor pre-action REJECTED] 计划需补齐:H_i/G_i/W_i 的 profile/wire 来源与计费测试；self-driving cache 改为 reservation-backed slab，禁止现有 Tensor::cat 全 shard 临时副本；coordinator 全员 version/mode/capability 协商并在 mixed-mode 时于 prefill 前拒绝。修订后重新审查。 [第二轮修订完成待审] K/V slab 分别按 allocator granularity 计费；C_i 不再从 capacity_mb 粗略换算；AdmitRequest 物理分配成功后才 ack；bootstrap 改为 control hello/negotiation -> peer streams -> DataPlaneReady -> admission/prefill。
 
-_updated: 2026-07-29 06:26:48_
+_updated: 2026-07-29 17:24:29_
 ### 固定 sampler 不增加 durable KV,额外显存仅 O(batch*vocab) 瞬时 logits
 
 type: `evidence` · status: `held` · confidence: 0.98 · importance: 0.9 · source: `analysis-2026-07-29`

@@ -1,5 +1,9 @@
 # Self-Driving Decode Ring Implementation Plan
 
+> **状态（2026-07-30）：已被最小核心切片策略替代，不再作为当前执行入口。**
+> 本文中的 14 Task、生产级 admission/ledger、完整协议协商、容错与调度泛化仅保留为历史设计素材。
+> 当前阶段未经用户明确提出，不实施这些生产级能力；只实现并验证核心 ring 闭环，再根据实测结果决定下一步。
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** 在 Rust/tch HCP 路径实现单 packet、每层 `N-1` 跳、KV 显存硬上界内 compute-balanced、支持异步多请求 pipeline，并最终由 worker 自主采样续 token 的 decode ring。

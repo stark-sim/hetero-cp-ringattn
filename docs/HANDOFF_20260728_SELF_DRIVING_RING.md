@@ -1,5 +1,8 @@
 # HCP Ring Attention — Session Handoff (2026-07-28)
 
+> **状态（2026-07-30）：历史快照，不能作为当前计划。**
+> 其中 plugin Task E、14 Task 生产化路线等后续已被修订；当前以 graph-memory 中的“核心优先、小步验证”决策为准。
+
 ## 接手第一步（强制）
 
 按项目 `AGENTS.md` 的 Graph Memory Protocol 恢复上下文，**不要跳过**：

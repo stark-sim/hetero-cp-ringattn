@@ -2,6 +2,27 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 用户约束：核心优先，小步验证，未经明确要求不做生产级扩张
+
+type: `preference` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-07-30`
+
+用户明确要求：现阶段只实现自驱动 decode ring 的核心和为核心闭环不可缺少的能力；每完成一个小步先验证正确性与实际效果，再讨论下一步。凡用户没有主动提出的生产级 admission、精确资源 ledger、完整版本协商、容错重试、调度泛化、性能策略泛化等，不得自动前置或扩入当前任务。复杂性必须由当前核心验证的具体阻塞证据触发。
+
+_updated: 2026-07-29 17:24:29_
+### 修订自驱动 decode 实施范围：先做最小真实核心闭环
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-07-30`
+
+【动机六问】1.问题：14 Task 计划把 ring 核心验证与生产级资源管理、协议治理和通用调度绑定，步幅过大，核心效果迟迟不可见。2.现状：核心理论已明确，但真实 tensor 路径尚未证明 attention + norm/MLP continuation + N-1 hops；工作树却先出现约千行 placement/ledger 实现。3.目标：以最小真实切片证明单 packet、每层 N-1 hops、每 worker 仅两 peer、KV 唯一持久归属、attention partial 全员参与、finisher 唯一执行 W_o/residual/norm/MLP、末层唯一 logits；完成一个节点即验证并停下审查。4.他者做法：算法原型通常先固定简单 ownership 和单请求路径证明数据流/数学正确，再依据测量补 admission、continuous batching、容错与生产治理。5.本方案：保留 starter/finisher、唯一 KV assignee、简单冻结 capacity-weighted owner map 和 request phase；暂停二维 layer calendar、throughput water-filling、完整 memory ledger、versioned cluster negotiation、通用 backpressure/counter RNG 等非核心能力。6.为什么：这些保留项是 ring 正确性与异构 KV 切分的直接依赖；暂停项不影响验证核心数据流，提前实现只会扩大失败面。【牺牲四问】1.生产级默认用于并发资源安全、兼容升级和故障治理。2.当前牺牲的是尚未实装这些保证，不把原型称为生产可用。3.这些能力在真实多租户长期运行中不可替代。4.本项目当前先判断核心机制效果，明确标注原型边界即可；出现实测阻塞或用户明确要求后再逐项引入。结论：implement minimal core only；defer production-grade expansion。
+
+_updated: 2026-07-29 17:24:29_
+### 当前唯一实施任务：自驱动 decode ring 最小核心切片
+
+type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-07-30`
+
+范围只包含：1. 简单、冻结且可复现的 capacity-weighted KV owner map，并用 stable request_id 分散初始 phase；第一版不引入 layer 维二维 calendar或运行期动态迁移。2. 单请求、单 token 的真实 tensor 垂直路径：starter 生成 Q，packet 用 N-1 hops 合并所有本地 KV partial，唯一 assignee 计算并持久保存 current K/V，finisher 唯一执行 W_o + residual + norm + MLP，末层唯一产生 logits。3. 最小机器验证：与单节点参考一致；hop、Q、KV project/append、partial、MLP、logits exact-once；无完整远端历史 KV 临时副本。每完成一个小节点即汇报结果、下一节点和方向判断，未经用户确认不跨入生产化能力。当前工作树中的大型 placement/ledger 草稿不自动视为本任务成果，需先单独审查取舍。
+
+_updated: 2026-07-29 17:24:29_
 ### 修订自驱动 ring 计划:拒绝插件 E,合并 Rust D1 与最小 D2 垂直切片
 
 type: `revision` · status: `held` · confidence: 0.98 · importance: 1.0 · source: `docs/plans/2026-07-29-self-driving-ring-decode-revision.md`
@@ -40,8 +61,9 @@ decision-self-driving-ring-20260728 的 Rust 落地。改动面:ring.rs decode �
 [2026-07-28 细化] 子步分解:D1 单包轮转 attention(ring.rs,不动 model 层间)→ D2 finisher 就地续层(model.rs decode 期事件循环化,最大风险点)→ D3 采样轮转+coordinator 退位 → D4 验证阶梯(mock→MPS→跨节点 CUDA+HIP)。前置:任务E(plugin successor-seeded)先行预演 owner-最后归并。
 [2026-07-29 计划修订] task E 已因 owner-return N-hop 下限被拒绝,不再作为前置。D1 单包 attention 与最小 D2 层间 continuation 合并为首个可运行垂直切片:coordinator 暂保留 token 广播,所有 worker 进入 collective decode;环内单包 N-1 hops,finisher 续层,末层唯一 logits producer。之后再做 batch 隔离、采样自治和 coordinator 退位。
 [2026-07-29 最终策略与实施计划] KV placement 改为显存 hard bound 内 bounded compute balance，容量墙处退化 pure capacity；二维 assignee=(request phase+position+layer)；每 request 独立异步 packet pipeline；详细 TDD 计划见 docs/plans/2026-07-29-self-driving-ring-decode-implementation.md，按 Task 1-14 和 R1/R2/R3/R4 checkpoint 执行。
+[2026-07-30 范围收缩] 当前只按 task-self-driving-minimal-core-20260730 实施最小真实核心切片；14 Task 生产化路线已 superseded。未经用户明确要求，不前置生产级能力。
 
-_updated: 2026-07-29 05:05:41_
+_updated: 2026-07-29 17:24:29_
 ### 不为形式上的无 owner 强制轮转 sampler;以 KV/计算瓶颈为判据
 
 type: `preference` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `user-direction-2026-07-29`
