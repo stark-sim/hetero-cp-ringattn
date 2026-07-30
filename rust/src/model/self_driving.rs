@@ -189,6 +189,12 @@ pub struct SingleLayerRingResult {
     pub stats: SingleLayerRingStats,
 }
 
+#[derive(Debug)]
+pub struct TwoLayerRingResult {
+    pub hidden_states: Tensor,
+    pub layer_stats: [SingleLayerRingStats; 2],
+}
+
 /// Run one real decoder layer over already-sharded history KV.
 ///
 /// This is deliberately an in-process experiment: it proves the tensor data
@@ -260,6 +266,47 @@ pub fn run_single_layer_ring(
     })
 }
 
+/// Run exactly two decoder layers, continuing layer 1 on layer 0's finisher.
+pub fn run_two_layer_ring(
+    layers: &mut [DecoderLayer],
+    hidden_states: &Tensor,
+    position_ids: &Tensor,
+    layer_history_shards: &mut [Vec<(Tensor, Tensor)>],
+    starter: usize,
+    assignees: [usize; 2],
+) -> Result<TwoLayerRingResult, ModelError> {
+    if layers.len() != 2 || layer_history_shards.len() != 2 {
+        return Err(ModelError::Backend(format!(
+            "two-layer self-driving experiment requires exactly two layers and shard sets: layers={}, shard_sets={}",
+            layers.len(),
+            layer_history_shards.len()
+        )));
+    }
+
+    let first = run_single_layer_ring(
+        &mut layers[0],
+        hidden_states,
+        position_ids,
+        &mut layer_history_shards[0],
+        starter,
+        assignees[0],
+    )?;
+    let second_starter = first.stats.finisher;
+    let second = run_single_layer_ring(
+        &mut layers[1],
+        &first.hidden_states,
+        position_ids,
+        &mut layer_history_shards[1],
+        second_starter,
+        assignees[1],
+    )?;
+
+    Ok(TwoLayerRingResult {
+        hidden_states: second.hidden_states,
+        layer_stats: [first.stats, second.stats],
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,41 +365,61 @@ mod tests {
             WeightNames::lm_head().to_string(),
             deterministic_tensor(&[config.vocab_size as i64, hidden], 2.0, device),
         );
-        tensors.insert(
-            WeightNames::rms_norm_weight(0),
-            Tensor::ones([hidden], (Kind::Float, device)),
-        );
-        tensors.insert(
-            WeightNames::post_attn_norm_weight(0),
-            Tensor::ones([hidden], (Kind::Float, device)),
-        );
-        for (name, shape, phase) in [
-            (WeightNames::q_proj_weight(0), vec![q_width, hidden], 3.0),
-            (WeightNames::k_proj_weight(0), vec![kv_width, hidden], 4.0),
-            (WeightNames::v_proj_weight(0), vec![kv_width, hidden], 5.0),
-            (WeightNames::o_proj_weight(0), vec![hidden, q_width], 6.0),
-            (
-                WeightNames::gate_proj_weight(0),
-                vec![intermediate, hidden],
-                7.0,
-            ),
-            (
-                WeightNames::up_proj_weight(0),
-                vec![intermediate, hidden],
-                8.0,
-            ),
-            (
-                WeightNames::down_proj_weight(0),
-                vec![hidden, intermediate],
-                9.0,
-            ),
-        ] {
-            tensors.insert(name, deterministic_tensor(&shape, phase, device));
+        for layer_idx in 0..config.num_layers {
+            let phase = layer_idx as f64 * 10.0;
+            tensors.insert(
+                WeightNames::rms_norm_weight(layer_idx),
+                Tensor::ones([hidden], (Kind::Float, device)),
+            );
+            tensors.insert(
+                WeightNames::post_attn_norm_weight(layer_idx),
+                Tensor::ones([hidden], (Kind::Float, device)),
+            );
+            for (name, shape, tensor_phase) in [
+                (
+                    WeightNames::q_proj_weight(layer_idx),
+                    vec![q_width, hidden],
+                    3.0 + phase,
+                ),
+                (
+                    WeightNames::k_proj_weight(layer_idx),
+                    vec![kv_width, hidden],
+                    4.0 + phase,
+                ),
+                (
+                    WeightNames::v_proj_weight(layer_idx),
+                    vec![kv_width, hidden],
+                    5.0 + phase,
+                ),
+                (
+                    WeightNames::o_proj_weight(layer_idx),
+                    vec![hidden, q_width],
+                    6.0 + phase,
+                ),
+                (
+                    WeightNames::gate_proj_weight(layer_idx),
+                    vec![intermediate, hidden],
+                    7.0 + phase,
+                ),
+                (
+                    WeightNames::up_proj_weight(layer_idx),
+                    vec![intermediate, hidden],
+                    8.0 + phase,
+                ),
+                (
+                    WeightNames::down_proj_weight(layer_idx),
+                    vec![hidden, intermediate],
+                    9.0 + phase,
+                ),
+            ] {
+                tensors.insert(name, deterministic_tensor(&shape, tensor_phase, device));
+            }
         }
         ModelWeights { tensors }
     }
 
     fn reference_layer_output(
+        layer_idx: usize,
         config: &ModelConfig,
         weights: &crate::model::ModelWeights,
         hidden: &Tensor,
@@ -367,20 +434,20 @@ mod tests {
             config.rope_theta,
             device,
         );
-        let attention = GqaAttention::from_weights(weights, 0, config, &rope).unwrap();
+        let attention = GqaAttention::from_weights(weights, layer_idx, config, &rope).unwrap();
         let input_norm = RmsNorm::from_weights(
             weights,
-            &WeightNames::rms_norm_weight(0),
+            &WeightNames::rms_norm_weight(layer_idx),
             config.rms_norm_eps,
         )
         .unwrap();
         let post_norm = RmsNorm::from_weights(
             weights,
-            &WeightNames::post_attn_norm_weight(0),
+            &WeightNames::post_attn_norm_weight(layer_idx),
             config.rms_norm_eps,
         )
         .unwrap();
-        let mlp = Mlp::from_weights(weights, 0).unwrap();
+        let mlp = Mlp::from_weights(weights, layer_idx).unwrap();
         let mut cache = ContiguousKvCache::new();
         let _ = cache.update(history_k, history_v).unwrap();
 
@@ -439,6 +506,7 @@ mod tests {
         assert_eq!(shards[1].0.size()[2], shard_lengths[1]);
         assert_eq!(shards[2].0.size()[2], shard_lengths[2] + 1);
         let (reference_attention, reference) = reference_layer_output(
+            0,
             &config,
             &weights,
             &hidden,
@@ -587,6 +655,7 @@ mod tests {
             assert_eq!(result.stats.finisher, (starter + domains - 1) % domains);
 
             let (reference_attention, reference) = reference_layer_output(
+                0,
                 &config,
                 &weights,
                 &hidden,
@@ -652,6 +721,7 @@ mod tests {
             2,
         );
         let (_, reference) = reference_layer_output(
+            0,
             &config,
             &weights,
             &hidden,
@@ -708,5 +778,124 @@ mod tests {
         let long_context_payload = payload_after_first_hop(47);
         assert_eq!(short_context_payload, long_context_payload);
         assert!(short_context_payload > 0);
+    }
+
+    #[test]
+    fn two_layer_handoff_continues_from_each_finisher() {
+        let device = Device::Cpu;
+        let mut config = test_config();
+        config.num_layers = 2;
+        let weights = deterministic_weights(&config, device);
+        let mut model = LlamaModel::from_weights(config.clone(), &weights, device, 3).unwrap();
+        let hidden = deterministic_tensor(&[1, 1, config.hidden_size as i64], 130.0, device);
+        let shard_lengths = [2_i64, 4, 3];
+        let history_len = shard_lengths.iter().sum::<i64>();
+        let position_ids = Tensor::from_slice(&[history_len]).unsqueeze(0);
+        let mut layer_shards = (0..2)
+            .map(|layer_idx| {
+                shard_lengths
+                    .iter()
+                    .enumerate()
+                    .map(|(domain, &len)| {
+                        let shape = [
+                            1,
+                            config.num_kv_heads() as i64,
+                            len,
+                            config.head_dim() as i64,
+                        ];
+                        (
+                            deterministic_tensor(
+                                &shape,
+                                140.0 + layer_idx as f64 * 20.0 + domain as f64,
+                                device,
+                            ),
+                            deterministic_tensor(
+                                &shape,
+                                150.0 + layer_idx as f64 * 20.0 + domain as f64,
+                                device,
+                            ),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let reference_histories = layer_shards
+            .iter()
+            .map(|shards| {
+                (
+                    Tensor::cat(
+                        &shards
+                            .iter()
+                            .map(|(k, _)| k.shallow_clone())
+                            .collect::<Vec<_>>(),
+                        2,
+                    ),
+                    Tensor::cat(
+                        &shards
+                            .iter()
+                            .map(|(_, v)| v.shallow_clone())
+                            .collect::<Vec<_>>(),
+                        2,
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (_, reference_layer_0) = reference_layer_output(
+            0,
+            &config,
+            &weights,
+            &hidden,
+            &position_ids,
+            &reference_histories[0].0,
+            &reference_histories[0].1,
+        );
+        let (_, reference_layer_1) = reference_layer_output(
+            1,
+            &config,
+            &weights,
+            &reference_layer_0,
+            &position_ids,
+            &reference_histories[1].0,
+            &reference_histories[1].1,
+        );
+
+        let result = run_two_layer_ring(
+            &mut model.layers,
+            &hidden,
+            &position_ids,
+            &mut layer_shards,
+            1,
+            [2, 1],
+        )
+        .unwrap();
+
+        let max_diff = (&result.hidden_states - reference_layer_1)
+            .abs()
+            .max()
+            .double_value(&[]);
+        assert!(max_diff < 4e-4, "two-layer output diff: {max_diff}");
+        assert_eq!(result.layer_stats[0].starter, 1);
+        assert_eq!(result.layer_stats[0].finisher, 0);
+        assert_eq!(result.layer_stats[1].starter, 0);
+        assert_eq!(result.layer_stats[1].finisher, 2);
+        assert_eq!(
+            result
+                .layer_stats
+                .iter()
+                .map(|stats| stats.hops)
+                .sum::<usize>(),
+            4
+        );
+        for (layer_idx, &assignee) in [2_usize, 1].iter().enumerate() {
+            assert_eq!(result.layer_stats[layer_idx].q_projections, 1);
+            assert_eq!(result.layer_stats[layer_idx].local_partials, 3);
+            assert_eq!(result.layer_stats[layer_idx].current_kv_projections, 1);
+            assert_eq!(result.layer_stats[layer_idx].current_kv_commits, 1);
+            assert_eq!(result.layer_stats[layer_idx].layer_finishes, 1);
+            for domain in 0..3 {
+                let expected = shard_lengths[domain] + i64::from(domain == assignee);
+                assert_eq!(layer_shards[layer_idx][domain].0.size()[2], expected);
+            }
+        }
     }
 }
