@@ -2,6 +2,22 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### Rust 末层 finisher 唯一 final logits 验证通过
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@e2c6cd6`
+
+实现 commit e2c6cd6。在固定两层 self-driving runner 上，末层 finisher 的 hidden 就地执行 final RMSNorm 与 LM head；独立 lm_head 和 tied embedding fallback 两条路径均与标准参考 logits 误差低于 4e-4。N=3 主例 producer domain=2、logits projection=1、总 hops=4=2*(N-1)，final head 不增加 ring hop；N=1 tied 例 producer domain=0、hops=0。验证命令：LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib:/opt/homebrew/opt/libomp/lib HCP_ENABLE_TORCH=1 CARGO_NET_OFFLINE=true cargo test --manifest-path rust/Cargo.toml --features tch-backend，85 passed/0 failed，doc tests 0 failed/3 ignored；同环境 cargo clippy --manifest-path rust/Cargo.toml --features tch-backend --lib --tests exit 0，warnings 均来自既有文件，self_driving.rs 无诊断；rustfmt --edition 2021 --check rust/src/model/self_driving.rs 与 git diff --check 均通过。执行环境为 inventory 中 available 的 mac-local-shell 与本地 libtorch CPU；本节点不声明硬件性能。
+
+_updated: 2026-07-30 14:16:34_
+### Rust 第四个实验切片：末层 finisher 唯一产生 logits
+
+type: `task` · status: `closed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@e2c6cd6`
+
+在已验证固定两层 self-driving runner 上，末层 finisher 用自己的 hidden 执行 final RMSNorm + 独立 lm_head 或 tied embedding fallback，唯一生成单 token logits。验证 producer domain=末层 finisher、次数=1、无额外 ring hop、logits 与标准参考一致。仅用 mac-local-shell + local libtorch CPU correctness；不加入 sampling、token handoff、serde、网络或 runtime。
+
+[2026-07-30 完成] 末层 finisher 已唯一执行 final norm + 独立或 tied LM head；logits 与参考一致且不增加 hop。未加入 sampling、token handoff、serde、网络或 runtime。
+
+_updated: 2026-07-30 14:16:34_
 ### Rust 两层 self-driving packet handoff 验证通过
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@dc1aeb5`
