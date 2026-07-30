@@ -16,16 +16,30 @@ type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · sourc
 
 [2026-07-30 checkpoint 4] 末层 finisher 已唯一执行 final RMSNorm + 独立或 tied LM head；logits projection=1，N=3 两层总 hops 仍为 4，完整 Rust 测试 85/85 通过。
 
-尚未实现任意层数的全模型 runner、sampling/token continuation 或真实 P2P。下一候选为先将固定两层推广到任意 L，机器验证 L%N 角色共振与 logits producer 公式；待用户确认。
+当前实施任意层数 L 的单 token 全模型 runner，机器验证 L%N 角色共振与 logits producer 公式；sampling/token continuation 与真实 P2P 仍未开始。
 
-_updated: 2026-07-30 14:16:34_
+_updated: 2026-07-30 14:46:39_
 ### 候选下一小节点：任意 L 的单 token 全模型 ring
 
-type: `hypothesis` · status: `open` · confidence: 0.98 · importance: 1.0 · source: `analysis-after-e2c6cd6`
+type: `hypothesis` · status: `superseded` · confidence: 0.98 · importance: 1.0 · source: `analysis-after-e2c6cd6`
 
 【动机六问】1.问题：当前 final logits 已闭合，但 runner 固定为两层，尚不能直接运行真实模型层数，也不能机器验证用户关心的 L%N=0 时末层 producer 固定现象。2.现状：run_two_layer_ring 使用 [usize; 2] assignee，并正确完成两次 finisher-to-starter handoff 与唯一 final head；任意 N 的单层数学已验证，因此推广的未知点主要是全模型控制循环和角色递推，不是 attention 数学。3.目标：新增仅供实验的任意 L 单 token runner，接收每层 local KV shards 与冻结 assignee 序列；逐层令上一层 finisher 成为下一层 starter，末层只执行一次 final norm/head；至少验证 N=3 下 L=3 与非整倍数 L 的 logits 对齐、总 hops=L*(N-1)、producer=(starter-L) mod N、每层 exact-once。4.他者：普通 transformer forward 以循环串联 decoder layers，pipeline parallel 以 activation 串联 stages；可复用这种顺序 composition，但现成实现不表达 HCP 的同层 ring accumulator、capacity-owned KV 与每层轮转角色。5.本方案：把已验证两层逻辑泛化成一个小循环，保留现有单层 primitive 和 in-process 边界；不加入 sampling、跨 token 状态、serde、QUIC、runtime、动态 planner 或生产治理。6.为什么：这是进入真实 P2P 前最小的去人工边界步骤；先网络化固定两层会把测试专用限制写入线协议，先做 sampling 又无法证明真实层数下 sampler 所在节点。VERDICT: PROPOSE IMPLEMENT EXPERIMENT ONLY；待用户确认。
 
-_updated: 2026-07-30 14:16:34_
+_updated: 2026-07-30 14:46:39_
+### Rust 第五个实验切片：任意 L 的单 token 全模型 ring
+
+type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-07-30`
+
+把固定两层 self-driving runner 推广为任意非零层数 L。输入冻结的逐层 assignee 和逐层 local KV shards；每层让上一层 finisher 成为下一层 starter，末层唯一执行 final norm/head。验证 N=3 下 L=3 与非整倍数 L：logits 与标准参考一致、总 hops=L*(N-1)、producer=(starter-L) mod N、每层 Q/KV commit/partial/finish exact-once。仅使用 mac-local-shell + local libtorch CPU correctness；不加入 sampling、跨 token 状态、serde、QUIC、runtime、动态 planner 或生产治理。
+
+_updated: 2026-07-30 14:46:39_
+### 实施任意 L 的单 token 全模型 self-driving ring
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-07-30`
+
+【动机六问】1.问题：当前 final logits 已闭合，但 runner 固定为两层，尚不能直接运行真实模型层数，也不能机器验证用户关心的 L%N=0 时末层 producer 固定现象。2.现状：run_two_layer_ring 使用 [usize; 2] assignee，并正确完成两次 finisher-to-starter handoff 与唯一 final head；任意 N 的单层数学已验证，因此推广的未知点主要是全模型控制循环和角色递推，不是 attention 数学。3.目标：新增仅供实验的任意 L 单 token runner，接收每层 local KV shards 与冻结 assignee 序列；逐层令上一层 finisher 成为下一层 starter，末层只执行一次 final norm/head；至少验证 N=3 下 L=3 与非整倍数 L 的 logits 对齐、总 hops=L*(N-1)、producer=(starter-L) mod N、每层 exact-once。4.他者：普通 transformer forward 以循环串联 decoder layers，pipeline parallel 以 activation 串联 stages；可复用这种顺序 composition，但现成实现不表达 HCP 的同层 ring accumulator、capacity-owned KV 与每层轮转角色。5.本方案：把已验证两层逻辑泛化成一个小循环，保留现有单层 primitive 和 in-process 边界；不加入 sampling、跨 token 状态、serde、QUIC、runtime、动态 planner 或生产治理。6.为什么：这是进入真实 P2P 前最小的去人工边界步骤；先网络化固定两层会把测试专用限制写入线协议，先做 sampling 又无法证明真实层数下 sampler 所在节点。执行环境按 infrastructure-inventory 选择 mac-local-shell + local libtorch CPU，因为本节点只声明 correctness。VERDICT: IMPLEMENT EXPERIMENT ONLY。
+
+_updated: 2026-07-30 14:46:39_
 ### 候选下一小节点：末层 finisher 唯一产生 logits
 
 type: `hypothesis` · status: `superseded` · confidence: 0.98 · importance: 1.0 · source: `analysis-after-dc1aeb5`
