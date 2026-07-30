@@ -36,6 +36,9 @@ pub mod layers;
 #[allow(clippy::module_inception)]
 pub mod model;
 #[cfg(feature = "tch-backend")]
+#[allow(dead_code)]
+pub mod self_driving;
+#[cfg(feature = "tch-backend")]
 pub mod weights;
 
 #[cfg(feature = "tch-backend")]

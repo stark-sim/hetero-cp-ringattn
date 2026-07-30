@@ -2,6 +2,29 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### Rust 单层真实 tensor 自驱动 ring 验证通过
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `rust/src/model/self_driving.rs`
+
+本地 Mac CPU synthetic tensor，独立 libtorch。主例 N=3，历史 KV shard 长度 [2,5,3]，starter=1、assignee=2、finisher=0：Q 投影 1 次且归属 starter，current K/V 投影与 commit 各 1 次且归属 assignee，local partial=3，layer finish=1，hops=2；attention 最大误差 7.45e-9，整层最大误差 2.98e-8。通用性覆盖 N=1/2/4，route=successor 顺序且 hops=N-1。回归：focused 2/2、既有 ring attention 12/12、全量 tch 81/81 均通过。clippy 退出 0；只报告既有文件 warning，新代码无诊断。实验明确不包含真实网络、全模型、多请求或物理显存证明。
+
+_updated: 2026-07-30 05:59:08_
+### 单进程数值等价会掩盖跨节点角色归属错误
+
+type: `lesson` · status: `held` · confidence: 1.0 · importance: 0.9 · source: `incident-2026-07-30-single-layer-role-boundary`
+
+症状：第一版测试数值与单节点参考一致，但 starter 同时计算 Q/K/V 后借共享地址空间直接写入 assignee shard；这不能证明最终跨进程设计中的 assignee 自算自留，也会隐藏额外 K/V 传输。根因：测试只观察输出与写入份数，没有观察计算发生的逻辑 domain，单地址空间抹平了物理边界。修复：拆分 Q 与 current K/V 投影原语；Q 在 starter 执行，packet 抵达 assignee 时才投影并 commit K/V；统计实际执行计数并记录 projection domain。验证：新增角色断言先编译 RED，最小修复后 focused、ring 回归和全量 tch 测试均通过。可复用判据：涉及分布式 ownership 的 in-process 原型，输出等价不是充分证据，必须同时观察操作发生在哪个逻辑节点。
+
+_updated: 2026-07-30 05:59:08_
+### 执行 Rust 单层真实 tensor 自驱动 ring 实验
+
+type: `task` · status: `closed` · confidence: 1.0 · importance: 1.0 · source: `docs/plans/2026-07-30-rust-single-layer-self-driving-experiment.md`
+
+当前小节点。改动：提取现有 decode attention 数学原语；新增单层 in-process ring runner；用 uneven shards 验证 N=3，并覆盖 N=1/2/4。原因：直接验证 attention 与 residual/norm/MLP continuation 的组合，不让网络、runtime 或生产级 planner 混入。对计划贡献：若通过，证明自驱动 ring 的模型层核心可行；若失败，失败面被限制在投影、online-softmax merge 或 layer continuation。完成后必须停下汇报，不自动进入全模型或网络节点。
+
+【完成证据 2026-07-30】实现单层真实 tensor runner：starter 唯一投影 Q；packet 按 successor 顺序访问 N 个互斥历史 KV shard；assignee 在 packet 抵达时唯一投影并持久保存 current K/V；finisher 唯一执行 O projection、attention residual、post-attention norm、MLP residual。N=3 uneven shards 与单节点参考最大整层误差 2.98e-8；N=1/2/4 路由与 N-1 hops 均通过。完整 tch 测试 81/81 通过，既有 ring-attention 回归 12/12 通过。边界：仍是单进程单层实验，不证明 QUIC、跨进程、全模型或物理显存 reservation。
+
+_updated: 2026-07-30 05:59:08_
 ### Harness Auditor 拒绝第一版自驱动 decode 实施计划发布
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `harness-review-2026-07-29`

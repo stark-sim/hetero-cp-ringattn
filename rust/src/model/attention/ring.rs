@@ -346,6 +346,147 @@ impl HcpRingAttentionBackend {
         *rs = new_sum;
     }
 
+    /// Project the single current token's query on the logical starter.
+    #[allow(dead_code)]
+    pub(crate) fn project_decode_q(
+        &self,
+        hidden_states: &Tensor,
+        position_ids: &Tensor,
+    ) -> Result<Tensor, ModelError> {
+        let batch = hidden_states.size()[0];
+        let seq_len = hidden_states.size()[1];
+        if seq_len != 1 {
+            return Err(ModelError::Backend(format!(
+                "self-driving decode query projection requires seq_len=1, got {seq_len}"
+            )));
+        }
+
+        let mut q = hidden_states.matmul(&self.q_proj.transpose(0, 1));
+        if let Some(ref bias) = self.q_bias {
+            q += bias;
+        }
+        let q = q
+            .view([
+                batch,
+                seq_len,
+                self.num_heads as i64,
+                self.head_dim as i64,
+            ])
+            .transpose(1, 2);
+        let (q, _) = self.rope.apply(&q, &q, Some(position_ids));
+        Ok(q)
+    }
+
+    /// Project the single current token's K/V on its logical KV assignee.
+    /// K/V remain in their compact GQA head layout.
+    #[allow(dead_code)]
+    pub(crate) fn project_decode_current_kv(
+        &self,
+        hidden_states: &Tensor,
+        position_ids: &Tensor,
+    ) -> Result<(Tensor, Tensor), ModelError> {
+        let batch = hidden_states.size()[0];
+        let seq_len = hidden_states.size()[1];
+        if seq_len != 1 {
+            return Err(ModelError::Backend(format!(
+                "self-driving decode KV projection requires seq_len=1, got {seq_len}"
+            )));
+        }
+
+        let mut k = hidden_states.matmul(&self.k_proj.transpose(0, 1));
+        if let Some(ref bias) = self.k_bias {
+            k += bias;
+        }
+        let mut v = hidden_states.matmul(&self.v_proj.transpose(0, 1));
+        if let Some(ref bias) = self.v_bias {
+            v += bias;
+        }
+        let k = k
+            .view([
+                batch,
+                seq_len,
+                self.num_kv_heads as i64,
+                self.head_dim as i64,
+            ])
+            .transpose(1, 2);
+        let v = v
+            .view([
+                batch,
+                seq_len,
+                self.num_kv_heads as i64,
+                self.head_dim as i64,
+            ])
+            .transpose(1, 2);
+        let (_, k) = self.rope.apply(&k, &k, Some(position_ids));
+        Ok((k, v))
+    }
+
+    #[allow(dead_code)]
+    fn repeat_decode_kv_heads(&self, k: &Tensor, v: &Tensor) -> (Tensor, Tensor) {
+        let num_rep = self.num_heads / self.num_kv_heads;
+        if num_rep == 1 {
+            return (k.shallow_clone(), v.shallow_clone());
+        }
+        let repeat = |tensor: &Tensor| {
+            let shape = tensor.size();
+            tensor
+                .unsqueeze(2)
+                .expand(
+                    [
+                        shape[0],
+                        shape[1],
+                        num_rep as i64,
+                        shape[2],
+                        shape[3],
+                    ],
+                    false,
+                )
+                .reshape([
+                    shape[0],
+                    shape[1] * num_rep as i64,
+                    shape[2],
+                    shape[3],
+                ])
+        };
+        (repeat(k), repeat(v))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn decode_local_compact_partial(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+    ) -> (Tensor, Tensor) {
+        let (k, v) = self.repeat_decode_kv_heads(k, v);
+        self.decode_local_partial(q, &k, &v)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn decode_merge_compact_partial(
+        &self,
+        q: &Tensor,
+        o: &Tensor,
+        lse: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+    ) -> (Tensor, Tensor) {
+        let (k, v) = self.repeat_decode_kv_heads(k, v);
+        self.decode_merge_packet(q, o, lse, &k, &v)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn project_decode_output(&self, attention_output: &Tensor) -> Tensor {
+        let batch = attention_output.size()[0];
+        let seq_len = attention_output.size()[2];
+        let hidden_size = (self.num_heads * self.head_dim) as i64;
+        let attention_output = attention_output
+            .transpose(1, 2)
+            .contiguous()
+            .view([batch, seq_len, hidden_size]);
+        attention_output.matmul(&self.o_proj.transpose(0, 1))
+    }
+
     /// 【decode 局部 partial】单 token 的 q 对本地 KV segment 做非因果 attention，
     /// 输出 (O, LSE)：O 是归一化输出 [B,H,1,D]，LSE 是 fp32 的 log-sum-exp [B,H,1]。
     ///
