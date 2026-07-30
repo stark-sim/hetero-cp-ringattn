@@ -2,6 +2,27 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 候选下一小节点：两层 packet handoff，不含 logits
+
+type: `hypothesis` · status: `superseded` · confidence: 0.98 · importance: 1.0 · source: `analysis-after-76be3b6`
+
+【动机六问】1.问题：单层 packet 已自足，但 finisher 产出的 hidden 仍作为函数结果返回，尚未证明它能在同一逻辑 domain 直接成为下一层 starter 并保持 N-1 hops/layer。2.现状：一层内 attention+residual+post-attention norm+MLP 已闭合；多层角色递推与层边界 packet 初始化未进入真实 tensor 测试。3.目标：仅用两个真实 DecoderLayer，在 layer 0 finisher 上以其 hidden 创建 layer 1 packet；验证 layer 1 starter==layer 0 finisher、两层输出与单节点参考一致、总 hops=2*(N-1)、每层 exact-once 与 capacity-owned local KV 不变。4.他者：pipeline parallel 在 stage 边界传 activation，Ring Attention 每层独立传 accumulator；可复用 activation continuation，但没有 HCP 同层序列分片与下一层 starter 递推的组合测试。5.本方案：扩展 in-process 实验为固定两层 handoff，复用现有 LayerPacket/process_layer_packet，不加通用全模型 driver、LM head、sampling、serde 或网络。6.为什么：它只隔离验证层边界递推；把末层 logits 同时加入会让失败无法区分是 handoff 还是 head/sampling 边界。【牺牲四问】默认完整 model.forward 一次遍历所有层并最终做 norm/head，控制流最简单；本节点暂时牺牲全模型与可生成 token 的完整性；完整 forward 的价值是提供最终模型合同；当前只验证自驱动 ring 的下一项最小数学依赖，因此两层固定实验足够。VERDICT: PROPOSE IMPLEMENT EXPERIMENT ONLY；待用户确认。
+
+_updated: 2026-07-30 10:52:57_
+### Rust 第三个实验切片：两层 packet handoff
+
+type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-07-30`
+
+固定两个真实 DecoderLayer。layer 0 finisher 用自己的输出 hidden 原地创建 layer 1 LayerPacket，并成为下一层 starter；验证两层输出、角色递推、每层 N-1 hops 与 exact-once。仅用 mac-local-shell + local libtorch CPU synthetic correctness；不包含 logits、sampling、通用全模型 driver、serde、QUIC、runtime 或硬件性能结论。
+
+_updated: 2026-07-30 10:52:57_
+### 实施固定两层 packet handoff，隔离验证层间 continuation
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-07-30`
+
+【动机六问】1.问题：单层 packet 已自足，但 finisher 产出的 hidden 仍作为函数结果返回，尚未证明它能在同一逻辑 domain 直接成为下一层 starter 并保持 N-1 hops/layer。2.现状：一层内 attention+residual+post-attention norm+MLP 已闭合；多层角色递推与层边界 packet 初始化未进入真实 tensor 测试。3.目标：仅用两个真实 DecoderLayer，在 layer 0 finisher 上以其 hidden 创建 layer 1 packet；验证 layer 1 starter==layer 0 finisher、两层输出与单节点参考一致、总 hops=2*(N-1)、每层 exact-once 与 capacity-owned local KV 不变。4.他者：pipeline parallel 在 stage 边界传 activation，Ring Attention 每层独立传 accumulator；可复用 activation continuation，但没有 HCP 同层序列分片与下一层 starter 递推的组合测试。5.本方案：扩展 in-process 实验为固定两层 handoff，复用现有 LayerPacket/process_layer_packet，不加通用全模型 driver、LM head、sampling、serde 或网络。6.为什么：它只隔离验证层边界递推；把末层 logits 同时加入会让失败无法区分是 handoff 还是 head/sampling 边界。【牺牲四问】默认完整 model.forward 一次遍历所有层并最终做 norm/head，控制流最简单；本节点暂时牺牲全模型与可生成 token 的完整性；完整 forward 的价值是提供最终模型合同；当前只验证自驱动 ring 的下一项最小数学依赖，因此两层固定实验足够。执行环境按 infrastructure-inventory 选择 mac-local-shell + local libtorch CPU，因为本节点只声明 correctness，不声明硬件性能。VERDICT: IMPLEMENT EXPERIMENT ONLY。
+
+_updated: 2026-07-30 10:52:57_
 ### 当前唯一实施任务：自驱动 decode ring 最小核心切片
 
 type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-07-30`
@@ -15,13 +36,6 @@ type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · sourc
 尚未实现多层 handoff、末层 logits 或真实 P2P。下一候选为固定两层 in-process handoff，待用户确认。
 
 _updated: 2026-07-30 10:25:44_
-### 候选下一小节点：两层 packet handoff，不含 logits
-
-type: `hypothesis` · status: `open` · confidence: 0.98 · importance: 1.0 · source: `analysis-after-76be3b6`
-
-【动机六问】1.问题：单层 packet 已自足，但 finisher 产出的 hidden 仍作为函数结果返回，尚未证明它能在同一逻辑 domain 直接成为下一层 starter 并保持 N-1 hops/layer。2.现状：一层内 attention+residual+post-attention norm+MLP 已闭合；多层角色递推与层边界 packet 初始化未进入真实 tensor 测试。3.目标：仅用两个真实 DecoderLayer，在 layer 0 finisher 上以其 hidden 创建 layer 1 packet；验证 layer 1 starter==layer 0 finisher、两层输出与单节点参考一致、总 hops=2*(N-1)、每层 exact-once 与 capacity-owned local KV 不变。4.他者：pipeline parallel 在 stage 边界传 activation，Ring Attention 每层独立传 accumulator；可复用 activation continuation，但没有 HCP 同层序列分片与下一层 starter 递推的组合测试。5.本方案：扩展 in-process 实验为固定两层 handoff，复用现有 LayerPacket/process_layer_packet，不加通用全模型 driver、LM head、sampling、serde 或网络。6.为什么：它只隔离验证层边界递推；把末层 logits 同时加入会让失败无法区分是 handoff 还是 head/sampling 边界。【牺牲四问】默认完整 model.forward 一次遍历所有层并最终做 norm/head，控制流最简单；本节点暂时牺牲全模型与可生成 token 的完整性；完整 forward 的价值是提供最终模型合同；当前只验证自驱动 ring 的下一项最小数学依赖，因此两层固定实验足够。VERDICT: PROPOSE IMPLEMENT EXPERIMENT ONLY；待用户确认。
-
-_updated: 2026-07-30 10:23:35_
 ### 候选下一小节点：显式化单层自驱动 packet 数据边界
 
 type: `hypothesis` · status: `superseded` · confidence: 0.95 · importance: 1.0 · source: `analysis-2026-07-30-next-node-motivation`
