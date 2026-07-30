@@ -2,6 +2,21 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### Rust 两层 self-driving packet handoff 验证通过
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@dc1aeb5`
+
+实现 commit dc1aeb5。固定两个真实 DecoderLayer，layer 0 starter=1 经 N=3 ring 在 domain 0 finisher 完成，domain 0 随即用该 hidden 初始化 layer 1 packet；layer 1 在 domain 2 finish，角色递推 1->0->2。每层 hops=2，总 hops=4=2*(N-1)；每层 Q projection=1、local partial=3、current K/V projection/commit=1、layer finish=1；layer 0/1 分别只有 assignee 2/1 的 local KV 长度增加 1。最终 hidden 与两层单节点参考误差低于 4e-4。验证命令：LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib cargo test --manifest-path rust/Cargo.toml --features tch-backend，84 passed/0 failed；cargo clippy --features tch-backend --all-targets exit 0，只有既有文件 warnings，self_driving.rs 无诊断。执行环境为 inventory 中 available 的 mac-local-shell、arm64、cargo 1.93.0、本地 libtorch CPU；本节点不声明硬件性能。
+
+_updated: 2026-07-30 11:21:43_
+### Rust 第三个实验切片：两层 packet handoff
+
+type: `task` · status: `closed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@dc1aeb5`
+
+固定两个真实 DecoderLayer。layer 0 finisher 用自己的输出 hidden 原地创建 layer 1 LayerPacket，并成为下一层 starter；验证两层输出、角色递推、每层 N-1 hops 与 exact-once。仅用 mac-local-shell + local libtorch CPU synthetic correctness；不包含 logits、sampling、通用全模型 driver、serde、QUIC、runtime 或硬件性能结论。
+[2026-07-30 完成] 两层 runner 已验证 finisher-to-starter continuation；未加入 logits、网络或通用全模型 driver。
+
+_updated: 2026-07-30 11:21:43_
 ### Rust 自驱动 LayerPacket 数据边界验证通过
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@76be3b6`

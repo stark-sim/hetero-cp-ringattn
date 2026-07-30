@@ -2,18 +2,33 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 当前唯一实施任务：自驱动 decode ring 最小核心切片
+
+type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-07-30`
+
+范围只包含：1. 简单、冻结且可复现的 capacity-weighted KV owner map，并用 stable request_id 分散初始 phase；第一版不引入 layer 维二维 calendar 或运行期动态迁移。2. 单请求、单 token 的真实 tensor 垂直路径：starter 生成 Q，packet 用 N-1 hops 合并所有本地 KV partial，唯一 assignee 计算并持久保存 current K/V，finisher 唯一执行 W_o + residual + norm + MLP，末层唯一产生 logits。3. 最小机器验证：与单节点参考一致；hop、Q、KV project/append、partial、MLP、logits exact-once；无完整远端历史 KV 临时副本。每完成一个小节点即汇报结果、下一节点和方向判断，未经用户确认不跨入生产化能力。当前工作树中的大型 placement/ledger 草稿不自动视为本任务成果，需先单独审查取舍。
+
+[2026-07-30 checkpoint 1] 任意 N 的单层真实 tensor ring 已验证 attention + residual/norm/MLP 数学与 exact-once 角色。
+
+[2026-07-30 checkpoint 2] 显式 LayerPacket 已验证：runner 只编排 packet+local shard step；历史长度 2 与 47 的首跳 payload 元素数相同。
+
+[2026-07-30 checkpoint 3] 固定两层 N=3 handoff 已验证：角色 1->0->2，总 hops=4；每层 Q/KV/partial/finisher exact-once，输出与两层单节点参考一致。
+
+尚未实现末层唯一 logits 或真实 P2P。下一候选为末层 finisher 唯一执行 final norm + LM head，待用户确认。
+
+_updated: 2026-07-30 11:21:43_
+### 候选下一小节点：末层 finisher 唯一产生 logits
+
+type: `hypothesis` · status: `open` · confidence: 0.98 · importance: 1.0 · source: `analysis-after-dc1aeb5`
+
+【动机六问】1.问题：两层 handoff 已闭合，但末层 finisher 的 hidden 仍作为实验结果返回；尚未证明完整 decode 模型输出能在该节点就地产生且只产生一次。2.现状：LlamaModel::forward 在所有层后集中执行 final RMSNorm，再用独立 lm_head 或 tied embedding 计算 logits；self-driving 两层 runner 尚未接这段尾部。3.目标：末层 finisher 用自己的 hidden 执行 final norm + LM head，唯一生成单 token logits；记录 logits producer domain=末层 finisher、次数=1，并与标准两层模型参考 logits 一致；不增加 ring hop。4.他者：pipeline parallel 通常由最后 stage 持有/执行 output head；vLLM 在 model hidden 后由 logits processor 生成 logits。可复用 final-stage ownership，但现成实现不能直接表达 HCP 中随层轮转的 finisher。5.本方案：在固定两层 in-process 实验上增加最小 final-head helper/result，复用 LlamaModel 的 norm、lm_head 与 tied embedding fallback；不接 sampling、token handoff、serde、网络或 runtime。6.为什么：这是核心 tensor 垂直路径的最后一个独立模型边界；sampling 是控制/RNG 合同，分开验证更容易归因。【牺牲四问】1.当前每 worker 返回 logits 的对称合同简化 coordinator 汇总和故障诊断。2.唯一 producer 放弃冗余 logits 副本与任意 worker 可替代返回。3.这些副本在一般分布式系统中可用于一致性对照或失败接管。4.当前 PoC 不做容错，目标正是消除 N 倍冗余 forward；保留标准 reference 路径用于对照即可。VERDICT: PROPOSE IMPLEMENT EXPERIMENT ONLY；待用户确认。
+
+_updated: 2026-07-30 11:21:43_
 ### 候选下一小节点：两层 packet handoff，不含 logits
 
 type: `hypothesis` · status: `superseded` · confidence: 0.98 · importance: 1.0 · source: `analysis-after-76be3b6`
 
 【动机六问】1.问题：单层 packet 已自足，但 finisher 产出的 hidden 仍作为函数结果返回，尚未证明它能在同一逻辑 domain 直接成为下一层 starter 并保持 N-1 hops/layer。2.现状：一层内 attention+residual+post-attention norm+MLP 已闭合；多层角色递推与层边界 packet 初始化未进入真实 tensor 测试。3.目标：仅用两个真实 DecoderLayer，在 layer 0 finisher 上以其 hidden 创建 layer 1 packet；验证 layer 1 starter==layer 0 finisher、两层输出与单节点参考一致、总 hops=2*(N-1)、每层 exact-once 与 capacity-owned local KV 不变。4.他者：pipeline parallel 在 stage 边界传 activation，Ring Attention 每层独立传 accumulator；可复用 activation continuation，但没有 HCP 同层序列分片与下一层 starter 递推的组合测试。5.本方案：扩展 in-process 实验为固定两层 handoff，复用现有 LayerPacket/process_layer_packet，不加通用全模型 driver、LM head、sampling、serde 或网络。6.为什么：它只隔离验证层边界递推；把末层 logits 同时加入会让失败无法区分是 handoff 还是 head/sampling 边界。【牺牲四问】默认完整 model.forward 一次遍历所有层并最终做 norm/head，控制流最简单；本节点暂时牺牲全模型与可生成 token 的完整性；完整 forward 的价值是提供最终模型合同；当前只验证自驱动 ring 的下一项最小数学依赖，因此两层固定实验足够。VERDICT: PROPOSE IMPLEMENT EXPERIMENT ONLY；待用户确认。
-
-_updated: 2026-07-30 10:52:57_
-### Rust 第三个实验切片：两层 packet handoff
-
-type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-07-30`
-
-固定两个真实 DecoderLayer。layer 0 finisher 用自己的输出 hidden 原地创建 layer 1 LayerPacket，并成为下一层 starter；验证两层输出、角色递推、每层 N-1 hops 与 exact-once。仅用 mac-local-shell + local libtorch CPU synthetic correctness；不包含 logits、sampling、通用全模型 driver、serde、QUIC、runtime 或硬件性能结论。
 
 _updated: 2026-07-30 10:52:57_
 ### 实施固定两层 packet handoff，隔离验证层间 continuation
@@ -23,19 +38,6 @@ type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · sour
 【动机六问】1.问题：单层 packet 已自足，但 finisher 产出的 hidden 仍作为函数结果返回，尚未证明它能在同一逻辑 domain 直接成为下一层 starter 并保持 N-1 hops/layer。2.现状：一层内 attention+residual+post-attention norm+MLP 已闭合；多层角色递推与层边界 packet 初始化未进入真实 tensor 测试。3.目标：仅用两个真实 DecoderLayer，在 layer 0 finisher 上以其 hidden 创建 layer 1 packet；验证 layer 1 starter==layer 0 finisher、两层输出与单节点参考一致、总 hops=2*(N-1)、每层 exact-once 与 capacity-owned local KV 不变。4.他者：pipeline parallel 在 stage 边界传 activation，Ring Attention 每层独立传 accumulator；可复用 activation continuation，但没有 HCP 同层序列分片与下一层 starter 递推的组合测试。5.本方案：扩展 in-process 实验为固定两层 handoff，复用现有 LayerPacket/process_layer_packet，不加通用全模型 driver、LM head、sampling、serde 或网络。6.为什么：它只隔离验证层边界递推；把末层 logits 同时加入会让失败无法区分是 handoff 还是 head/sampling 边界。【牺牲四问】默认完整 model.forward 一次遍历所有层并最终做 norm/head，控制流最简单；本节点暂时牺牲全模型与可生成 token 的完整性；完整 forward 的价值是提供最终模型合同；当前只验证自驱动 ring 的下一项最小数学依赖，因此两层固定实验足够。执行环境按 infrastructure-inventory 选择 mac-local-shell + local libtorch CPU，因为本节点只声明 correctness，不声明硬件性能。VERDICT: IMPLEMENT EXPERIMENT ONLY。
 
 _updated: 2026-07-30 10:52:57_
-### 当前唯一实施任务：自驱动 decode ring 最小核心切片
-
-type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-07-30`
-
-范围只包含：1. 简单、冻结且可复现的 capacity-weighted KV owner map，并用 stable request_id 分散初始 phase；第一版不引入 layer 维二维 calendar 或运行期动态迁移。2. 单请求、单 token 的真实 tensor 垂直路径：starter 生成 Q，packet 用 N-1 hops 合并所有本地 KV partial，唯一 assignee 计算并持久保存 current K/V，finisher 唯一执行 W_o + residual + norm + MLP，末层唯一产生 logits。3. 最小机器验证：与单节点参考一致；hop、Q、KV project/append、partial、MLP、logits exact-once；无完整远端历史 KV 临时副本。每完成一个小节点即汇报结果、下一节点和方向判断，未经用户确认不跨入生产化能力。当前工作树中的大型 placement/ledger 草稿不自动视为本任务成果，需先单独审查取舍。
-
-[2026-07-30 checkpoint 1] 任意 N 的单层真实 tensor ring 已验证 attention + residual/norm/MLP 数学与 exact-once 角色。
-
-[2026-07-30 checkpoint 2] 显式 LayerPacket 已验证：runner 只编排 packet+local shard step；packet 携带 residual、normalized、position、Q、O/LSE 与路由状态；历史长度 2 与 47 的首跳 tensor payload 元素数相同。
-
-尚未实现多层 handoff、末层 logits 或真实 P2P。下一候选为固定两层 in-process handoff，待用户确认。
-
-_updated: 2026-07-30 10:25:44_
 ### 候选下一小节点：显式化单层自驱动 packet 数据边界
 
 type: `hypothesis` · status: `superseded` · confidence: 0.95 · importance: 1.0 · source: `analysis-2026-07-30-next-node-motivation`
