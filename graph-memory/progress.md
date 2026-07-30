@@ -2,6 +2,22 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### Rust 任意 L 单 token 全模型 self-driving ring 验证通过
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@c2a0483`
+
+实现 commit c2a0483。新增 run_model_ring，以 Vec 逐层复用已验证的 run_single_layer_ring：上一层 finisher 成为下一层 starter，末层共享同一个 final norm/head helper 并唯一产生 logits。N=3、starter=1 时，L=3 角色回到 producer domain 1、总 hops=6；L=4 producer 轮转到 domain 0、总 hops=8；两例均满足 producer=(starter-L) mod N、每层 Q projection=1、local partial=3、current K/V projection/commit=1、layer finish=1，且只有指定 assignee 的 local shard 增长。完整 logits 与逐层单节点参考误差低于 1e-3。TDD RED 命令因 run_model_ring 不存在以 E0425 失败，补最小循环后定向测试转绿。最终验证命令：LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib:/opt/homebrew/opt/libomp/lib HCP_ENABLE_TORCH=1 CARGO_NET_OFFLINE=true cargo test --manifest-path rust/Cargo.toml --features tch-backend，87 passed/0 failed，doc tests 0 failed/3 ignored；同环境 cargo clippy --manifest-path rust/Cargo.toml --features tch-backend --lib --tests exit 0，warnings 均来自既有文件，self_driving.rs 无诊断；rustfmt --edition 2021 --check rust/src/model/self_driving.rs 与 git diff --check 均通过。执行环境为 inventory 中 available 的 mac-local-shell 与本地 libtorch CPU；本节点不声明硬件性能。
+
+_updated: 2026-07-30 16:10:16_
+### Rust 第五个实验切片：任意 L 的单 token 全模型 ring
+
+type: `task` · status: `closed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@c2a0483`
+
+把固定两层 self-driving runner 推广为任意非零层数 L。输入冻结的逐层 assignee 和逐层 local KV shards；每层让上一层 finisher 成为下一层 starter，末层唯一执行 final norm/head。验证 N=3 下 L=3 与非整倍数 L：logits 与标准参考一致、总 hops=L*(N-1)、producer=(starter-L) mod N、每层 Q/KV commit/partial/finish exact-once。仅使用 mac-local-shell + local libtorch CPU correctness；不加入 sampling、跨 token 状态、serde、QUIC、runtime、动态 planner 或生产治理。
+
+[2026-07-30 完成] 任意非零 L 的单 token 全模型 runner 已闭合；L=3/L=4 在 N=3 下验证 logits、角色递推、L*(N-1) hops 与逐层 exact-once。未加入 sampling、跨 token 状态、serde、P2P 或 runtime。
+
+_updated: 2026-07-30 16:10:16_
 ### Rust 末层 finisher 唯一 final logits 验证通过
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@e2c6cd6`

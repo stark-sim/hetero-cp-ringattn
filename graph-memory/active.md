@@ -16,21 +16,23 @@ type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · sourc
 
 [2026-07-30 checkpoint 4] 末层 finisher 已唯一执行 final RMSNorm + 独立或 tied LM head；logits projection=1，N=3 两层总 hops 仍为 4，完整 Rust 测试 85/85 通过。
 
-当前实施任意层数 L 的单 token 全模型 runner，机器验证 L%N 角色共振与 logits producer 公式；sampling/token continuation 与真实 P2P 仍未开始。
+[2026-07-30 checkpoint 5] 任意 L 的单 token 全模型 runner 已验证：N=3 下 L=3 回到 starter、L=4 轮转 producer，满足 producer=(starter-L) mod N、总 hops=L*(N-1)、逐层 exact-once，完整 Rust 测试 87/87 通过。
 
-_updated: 2026-07-30 14:46:39_
+尚未实现真实 P2P 或 sampling/token continuation。代码审计确认现有 transport RingPacket 仅有 Q/O/LSE，不能承载 self-driving LayerPacket 的 residual/normalized/position/route 状态；下一候选为 N=3 localhost 单层真实 P2P 垂直切片，待用户确认。
+
+_updated: 2026-07-30 16:10:16_
+### 候选下一小节点：N=3 localhost 单层真实 P2P self-driving ring
+
+type: `hypothesis` · status: `open` · confidence: 0.97 · importance: 1.0 · source: `analysis-after-c2a0483`
+
+【动机六问】1.问题：任意 L 的模型控制循环已成立，但所有 domain step 仍在同一进程直接调用；尚未证明 LayerPacket 能沿只有前驱/后继的真实字节流传递，当前最核心的 P2P 拓扑主张仍缺机器证据。2.现状：self_driving::LayerPacket 需要 residual、normalized hidden、position_ids、Q、O/LSE、assignee/current_domain/domains/visited；现有 model::transport::RingPacket 和 TCP/QUIC codec 只承载 layer_idx、Q、O、LSE、scale，无法直接恢复 finisher 的 residual/norm/MLP continuation。3.目标：做一个单层、单 token、N=3 localhost 的真实 TCP P2P 垂直切片；三个 worker 各只持自己的 local KV shard，只连接 predecessor/successor，packet 经过 N-1=2 个网络 hop 后由 finisher 完成 W_o+residual+norm+MLP；输出与单节点参考一致，只有 assignee shard 增长，wire payload 不随历史 KV 长度增长。4.他者：Ring Attention 通过 P2P send/recv 传 online-softmax accumulator，pipeline parallel 通过 stage link 传 activation；项目现有 TCP/QUIC RingPacket codec 已实现 Tensor 字节化，可复用 framed transport 与 dtype/shape roundtrip，但其 payload 合同不足以承载两者组合。5.本方案：先扩展一个最小 self-driving wire packet，并用 localhost N=3 单层线程/连接测试贯通 encode-send-recv-decode-domain-step；复用现有 tensor codec，不接任意 L 网络循环、sampling、多请求、QUIC、远端硬件、重试、版本协商或 runtime。6.为什么：codec-only 测试不能证明两 peer ring 数据流，直接网络化任意 L 又会同时扩大协议与层循环失败面；单层 N=3 TCP 垂直切片是能证明真实 P2P 核心主张的最小可归因步骤。VERDICT: PROPOSE IMPLEMENT EXPERIMENT ONLY；待用户确认。
+
+_updated: 2026-07-30 16:10:16_
 ### 候选下一小节点：任意 L 的单 token 全模型 ring
 
 type: `hypothesis` · status: `superseded` · confidence: 0.98 · importance: 1.0 · source: `analysis-after-e2c6cd6`
 
 【动机六问】1.问题：当前 final logits 已闭合，但 runner 固定为两层，尚不能直接运行真实模型层数，也不能机器验证用户关心的 L%N=0 时末层 producer 固定现象。2.现状：run_two_layer_ring 使用 [usize; 2] assignee，并正确完成两次 finisher-to-starter handoff 与唯一 final head；任意 N 的单层数学已验证，因此推广的未知点主要是全模型控制循环和角色递推，不是 attention 数学。3.目标：新增仅供实验的任意 L 单 token runner，接收每层 local KV shards 与冻结 assignee 序列；逐层令上一层 finisher 成为下一层 starter，末层只执行一次 final norm/head；至少验证 N=3 下 L=3 与非整倍数 L 的 logits 对齐、总 hops=L*(N-1)、producer=(starter-L) mod N、每层 exact-once。4.他者：普通 transformer forward 以循环串联 decoder layers，pipeline parallel 以 activation 串联 stages；可复用这种顺序 composition，但现成实现不表达 HCP 的同层 ring accumulator、capacity-owned KV 与每层轮转角色。5.本方案：把已验证两层逻辑泛化成一个小循环，保留现有单层 primitive 和 in-process 边界；不加入 sampling、跨 token 状态、serde、QUIC、runtime、动态 planner 或生产治理。6.为什么：这是进入真实 P2P 前最小的去人工边界步骤；先网络化固定两层会把测试专用限制写入线协议，先做 sampling 又无法证明真实层数下 sampler 所在节点。VERDICT: PROPOSE IMPLEMENT EXPERIMENT ONLY；待用户确认。
-
-_updated: 2026-07-30 14:46:39_
-### Rust 第五个实验切片：任意 L 的单 token 全模型 ring
-
-type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-07-30`
-
-把固定两层 self-driving runner 推广为任意非零层数 L。输入冻结的逐层 assignee 和逐层 local KV shards；每层让上一层 finisher 成为下一层 starter，末层唯一执行 final norm/head。验证 N=3 下 L=3 与非整倍数 L：logits 与标准参考一致、总 hops=L*(N-1)、producer=(starter-L) mod N、每层 Q/KV commit/partial/finish exact-once。仅使用 mac-local-shell + local libtorch CPU correctness；不加入 sampling、跨 token 状态、serde、QUIC、runtime、动态 planner 或生产治理。
 
 _updated: 2026-07-30 14:46:39_
 ### 实施任意 L 的单 token 全模型 self-driving ring
