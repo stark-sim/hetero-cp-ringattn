@@ -5,6 +5,166 @@ use crate::model::layers::DecoderLayer;
 use crate::model::ModelError;
 use tch::Tensor;
 
+#[derive(Debug)]
+pub struct LayerPacket {
+    residual: Tensor,
+    normalized: Tensor,
+    position_ids: Tensor,
+    q: Tensor,
+    attention_output: Option<Tensor>,
+    lse: Option<Tensor>,
+    assignee: usize,
+    current_domain: usize,
+    domains: usize,
+    visited_domains: usize,
+}
+
+impl LayerPacket {
+    pub fn start(
+        layer: &mut DecoderLayer,
+        hidden_states: &Tensor,
+        position_ids: &Tensor,
+        starter: usize,
+        assignee: usize,
+        domains: usize,
+    ) -> Result<Self, ModelError> {
+        validate_route(hidden_states, starter, assignee, domains)?;
+        let residual = hidden_states.shallow_clone();
+        let normalized = layer.input_layernorm.forward(hidden_states);
+        let q = ring_backend(layer)?.project_decode_q(&normalized, position_ids)?;
+        Ok(Self {
+            residual,
+            normalized,
+            position_ids: position_ids.shallow_clone(),
+            q,
+            attention_output: None,
+            lse: None,
+            assignee,
+            current_domain: starter,
+            domains,
+            visited_domains: 0,
+        })
+    }
+
+    pub fn tensor_payload_elements(&self) -> usize {
+        let fixed = self.residual.numel()
+            + self.normalized.numel()
+            + self.position_ids.numel()
+            + self.q.numel();
+        fixed
+            + self.attention_output.as_ref().map_or(0, Tensor::numel)
+            + self.lse.as_ref().map_or(0, Tensor::numel)
+    }
+}
+
+#[derive(Debug)]
+pub enum LayerStepOutcome {
+    Forward(LayerPacket),
+    Finished {
+        attention_output: Tensor,
+        hidden_states: Tensor,
+    },
+}
+
+fn validate_route(
+    hidden_states: &Tensor,
+    starter: usize,
+    assignee: usize,
+    domains: usize,
+) -> Result<(), ModelError> {
+    if domains == 0 {
+        return Err(ModelError::Backend(
+            "self-driving layer requires at least one domain".to_string(),
+        ));
+    }
+    if starter >= domains || assignee >= domains {
+        return Err(ModelError::Backend(format!(
+            "self-driving route out of range: domains={domains}, starter={starter}, assignee={assignee}"
+        )));
+    }
+    if hidden_states.size().get(1) != Some(&1) {
+        return Err(ModelError::Backend(
+            "self-driving layer requires one decode token".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn ring_backend(layer: &mut DecoderLayer) -> Result<&mut HcpRingAttentionBackend, ModelError> {
+    layer
+        .attention
+        .as_any_mut()
+        .downcast_mut::<HcpRingAttentionBackend>()
+        .ok_or_else(|| {
+            ModelError::Backend("self-driving layer requires HcpRingAttentionBackend".to_string())
+        })
+}
+
+pub fn process_layer_packet(
+    layer: &mut DecoderLayer,
+    mut packet: LayerPacket,
+    local_history: &mut (Tensor, Tensor),
+) -> Result<LayerStepOutcome, ModelError> {
+    if local_history.0.size() != local_history.1.size() {
+        return Err(ModelError::Backend(format!(
+            "domain {} has mismatched K/V shapes",
+            packet.current_domain
+        )));
+    }
+
+    let finished = packet.visited_domains + 1 == packet.domains;
+    let projected_output = {
+        let ring = ring_backend(layer)?;
+        if packet.current_domain == packet.assignee {
+            let (current_k, current_v) =
+                ring.project_decode_current_kv(&packet.normalized, &packet.position_ids)?;
+            local_history.0 = Tensor::cat(&[&local_history.0, &current_k], 2);
+            local_history.1 = Tensor::cat(&[&local_history.1, &current_v], 2);
+        }
+
+        let (next_output, next_lse) = match (packet.attention_output.take(), packet.lse.take()) {
+            (None, None) => {
+                ring.decode_local_compact_partial(&packet.q, &local_history.0, &local_history.1)
+            }
+            (Some(output), Some(lse)) => ring.decode_merge_compact_partial(
+                &packet.q,
+                &output,
+                &lse,
+                &local_history.0,
+                &local_history.1,
+            ),
+            _ => {
+                return Err(ModelError::Backend(
+                    "self-driving packet has incomplete attention accumulator".to_string(),
+                ));
+            }
+        };
+
+        if finished {
+            Some(ring.project_decode_output(&next_output))
+        } else {
+            packet.attention_output = Some(next_output);
+            packet.lse = Some(next_lse);
+            None
+        }
+    };
+
+    if let Some(attention_output) = projected_output {
+        let post_attention = &attention_output + &packet.residual;
+        let mlp_output = layer
+            .mlp
+            .forward(&layer.post_attention_layernorm.forward(&post_attention));
+        return Ok(LayerStepOutcome::Finished {
+            attention_output,
+            hidden_states: post_attention + mlp_output,
+        });
+    }
+
+    packet.visited_domains += 1;
+    packet.current_domain = (packet.current_domain + 1) % packet.domains;
+    Ok(LayerStepOutcome::Forward(packet))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SingleLayerRingStats {
     pub domains: usize,
@@ -42,90 +202,41 @@ pub fn run_single_layer_ring(
     assignee: usize,
 ) -> Result<SingleLayerRingResult, ModelError> {
     let domains = history_shards.len();
-    if domains == 0 {
-        return Err(ModelError::Backend(
-            "self-driving layer requires at least one domain".to_string(),
-        ));
-    }
-    if starter >= domains || assignee >= domains {
-        return Err(ModelError::Backend(format!(
-            "self-driving route out of range: domains={domains}, starter={starter}, assignee={assignee}"
-        )));
-    }
-    if hidden_states.size().get(1) != Some(&1) {
-        return Err(ModelError::Backend(
-            "self-driving layer requires one decode token".to_string(),
-        ));
-    }
-
-    let residual = hidden_states.shallow_clone();
-    let normalized = layer.input_layernorm.forward(hidden_states);
-    let attention_output = {
-        let ring = layer
-            .attention
-            .as_any_mut()
-            .downcast_mut::<HcpRingAttentionBackend>()
-            .ok_or_else(|| {
-                ModelError::Backend(
-                    "self-driving layer requires HcpRingAttentionBackend".to_string(),
-                )
-            })?;
-        let q = ring.project_decode_q(&normalized, position_ids)?;
-        let q_projections = 1;
-        let mut current_kv_projections = 0;
-        let mut current_kv_commits = 0;
-        let mut accumulator: Option<(Tensor, Tensor)> = None;
-        let mut visited_domains = Vec::with_capacity(domains);
-
-        for step in 0..domains {
-            let domain = (starter + step) % domains;
-            visited_domains.push(domain);
-            if domain == assignee {
-                let (current_k, current_v) =
-                    ring.project_decode_current_kv(&normalized, position_ids)?;
-                current_kv_projections += 1;
-                let committed_k = Tensor::cat(&[&history_shards[domain].0, &current_k], 2);
-                let committed_v = Tensor::cat(&[&history_shards[domain].1, &current_v], 2);
-                history_shards[domain] = (committed_k, committed_v);
-                current_kv_commits += 1;
-            }
-            let (history_k, history_v) = &history_shards[domain];
-            if history_k.size() != history_v.size() {
-                return Err(ModelError::Backend(format!(
-                    "domain {domain} has mismatched K/V shapes"
-                )));
-            }
-            accumulator = Some(match accumulator {
-                None => ring.decode_local_compact_partial(&q, history_k, history_v),
-                Some((o, lse)) => {
-                    ring.decode_merge_compact_partial(&q, &o, &lse, history_k, history_v)
+    let mut packet = LayerPacket::start(
+        layer,
+        hidden_states,
+        position_ids,
+        starter,
+        assignee,
+        domains,
+    )?;
+    let mut visited_domains = Vec::with_capacity(domains);
+    let mut current_kv_projections = 0;
+    let mut current_kv_commits = 0;
+    let (attention_output, hidden_states) = loop {
+        let domain = packet.current_domain;
+        visited_domains.push(domain);
+        let is_assignee = domain == packet.assignee;
+        match process_layer_packet(layer, packet, &mut history_shards[domain])? {
+            LayerStepOutcome::Forward(next_packet) => {
+                if is_assignee {
+                    current_kv_projections += 1;
+                    current_kv_commits += 1;
                 }
-            });
+                packet = next_packet;
+            }
+            LayerStepOutcome::Finished {
+                attention_output,
+                hidden_states,
+            } => {
+                if is_assignee {
+                    current_kv_projections += 1;
+                    current_kv_commits += 1;
+                }
+                break (attention_output, hidden_states);
+            }
         }
-
-        let (o, _) = accumulator.expect("non-empty ring must produce an accumulator");
-        (
-            ring.project_decode_output(&o),
-            visited_domains,
-            q_projections,
-            current_kv_projections,
-            current_kv_commits,
-        )
     };
-
-    let (
-        attention_output,
-        visited_domains,
-        q_projections,
-        current_kv_projections,
-        current_kv_commits,
-    ) = attention_output;
-
-    let post_attention = &attention_output + residual;
-    let mlp_output = layer
-        .mlp
-        .forward(&layer.post_attention_layernorm.forward(&post_attention));
-    let hidden_states = post_attention + mlp_output;
     let finisher = (starter + domains - 1) % domains;
 
     Ok(SingleLayerRingResult {
@@ -136,7 +247,7 @@ pub fn run_single_layer_ring(
             hops: domains - 1,
             visited_domains,
             local_partials: domains,
-            q_projections,
+            q_projections: 1,
             q_projection_domain: starter,
             current_kv_projections,
             current_kv_projection_domain: assignee,
@@ -497,5 +608,105 @@ mod tests {
             );
             assert!(layer_diff < 2e-4, "N={domains} layer diff: {layer_diff}");
         }
+    }
+
+    #[test]
+    fn layer_packet_is_sufficient_for_each_domain_step() {
+        let device = Device::Cpu;
+        let config = test_config();
+        let weights = deterministic_weights(&config, device);
+        let mut model = LlamaModel::from_weights(config.clone(), &weights, device, 2).unwrap();
+        let mut layer = model.layers.remove(0);
+        let hidden = deterministic_tensor(&[1, 1, config.hidden_size as i64], 70.0, device);
+        let shard_lengths = [3_i64, 5];
+        let history_len = shard_lengths.iter().sum::<i64>();
+        let position_ids = Tensor::from_slice(&[history_len]).unsqueeze(0);
+        let mut shards = shard_lengths
+            .iter()
+            .enumerate()
+            .map(|(domain, &len)| {
+                let shape = [
+                    1,
+                    config.num_kv_heads() as i64,
+                    len,
+                    config.head_dim() as i64,
+                ];
+                (
+                    deterministic_tensor(&shape, 80.0 + domain as f64, device),
+                    deterministic_tensor(&shape, 90.0 + domain as f64, device),
+                )
+            })
+            .collect::<Vec<_>>();
+        let history_k = Tensor::cat(
+            &shards
+                .iter()
+                .map(|(k, _)| k.shallow_clone())
+                .collect::<Vec<_>>(),
+            2,
+        );
+        let history_v = Tensor::cat(
+            &shards
+                .iter()
+                .map(|(_, v)| v.shallow_clone())
+                .collect::<Vec<_>>(),
+            2,
+        );
+        let (_, reference) = reference_layer_output(
+            &config,
+            &weights,
+            &hidden,
+            &position_ids,
+            &history_k,
+            &history_v,
+        );
+
+        let packet = LayerPacket::start(&mut layer, &hidden, &position_ids, 0, 1, 2).unwrap();
+        let packet = match process_layer_packet(&mut layer, packet, &mut shards[0]).unwrap() {
+            LayerStepOutcome::Forward(packet) => packet,
+            LayerStepOutcome::Finished { .. } => panic!("N=2 packet finished before successor"),
+        };
+        let hidden_states = match process_layer_packet(&mut layer, packet, &mut shards[1]).unwrap()
+        {
+            LayerStepOutcome::Finished { hidden_states, .. } => hidden_states,
+            LayerStepOutcome::Forward(_) => panic!("N=2 packet did not finish at successor"),
+        };
+
+        let max_diff = (&hidden_states - reference).abs().max().double_value(&[]);
+        assert!(max_diff < 2e-4, "explicit packet layer diff: {max_diff}");
+        assert_eq!(shards[0].0.size()[2], shard_lengths[0]);
+        assert_eq!(shards[1].0.size()[2], shard_lengths[1] + 1);
+    }
+
+    #[test]
+    fn layer_packet_payload_does_not_grow_with_history_context() {
+        fn payload_after_first_hop(history_len: i64) -> usize {
+            let device = Device::Cpu;
+            let config = test_config();
+            let weights = deterministic_weights(&config, device);
+            let mut model = LlamaModel::from_weights(config.clone(), &weights, device, 2).unwrap();
+            let mut layer = model.layers.remove(0);
+            let hidden = deterministic_tensor(&[1, 1, config.hidden_size as i64], 100.0, device);
+            let position_ids = Tensor::from_slice(&[history_len * 2]).unsqueeze(0);
+            let shape = [
+                1,
+                config.num_kv_heads() as i64,
+                history_len,
+                config.head_dim() as i64,
+            ];
+            let mut local_history = (
+                deterministic_tensor(&shape, 110.0, device),
+                deterministic_tensor(&shape, 120.0, device),
+            );
+            let packet = LayerPacket::start(&mut layer, &hidden, &position_ids, 0, 1, 2).unwrap();
+            match process_layer_packet(&mut layer, packet, &mut local_history).unwrap() {
+                LayerStepOutcome::Forward(packet) => packet.tensor_payload_elements(),
+                LayerStepOutcome::Finished { .. } => panic!("N=2 packet finished before successor"),
+            }
+        }
+
+        let short_context_payload = payload_after_first_hop(2);
+        let long_context_payload = payload_after_first_hop(47);
+        assert_eq!(short_context_payload, long_context_payload);
+        assert!(short_context_payload > 0);
     }
 }
