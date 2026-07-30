@@ -2,6 +2,29 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### Rust 自驱动 LayerPacket 数据边界验证通过
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@76be3b6`
+
+实现 commit 76be3b6。LayerPacket 显式携带 residual hidden、normalized hidden、position_ids、Q、online-softmax O/LSE 与最小路由状态；process_layer_packet 的接口只接收 local layer weights、packet 和单个 local KV shard。N=2 直接逐 domain step 与单节点参考一致；原 N=1/2/3/4 runner 回归保持 N-1 hops、Q/KV projection/commit/partial/finisher exact-once。历史 shard 长度 2 与 47 时，首跳后 packet tensor payload 元素数严格相等，证明 payload 不随历史 context 增长；没有远端历史 KV 进入 packet。验证命令：LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib cargo test --manifest-path rust/Cargo.toml --features tch-backend，83 passed/0 failed；cargo clippy --features tch-backend --all-targets exit 0，只有既有文件 warnings，self_driving.rs 无诊断。测试过程中一次 RoPE 越界来自 fixture position=194 超过 max=128，改为 position=94 后原测试通过；按 learning-from-incidents 判定为一次性夹具问题，不升级规则或 skill。
+
+_updated: 2026-07-30 10:23:35_
+### Rust 第二个实验切片：显式化自足 LayerPacket 数据边界
+
+type: `task` · status: `closed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@76be3b6`
+
+只修改单层 in-process 实验：引入携带 residual h、normalized h、Q、O/LSE 与最小路由状态的 LayerPacket；每个逻辑 domain step 仅依赖 packet、当前 layer 和自己的 KV shard。验证 N=1/2/3/4 数学、N-1 hops、exact-once 角色不变，以及 tensor payload 元素数不随历史 context 长度变化。不包含 serde、QUIC、worker runtime、多层、logits、重试或生产级 planner。
+[2026-07-30 完成] LayerPacket 与 process_layer_packet 已落地；runner 不再通过共享作用域向 assignee/finisher 提供 hidden。
+
+_updated: 2026-07-30 10:25:44_
+### 单层 in-process runner 仍通过共享作用域隐藏 packet 必需状态
+
+type: `risk` · status: `resolved` · confidence: 0.98 · importance: 1.0 · source: `hetero-cp-ringattn@76be3b6`
+
+已验证的单层数学成立，但 run_single_layer_ring 中 residual 与 normalized hidden 位于整个函数共享作用域：逻辑 assignee 能直接读取 normalized hidden，逻辑 finisher 能直接读取 residual。真实 P2P worker 不共享地址空间，因此后续 packet 必须显式携带这两类 O(d) 状态，或接受重复 norm / 额外 K/V 传输。该风险不反驳单层 attention 与 layer continuation 的代数证据，也不产生 context-sized 远端 KV；它限制的是“wire-ready 数据面已被证明”这一更强结论。
+[2026-07-30 解除] run_single_layer_ring 已完全改用 LayerPacket step；assignee/finisher 所需 normalized hidden 与 residual 均来自 packet。
+
+_updated: 2026-07-30 10:25:44_
 ### Rust 单层真实 tensor 自驱动 ring 验证通过
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `rust/src/model/self_driving.rs`
