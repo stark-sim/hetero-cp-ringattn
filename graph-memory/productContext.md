@@ -126,6 +126,13 @@ type: `decision` · status: `held` · confidence: 0.9 · importance: 0.95 · sou
 [2026-07-27 三机闭环] p2p3n-175719:laptop(4060 CUDA)+white(4090 CUDA)+pearl(9060XT ROCm) 三机真异构 P2P decode Q-ring PASS(ev-decode-p2p-3node-p2p3n-20260727),Reviewer APPROVE。
 
 _updated: 2026-07-27 10:19:39_
+### 自驱动 decode ring 跳数路线：当前 N-1，保留 N-hop 回访分支
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `user-direction-2026-07-30`
+
+当前实验路线选择 N-1 peer hops/layer：starter 计算首个 local partial，packet 依次访问其余 N-1 个 domain，最后访问者即 finisher 并就地完成 O projection、residual、norm、MLP，再成为下一层 starter。备选 N-hop 路线不判错也不删除：packet 在汇总 N 个 partial 后再多走一跳回到 starter或固定执行点，由该点完成 layer continuation。N-hop 的潜在价值是固定 continuation locality、简化某些同步/权重布局或调试合同；当前全节点均持有完整 layer weights，且目标是减少单请求线性 ring 流量，因此额外一跳暂时没有核心收益。回访触发条件：后续真实 P2P 实验发现 finisher continuation 明显增加状态、破坏局部执行约束，或固定执行点能带来可测的调度/内存收益。
+
+_updated: 2026-07-30 09:30:41_
 ### 架构决策：采用原始论文 P2P 而非 PyTorch CP Collective
 
 type: `decision` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `memory-bank/systemPatterns.md`

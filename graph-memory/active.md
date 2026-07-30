@@ -2,6 +2,27 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 候选下一小节点：显式化单层自驱动 packet 数据边界
+
+type: `hypothesis` · status: `superseded` · confidence: 0.95 · importance: 1.0 · source: `analysis-2026-07-30-next-node-motivation`
+
+【动机六问】1.问题：当前单层 runner 的数值与角色正确，但共享作用域让 assignee/finisher 读取 normalized hidden 与 residual，尚未证明真实 P2P packet 自足，也无法直接审计通信 payload 是否与 context 长度无关。2.现状：starter 投影 Q，assignee 唯一投影并 commit current K/V，finisher 唯一完成 O projection+residual+norm+MLP；然而 domain step 没有只依赖 packet+local KV 的接口。3.目标：定义仅供实验使用的显式 LayerPacket，至少携带 residual h、normalized h、Q、O/LSE 与最小路由元数据；每个 domain step 只能访问 packet 和本地 shard；验证 N=1/2/3/4 数学不变、N-1 hops、exact-once 不变、packet tensor 元素数不随历史 KV 长度增长。4.他者：Ring Attention 显式传 online-softmax accumulator；pipeline parallel 显式传 activation。可复用“状态载体必须自足”的思想，但二者没有 HCP 同层 KV 分片下 assignee 自算 K/V 与 finisher continuation 的组合 packet。5.本方案：先做纯 in-process struct 与 domain-step 边界，不加 serde、QUIC、worker command、重试或 planner；把现有闭包隐式读取改成 packet 字段读取。6.为什么：这是从单层数学证明走向真实两-peer P2P 的最小依赖；先做多层会复制当前隐藏边界，先做 QUIC则同时引入网络失败面。【牺牲四问】1.默认共享借用用于减少类型和状态搬运，最适合普通单进程 forward。2.牺牲：增加一个实验 packet 类型，并显式保留 residual h 与 normalized h 两个 O(d) 瞬时 tensor。3.这些共享借用在一般单进程代码中提供简单控制流和较少 bookkeeping。4.对 HCP，显式 O(d) packet 是验证 P2P 自足性和线性通信的必要成本，且不随 context 增长，不破坏 KV capacity-weighted 切分。结论：建议 implement this experiment only；多层 handoff+唯一 logits 延后一节点。
+
+_updated: 2026-07-30 09:30:41_
+### Rust 第二个实验切片：显式化自足 LayerPacket 数据边界
+
+type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-07-30`
+
+只修改单层 in-process 实验：引入携带 residual h、normalized h、Q、O/LSE 与最小路由状态的 LayerPacket；每个逻辑 domain step 仅依赖 packet、当前 layer 和自己的 KV shard。验证 N=1/2/3/4 数学、N-1 hops、exact-once 角色不变，以及 tensor payload 元素数不随历史 context 长度变化。不包含 serde、QUIC、worker runtime、多层、logits、重试或生产级 planner。
+
+_updated: 2026-07-30 09:30:41_
+### 实施显式 LayerPacket，先证明跨节点所需状态边界
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-07-30`
+
+【动机六问】1.问题：单层数值与角色已正确，但 assignee/finisher 仍从共享作用域读取 normalized hidden 与 residual，无法证明真实 P2P packet 自足。2.现状：starter 唯一投影 Q、assignee 唯一投影并 commit 当前 K/V、全节点各算一个 partial、finisher 唯一做 O projection+residual+norm+MLP；隐藏共享借用掩盖了线上必须传输的 O(d) 状态。3.目标：显式 LayerPacket 使 domain step 只能访问 packet+本地 shard，并以测试证明数学与 exact-once 不变、payload 与历史 context 长度无关。4.他者：Ring Attention 显式传 online-softmax accumulator，pipeline parallel 显式传 activation；可复用自足状态载体思想。5.本方案：仅在现有 in-process runner 中增加实验 struct 和 step 边界，不接线协议与 runtime。6.为什么：这是进入两-peer P2P 前最小且必要的边界证明，先多层会复制隐藏共享状态，先网络化会同时扩大失败面。【牺牲四问】默认共享借用让普通单进程 forward 更简单且少 bookkeeping；本次牺牲这种简洁性，显式保留 residual h 与 normalized h 两个 O(d) 瞬时 tensor；它们在普通 forward 中本可由调用栈隐含持有；对 HCP 而言这是 packet 自足的必要成本，且不随 context 增长、不形成远端历史 KV 副本。VERDICT: IMPLEMENT EXPERIMENT ONLY。
+
+_updated: 2026-07-30 09:30:41_
 ### 当前唯一实施任务：自驱动 decode ring 最小核心切片
 
 type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-07-30`
@@ -19,13 +40,6 @@ _updated: 2026-07-30 06:43:11_
 type: `risk` · status: `open` · confidence: 0.98 · importance: 1.0 · source: `analysis-2026-07-30-next-node-motivation`
 
 已验证的单层数学成立，但 run_single_layer_ring 中 residual 与 normalized hidden 位于整个函数共享作用域：逻辑 assignee 能直接读取 normalized hidden，逻辑 finisher 能直接读取 residual。真实 P2P worker 不共享地址空间，因此后续 packet 必须显式携带这两类 O(d) 状态，或接受重复 norm / 额外 K/V 传输。该风险不反驳单层 attention 与 layer continuation 的代数证据，也不产生 context-sized 远端 KV；它限制的是“wire-ready 数据面已被证明”这一更强结论。
-
-_updated: 2026-07-30 06:43:11_
-### 候选下一小节点：显式化单层自驱动 packet 数据边界
-
-type: `hypothesis` · status: `open` · confidence: 0.95 · importance: 1.0 · source: `analysis-2026-07-30-next-node-motivation`
-
-【动机六问】1.问题：当前单层 runner 的数值与角色正确，但共享作用域让 assignee/finisher 读取 normalized hidden 与 residual，尚未证明真实 P2P packet 自足，也无法直接审计通信 payload 是否与 context 长度无关。2.现状：starter 投影 Q，assignee 唯一投影并 commit current K/V，finisher 唯一完成 O projection+residual+norm+MLP；然而 domain step 没有只依赖 packet+local KV 的接口。3.目标：定义仅供实验使用的显式 LayerPacket，至少携带 residual h、normalized h、Q、O/LSE 与最小路由元数据；每个 domain step 只能访问 packet 和本地 shard；验证 N=1/2/3/4 数学不变、N-1 hops、exact-once 不变、packet tensor 元素数不随历史 KV 长度增长。4.他者：Ring Attention 显式传 online-softmax accumulator；pipeline parallel 显式传 activation。可复用“状态载体必须自足”的思想，但二者没有 HCP 同层 KV 分片下 assignee 自算 K/V 与 finisher continuation 的组合 packet。5.本方案：先做纯 in-process struct 与 domain-step 边界，不加 serde、QUIC、worker command、重试或 planner；把现有闭包隐式读取改成 packet 字段读取。6.为什么：这是从单层数学证明走向真实两-peer P2P 的最小依赖；先做多层会复制当前隐藏边界，先做 QUIC则同时引入网络失败面。【牺牲四问】1.默认共享借用用于减少类型和状态搬运，最适合普通单进程 forward。2.牺牲：增加一个实验 packet 类型，并显式保留 residual h 与 normalized h 两个 O(d) 瞬时 tensor。3.这些共享借用在一般单进程代码中提供简单控制流和较少 bookkeeping。4.对 HCP，显式 O(d) packet 是验证 P2P 自足性和线性通信的必要成本，且不随 context 增长，不破坏 KV capacity-weighted 切分。结论：建议 implement this experiment only；多层 handoff+唯一 logits 延后一节点。
 
 _updated: 2026-07-30 06:43:11_
 ### Rust 首个实验切片：任意 N 的单层真实 tensor 自驱动 ring
