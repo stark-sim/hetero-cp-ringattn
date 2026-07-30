@@ -101,6 +101,17 @@ fn ring_backend(layer: &mut DecoderLayer) -> Result<&mut HcpRingAttentionBackend
         })
 }
 
+fn project_final_logits(model: &LlamaModel, hidden_states: &Tensor) -> Tensor {
+    let normalized = model.norm.forward(hidden_states);
+    let lm_head = model.lm_head.as_ref().unwrap_or(&model.embedding);
+    let logits = normalized.matmul(&lm_head.transpose(0, 1));
+    if model.dtype != Kind::Float {
+        logits.to_kind(Kind::Float)
+    } else {
+        logits
+    }
+}
+
 pub fn process_layer_packet(
     layer: &mut DecoderLayer,
     mut packet: LayerPacket,
@@ -205,6 +216,15 @@ pub struct TwoLayerLogitsResult {
     pub logits_projections: usize,
 }
 
+#[derive(Debug)]
+pub struct ModelRingResult {
+    pub hidden_states: Tensor,
+    pub logits: Tensor,
+    pub layer_stats: Vec<SingleLayerRingStats>,
+    pub logits_producer_domain: usize,
+    pub logits_projections: usize,
+}
+
 /// Run one real decoder layer over already-sharded history KV.
 ///
 /// This is deliberately an in-process experiment: it proves the tensor data
@@ -276,6 +296,52 @@ pub fn run_single_layer_ring(
     })
 }
 
+/// Run one decode token through every model layer using finisher-to-starter handoff.
+pub fn run_model_ring(
+    model: &mut LlamaModel,
+    hidden_states: &Tensor,
+    position_ids: &Tensor,
+    layer_history_shards: &mut [Vec<(Tensor, Tensor)>],
+    starter: usize,
+    assignees: &[usize],
+) -> Result<ModelRingResult, ModelError> {
+    let layers = model.layers.len();
+    if layers == 0 || layer_history_shards.len() != layers || assignees.len() != layers {
+        return Err(ModelError::Backend(format!(
+            "self-driving model requires matching non-empty layers, shard sets, and assignees: layers={layers}, shard_sets={}, assignees={}",
+            layer_history_shards.len(),
+            assignees.len()
+        )));
+    }
+
+    let mut current_hidden = hidden_states.shallow_clone();
+    let mut current_starter = starter;
+    let mut layer_stats = Vec::with_capacity(layers);
+    for layer_idx in 0..layers {
+        let layer_result = run_single_layer_ring(
+            &mut model.layers[layer_idx],
+            &current_hidden,
+            position_ids,
+            &mut layer_history_shards[layer_idx],
+            current_starter,
+            assignees[layer_idx],
+        )?;
+        current_hidden = layer_result.hidden_states;
+        current_starter = layer_result.stats.finisher;
+        layer_stats.push(layer_result.stats);
+    }
+
+    let logits = project_final_logits(model, &current_hidden);
+
+    Ok(ModelRingResult {
+        hidden_states: current_hidden,
+        logits,
+        layer_stats,
+        logits_producer_domain: current_starter,
+        logits_projections: 1,
+    })
+}
+
 /// Run exactly two decoder layers, continuing layer 1 on layer 0's finisher.
 pub fn run_two_layer_ring(
     layers: &mut [DecoderLayer],
@@ -334,14 +400,7 @@ pub fn run_two_layer_ring_with_logits(
         assignees,
     )?;
     let logits_producer_domain = layer_result.layer_stats[1].finisher;
-    let normalized = model.norm.forward(&layer_result.hidden_states);
-    let lm_head = model.lm_head.as_ref().unwrap_or(&model.embedding);
-    let logits = normalized.matmul(&lm_head.transpose(0, 1));
-    let logits = if model.dtype != Kind::Float {
-        logits.to_kind(Kind::Float)
-    } else {
-        logits
-    };
+    let logits = project_final_logits(model, &layer_result.hidden_states);
 
     Ok(TwoLayerLogitsResult {
         hidden_states: layer_result.hidden_states,
@@ -955,6 +1014,175 @@ mod tests {
                 assert_eq!(layer_shards[layer_idx][domain].0.size()[2], expected);
             }
         }
+    }
+
+    fn assert_full_model_ring_case(num_layers: usize, starter: usize) {
+        let domains = 3_usize;
+        let device = Device::Cpu;
+        let mut config = test_config();
+        config.num_layers = num_layers;
+        let weights = deterministic_weights(&config, device);
+        let mut model =
+            LlamaModel::from_weights(config.clone(), &weights, device, domains).unwrap();
+        let hidden = deterministic_tensor(
+            &[1, 1, config.hidden_size as i64],
+            210.0 + num_layers as f64,
+            device,
+        );
+        let shard_lengths = [2_i64, 4, 3];
+        let history_len = shard_lengths.iter().sum::<i64>();
+        let position_ids = Tensor::from_slice(&[history_len]).unsqueeze(0);
+        let mut layer_shards = (0..config.num_layers)
+            .map(|layer_idx| {
+                shard_lengths
+                    .iter()
+                    .enumerate()
+                    .map(|(domain, &len)| {
+                        let shape = [
+                            1,
+                            config.num_kv_heads() as i64,
+                            len,
+                            config.head_dim() as i64,
+                        ];
+                        (
+                            deterministic_tensor(
+                                &shape,
+                                220.0 + layer_idx as f64 * 20.0 + domain as f64,
+                                device,
+                            ),
+                            deterministic_tensor(
+                                &shape,
+                                230.0 + layer_idx as f64 * 20.0 + domain as f64,
+                                device,
+                            ),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let reference_histories = layer_shards
+            .iter()
+            .map(|shards| {
+                (
+                    Tensor::cat(
+                        &shards
+                            .iter()
+                            .map(|(k, _)| k.shallow_clone())
+                            .collect::<Vec<_>>(),
+                        2,
+                    ),
+                    Tensor::cat(
+                        &shards
+                            .iter()
+                            .map(|(_, v)| v.shallow_clone())
+                            .collect::<Vec<_>>(),
+                        2,
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut reference_hidden = hidden.shallow_clone();
+        for (layer_idx, (history_k, history_v)) in reference_histories.iter().enumerate() {
+            let (_, next_hidden) = reference_layer_output(
+                layer_idx,
+                &config,
+                &weights,
+                &reference_hidden,
+                &position_ids,
+                history_k,
+                history_v,
+            );
+            reference_hidden = next_hidden;
+        }
+        let reference_final_norm =
+            RmsNorm::from_weights(&weights, WeightNames::layer_norm(), config.rms_norm_eps)
+                .unwrap();
+        let reference_logits = reference_final_norm
+            .forward(&reference_hidden)
+            .matmul(&weights.get(WeightNames::lm_head()).unwrap().transpose(0, 1));
+        let assignees = (0..num_layers)
+            .map(|layer_idx| (2 + domains - layer_idx % domains) % domains)
+            .collect::<Vec<_>>();
+
+        let result = run_model_ring(
+            &mut model,
+            &hidden,
+            &position_ids,
+            &mut layer_shards,
+            starter,
+            &assignees,
+        )
+        .unwrap();
+
+        let logits_diff = (&result.logits - reference_logits)
+            .abs()
+            .max()
+            .double_value(&[]);
+        assert!(
+            logits_diff < 1e-3,
+            "L={num_layers} full-model logits diff: {logits_diff}"
+        );
+        let expected_producer = (starter + domains - num_layers % domains) % domains;
+        assert_eq!(result.logits_producer_domain, expected_producer);
+        assert_eq!(result.logits_projections, 1);
+        assert_eq!(result.layer_stats.len(), num_layers);
+        assert_eq!(
+            result
+                .layer_stats
+                .iter()
+                .map(|stats| stats.hops)
+                .sum::<usize>(),
+            num_layers * (domains - 1)
+        );
+        let expected_starters = (0..num_layers)
+            .scan(starter, |current, _| {
+                let layer_starter = *current;
+                *current = (layer_starter + domains - 1) % domains;
+                Some(layer_starter)
+            })
+            .collect::<Vec<_>>();
+        let expected_finishers = expected_starters
+            .iter()
+            .map(|layer_starter| (layer_starter + domains - 1) % domains)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            result
+                .layer_stats
+                .iter()
+                .map(|stats| stats.starter)
+                .collect::<Vec<_>>(),
+            expected_starters
+        );
+        assert_eq!(
+            result
+                .layer_stats
+                .iter()
+                .map(|stats| stats.finisher)
+                .collect::<Vec<_>>(),
+            expected_finishers
+        );
+        for (layer_idx, &assignee) in assignees.iter().enumerate() {
+            let stats = &result.layer_stats[layer_idx];
+            assert_eq!(stats.q_projections, 1);
+            assert_eq!(stats.local_partials, 3);
+            assert_eq!(stats.current_kv_projections, 1);
+            assert_eq!(stats.current_kv_commits, 1);
+            assert_eq!(stats.layer_finishes, 1);
+            for domain in 0..3 {
+                let expected = shard_lengths[domain] + i64::from(domain == assignee);
+                assert_eq!(layer_shards[layer_idx][domain].0.size()[2], expected);
+            }
+        }
+    }
+
+    #[test]
+    fn full_model_ring_returns_to_starter_when_layers_divide_domains() {
+        assert_full_model_ring_case(3, 1);
+    }
+
+    #[test]
+    fn full_model_ring_rotates_producer_when_layers_do_not_divide_domains() {
+        assert_full_model_ring_case(4, 1);
     }
 
     #[test]
