@@ -2,8 +2,9 @@
 
 use crate::model::attention::HcpRingAttentionBackend;
 use crate::model::layers::DecoderLayer;
+use crate::model::model::LlamaModel;
 use crate::model::ModelError;
-use tch::Tensor;
+use tch::{Kind, Tensor};
 
 #[derive(Debug)]
 pub struct LayerPacket {
@@ -195,6 +196,15 @@ pub struct TwoLayerRingResult {
     pub layer_stats: [SingleLayerRingStats; 2],
 }
 
+#[derive(Debug)]
+pub struct TwoLayerLogitsResult {
+    pub hidden_states: Tensor,
+    pub logits: Tensor,
+    pub layer_stats: [SingleLayerRingStats; 2],
+    pub logits_producer_domain: usize,
+    pub logits_projections: usize,
+}
+
 /// Run one real decoder layer over already-sharded history KV.
 ///
 /// This is deliberately an in-process experiment: it proves the tensor data
@@ -304,6 +314,41 @@ pub fn run_two_layer_ring(
     Ok(TwoLayerRingResult {
         hidden_states: second.hidden_states,
         layer_stats: [first.stats, second.stats],
+    })
+}
+
+pub fn run_two_layer_ring_with_logits(
+    model: &mut LlamaModel,
+    hidden_states: &Tensor,
+    position_ids: &Tensor,
+    layer_history_shards: &mut [Vec<(Tensor, Tensor)>],
+    starter: usize,
+    assignees: [usize; 2],
+) -> Result<TwoLayerLogitsResult, ModelError> {
+    let layer_result = run_two_layer_ring(
+        &mut model.layers,
+        hidden_states,
+        position_ids,
+        layer_history_shards,
+        starter,
+        assignees,
+    )?;
+    let logits_producer_domain = layer_result.layer_stats[1].finisher;
+    let normalized = model.norm.forward(&layer_result.hidden_states);
+    let lm_head = model.lm_head.as_ref().unwrap_or(&model.embedding);
+    let logits = normalized.matmul(&lm_head.transpose(0, 1));
+    let logits = if model.dtype != Kind::Float {
+        logits.to_kind(Kind::Float)
+    } else {
+        logits
+    };
+
+    Ok(TwoLayerLogitsResult {
+        hidden_states: layer_result.hidden_states,
+        logits,
+        layer_stats: layer_result.layer_stats,
+        logits_producer_domain,
+        logits_projections: 1,
     })
 }
 
@@ -858,9 +903,15 @@ mod tests {
             &reference_histories[1].0,
             &reference_histories[1].1,
         );
+        let reference_final_norm =
+            RmsNorm::from_weights(&weights, WeightNames::layer_norm(), config.rms_norm_eps)
+                .unwrap();
+        let reference_logits = reference_final_norm
+            .forward(&reference_layer_1)
+            .matmul(&weights.get(WeightNames::lm_head()).unwrap().transpose(0, 1));
 
-        let result = run_two_layer_ring(
-            &mut model.layers,
+        let result = run_two_layer_ring_with_logits(
+            &mut model,
             &hidden,
             &position_ids,
             &mut layer_shards,
@@ -874,6 +925,13 @@ mod tests {
             .max()
             .double_value(&[]);
         assert!(max_diff < 4e-4, "two-layer output diff: {max_diff}");
+        let logits_diff = (&result.logits - reference_logits)
+            .abs()
+            .max()
+            .double_value(&[]);
+        assert!(logits_diff < 4e-4, "final logits diff: {logits_diff}");
+        assert_eq!(result.logits_producer_domain, 2);
+        assert_eq!(result.logits_projections, 1);
         assert_eq!(result.layer_stats[0].starter, 1);
         assert_eq!(result.layer_stats[0].finisher, 0);
         assert_eq!(result.layer_stats[1].starter, 0);
@@ -897,5 +955,90 @@ mod tests {
                 assert_eq!(layer_shards[layer_idx][domain].0.size()[2], expected);
             }
         }
+    }
+
+    #[test]
+    fn two_layer_final_logits_support_tied_embeddings() {
+        let device = Device::Cpu;
+        let mut config = test_config();
+        config.num_layers = 2;
+        config.tie_word_embeddings = true;
+        let weights = deterministic_weights(&config, device);
+        let mut model = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+        assert!(model.lm_head.is_none());
+        let hidden = deterministic_tensor(&[1, 1, config.hidden_size as i64], 180.0, device);
+        let history_len = 3_i64;
+        let position_ids = Tensor::from_slice(&[history_len]).unsqueeze(0);
+        let mut layer_shards = (0..2)
+            .map(|layer_idx| {
+                let shape = [
+                    1,
+                    config.num_kv_heads() as i64,
+                    history_len,
+                    config.head_dim() as i64,
+                ];
+                vec![(
+                    deterministic_tensor(&shape, 190.0 + layer_idx as f64 * 10.0, device),
+                    deterministic_tensor(&shape, 200.0 + layer_idx as f64 * 10.0, device),
+                )]
+            })
+            .collect::<Vec<_>>();
+        let reference_histories = layer_shards
+            .iter()
+            .map(|shards| (shards[0].0.shallow_clone(), shards[0].1.shallow_clone()))
+            .collect::<Vec<_>>();
+        let (_, reference_layer_0) = reference_layer_output(
+            0,
+            &config,
+            &weights,
+            &hidden,
+            &position_ids,
+            &reference_histories[0].0,
+            &reference_histories[0].1,
+        );
+        let (_, reference_layer_1) = reference_layer_output(
+            1,
+            &config,
+            &weights,
+            &reference_layer_0,
+            &position_ids,
+            &reference_histories[1].0,
+            &reference_histories[1].1,
+        );
+        let reference_final_norm =
+            RmsNorm::from_weights(&weights, WeightNames::layer_norm(), config.rms_norm_eps)
+                .unwrap();
+        let reference_logits = reference_final_norm.forward(&reference_layer_1).matmul(
+            &weights
+                .get(WeightNames::embedding())
+                .unwrap()
+                .transpose(0, 1),
+        );
+
+        let result = run_two_layer_ring_with_logits(
+            &mut model,
+            &hidden,
+            &position_ids,
+            &mut layer_shards,
+            0,
+            [0, 0],
+        )
+        .unwrap();
+
+        let logits_diff = (&result.logits - reference_logits)
+            .abs()
+            .max()
+            .double_value(&[]);
+        assert!(logits_diff < 4e-4, "tied final logits diff: {logits_diff}");
+        assert_eq!(result.logits_producer_domain, 0);
+        assert_eq!(result.logits_projections, 1);
+        assert_eq!(
+            result
+                .layer_stats
+                .iter()
+                .map(|stats| stats.hops)
+                .sum::<usize>(),
+            0
+        );
     }
 }
