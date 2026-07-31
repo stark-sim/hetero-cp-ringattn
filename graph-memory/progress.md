@@ -2,6 +2,20 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### Rust localhost TCP ring 的任意 N 与 wrap-around 路由验证通过
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@2150d7a`
+
+实现提交 2150d7a 只参数化既有 localhost TCP 单层试验，没有新增生产路由机制。测试 helper 直接记录每个 packet 的 visited_index/current_domain，并对 N=2/3/4 使用 starter=N-1、assignee=(starter+1)%N。实际处理顺序分别为 N=2:1->0、N=3:2->0->1、N=4:3->0->1->2，均真实经过尾节点->0 的 wrap-around TCP 边。每例同时断言 send=N-1、每 worker 一次 local partial、finisher=(starter+N-1)%N 且唯一、只有 assignee K/V 各增长一个 token、attention diff<1e-4、layer hidden diff<2e-4。验证：cargo test --features tch-backend 最终 91 passed, 0 failed，3 doctests ignored；新增定向测试通过；定向 clippy 对 self_driving.rs 无 warning；git diff --check 通过。结论只覆盖 mac-local-shell + libtorch CPU 的单层 localhost TCP correctness，不覆盖多层网络循环、sampling、QUIC、远端硬件或性能。
+
+_updated: 2026-07-31 06:40:06_
+### 未固定随机权重的 CPU batch 数值阈值可能偶发越界，不能在无关节点顺手调阈值
+
+type: `lesson` · status: `held` · confidence: 0.95 · importance: 0.65 · source: `hetero-cp-ringattn@2150d7a`
+
+症状：首次完整 91 项回归中，既有 test_batch_forward_correctness 的 decode sample 1 mean diff=1.095e-4，略高于 BATCH_TOL=1e-4；新增 arbitrary-N TCP 测试本身通过。定位：本轮 diff 仅在 self_driving.rs；失败用例位于 model.rs，fixture 使用未固定 seed 的 Tensor::randn，且注释已说明 CPU BLAS batched/single 路径存在非确定数值差异。复验：该用例在五个独立 cargo test 进程中 5/5 通过，随后完整 91/91 通过。处理：本节点不调阈值、不改模型；只保留 incident。预防：遇到这种跨模块数值边界失败，先查随机 fixture并独立重复，只有稳定可复现且与改动有数据流联系时才修改测试或实现。
+
+_updated: 2026-07-31 06:40:06_
 ### Rust N=3 localhost 单层 self-driving TCP ring 验证通过
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@71c8698`

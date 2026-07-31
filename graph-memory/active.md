@@ -2,27 +2,6 @@
 
 当前活跃的任务、决策、风险和假设。
 
-### 候选下一小节点：任意 N 与 wrap-around 的 localhost TCP 单层 ring
-
-type: `hypothesis` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `analysis-after-71c8698`
-
-【动机六问】1.问题：N=3 starter=0 已证明两个真实 TCP hop，但用户要求任意 N 通用；当前机器证据没有覆盖 N=2/N=4，也没有让请求跨过最后节点->0 的 wrap-around 边。2.现状：LayerPacket/SelfDrivingPacket 的 domains/current_domain/visited 与 localhost listener 拓扑构造均按 N 参数化；in-process 测试已覆盖 N=1/2/4，但网络测试把 N=3、starter=0、assignee=1 固定。3.目标：保持单层、单 token、localhost CPU，最小泛化测试覆盖 N=2/3/4 与非零 starter；每例断言 route 沿 successor 且包含需要的 wrap-around、send=N-1、每 worker local partial exact-once、唯一 assignee KV 增长、唯一 finisher 输出对齐参考、wire 不携带历史 KV。4.他者：标准 ring send/recv 以 rank、world_size、successor=(rank+1)%N 参数化，正确性通常用多 world-size 和 wrap-around case 验证；无需 collective 或动态 planner。5.本方案：提取现有 localhost 测试的参数化 helper，只扩测试和必要的最小观测字段；不修改 wire 合同、transport trait、任意 L 循环、sampling、QUIC、远端脚本或 runtime。6.为什么：直接进入任意 L 网络循环会把 domain-count 路由问题与 layer handoff 混在一起；先补 N 与 wrap-around 是更小、可归因的证据节点，且 laptop 不可达也不阻塞。VERDICT: PROPOSE IMPLEMENT EXPERIMENT ONLY；待用户确认。
-
-_updated: 2026-07-31 05:33:39_
-### Rust 第七个实验切片：任意 N 与 wrap-around 的 localhost TCP 单层 ring
-
-type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-07-31`
-
-仅参数化现有单层、单 token localhost TCP correctness 测试，覆盖 N=2/3/4 和非零 starter。验证 successor modulo 路由真实经过尾节点->0 的 wrap-around 边；每例 send=N-1、每 worker local partial exact-once、唯一 assignee K/V 增长、唯一 finisher 完成 W_o+residual+norm+MLP、输出对齐未切分参考。继续使用 mac-local-shell + libtorch CPU；不修改 wire 合同或 transport trait，不进入任意 L 网络循环、sampling、多请求 runtime、QUIC、远端硬件、重试或生产治理。
-
-_updated: 2026-07-31 05:33:39_
-### 实施任意 N 与非零 starter 的 localhost TCP ring 路由验证
-
-type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-07-31`
-
-【动机六问】1.问题：现有 N=3 starter=0 的真实 TCP 路径 0->1->2 没有经过尾节点->0，只证明了链式两跳；不能排除 modulo 闭环边或非零 phase 有错。2.现状：LayerPacket/SelfDrivingPacket 的 domains/current_domain/visited 与 listener 拓扑均按 N 参数化，in-process 已覆盖 N=1/2/4，但真实 TCP 测试固定 N=3、starter=0、assignee=1。非零 starter 不只来自多层：finisher-to-starter handoff、跨 token continuation、以及 stable request_id 分散初始 phase 都会产生。3.目标：保持单层单 token，覆盖 N=2/3/4，并令至少 N=3/N=4 使用 starter=N-1；机器断言实际 route 经过 wrap-around、send=N-1、每节点一次 partial、唯一 assignee 增长、唯一 finisher 输出对齐参考。4.他者：标准 P2P ring 用 successor=(rank+1)%world_size，正确性验证必须覆盖多 world size 和 wrap-around；否则只能证明 linear pipeline。5.本方案：把既有 N=3 localhost 测试提取为参数化 helper，增加最小 route 观测；不修改独立 SelfDrivingPacket、TcpFrame、KvTransport trait 或运行时。6.为什么：直接做多层网络循环会把 modulo 路由与 layer handoff 混在一起；单层非零 starter 能独立证明物理环闭合，随后多层只需复用该不变量。执行环境仍为 mac-local-shell + libtorch CPU，只声明 localhost correctness。VERDICT: IMPLEMENT EXPERIMENT ONLY。
-
-_updated: 2026-07-31 05:33:39_
 ### 当前唯一实施任务：自驱动 decode ring 最小核心切片
 
 type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-07-30`
@@ -43,7 +22,32 @@ type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · sourc
 
 下一候选仅为任意 N localhost 网络证据：用 N=2/3/4 与非零 starter 覆盖 successor wrap-around；未经用户确认不实施。sampling/token continuation、任意 L 网络循环、QUIC、远端硬件与 runtime 仍未开始。
 
-_updated: 2026-07-31 04:51:06_
+[2026-07-31 checkpoint 7] localhost 单层 TCP ring 的任意 N 与闭环边已验证：N=2/3/4 使用 starter=N-1，实际 route 为 1->0、2->0->1、3->0->1->2，均经过 wrap-around；每例 N-1 sends、local partial/assignee KV/finisher exact-once 与参考输出断言通过。没有新增生产路由代码，仅参数化试验。完整 Rust 测试 91/91 通过，实现 2150d7a 已推送。
+
+下一候选为 N=3 固定两层 localhost TCP handoff：让 layer 0 finisher 原地成为 layer 1 starter，验证跨层无需 coordinator return；未经用户确认不实施。
+
+_updated: 2026-07-31 06:40:06_
+### 候选下一小节点：N=3 固定两层 localhost TCP finisher-to-starter handoff
+
+type: `hypothesis` · status: `proposed` · confidence: 1.0 · importance: 1.0 · source: `analysis-after-2150d7a`
+
+【动机六问】1.问题：单层真实 TCP 已覆盖任意 N 与 wrap-around，但网络 worker 仍是单包单层后退出；尚未证明 layer 0 finisher 能在本节点用输出 hidden 原地启动 layer 1，而不把 activation 返回 coordinator。2.现状：in-process 两层和任意 L runner 已证明 s(l+1)=s(l)-1 mod N 与数值正确；TCP 试验只证明 LayerPacket 在一层内流动。3.目标：N=3、两层、单 token、localhost CPU；layer 0 finisher 直接创建并先处理 layer 1 packet，然后沿已有 predecessor/successor 连接继续；断言 layer1 starter==layer0 finisher、总 sends=2*(N-1)=4、每层每节点 partial exact-once、每层唯一 assignee KV 增长、末层唯一 finisher hidden 对齐两层参考。4.他者：pipeline parallel 在 stage 间传 activation，Ring Attention 每层独立传 accumulator；常见事件循环根据 layer/step 元数据继续，但没有现成实现表达 HCP 同层 KV 分片与 finisher 续层组合。5.本方案：只把 localhost test worker 从单层 one-shot 改为固定两层事件循环，复用 SelfDrivingPacket.layer_idx 与同一 TCP ring；不泛化任意 L，不接 logits/sampling、QUIC、remote 或 runtime。6.为什么：这是非零 starter 在多层中的第一个真实应用，同时仍把失败面限制在一次 layer boundary；直接任意 L 或 token continuation 会混入终止协议与 sampling。VERDICT: PROPOSE IMPLEMENT EXPERIMENT ONLY；待用户确认。
+
+_updated: 2026-07-31 06:40:06_
+### 候选下一小节点：任意 N 与 wrap-around 的 localhost TCP 单层 ring
+
+type: `hypothesis` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `analysis-after-71c8698`
+
+【动机六问】1.问题：N=3 starter=0 已证明两个真实 TCP hop，但用户要求任意 N 通用；当前机器证据没有覆盖 N=2/N=4，也没有让请求跨过最后节点->0 的 wrap-around 边。2.现状：LayerPacket/SelfDrivingPacket 的 domains/current_domain/visited 与 localhost listener 拓扑构造均按 N 参数化；in-process 测试已覆盖 N=1/2/4，但网络测试把 N=3、starter=0、assignee=1 固定。3.目标：保持单层、单 token、localhost CPU，最小泛化测试覆盖 N=2/3/4 与非零 starter；每例断言 route 沿 successor 且包含需要的 wrap-around、send=N-1、每 worker local partial exact-once、唯一 assignee KV 增长、唯一 finisher 输出对齐参考、wire 不携带历史 KV。4.他者：标准 ring send/recv 以 rank、world_size、successor=(rank+1)%N 参数化，正确性通常用多 world-size 和 wrap-around case 验证；无需 collective 或动态 planner。5.本方案：提取现有 localhost 测试的参数化 helper，只扩测试和必要的最小观测字段；不修改 wire 合同、transport trait、任意 L 循环、sampling、QUIC、远端脚本或 runtime。6.为什么：直接进入任意 L 网络循环会把 domain-count 路由问题与 layer handoff 混在一起；先补 N 与 wrap-around 是更小、可归因的证据节点，且 laptop 不可达也不阻塞。VERDICT: PROPOSE IMPLEMENT EXPERIMENT ONLY；待用户确认。
+
+_updated: 2026-07-31 05:33:39_
+### 实施任意 N 与非零 starter 的 localhost TCP ring 路由验证
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-07-31`
+
+【动机六问】1.问题：现有 N=3 starter=0 的真实 TCP 路径 0->1->2 没有经过尾节点->0，只证明了链式两跳；不能排除 modulo 闭环边或非零 phase 有错。2.现状：LayerPacket/SelfDrivingPacket 的 domains/current_domain/visited 与 listener 拓扑均按 N 参数化，in-process 已覆盖 N=1/2/4，但真实 TCP 测试固定 N=3、starter=0、assignee=1。非零 starter 不只来自多层：finisher-to-starter handoff、跨 token continuation、以及 stable request_id 分散初始 phase 都会产生。3.目标：保持单层单 token，覆盖 N=2/3/4，并令至少 N=3/N=4 使用 starter=N-1；机器断言实际 route 经过 wrap-around、send=N-1、每节点一次 partial、唯一 assignee 增长、唯一 finisher 输出对齐参考。4.他者：标准 P2P ring 用 successor=(rank+1)%world_size，正确性验证必须覆盖多 world size 和 wrap-around；否则只能证明 linear pipeline。5.本方案：把既有 N=3 localhost 测试提取为参数化 helper，增加最小 route 观测；不修改独立 SelfDrivingPacket、TcpFrame、KvTransport trait 或运行时。6.为什么：直接做多层网络循环会把 modulo 路由与 layer handoff 混在一起；单层非零 starter 能独立证明物理环闭合，随后多层只需复用该不变量。执行环境仍为 mac-local-shell + libtorch CPU，只声明 localhost correctness。VERDICT: IMPLEMENT EXPERIMENT ONLY。
+
+_updated: 2026-07-31 05:33:39_
 ### 候选下一小节点：N=3 localhost 单层真实 P2P self-driving ring
 
 type: `hypothesis` · status: `superseded` · confidence: 0.97 · importance: 1.0 · source: `analysis-after-c2a0483`
