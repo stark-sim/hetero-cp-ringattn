@@ -1147,6 +1147,279 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct TcpLayerEvent {
+        layer_idx: usize,
+        visit_index: usize,
+        domain: usize,
+        started: bool,
+        finished: bool,
+        sent_bytes: usize,
+        kv_before: i64,
+        kv_after: i64,
+    }
+
+    #[test]
+    fn two_layer_tcp_ring_continues_on_first_layer_finisher() {
+        let domains = 3_usize;
+        let layers_count = 2_usize;
+        let initial_starter = 1_usize;
+        let assignees = [2_usize, 1];
+        let device = Device::Cpu;
+        let mut config = test_config();
+        config.num_layers = layers_count;
+        let weights = deterministic_weights(&config, device);
+        let hidden = deterministic_tensor(&[1, 1, config.hidden_size as i64], 129.0, device);
+        let shard_lengths = [2_i64, 4, 3];
+        let history_len = shard_lengths.iter().sum::<i64>();
+        let position_ids = Tensor::from_slice(&[history_len]).unsqueeze(0);
+        let layer_shards = (0..layers_count)
+            .map(|layer_idx| {
+                shard_lengths
+                    .iter()
+                    .enumerate()
+                    .map(|(domain, &len)| {
+                        let shape = [
+                            1,
+                            config.num_kv_heads() as i64,
+                            len,
+                            config.head_dim() as i64,
+                        ];
+                        (
+                            deterministic_tensor(
+                                &shape,
+                                130.0 + layer_idx as f64 * 20.0 + domain as f64,
+                                device,
+                            ),
+                            deterministic_tensor(
+                                &shape,
+                                140.0 + layer_idx as f64 * 20.0 + domain as f64,
+                                device,
+                            ),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let reference_histories = layer_shards
+            .iter()
+            .map(|shards| {
+                (
+                    Tensor::cat(
+                        &shards
+                            .iter()
+                            .map(|(k, _)| k.shallow_clone())
+                            .collect::<Vec<_>>(),
+                        2,
+                    ),
+                    Tensor::cat(
+                        &shards
+                            .iter()
+                            .map(|(_, v)| v.shallow_clone())
+                            .collect::<Vec<_>>(),
+                        2,
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (_, reference_layer_0) = reference_layer_output(
+            0,
+            &config,
+            &weights,
+            &hidden,
+            &position_ids,
+            &reference_histories[0].0,
+            &reference_histories[0].1,
+        );
+        let (_, reference_layer_1) = reference_layer_output(
+            1,
+            &config,
+            &weights,
+            &reference_layer_0,
+            &position_ids,
+            &reference_histories[1].0,
+            &reference_histories[1].1,
+        );
+
+        let worker_layers = (0..domains)
+            .map(|_| {
+                LlamaModel::from_weights(config.clone(), &weights, device, domains)
+                    .unwrap()
+                    .layers
+            })
+            .collect::<Vec<_>>();
+        let mut worker_shards = (0..domains)
+            .map(|_| Vec::with_capacity(layers_count))
+            .collect::<Vec<_>>();
+        for shards in layer_shards {
+            for (domain, shard) in shards.into_iter().enumerate() {
+                worker_shards[domain].push(shard);
+            }
+        }
+
+        let listeners = (0..domains)
+            .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect::<Vec<_>>();
+        let addresses = listeners
+            .iter()
+            .map(|listener| listener.local_addr().unwrap())
+            .collect::<Vec<_>>();
+        let outgoing = (0..domains)
+            .map(|domain| TcpStream::connect(addresses[(domain + 1) % domains]).unwrap())
+            .collect::<Vec<_>>();
+        let incoming = listeners
+            .into_iter()
+            .map(|listener| listener.accept().unwrap().0)
+            .collect::<Vec<_>>();
+
+        let workers = worker_layers
+            .into_iter()
+            .zip(worker_shards)
+            .zip(incoming)
+            .zip(outgoing)
+            .enumerate()
+            .map(
+                |(domain, (((mut layers, mut shards), incoming), outgoing))| {
+                    let initial_hidden =
+                        (domain == initial_starter).then(|| hidden.shallow_clone());
+                    let worker_position_ids = position_ids.shallow_clone();
+                    thread::spawn(move || {
+                        let mut predecessor = TcpKvTransport::new(incoming, device).unwrap();
+                        let mut successor = TcpKvTransport::new(outgoing, device).unwrap();
+                        let mut next_layer_hidden = initial_hidden;
+                        let mut events = Vec::with_capacity(layers_count);
+                        let mut final_hidden = None;
+
+                        for layer_idx in 0..layers_count {
+                            let started = next_layer_hidden.is_some();
+                            let packet = if let Some(layer_hidden) = next_layer_hidden.take() {
+                                LayerPacket::start(
+                                    &mut layers[layer_idx],
+                                    &layer_hidden,
+                                    &worker_position_ids,
+                                    domain,
+                                    assignees[layer_idx],
+                                    domains,
+                                )
+                                .unwrap()
+                            } else {
+                                let wire = predecessor
+                                    .recv_self_driving_packet()
+                                    .unwrap()
+                                    .expect("predecessor closed before the next layer packet");
+                                assert_eq!(wire.layer_idx, layer_idx);
+                                LayerPacket::from_self_driving_packet(wire).unwrap()
+                            };
+                            assert_eq!(packet.current_domain, domain);
+                            let visit_index = packet.visited_domains;
+                            let kv_before = shards[layer_idx].0.size()[2];
+                            let (finished, sent_bytes) = match process_layer_packet(
+                                &mut layers[layer_idx],
+                                packet,
+                                &mut shards[layer_idx],
+                            )
+                            .unwrap()
+                            {
+                                LayerStepOutcome::Forward(packet) => {
+                                    let wire = packet.into_self_driving_packet(layer_idx).unwrap();
+                                    let sent_bytes =
+                                        successor.send_self_driving_packet(&wire).unwrap();
+                                    (false, sent_bytes)
+                                }
+                                LayerStepOutcome::Finished { hidden_states, .. } => {
+                                    if layer_idx + 1 == layers_count {
+                                        final_hidden = Some(hidden_states);
+                                    } else {
+                                        next_layer_hidden = Some(hidden_states);
+                                    }
+                                    (true, 0)
+                                }
+                            };
+                            events.push(TcpLayerEvent {
+                                layer_idx,
+                                visit_index,
+                                domain,
+                                started,
+                                finished,
+                                sent_bytes,
+                                kv_before,
+                                kv_after: shards[layer_idx].0.size()[2],
+                            });
+                        }
+
+                        (events, final_hidden)
+                    })
+                },
+            )
+            .collect::<Vec<_>>();
+
+        let mut events = Vec::with_capacity(domains * layers_count);
+        let mut final_outputs = Vec::new();
+        for (domain, worker) in workers.into_iter().enumerate() {
+            let (worker_events, final_hidden) = worker.join().unwrap();
+            assert_eq!(worker_events.len(), layers_count);
+            events.extend(worker_events);
+            if let Some(hidden_states) = final_hidden {
+                final_outputs.push((domain, hidden_states));
+            }
+        }
+
+        assert_eq!(events.len(), domains * layers_count);
+        assert_eq!(
+            events.iter().filter(|event| event.sent_bytes > 0).count(),
+            layers_count * (domains - 1)
+        );
+        let expected_routes = [vec![1_usize, 2, 0], vec![0_usize, 1, 2]];
+        for layer_idx in 0..layers_count {
+            let mut layer_events = events
+                .iter()
+                .filter(|event| event.layer_idx == layer_idx)
+                .collect::<Vec<_>>();
+            layer_events.sort_by_key(|event| event.visit_index);
+            assert_eq!(
+                layer_events
+                    .iter()
+                    .map(|event| event.domain)
+                    .collect::<Vec<_>>(),
+                expected_routes[layer_idx]
+            );
+            assert_eq!(
+                layer_events
+                    .iter()
+                    .filter(|event| event.started)
+                    .map(|event| event.domain)
+                    .collect::<Vec<_>>(),
+                vec![expected_routes[layer_idx][0]]
+            );
+            assert_eq!(
+                layer_events
+                    .iter()
+                    .filter(|event| event.finished)
+                    .map(|event| event.domain)
+                    .collect::<Vec<_>>(),
+                vec![expected_routes[layer_idx][domains - 1]]
+            );
+            for event in layer_events {
+                assert_eq!(
+                    event.kv_after,
+                    event.kv_before + i64::from(event.domain == assignees[layer_idx])
+                );
+            }
+        }
+        assert_eq!(expected_routes[1][0], expected_routes[0][domains - 1]);
+        assert_eq!(final_outputs.len(), 1);
+        let (final_domain, actual_hidden) = final_outputs.pop().unwrap();
+        assert_eq!(final_domain, 2);
+        let hidden_diff = (actual_hidden - reference_layer_1)
+            .abs()
+            .max()
+            .double_value(&[]);
+        assert!(
+            hidden_diff < 4e-4,
+            "two-layer TCP hidden diff: {hidden_diff}"
+        );
+    }
+
     #[test]
     fn self_driving_tcp_wire_bytes_do_not_grow_with_history_context() {
         fn first_hop_wire_bytes(history_len: i64) -> usize {
