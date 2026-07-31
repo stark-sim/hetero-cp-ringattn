@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### 未提交 production placement 草稿的范围审计
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `working-tree-audit-2026-07-31`
+
+只读审计确认 rust/src/distributed/placement.rs 为 1079 行未跟踪文件，并依赖 rust/src/capacity.rs 的新 largest-remainder helper、distributed/mod.rs 导出及 Cargo/attention 配套工作树修改。草稿数据模型含 WorkerKvProfile、RequestDemand、RequestPlacementPlan、KvReservationLedger；算法含 byte hard bounds、active persistent+max workspace ledger、optional attention rate、prompt/decode calendar、逐层 K/V granularity 计费、integer repair 和 stable placement hash。完整 Rust 回归能编译并运行其中测试，但当前 synthetic localhost 实验没有真实 profile/admission 输入，因此测试通过不能证明生产显存合同。该证据只支持范围判断，不否定草稿未来价值。
+
+_updated: 2026-07-31 09:52:06_
 ### Rust 两层 TCP ring 末层 finisher 本地唯一 final logits 验证通过
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6ef5a18`
