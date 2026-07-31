@@ -1327,11 +1327,16 @@ mod tests {
     }
 
     #[test]
-    fn two_layer_tcp_ring_finisher_produces_final_logits() {
+    fn two_layer_tcp_ring_uses_scheduled_assignees_and_produces_final_logits() {
         let domains = 3_usize;
         let layers_count = 2_usize;
         let initial_starter = 1_usize;
-        let assignees = [2_usize, 1];
+        let schedule = FrozenKvAssigneeSchedule::new(&[1, 3, 2], 1, layers_count).unwrap();
+        let assignees: [usize; 2] = std::array::from_fn(|layer_idx| {
+            schedule.assignee_for(0, layer_idx, layers_count).unwrap()
+        });
+        assert_eq!(schedule.counts(), &[0, 1, 1]);
+        assert_eq!(assignees, [2, 1]);
         let device = Device::Cpu;
         let mut config = test_config();
         config.num_layers = layers_count;
