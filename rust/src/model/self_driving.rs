@@ -726,6 +726,32 @@ mod tests {
         (attention_output, post_attention + mlp_output)
     }
 
+    fn reference_current_kv(
+        layer_idx: usize,
+        config: &ModelConfig,
+        weights: &ModelWeights,
+        hidden: &Tensor,
+        position_ids: &Tensor,
+    ) -> (Tensor, Tensor) {
+        let rope = RotaryEmbedding::new(
+            config.head_dim(),
+            config.max_position_embeddings.unwrap(),
+            config.rope_theta,
+            hidden.device(),
+        );
+        let backend =
+            HcpRingAttentionBackend::from_weights(weights, layer_idx, config, &rope, 1).unwrap();
+        let input_norm = RmsNorm::from_weights(
+            weights,
+            &WeightNames::rms_norm_weight(layer_idx),
+            config.rms_norm_eps,
+        )
+        .unwrap();
+        backend
+            .project_decode_current_kv(&input_norm.forward(hidden), position_ids)
+            .unwrap()
+    }
+
     #[test]
     fn frozen_kv_assignee_schedule_is_capacity_weighted_and_phase_stable() {
         let first = FrozenKvAssigneeSchedule::new(&[1, 3, 2], 41, 24).unwrap();
@@ -1316,6 +1342,7 @@ mod tests {
 
     #[derive(Debug)]
     struct TcpLayerEvent {
+        token_offset: usize,
         layer_idx: usize,
         visit_index: usize,
         domain: usize,
@@ -1326,17 +1353,35 @@ mod tests {
         kv_after: i64,
     }
 
+    #[derive(Debug)]
+    struct TcpTokenOutput {
+        token_offset: usize,
+        hidden_states: Tensor,
+        logits: Tensor,
+        sampled_token: i64,
+    }
+
     #[test]
-    fn two_layer_tcp_ring_uses_scheduled_assignees_and_produces_final_logits() {
+    fn two_token_tcp_ring_continues_from_finisher_with_scheduled_assignees() {
         let domains = 3_usize;
         let layers_count = 2_usize;
+        let token_steps = 2_usize;
         let initial_starter = 1_usize;
-        let schedule = FrozenKvAssigneeSchedule::new(&[1, 3, 2], 1, layers_count).unwrap();
-        let assignees: [usize; 2] = std::array::from_fn(|layer_idx| {
-            schedule.assignee_for(0, layer_idx, layers_count).unwrap()
-        });
-        assert_eq!(schedule.counts(), &[0, 1, 1]);
-        assert_eq!(assignees, [2, 1]);
+        let schedule =
+            FrozenKvAssigneeSchedule::new(&[1, 3, 2], 2, token_steps * layers_count).unwrap();
+        let assignees = (0..token_steps)
+            .map(|token_offset| {
+                (0..layers_count)
+                    .map(|layer_idx| {
+                        schedule
+                            .assignee_for(token_offset, layer_idx, layers_count)
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(schedule.counts(), &[1, 2, 1]);
+        assert_eq!(assignees, [vec![2, 1], vec![1, 0]]);
         let device = Device::Cpu;
         let mut config = test_config();
         config.num_layers = layers_count;
@@ -1344,7 +1389,6 @@ mod tests {
         let hidden = deterministic_tensor(&[1, 1, config.hidden_size as i64], 129.0, device);
         let shard_lengths = [2_i64, 4, 3];
         let history_len = shard_lengths.iter().sum::<i64>();
-        let position_ids = Tensor::from_slice(&[history_len]).unsqueeze(0);
         let layer_shards = (0..layers_count)
             .map(|layer_idx| {
                 shard_lengths
@@ -1373,7 +1417,7 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        let reference_histories = layer_shards
+        let mut reference_histories = layer_shards
             .iter()
             .map(|shards| {
                 (
@@ -1394,30 +1438,59 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let (_, reference_layer_0) = reference_layer_output(
-            0,
-            &config,
-            &weights,
-            &hidden,
-            &position_ids,
-            &reference_histories[0].0,
-            &reference_histories[0].1,
-        );
-        let (_, reference_layer_1) = reference_layer_output(
-            1,
-            &config,
-            &weights,
-            &reference_layer_0,
-            &position_ids,
-            &reference_histories[1].0,
-            &reference_histories[1].1,
-        );
         let reference_final_norm =
             RmsNorm::from_weights(&weights, WeightNames::layer_norm(), config.rms_norm_eps)
                 .unwrap();
-        let reference_logits = reference_final_norm
-            .forward(&reference_layer_1)
-            .matmul(&weights.get(WeightNames::lm_head()).unwrap().transpose(0, 1));
+        let reference_lm_head = weights.get(WeightNames::lm_head()).unwrap();
+        let mut reference_hidden = hidden.shallow_clone();
+        let mut reference_outputs = Vec::with_capacity(token_steps);
+        for token_offset in 0..token_steps {
+            let position_ids =
+                Tensor::from_slice(&[history_len + token_offset as i64]).unsqueeze(0);
+            for layer_idx in 0..layers_count {
+                let (current_k, current_v) = reference_current_kv(
+                    layer_idx,
+                    &config,
+                    &weights,
+                    &reference_hidden,
+                    &position_ids,
+                );
+                let (_, next_hidden) = reference_layer_output(
+                    layer_idx,
+                    &config,
+                    &weights,
+                    &reference_hidden,
+                    &position_ids,
+                    &reference_histories[layer_idx].0,
+                    &reference_histories[layer_idx].1,
+                );
+                reference_histories[layer_idx].0 =
+                    Tensor::cat(&[&reference_histories[layer_idx].0, &current_k], 2);
+                reference_histories[layer_idx].1 =
+                    Tensor::cat(&[&reference_histories[layer_idx].1, &current_v], 2);
+                reference_hidden = next_hidden;
+            }
+            let logits = reference_final_norm
+                .forward(&reference_hidden)
+                .matmul(&reference_lm_head.transpose(0, 1));
+            let sampled_token = logits.squeeze().argmax(-1, false).int64_value(&[]);
+            reference_outputs.push(TcpTokenOutput {
+                token_offset,
+                hidden_states: reference_hidden.shallow_clone(),
+                logits,
+                sampled_token,
+            });
+            if token_offset + 1 < token_steps {
+                let token_ids = Tensor::from_slice(&[sampled_token]).unsqueeze(0);
+                reference_hidden = Tensor::embedding(
+                    weights.get(WeightNames::embedding()).unwrap(),
+                    &token_ids,
+                    -1,
+                    false,
+                    false,
+                );
+            }
+        }
 
         let worker_models = (0..domains)
             .map(|_| LlamaModel::from_weights(config.clone(), &weights, device, domains).unwrap())
@@ -1456,160 +1529,217 @@ mod tests {
                 |(domain, (((mut model, mut shards), incoming), outgoing))| {
                     let initial_hidden =
                         (domain == initial_starter).then(|| hidden.shallow_clone());
-                    let worker_position_ids = position_ids.shallow_clone();
+                    let worker_assignees = assignees.clone();
                     thread::spawn(move || {
                         let mut predecessor = TcpKvTransport::new(incoming, device).unwrap();
                         let mut successor = TcpKvTransport::new(outgoing, device).unwrap();
-                        let mut next_layer_hidden = initial_hidden;
-                        let mut events = Vec::with_capacity(layers_count);
-                        let mut final_hidden = None;
-                        let mut final_logits = None;
+                        let mut next_token_hidden = initial_hidden;
+                        let mut events = Vec::with_capacity(token_steps * layers_count);
+                        let mut outputs = Vec::with_capacity(token_steps);
 
-                        for layer_idx in 0..layers_count {
-                            let started = next_layer_hidden.is_some();
-                            let packet = if let Some(layer_hidden) = next_layer_hidden.take() {
-                                LayerPacket::start(
+                        for token_offset in 0..token_steps {
+                            let position_ids =
+                                Tensor::from_slice(&[history_len + token_offset as i64])
+                                    .unsqueeze(0);
+                            let mut next_layer_hidden = next_token_hidden.take();
+                            for layer_idx in 0..layers_count {
+                                let started = next_layer_hidden.is_some();
+                                let packet = if let Some(layer_hidden) = next_layer_hidden.take() {
+                                    LayerPacket::start(
+                                        &mut model.layers[layer_idx],
+                                        &layer_hidden,
+                                        &position_ids,
+                                        domain,
+                                        worker_assignees[token_offset][layer_idx],
+                                        domains,
+                                    )
+                                    .unwrap()
+                                } else {
+                                    let wire = predecessor
+                                        .recv_self_driving_packet()
+                                        .unwrap()
+                                        .expect("predecessor closed before the next packet");
+                                    assert_eq!(wire.layer_idx, layer_idx);
+                                    LayerPacket::from_self_driving_packet(wire).unwrap()
+                                };
+                                assert_eq!(packet.current_domain, domain);
+                                let visit_index = packet.visited_domains;
+                                let kv_before = shards[layer_idx].0.size()[2];
+                                let (finished, sent_bytes) = match process_layer_packet(
                                     &mut model.layers[layer_idx],
-                                    &layer_hidden,
-                                    &worker_position_ids,
-                                    domain,
-                                    assignees[layer_idx],
-                                    domains,
+                                    packet,
+                                    &mut shards[layer_idx],
                                 )
                                 .unwrap()
-                            } else {
-                                let wire = predecessor
-                                    .recv_self_driving_packet()
-                                    .unwrap()
-                                    .expect("predecessor closed before the next layer packet");
-                                assert_eq!(wire.layer_idx, layer_idx);
-                                LayerPacket::from_self_driving_packet(wire).unwrap()
-                            };
-                            assert_eq!(packet.current_domain, domain);
-                            let visit_index = packet.visited_domains;
-                            let kv_before = shards[layer_idx].0.size()[2];
-                            let (finished, sent_bytes) = match process_layer_packet(
-                                &mut model.layers[layer_idx],
-                                packet,
-                                &mut shards[layer_idx],
-                            )
-                            .unwrap()
-                            {
-                                LayerStepOutcome::Forward(packet) => {
-                                    let wire = packet.into_self_driving_packet(layer_idx).unwrap();
-                                    let sent_bytes =
-                                        successor.send_self_driving_packet(&wire).unwrap();
-                                    (false, sent_bytes)
-                                }
-                                LayerStepOutcome::Finished { hidden_states, .. } => {
-                                    if layer_idx + 1 == layers_count {
-                                        final_logits =
-                                            Some(project_final_logits(&model, &hidden_states));
-                                        final_hidden = Some(hidden_states);
-                                    } else {
-                                        next_layer_hidden = Some(hidden_states);
+                                {
+                                    LayerStepOutcome::Forward(packet) => {
+                                        let wire =
+                                            packet.into_self_driving_packet(layer_idx).unwrap();
+                                        let sent_bytes =
+                                            successor.send_self_driving_packet(&wire).unwrap();
+                                        (false, sent_bytes)
                                     }
-                                    (true, 0)
-                                }
-                            };
-                            events.push(TcpLayerEvent {
-                                layer_idx,
-                                visit_index,
-                                domain,
-                                started,
-                                finished,
-                                sent_bytes,
-                                kv_before,
-                                kv_after: shards[layer_idx].0.size()[2],
-                            });
+                                    LayerStepOutcome::Finished { hidden_states, .. } => {
+                                        if layer_idx + 1 == layers_count {
+                                            let logits =
+                                                project_final_logits(&model, &hidden_states);
+                                            let sampled_token =
+                                                logits.squeeze().argmax(-1, false).int64_value(&[]);
+                                            if token_offset + 1 < token_steps {
+                                                let token_ids =
+                                                    Tensor::from_slice(&[sampled_token])
+                                                        .unsqueeze(0);
+                                                next_token_hidden = Some(Tensor::embedding(
+                                                    &model.embedding,
+                                                    &token_ids,
+                                                    -1,
+                                                    false,
+                                                    false,
+                                                ));
+                                            }
+                                            outputs.push(TcpTokenOutput {
+                                                token_offset,
+                                                hidden_states,
+                                                logits,
+                                                sampled_token,
+                                            });
+                                        } else {
+                                            next_layer_hidden = Some(hidden_states);
+                                        }
+                                        (true, 0)
+                                    }
+                                };
+                                events.push(TcpLayerEvent {
+                                    token_offset,
+                                    layer_idx,
+                                    visit_index,
+                                    domain,
+                                    started,
+                                    finished,
+                                    sent_bytes,
+                                    kv_before,
+                                    kv_after: shards[layer_idx].0.size()[2],
+                                });
+                            }
                         }
 
-                        (events, final_hidden, final_logits)
+                        (events, outputs)
                     })
                 },
             )
             .collect::<Vec<_>>();
 
-        let mut events = Vec::with_capacity(domains * layers_count);
-        let mut final_outputs = Vec::new();
-        let mut logits_outputs = Vec::new();
+        let mut events = Vec::with_capacity(domains * token_steps * layers_count);
+        let mut outputs = Vec::with_capacity(token_steps);
         for (domain, worker) in workers.into_iter().enumerate() {
-            let (worker_events, final_hidden, final_logits) = worker.join().unwrap();
-            assert_eq!(worker_events.len(), layers_count);
+            let (worker_events, worker_outputs) = worker.join().unwrap();
+            assert_eq!(worker_events.len(), token_steps * layers_count);
             events.extend(worker_events);
-            if let Some(hidden_states) = final_hidden {
-                final_outputs.push((domain, hidden_states));
-            }
-            if let Some(logits) = final_logits {
-                logits_outputs.push((domain, logits));
+            for output in worker_outputs {
+                outputs.push((domain, output));
             }
         }
 
-        assert_eq!(events.len(), domains * layers_count);
+        assert_eq!(events.len(), domains * token_steps * layers_count);
         assert_eq!(
             events.iter().filter(|event| event.sent_bytes > 0).count(),
-            layers_count * (domains - 1)
+            token_steps * layers_count * (domains - 1)
         );
-        let expected_routes = [vec![1_usize, 2, 0], vec![0_usize, 1, 2]];
-        for layer_idx in 0..layers_count {
-            let mut layer_events = events
-                .iter()
-                .filter(|event| event.layer_idx == layer_idx)
-                .collect::<Vec<_>>();
-            layer_events.sort_by_key(|event| event.visit_index);
-            assert_eq!(
-                layer_events
+        let expected_routes = (0..token_steps)
+            .map(|token_offset| {
+                (0..layers_count)
+                    .map(|layer_idx| {
+                        let layer_ordinal = token_offset * layers_count + layer_idx;
+                        let starter =
+                            (initial_starter + domains - layer_ordinal % domains) % domains;
+                        (0..domains)
+                            .map(|visit_index| (starter + visit_index) % domains)
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            expected_routes,
+            [
+                vec![vec![1, 2, 0], vec![0, 1, 2]],
+                vec![vec![2, 0, 1], vec![1, 2, 0]],
+            ]
+        );
+        for token_offset in 0..token_steps {
+            for layer_idx in 0..layers_count {
+                let mut layer_events = events
                     .iter()
-                    .map(|event| event.domain)
-                    .collect::<Vec<_>>(),
-                expected_routes[layer_idx]
-            );
-            assert_eq!(
-                layer_events
-                    .iter()
-                    .filter(|event| event.started)
-                    .map(|event| event.domain)
-                    .collect::<Vec<_>>(),
-                vec![expected_routes[layer_idx][0]]
-            );
-            assert_eq!(
-                layer_events
-                    .iter()
-                    .filter(|event| event.finished)
-                    .map(|event| event.domain)
-                    .collect::<Vec<_>>(),
-                vec![expected_routes[layer_idx][domains - 1]]
-            );
-            for event in layer_events {
+                    .filter(|event| {
+                        event.token_offset == token_offset && event.layer_idx == layer_idx
+                    })
+                    .collect::<Vec<_>>();
+                layer_events.sort_by_key(|event| event.visit_index);
                 assert_eq!(
-                    event.kv_after,
-                    event.kv_before + i64::from(event.domain == assignees[layer_idx])
+                    layer_events
+                        .iter()
+                        .map(|event| event.domain)
+                        .collect::<Vec<_>>(),
+                    expected_routes[token_offset][layer_idx]
                 );
+                assert_eq!(
+                    layer_events
+                        .iter()
+                        .filter(|event| event.started)
+                        .map(|event| event.domain)
+                        .collect::<Vec<_>>(),
+                    vec![expected_routes[token_offset][layer_idx][0]]
+                );
+                assert_eq!(
+                    layer_events
+                        .iter()
+                        .filter(|event| event.finished)
+                        .map(|event| event.domain)
+                        .collect::<Vec<_>>(),
+                    vec![expected_routes[token_offset][layer_idx][domains - 1]]
+                );
+                for event in layer_events {
+                    assert_eq!(
+                        event.kv_after,
+                        event.kv_before
+                            + i64::from(event.domain == assignees[token_offset][layer_idx])
+                    );
+                }
             }
         }
-        assert_eq!(expected_routes[1][0], expected_routes[0][domains - 1]);
-        assert_eq!(final_outputs.len(), 1);
-        let (final_domain, actual_hidden) = final_outputs.pop().unwrap();
-        assert_eq!(final_domain, 2);
-        let hidden_diff = (actual_hidden - reference_layer_1)
-            .abs()
-            .max()
-            .double_value(&[]);
-        assert!(
-            hidden_diff < 4e-4,
-            "two-layer TCP hidden diff: {hidden_diff}"
+        assert_eq!(
+            expected_routes[1][0][0],
+            expected_routes[0][layers_count - 1][domains - 1]
         );
-        assert_eq!(logits_outputs.len(), 1);
-        let (logits_domain, actual_logits) = logits_outputs.pop().unwrap();
-        assert_eq!(logits_domain, final_domain);
-        let logits_diff = (actual_logits - reference_logits)
-            .abs()
-            .max()
-            .double_value(&[]);
-        assert!(
-            logits_diff < 4e-4,
-            "two-layer TCP final logits diff: {logits_diff}"
-        );
+
+        outputs.sort_by_key(|(_, output)| output.token_offset);
+        assert_eq!(outputs.len(), token_steps);
+        for (token_offset, (domain, actual)) in outputs.iter().enumerate() {
+            let reference = &reference_outputs[token_offset];
+            assert_eq!(actual.token_offset, token_offset);
+            assert_eq!(reference.token_offset, token_offset);
+            assert_eq!(
+                *domain,
+                expected_routes[token_offset][layers_count - 1][domains - 1]
+            );
+            let hidden_diff = (&actual.hidden_states - &reference.hidden_states)
+                .abs()
+                .max()
+                .double_value(&[]);
+            assert!(
+                hidden_diff < 4e-4,
+                "token {token_offset} TCP hidden diff: {hidden_diff}"
+            );
+            let logits_diff = (&actual.logits - &reference.logits)
+                .abs()
+                .max()
+                .double_value(&[]);
+            assert!(
+                logits_diff < 4e-4,
+                "token {token_offset} TCP logits diff: {logits_diff}"
+            );
+            assert_eq!(actual.sampled_token, reference.sampled_token);
+        }
     }
 
     #[test]
