@@ -2,6 +2,13 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 分层裁定：单请求核心闭环，系统闭环仍待后续小节点
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `code-audit-2026-08-01`
+
+【动机六问】1.问题：连续实验已走到两 token TCP，但需要确认它证明的是完整核心数据流，还是被同步测试结构掩盖了缺口。2.现状：LayerPacket 显式携带 residual、normalized、position、Q、O/LSE；assignee 唯一追加 current K/V；finisher 唯一执行 W_o、residual、post norm、MLP；末层本地 logits、greedy sampling、embedding 后继续下一 token。真实 TCP 证据仅为单请求 N=3、L=2、两 token。3.目标：分别判断单请求数学/数据流、HCP 异构显存目标和可运行系统三层是否闭环，并用代码位置、反例和新鲜测试支撑。4.他者：Ring Attention 显式传递 Q 与 online-softmax accumulator，pipeline parallel 显式传 activation；vLLM 类运行时另外用 request-keyed KV/page state、调度队列和 admission 处理多请求与显存硬界。Ring Attention 本身不提供这些生命周期能力。5.本方案：保留当前最小实验设计；把已证明的 exact-once、N-1 hops、context-independent packet 与未证明的物理峰值、多请求 demux、runtime 集成严格分层，不把生产能力前置。6.为什么：这既回答核心方案是否自洽，又遵守核心优先、小步验证约束；现阶段没有证据要求重写数据面，也没有证据允许宣称系统完成。VERDICT: DEFER 后续实现；接受单请求核心设计，下一节点须另行确认。
+
+_updated: 2026-07-31 19:13:51_
 ### 当前唯一实施任务：自驱动 decode ring 最小核心切片
 
 type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-07-30`
@@ -252,6 +259,20 @@ B. vLLM decode ≥2 并发+增长分片保持(修 004,PoC 最小要求);
 C. Rust decode 移植 Q+LSE 累积器环+增长分片(修 007+008)。
 
 _updated: 2026-07-27 15:10:25_
+### 冻结 assignee schedule 的可靠保证是完整 horizon 精确份额，不是任意旋转前缀误差小于等于 1
+
+type: `belief` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `code-audit-2026-08-01`
+
+FrozenKvAssigneeSchedule 先用 largest remainder 得到 total_kv_units 内的精确整数 counts，再生成 smooth sequence；任意 request phase 对完整 horizon 的遍历仍精确保持 counts。现有 request_id 旋转后，所有前缀偏差小于等于 1 unit 并非普遍定理。该修订不破坏唯一 assignee、完整 horizon capacity-weighted 份额或单请求数据流；若未来需要物理显存 hard bound，应按完整 horizon 预留 counts，或另行证明/实现更强的 cyclic prefix bound。
+
+_updated: 2026-07-31 19:13:51_
+### 修订冻结 schedule 的任意 phase 前缀误差结论
+
+type: `revision` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `code-audit-2026-08-01`
+
+旧 evidence ev-rust-frozen-kv-assignee-schedule-20260731 中“任意前缀比例误差不超过一个 KV unit”只由 [1,3,2]、24 units、request_id=41 的单一实例覆盖，不能推广到任意 capacity、horizon 和 phase。保留旧 evidence 对实现、完整 counts、稳定 phase、零容量排除及测试通过的证明；仅撤回其普遍 prefix-bound 子结论，由 belief-frozen-schedule-guarantee-revised-20260801 取代。
+
+_updated: 2026-07-31 19:13:51_
 ### 任务D:Rust 线实现自驱动环 decode(单包 N-1 跳/层,角色全轮转,零冗余)
 
 type: `task` · status: `ongoing` · confidence: 0.9 · importance: 0.95 · source: `docs/plans/2026-07-29-self-driving-ring-decode-implementation.md`

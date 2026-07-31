@@ -2,6 +2,20 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### 自驱动 decode ring 核心闭环代码审查与聚焦回归
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@5681216`
+
+代码核对：self_driving.rs 的 LayerPacket 显式携带 residual、normalized、position_ids、Q、O/LSE 和 route；process_layer_packet 在唯一 assignee 追加 current K/V，所有 domain 合并 local partial，最后 domain 唯一执行 W_o+residual+post norm+MLP；两 token TCP 测试中末层 finisher 原地 logits+argmax+embedding 并成为下一 token starter。SelfDrivingPacket wire header只有 layer_idx/assignee/route，没有 request_id/token_offset；worker loop 依赖单请求固定循环顺序。KV append 仍使用 Tensor::cat，故不包含远端历史 KV，但未证明物理显存峰值 hard bound。新鲜验证命令：LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib:/opt/homebrew/opt/libomp/lib HCP_ENABLE_TORCH=1 CARGO_NET_OFFLINE=true cargo test --manifest-path rust/Cargo.toml --features tch-backend model::self_driving::tests:: -- --nocapture；结果 14 passed、0 failed、80 filtered out。仅为本地 libtorch CPU correctness，不是 MPS/CUDA/HIP 或性能证据。
+
+_updated: 2026-07-31 19:13:51_
+### request phase 旋转会打破普遍的一单位前缀偏差界
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `algorithm-exhaustive-check-2026-08-01`
+
+按 FrozenKvAssigneeSchedule 当前算法穷举得到最小反例：capacity tickets=[1,1,1]，total_kv_units=7 时 counts=[3,2,2]、smooth sequence=[0,1,2,0,1,2,0]；phase=1 的前 5 项为 [1,2,0,1,2]，domain 0 实际 count=1，目标=5*3/7，绝对偏差=8/7>1。完整 7 units 遍历仍回到 [3,2,2]。因此反例只否定任意旋转前缀小于等于 1 的普遍声明，不否定完整 horizon capacity-weighted counts。
+
+_updated: 2026-07-31 19:13:51_
 ### Rust 两 token TCP 自驱动 continuation 验证通过
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@b237266`
