@@ -2,6 +2,20 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### Rust 第十一个实验切片：TCP 两层路径消费冻结 KV assignee schedule
+
+type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-01`
+
+将已验证的 FrozenKvAssigneeSchedule 接入现有 N=3、两层、单 token localhost TCP 实验，替换手写 assignee 数组。由 capacity_tickets、request_id 和两层 append horizon 生成 token 0 的逐层 assignee；断言每层只有 schedule 指定节点的 KV shard 增长，并保持既有 N-1 hops/layer、finisher-to-starter handoff、唯一 final logits 与参考数值一致。只修改实验测试，不新增协议、runtime、admission、动态调度或物理 reservation。
+
+_updated: 2026-07-31 16:19:17_
+### 将冻结 KV assignee schedule 接入既有两层 TCP 实验
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-01`
+
+【动机六问】1.问题：纯 FrozenKvAssigneeSchedule 已验证，但真实 TCP 两层实验仍用手写 [2,1]，schedule 与数据路径之间缺少组合证据。2.现状：SelfDrivingPacket 已携带 assignee，LayerPacket::start 和 process_layer_packet 已按该值实现唯一 K/V projection+append；缺口仅在测试入口没有消费 schedule。3.目标：capacity_tickets+request_id 生成 token 0 的 layer 0/1 assignee；每层只有指定 domain 的 KV 长度 +1；其余既有断言继续成立，包括 route 1->2->0、0->1->2，总 sends=4、唯一 final logits、hidden/logits 对齐参考。4.他者：推理系统通常让执行层消费 admission/allocator 产生的冻结 placement 元数据；vLLM block allocator 可预先分配物理 block，但不能直接复用为 HCP 的 P2P layer packet assignee。5.本方案：只在现有 two_layer_tcp_ring_finisher_produces_final_logits 测试中构造 FrozenKvAssigneeSchedule(total_kv_units=2)，用 assignee_for(0,layer,2) 形成两层数组，并让既有 packet 与 KV growth 断言消费它。6.为什么：这是检验 schedule/API 与真实 ring 数据流是否相容的最小节点；不需要为两个值新增 runner API、协议字段或生产 planner。VERDICT: IMPLEMENT EXPERIMENT ONLY。边界：capacity tickets 仍被视为已计算输入；不证明 byte-level capacity、并发 admission、物理显存 reservation、远端网络或吞吐收益。
+
+_updated: 2026-07-31 16:19:17_
 ### 当前唯一实施任务：自驱动 decode ring 最小核心切片
 
 type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-07-30`
