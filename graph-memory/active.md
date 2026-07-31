@@ -30,7 +30,16 @@ type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · sourc
 
 下一候选尚未实施：先对最小后续证据节点做动机剖析，仍不进入生产化。
 
-_updated: 2026-07-31 08:04:37_
+[候选 checkpoint 9] 末层 TCP finisher 本地唯一产生 final logits：保持 N=3 两层 localhost，证明 final head 不增加 hop；待用户确认，不进入 sampling、token continuation、任意 L 网络化或 placement planner。
+
+_updated: 2026-07-31 08:19:33_
+### 候选下一小节点：末层 TCP finisher 本地唯一产生 final logits
+
+type: `hypothesis` · status: `proposed` · confidence: 1.0 · importance: 1.0 · source: `analysis-after-c5751f1`
+
+【动机六问】1.问题：固定两层真实 TCP 已把 activation 从 layer 0 finisher 原地续到 layer 1，但网络垂直路径仍停在末层 hidden；核心目标要求末层唯一产生 logits，尚未证明 final RMSNorm/LM head 不经 coordinator 回传即可在 TCP finisher 本地完成。2.现状：in-process 两层与任意 L runner 已验证唯一 final logits 和 tied/独立 head；TCP 两层只返回 final_hidden。任意 L 网络化此时主要重复已证的跨层归纳步骤，新增信息少。3.目标：保持 N=3、两层、单 token、localhost CPU；末层 domain 2 finisher 本地执行 final RMSNorm+独立 LM head，其他 worker 不产生 logits；logits 与未切分两层参考 max diff<既有阈值，logits projection=1，总 sends 仍为 4，无额外 activation/logits hop。4.他者：pipeline parallel 通常由最后 stage 执行 final norm/LM head；Ring Attention 只定义 attention accumulator，不负责模型尾部。vLLM 的同步 model forward 可产生 logits，但无法直接复用为 P2P finisher 事件。5.本方案：只扩展现有固定两层 TCP 实验，让每个 worker 保留自己的模型 final norm/head；仅在最后一层 Finished 分支调用既有 project_final_logits，并返回 Option logits 供测试断言。6.为什么：这把真实网络单 token 垂直路径闭到核心目标的最后输出，且不引入 sampling/下一 token 终止协议；比任意 L 网络循环提供更直接的新证据，也避免触碰未接纳的大型 placement/planner 草稿。VERDICT: PROPOSE IMPLEMENT EXPERIMENT ONLY；待用户确认。
+
+_updated: 2026-07-31 08:19:33_
 ### 候选下一小节点：N=3 固定两层 localhost TCP finisher-to-starter handoff
 
 type: `hypothesis` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `analysis-after-2150d7a`
