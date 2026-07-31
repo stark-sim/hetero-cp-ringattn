@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### Rust 两层 TCP ring 已消费冻结 KV assignee schedule
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@271de7f`
+
+实现提交 271de7f 仅修改 rust/src/model/self_driving.rs 中既有两层 localhost TCP 实验：删除手写 assignees=[2,1]，改由 FrozenKvAssigneeSchedule::new([1,3,2], request_id=1, total_kv_units=2) 生成。largest-remainder 在两层 horizon 得到 counts=[0,1,1]；phase=1 后 token 0 的 layer 0/1 assignee 为 [2,1]。这两个值进入 LayerPacket::start，并由既有逐 worker kv_before/kv_after 断言确认每层仅 schedule 指定 domain 增长一个 KV token；所有其他节点保持原长度。既有路径断言同时继续验证 layer routes=1->2->0 与 0->1->2、总 sends=2*(N-1)=4、layer 0 finisher 原地启动 layer 1、唯一末层 final logits、hidden/logits 对齐未切分参考。新鲜验证：LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib:/opt/homebrew/opt/libomp/lib HCP_ENABLE_TORCH=1 CARGO_NET_OFFLINE=true cargo test --manifest-path rust/Cargo.toml --features tch-backend two_layer_tcp_ring_uses_scheduled_assignees_and_produces_final_logits -- --nocapture => 1 passed, 0 failed；同环境 cargo test --manifest-path rust/Cargo.toml --features tch-backend => 94 passed, 0 failed, 3 doctests ignored；同环境 cargo clippy --manifest-path rust/Cargo.toml --features tch-backend --all-targets -- -A warnings => exit 0；rustfmt --edition 2021 --check rust/src/model/self_driving.rs 与 git diff --check => exit 0。证据边界：仅为 N=3、两层、单 token、localhost CPU 实验；capacity tickets 仍是输入，不证明 byte admission、物理 reservation、多 token/request、远端硬件或性能。
+
+_updated: 2026-07-31 16:50:14_
 ### Rust 冻结 capacity-weighted KV assignee schedule 验证通过
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@cfe25d9`
