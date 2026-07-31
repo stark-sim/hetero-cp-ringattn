@@ -3,6 +3,7 @@
 use crate::model::attention::HcpRingAttentionBackend;
 use crate::model::layers::DecoderLayer;
 use crate::model::model::LlamaModel;
+use crate::model::transport::SelfDrivingPacket;
 use crate::model::ModelError;
 use tch::{Kind, Tensor};
 
@@ -55,6 +56,58 @@ impl LayerPacket {
         fixed
             + self.attention_output.as_ref().map_or(0, Tensor::numel)
             + self.lse.as_ref().map_or(0, Tensor::numel)
+    }
+
+    pub fn into_self_driving_packet(
+        self,
+        layer_idx: usize,
+    ) -> Result<SelfDrivingPacket, ModelError> {
+        let attention_output = self.attention_output.ok_or_else(|| {
+            ModelError::Backend(
+                "self-driving wire packet requires an attention accumulator".to_string(),
+            )
+        })?;
+        let lse = self.lse.ok_or_else(|| {
+            ModelError::Backend("self-driving wire packet requires an LSE accumulator".to_string())
+        })?;
+        Ok(SelfDrivingPacket {
+            layer_idx,
+            residual: self.residual,
+            normalized: self.normalized,
+            position_ids: self.position_ids,
+            q: self.q,
+            attention_output,
+            lse,
+            assignee: self.assignee,
+            current_domain: self.current_domain,
+            domains: self.domains,
+            visited_domains: self.visited_domains,
+        })
+    }
+
+    pub fn from_self_driving_packet(packet: SelfDrivingPacket) -> Result<Self, ModelError> {
+        if packet.domains == 0
+            || packet.assignee >= packet.domains
+            || packet.current_domain >= packet.domains
+            || packet.visited_domains >= packet.domains
+        {
+            return Err(ModelError::Backend(format!(
+                "invalid self-driving wire route: domains={}, assignee={}, current_domain={}, visited_domains={}",
+                packet.domains, packet.assignee, packet.current_domain, packet.visited_domains
+            )));
+        }
+        Ok(Self {
+            residual: packet.residual,
+            normalized: packet.normalized,
+            position_ids: packet.position_ids,
+            q: packet.q,
+            attention_output: Some(packet.attention_output),
+            lse: Some(packet.lse),
+            assignee: packet.assignee,
+            current_domain: packet.current_domain,
+            domains: packet.domains,
+            visited_domains: packet.visited_domains,
+        })
     }
 }
 
@@ -417,8 +470,11 @@ mod tests {
     use crate::model::cache::{ContiguousKvCache, KvCache};
     use crate::model::layers::{GqaAttention, Mlp, RmsNorm, RotaryEmbedding};
     use crate::model::model::LlamaModel;
+    use crate::model::transport::TcpKvTransport;
     use crate::model::{ModelConfig, ModelWeights, WeightNames};
     use std::collections::HashMap;
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
     use tch::{Device, Kind, Tensor};
 
     fn test_config() -> ModelConfig {
@@ -882,6 +938,223 @@ mod tests {
         let long_context_payload = payload_after_first_hop(47);
         assert_eq!(short_context_payload, long_context_payload);
         assert!(short_context_payload > 0);
+    }
+
+    #[test]
+    fn three_domain_tcp_ring_runs_one_real_layer_in_two_hops() {
+        let domains = 3_usize;
+        let starter = 0_usize;
+        let assignee = 1_usize;
+        let device = Device::Cpu;
+        let config = test_config();
+        let weights = deterministic_weights(&config, device);
+        let hidden = deterministic_tensor(&[1, 1, config.hidden_size as i64], 125.0, device);
+        let shard_lengths = [2_i64, 5, 3];
+        let history_len = shard_lengths.iter().sum::<i64>();
+        let position_ids = Tensor::from_slice(&[history_len]).unsqueeze(0);
+        let shards = shard_lengths
+            .iter()
+            .enumerate()
+            .map(|(domain, &len)| {
+                let shape = [
+                    1,
+                    config.num_kv_heads() as i64,
+                    len,
+                    config.head_dim() as i64,
+                ];
+                (
+                    deterministic_tensor(&shape, 126.0 + domain as f64, device),
+                    deterministic_tensor(&shape, 136.0 + domain as f64, device),
+                )
+            })
+            .collect::<Vec<_>>();
+        let history_k = Tensor::cat(
+            &shards
+                .iter()
+                .map(|(k, _)| k.shallow_clone())
+                .collect::<Vec<_>>(),
+            2,
+        );
+        let history_v = Tensor::cat(
+            &shards
+                .iter()
+                .map(|(_, v)| v.shallow_clone())
+                .collect::<Vec<_>>(),
+            2,
+        );
+        let (reference_attention, reference_hidden) = reference_layer_output(
+            0,
+            &config,
+            &weights,
+            &hidden,
+            &position_ids,
+            &history_k,
+            &history_v,
+        );
+
+        let layers = (0..domains)
+            .map(|_| {
+                let mut model =
+                    LlamaModel::from_weights(config.clone(), &weights, device, domains).unwrap();
+                model.layers.remove(0)
+            })
+            .collect::<Vec<_>>();
+        let listeners = (0..domains)
+            .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect::<Vec<_>>();
+        let addresses = listeners
+            .iter()
+            .map(|listener| listener.local_addr().unwrap())
+            .collect::<Vec<_>>();
+        let outgoing = (0..domains)
+            .map(|domain| TcpStream::connect(addresses[(domain + 1) % domains]).unwrap())
+            .collect::<Vec<_>>();
+        let incoming = listeners
+            .into_iter()
+            .map(|listener| listener.accept().unwrap().0)
+            .collect::<Vec<_>>();
+
+        let workers = layers
+            .into_iter()
+            .zip(shards)
+            .zip(incoming)
+            .zip(outgoing)
+            .enumerate()
+            .map(|(domain, (((mut layer, mut shard), incoming), outgoing))| {
+                let worker_hidden = hidden.shallow_clone();
+                let worker_position_ids = position_ids.shallow_clone();
+                thread::spawn(move || {
+                    let mut predecessor = TcpKvTransport::new(incoming, device).unwrap();
+                    let mut successor = TcpKvTransport::new(outgoing, device).unwrap();
+                    let started = domain == starter;
+                    let packet = if started {
+                        LayerPacket::start(
+                            &mut layer,
+                            &worker_hidden,
+                            &worker_position_ids,
+                            starter,
+                            assignee,
+                            domains,
+                        )
+                        .unwrap()
+                    } else {
+                        let wire = predecessor
+                            .recv_self_driving_packet()
+                            .unwrap()
+                            .expect("predecessor closed before sending a packet");
+                        LayerPacket::from_self_driving_packet(wire).unwrap()
+                    };
+                    assert_eq!(packet.current_domain, domain);
+                    let before = shard.0.size()[2];
+                    match process_layer_packet(&mut layer, packet, &mut shard).unwrap() {
+                        LayerStepOutcome::Forward(packet) => {
+                            let wire = packet.into_self_driving_packet(0).unwrap();
+                            let sent_bytes = successor.send_self_driving_packet(&wire).unwrap();
+                            (domain, started, before, shard.0.size()[2], sent_bytes, None)
+                        }
+                        LayerStepOutcome::Finished {
+                            attention_output,
+                            hidden_states,
+                        } => (
+                            domain,
+                            started,
+                            before,
+                            shard.0.size()[2],
+                            0,
+                            Some((attention_output, hidden_states)),
+                        ),
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut started = 0_usize;
+        let mut sends = 0_usize;
+        let mut finished = 0_usize;
+        let mut actual_attention = None;
+        let mut actual_hidden = None;
+        for worker in workers {
+            let (domain, worker_started, before, after, sent_bytes, output) =
+                worker.join().unwrap();
+            started += usize::from(worker_started);
+            sends += usize::from(sent_bytes > 0);
+            let expected_growth = i64::from(domain == assignee);
+            assert_eq!(after, before + expected_growth);
+            if let Some((attention, hidden)) = output {
+                finished += 1;
+                actual_attention = Some(attention);
+                actual_hidden = Some(hidden);
+            }
+        }
+
+        assert_eq!(started, 1);
+        assert_eq!(sends, domains - 1);
+        assert_eq!(finished, 1);
+        let attention_diff = (actual_attention.unwrap() - reference_attention)
+            .abs()
+            .max()
+            .double_value(&[]);
+        let hidden_diff = (actual_hidden.unwrap() - reference_hidden)
+            .abs()
+            .max()
+            .double_value(&[]);
+        assert!(
+            attention_diff < 1e-4,
+            "TCP ring attention diff: {attention_diff}"
+        );
+        assert!(hidden_diff < 2e-4, "TCP ring layer diff: {hidden_diff}");
+    }
+
+    #[test]
+    fn self_driving_tcp_wire_bytes_do_not_grow_with_history_context() {
+        fn first_hop_wire_bytes(history_len: i64) -> usize {
+            let device = Device::Cpu;
+            let config = test_config();
+            let weights = deterministic_weights(&config, device);
+            let mut model = LlamaModel::from_weights(config.clone(), &weights, device, 3).unwrap();
+            let mut layer = model.layers.remove(0);
+            let hidden = deterministic_tensor(&[1, 1, config.hidden_size as i64], 127.0, device);
+            let position_ids = Tensor::from_slice(&[history_len * 2]).unsqueeze(0);
+            let shape = [
+                1,
+                config.num_kv_heads() as i64,
+                history_len,
+                config.head_dim() as i64,
+            ];
+            let mut local_history = (
+                deterministic_tensor(&shape, 128.0, device),
+                deterministic_tensor(&shape, 138.0, device),
+            );
+            let packet = LayerPacket::start(&mut layer, &hidden, &position_ids, 0, 1, 3).unwrap();
+            let packet = match process_layer_packet(&mut layer, packet, &mut local_history).unwrap()
+            {
+                LayerStepOutcome::Forward(packet) => packet.into_self_driving_packet(0).unwrap(),
+                LayerStepOutcome::Finished { .. } => panic!("N=3 starter unexpectedly finished"),
+            };
+
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let receiver = thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                TcpKvTransport::new(stream, device)
+                    .unwrap()
+                    .recv_self_driving_packet()
+                    .unwrap()
+                    .unwrap()
+            });
+            let stream = TcpStream::connect(address).unwrap();
+            let sent_bytes = TcpKvTransport::new(stream, device)
+                .unwrap()
+                .send_self_driving_packet(&packet)
+                .unwrap();
+            let _ = receiver.join().unwrap();
+            sent_bytes
+        }
+
+        let short_context_bytes = first_hop_wire_bytes(2);
+        let long_context_bytes = first_hop_wire_bytes(47);
+        assert_eq!(short_context_bytes, long_context_bytes);
+        assert!(short_context_bytes > 0);
     }
 
     #[test]

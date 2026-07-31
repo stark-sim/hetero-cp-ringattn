@@ -36,8 +36,23 @@ pub struct KvBlock {
 
 impl KvBlock {
     /// 【创建单个未切分的 KV block】向后兼容的便捷构造函数。
-    pub fn single(layer_idx: usize, global_seq_start: usize, global_seq_end: usize, k: Tensor, v: Tensor) -> Self {
-        Self { layer_idx, global_seq_start, global_seq_end, k, v, micro_block_idx: 0, total_micro_blocks: 1, position_ids: None }
+    pub fn single(
+        layer_idx: usize,
+        global_seq_start: usize,
+        global_seq_end: usize,
+        k: Tensor,
+        v: Tensor,
+    ) -> Self {
+        Self {
+            layer_idx,
+            global_seq_start,
+            global_seq_end,
+            k,
+            v,
+            micro_block_idx: 0,
+            total_micro_blocks: 1,
+            position_ids: None,
+        }
     }
 }
 
@@ -84,6 +99,46 @@ impl Clone for RingPacket {
             o: self.o.shallow_clone(),
             lse: self.lse.shallow_clone(),
             scale: self.scale,
+        }
+    }
+}
+
+/// Experimental self-driving layer packet sent after the starter has produced
+/// the first local attention partial.
+///
+/// Unlike `RingPacket`, this packet also carries the activation state needed by
+/// the finisher to run output projection, residual, norm, and MLP locally.
+#[cfg(feature = "tch-backend")]
+#[derive(Debug)]
+pub struct SelfDrivingPacket {
+    pub layer_idx: usize,
+    pub residual: Tensor,
+    pub normalized: Tensor,
+    pub position_ids: Tensor,
+    pub q: Tensor,
+    pub attention_output: Tensor,
+    pub lse: Tensor,
+    pub assignee: usize,
+    pub current_domain: usize,
+    pub domains: usize,
+    pub visited_domains: usize,
+}
+
+#[cfg(feature = "tch-backend")]
+impl Clone for SelfDrivingPacket {
+    fn clone(&self) -> Self {
+        Self {
+            layer_idx: self.layer_idx,
+            residual: self.residual.shallow_clone(),
+            normalized: self.normalized.shallow_clone(),
+            position_ids: self.position_ids.shallow_clone(),
+            q: self.q.shallow_clone(),
+            attention_output: self.attention_output.shallow_clone(),
+            lse: self.lse.shallow_clone(),
+            assignee: self.assignee,
+            current_domain: self.current_domain,
+            domains: self.domains,
+            visited_domains: self.visited_domains,
         }
     }
 }

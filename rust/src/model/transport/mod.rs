@@ -12,22 +12,22 @@
 #[cfg(feature = "tch-backend")]
 pub mod block;
 #[cfg(feature = "tch-backend")]
-pub mod r#trait;
+pub mod mock;
 #[cfg(feature = "tch-backend")]
 pub mod tcp;
 #[cfg(feature = "tch-backend")]
-pub mod mock;
+pub mod r#trait;
 
 #[cfg(feature = "tch-backend")]
-pub use block::{KvBlock, RingPacket};
+pub use block::{KvBlock, RingPacket, SelfDrivingPacket};
+#[cfg(feature = "tch-backend")]
+#[allow(unused_imports)]
+pub use mock::{LinkedMockKvTransport, MockKvTransport};
 #[cfg(feature = "tch-backend")]
 pub use r#trait::{KvTransport, RingMessage};
 #[cfg(feature = "tch-backend")]
 #[allow(unused_imports)]
 pub use tcp::TcpKvTransport;
-#[cfg(feature = "tch-backend")]
-#[allow(unused_imports)]
-pub use mock::{MockKvTransport, LinkedMockKvTransport};
 
 #[cfg(test)]
 #[cfg(feature = "tch-backend")]
@@ -86,8 +86,73 @@ mod tests {
         // Verify tensor values: float32 raw bytes round-trip should be exact
         let k_diff = (&k - &received.k).abs().max().double_value(&[]);
         let v_diff = (&v - &received.v).abs().max().double_value(&[]);
-        println!("TcpKvTransport roundtrip k_diff={} v_diff={}", k_diff, v_diff);
+        println!(
+            "TcpKvTransport roundtrip k_diff={} v_diff={}",
+            k_diff, v_diff
+        );
         assert_eq!(k_diff, 0.0, "K tensor changed after TCP roundtrip");
         assert_eq!(v_diff, 0.0, "V tensor changed after TCP roundtrip");
+    }
+
+    #[test]
+    fn test_tcp_self_driving_packet_roundtrip() {
+        let device = Device::Cpu;
+        let packet = SelfDrivingPacket {
+            layer_idx: 3,
+            residual: Tensor::arange(8, (Kind::Float, device)).reshape([1, 1, 8]),
+            normalized: Tensor::arange(8, (Kind::Float, device)).reshape([1, 1, 8]) * 0.5,
+            position_ids: Tensor::from_slice(&[16_777_217_i64]).reshape([1, 1]),
+            q: Tensor::arange(32, (Kind::Float, device)).reshape([1, 4, 1, 8]),
+            attention_output: Tensor::arange(32, (Kind::Float, device)).reshape([1, 4, 1, 8])
+                * 0.25,
+            lse: Tensor::arange(4, (Kind::Float, device)).reshape([1, 4, 1]),
+            assignee: 2,
+            current_domain: 2,
+            domains: 3,
+            visited_domains: 1,
+        };
+        let expected = packet.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut transport = TcpKvTransport::new(stream, device).unwrap();
+            transport.recv_self_driving_packet().unwrap().unwrap()
+        });
+        let client = thread::spawn(move || {
+            let stream = TcpStream::connect(address).unwrap();
+            let mut transport = TcpKvTransport::new(stream, device).unwrap();
+            transport.send_self_driving_packet(&packet).unwrap()
+        });
+
+        let sent_bytes = client.join().unwrap();
+        let received = server.join().unwrap();
+        assert!(sent_bytes > 0);
+        assert_eq!(received.layer_idx, expected.layer_idx);
+        assert_eq!(received.assignee, expected.assignee);
+        assert_eq!(received.current_domain, expected.current_domain);
+        assert_eq!(received.domains, expected.domains);
+        assert_eq!(received.visited_domains, expected.visited_domains);
+        assert_eq!(received.position_ids.kind(), Kind::Int64);
+        for (name, actual, wanted) in [
+            ("residual", &received.residual, &expected.residual),
+            ("normalized", &received.normalized, &expected.normalized),
+            (
+                "position_ids",
+                &received.position_ids,
+                &expected.position_ids,
+            ),
+            ("q", &received.q, &expected.q),
+            (
+                "attention_output",
+                &received.attention_output,
+                &expected.attention_output,
+            ),
+            ("lse", &received.lse, &expected.lse),
+        ] {
+            let diff = (actual - wanted).abs().max().double_value(&[]);
+            assert_eq!(diff, 0.0, "{name} changed after TCP roundtrip");
+        }
     }
 }
