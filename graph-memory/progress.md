@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### Rust N=3 两层 localhost TCP finisher-to-starter handoff 验证通过
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@c5751f1`
+
+实现提交 c5751f1 只新增固定 N=3、两层、单 token 的 localhost TCP 实验测试，没有修改生产 runtime 或 transport 合同。三个独立 worker 线程各持本地两层权重与本地 KV shard，并只复用 predecessor/successor socket；initial hidden 仅存在于 domain 1。layer 0 实际 route=1->2->0，domain 0 finisher 将输出 hidden 保存在本线程 next_layer_hidden 并直接 start layer 1；layer 1 route=0->1->2，没有 coordinator 或共享 activation 回传。两层总发送 4=2*(N-1)，每层三个 local partial exact-once、唯一 finisher；assignee 分别为 domain 2/domain 1，只有对应层对应 shard 的 K/V 各增长一个 token；最终 domain 2 hidden 与未切分两层参考 max diff<4e-4。验证环境为 inventory 的 mac-local-shell + libtorch CPU。定向测试通过；完整 LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib:/opt/homebrew/opt/libomp/lib HCP_ENABLE_TORCH=1 CARGO_NET_OFFLINE=true cargo test --features tch-backend 结果 92 passed、0 failed、3 doctests ignored；cargo clippy --features tch-backend --lib --tests exit 0 且 self_driving.rs 无诊断；rustfmt --check 与 git diff --check 通过。证据不覆盖任意 L 网络循环、final logits/sampling、跨 token continuation、QUIC、远端硬件或性能。
+
+_updated: 2026-07-31 08:04:37_
 ### Rust localhost TCP ring 的任意 N 与 wrap-around 路由验证通过
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@2150d7a`

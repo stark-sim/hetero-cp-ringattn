@@ -2,27 +2,6 @@
 
 当前活跃的任务、决策、风险和假设。
 
-### 候选下一小节点：N=3 固定两层 localhost TCP finisher-to-starter handoff
-
-type: `hypothesis` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `analysis-after-2150d7a`
-
-【动机六问】1.问题：单层真实 TCP 已覆盖任意 N 与 wrap-around，但网络 worker 仍是单包单层后退出；尚未证明 layer 0 finisher 能在本节点用输出 hidden 原地启动 layer 1，而不把 activation 返回 coordinator。2.现状：in-process 两层和任意 L runner 已证明 s(l+1)=s(l)-1 mod N 与数值正确；TCP 试验只证明 LayerPacket 在一层内流动。3.目标：N=3、两层、单 token、localhost CPU；layer 0 finisher 直接创建并先处理 layer 1 packet，然后沿已有 predecessor/successor 连接继续；断言 layer1 starter==layer0 finisher、总 sends=2*(N-1)=4、每层每节点 partial exact-once、每层唯一 assignee KV 增长、末层唯一 finisher hidden 对齐两层参考。4.他者：pipeline parallel 在 stage 间传 activation，Ring Attention 每层独立传 accumulator；常见事件循环根据 layer/step 元数据继续，但没有现成实现表达 HCP 同层 KV 分片与 finisher 续层组合。5.本方案：只把 localhost test worker 从单层 one-shot 改为固定两层事件循环，复用 SelfDrivingPacket.layer_idx 与同一 TCP ring；不泛化任意 L，不接 logits/sampling、QUIC、remote 或 runtime。6.为什么：这是非零 starter 在多层中的第一个真实应用，同时仍把失败面限制在一次 layer boundary；直接任意 L 或 token continuation 会混入终止协议与 sampling。VERDICT: PROPOSE IMPLEMENT EXPERIMENT ONLY；待用户确认。
-
-_updated: 2026-07-31 07:11:19_
-### Rust 第八个实验切片：N=3 固定两层 localhost TCP handoff
-
-type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-07-31`
-
-实现 N=3、两层、单 token、localhost CPU 的 finisher-to-starter TCP handoff。layer 0 starter=1，经 1->2->0 后由 domain 0 finisher 使用输出 hidden 原地创建并先处理 layer 1 packet，再经 0->1->2；复用同一 predecessor/successor TCP ring。验证 layer1 starter==layer0 finisher、总 sends=4、每层三次 local partial、每层唯一 assignee K/V 增长、每层唯一 finisher、最终 hidden 对齐两层未切分参考。仅为实验；不泛化任意 L，不加入 final logits/sampling、QUIC、远端硬件、重试或 runtime。
-
-_updated: 2026-07-31 07:11:19_
-### 实施固定两层 TCP finisher 原地续层实验
-
-type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-07-31`
-
-【动机六问】1.问题：单层 TCP 已证明任意 N 与 wrap-around，但 worker 仍单包单层后退出，尚未证明 layer 0 activation 无需返回 coordinator 即可继续 layer 1。2.现状：in-process 两层与任意 L 已证明角色递推和数值；TCP 只闭合单层。3.目标：N=3、两层、单 token；layer 0 route=1->2->0，domain 0 finisher 原地启动并先处理 layer 1，route=0->1->2；总 sends=4、逐层 partial/KV assignee/finisher exact-once，最终 hidden 对齐参考。4.他者：pipeline parallel 传 activation，Ring Attention 逐层传 accumulator；事件循环依 layer_idx 继续，但没有现成 HCP 同层 KV 分片加 finisher 续层组合。5.本方案：把 localhost test worker 扩为固定两层事件循环，复用 SelfDrivingPacket.layer_idx 和已有 TCP ring；不改 transport trait。6.为什么：它隔离唯一未证的 layer boundary；直接任意 L 或 token continuation 会混入终止协议、final head 与 sampling。执行环境为 mac-local-shell + libtorch CPU，只声明 localhost correctness。VERDICT: IMPLEMENT EXPERIMENT ONLY。
-
-_updated: 2026-07-31 07:11:19_
 ### 当前唯一实施任务：自驱动 decode ring 最小核心切片
 
 type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-07-30`
@@ -47,7 +26,25 @@ type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · sourc
 
 下一候选为 N=3 固定两层 localhost TCP handoff：让 layer 0 finisher 原地成为 layer 1 starter，验证跨层无需 coordinator return；未经用户确认不实施。
 
-_updated: 2026-07-31 06:40:06_
+[2026-07-31 checkpoint 8] N=3 固定两层 localhost TCP handoff 已验证：layer 0 route=1->2->0，domain 0 finisher 不经 coordinator 回传，直接用本地输出 hidden 启动 layer 1 route=0->1->2；两层总 sends=4，每层 partial/assignee KV/finisher exact-once，最终 hidden 对齐两层参考。完整 Rust 测试 92/92 通过，实现 c5751f1 已推送。
+
+下一候选尚未实施：先对最小后续证据节点做动机剖析，仍不进入生产化。
+
+_updated: 2026-07-31 08:04:37_
+### 候选下一小节点：N=3 固定两层 localhost TCP finisher-to-starter handoff
+
+type: `hypothesis` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `analysis-after-2150d7a`
+
+【动机六问】1.问题：单层真实 TCP 已覆盖任意 N 与 wrap-around，但网络 worker 仍是单包单层后退出；尚未证明 layer 0 finisher 能在本节点用输出 hidden 原地启动 layer 1，而不把 activation 返回 coordinator。2.现状：in-process 两层和任意 L runner 已证明 s(l+1)=s(l)-1 mod N 与数值正确；TCP 试验只证明 LayerPacket 在一层内流动。3.目标：N=3、两层、单 token、localhost CPU；layer 0 finisher 直接创建并先处理 layer 1 packet，然后沿已有 predecessor/successor 连接继续；断言 layer1 starter==layer0 finisher、总 sends=2*(N-1)=4、每层每节点 partial exact-once、每层唯一 assignee KV 增长、末层唯一 finisher hidden 对齐两层参考。4.他者：pipeline parallel 在 stage 间传 activation，Ring Attention 每层独立传 accumulator；常见事件循环根据 layer/step 元数据继续，但没有现成实现表达 HCP 同层 KV 分片与 finisher 续层组合。5.本方案：只把 localhost test worker 从单层 one-shot 改为固定两层事件循环，复用 SelfDrivingPacket.layer_idx 与同一 TCP ring；不泛化任意 L，不接 logits/sampling、QUIC、remote 或 runtime。6.为什么：这是非零 starter 在多层中的第一个真实应用，同时仍把失败面限制在一次 layer boundary；直接任意 L 或 token continuation 会混入终止协议与 sampling。VERDICT: PROPOSE IMPLEMENT EXPERIMENT ONLY；待用户确认。
+
+_updated: 2026-07-31 07:11:19_
+### 实施固定两层 TCP finisher 原地续层实验
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-07-31`
+
+【动机六问】1.问题：单层 TCP 已证明任意 N 与 wrap-around，但 worker 仍单包单层后退出，尚未证明 layer 0 activation 无需返回 coordinator 即可继续 layer 1。2.现状：in-process 两层与任意 L 已证明角色递推和数值；TCP 只闭合单层。3.目标：N=3、两层、单 token；layer 0 route=1->2->0，domain 0 finisher 原地启动并先处理 layer 1，route=0->1->2；总 sends=4、逐层 partial/KV assignee/finisher exact-once，最终 hidden 对齐参考。4.他者：pipeline parallel 传 activation，Ring Attention 逐层传 accumulator；事件循环依 layer_idx 继续，但没有现成 HCP 同层 KV 分片加 finisher 续层组合。5.本方案：把 localhost test worker 扩为固定两层事件循环，复用 SelfDrivingPacket.layer_idx 和已有 TCP ring；不改 transport trait。6.为什么：它隔离唯一未证的 layer boundary；直接任意 L 或 token continuation 会混入终止协议、final head 与 sampling。执行环境为 mac-local-shell + libtorch CPU，只声明 localhost correctness。VERDICT: IMPLEMENT EXPERIMENT ONLY。
+
+_updated: 2026-07-31 07:11:19_
 ### 候选下一小节点：任意 N 与 wrap-around 的 localhost TCP 单层 ring
 
 type: `hypothesis` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `analysis-after-71c8698`
