@@ -2,6 +2,20 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### Rust N=3 localhost 单层 self-driving TCP ring 验证通过
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@71c8698`
+
+实现提交 71c8698：新增独立 SelfDrivingPacket（residual、normalized hidden、position_ids、Q、attention output/LSE 与路由字段），LayerPacket 只在已产生首个 local partial 后转换为 wire packet；TcpKvTransport 以私有 TcpFrame 分派和固有 send/recv 承载实验 packet，不修改 KvTransport trait、旧 RingPacket 或 QUIC。N=3 loopback 建立完整定向 ring，每个 worker 各持 incoming predecessor、outgoing successor、完整同层权重和唯一 local KV shard；单请求实际走 0->1->2 两个 TCP hop。机器断言：三个 worker 各处理一次 local partial，发送次数=N-1=2，finisher=1，只有 assignee domain 1 的 K/V 各增长一个 token；attention diff<1e-4、layer hidden diff<2e-4；历史 shard 长度 2 与 47 的首跳实际 TCP frame 字节数相同；Int64 position_id=16777217 无损 roundtrip。验证：设置本地 LIBTORCH 动态库路径后运行 cargo test --features tch-backend => 90 passed, 0 failed, 3 doctests ignored；定向 cargo clippy 对 self_driving/transport touched files 无 warning；git diff --check 通过。证据只声明 mac-local-shell + libtorch CPU correctness 与 localhost 字节流，不声明远端、硬件性能、任意 L 网络循环、sampling、QUIC 或 runtime。
+
+_updated: 2026-07-31 04:47:00_
+### 构造长 context 测试时 position_id 必须先满足 fixture 的 RoPE 上限
+
+type: `lesson` · status: `held` · confidence: 1.0 · importance: 0.55 · source: `hetero-cp-ringattn@71c8698`
+
+症状：wire-size 测试用 history_len=47 且 position_id=history_len*3=141，在进入 TCP 前由 RotaryEmbedding index_select 报 index out of range。影响：协议测试被无关模型 fixture 约束阻断。根因：test_config.max_position_embeddings=128，而 synthetic position 超界；同文件既有可工作对照为 47*2=94。最小修复：只把测试 position_id 改为 history_len*2，不改模型、RoPE 或协议；原失败测试随后通过，完整 90/90 回归通过。预防条件：构造 synthetic 长历史时同时检查 position_id < max_position_embeddings；该教训目前只归属项目测试夹具，不升级为通用 skill 或生产规则。
+
+_updated: 2026-07-31 04:47:00_
 ### Rust 任意 L 单 token 全模型 self-driving ring 验证通过
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@c2a0483`

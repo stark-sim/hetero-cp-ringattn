@@ -18,21 +18,23 @@ type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · sourc
 
 [2026-07-30 checkpoint 5] 任意 L 的单 token 全模型 runner 已验证：N=3 下 L=3 回到 starter、L=4 轮转 producer，满足 producer=(starter-L) mod N、总 hops=L*(N-1)、逐层 exact-once，完整 Rust 测试 87/87 通过。
 
-当前实施 N=3 localhost 单层真实 TCP P2P 垂直切片；sampling/token continuation、任意 L 网络循环、QUIC 与 runtime 仍未开始。
+[2026-07-31 checkpoint 6] N=3 localhost 单层真实 TCP self-driving ring 已验证：独立 packet 经 0->1->2 两个 hop，三个 worker 各处理一次 local partial，只有 capacity map 指定的 assignee shard 增长，finisher 唯一完成 W_o+residual+norm+MLP；输出对齐参考，实际 wire bytes 对历史长度 2/47 恒定，完整 Rust 测试 90/90 通过。实现 71c8698 已推送。
 
-_updated: 2026-07-31 03:55:20_
+下一候选仅为任意 N localhost 网络证据：用 N=2/3/4 与非零 starter 覆盖 successor wrap-around；未经用户确认不实施。sampling/token continuation、任意 L 网络循环、QUIC、远端硬件与 runtime 仍未开始。
+
+_updated: 2026-07-31 04:51:06_
+### 候选下一小节点：任意 N 与 wrap-around 的 localhost TCP 单层 ring
+
+type: `hypothesis` · status: `proposed` · confidence: 1.0 · importance: 1.0 · source: `analysis-after-71c8698`
+
+【动机六问】1.问题：N=3 starter=0 已证明两个真实 TCP hop，但用户要求任意 N 通用；当前机器证据没有覆盖 N=2/N=4，也没有让请求跨过最后节点->0 的 wrap-around 边。2.现状：LayerPacket/SelfDrivingPacket 的 domains/current_domain/visited 与 localhost listener 拓扑构造均按 N 参数化；in-process 测试已覆盖 N=1/2/4，但网络测试把 N=3、starter=0、assignee=1 固定。3.目标：保持单层、单 token、localhost CPU，最小泛化测试覆盖 N=2/3/4 与非零 starter；每例断言 route 沿 successor 且包含需要的 wrap-around、send=N-1、每 worker local partial exact-once、唯一 assignee KV 增长、唯一 finisher 输出对齐参考、wire 不携带历史 KV。4.他者：标准 ring send/recv 以 rank、world_size、successor=(rank+1)%N 参数化，正确性通常用多 world-size 和 wrap-around case 验证；无需 collective 或动态 planner。5.本方案：提取现有 localhost 测试的参数化 helper，只扩测试和必要的最小观测字段；不修改 wire 合同、transport trait、任意 L 循环、sampling、QUIC、远端脚本或 runtime。6.为什么：直接进入任意 L 网络循环会把 domain-count 路由问题与 layer handoff 混在一起；先补 N 与 wrap-around 是更小、可归因的证据节点，且 laptop 不可达也不阻塞。VERDICT: PROPOSE IMPLEMENT EXPERIMENT ONLY；待用户确认。
+
+_updated: 2026-07-31 04:51:06_
 ### 候选下一小节点：N=3 localhost 单层真实 P2P self-driving ring
 
 type: `hypothesis` · status: `superseded` · confidence: 0.97 · importance: 1.0 · source: `analysis-after-c2a0483`
 
 【动机六问】1.问题：任意 L 的模型控制循环已成立，但所有 domain step 仍在同一进程直接调用；尚未证明 LayerPacket 能沿只有前驱/后继的真实字节流传递，当前最核心的 P2P 拓扑主张仍缺机器证据。2.现状：self_driving::LayerPacket 需要 residual、normalized hidden、position_ids、Q、O/LSE、assignee/current_domain/domains/visited；现有 model::transport::RingPacket 和 TCP/QUIC codec 只承载 layer_idx、Q、O、LSE、scale，无法直接恢复 finisher 的 residual/norm/MLP continuation。3.目标：做一个单层、单 token、N=3 localhost 的真实 TCP P2P 垂直切片；三个 worker 各只持自己的 local KV shard，只连接 predecessor/successor，packet 经过 N-1=2 个网络 hop 后由 finisher 完成 W_o+residual+norm+MLP；输出与单节点参考一致，只有 assignee shard 增长，wire payload 不随历史 KV 长度增长。4.他者：Ring Attention 通过 P2P send/recv 传 online-softmax accumulator，pipeline parallel 通过 stage link 传 activation；项目现有 TCP/QUIC RingPacket codec 已实现 Tensor 字节化，可复用 framed transport 与 dtype/shape roundtrip，但其 payload 合同不足以承载两者组合。5.本方案：先扩展一个最小 self-driving wire packet，并用 localhost N=3 单层线程/连接测试贯通 encode-send-recv-decode-domain-step；复用现有 tensor codec，不接任意 L 网络循环、sampling、多请求、QUIC、远端硬件、重试、版本协商或 runtime。6.为什么：codec-only 测试不能证明两 peer ring 数据流，直接网络化任意 L 又会同时扩大协议与层循环失败面；单层 N=3 TCP 垂直切片是能证明真实 P2P 核心主张的最小可归因步骤。VERDICT: PROPOSE IMPLEMENT EXPERIMENT ONLY；待用户确认。
-
-_updated: 2026-07-31 03:55:20_
-### Rust 第六个实验切片：N=3 localhost 单层真实 TCP P2P ring
-
-type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-07-31`
-
-实现单层、单 token、N=3 localhost TCP self-driving ring。三个 worker 各自持有完整相同层权重和唯一 local KV shard，并各建立 predecessor/successor 两条 peer 连接；starter 本地处理后发送独立 SelfDrivingPacket，第二节点接收/处理/转发，finisher 在第 2 个网络 hop 后完成 W_o+residual+norm+MLP。验证输出与单节点参考一致、只有 assignee shard 增长、hop=2、wire payload 不随历史 KV 长度增长。仅使用 mac-local-shell + local libtorch CPU correctness；不加入任意 L 网络循环、sampling、多请求、QUIC、远端硬件、重试、版本协商或 runtime。
 
 _updated: 2026-07-31 03:55:20_
 ### 实施独立 SelfDrivingPacket 的 N=3 localhost TCP 垂直切片
