@@ -2,25 +2,11 @@
 
 当前活跃的任务、决策、风险和假设。
 
-### Rust 第十二个实验切片：两 token TCP 自驱动 continuation
-
-type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-01`
-
-把现有 N=3、两层、单 token localhost TCP 实验扩为两个连续 decode forward。token 0 末层 finisher 唯一计算 logits 与 greedy argmax，并用本地复制的 embedding 权重生成 token 1 hidden，原地成为下一 token starter；不增加 token-boundary hop。冻结 KV schedule 覆盖 2 tokens × 2 layers，并验证 token_offset=1 的 assignee。参考侧显式追加 token 0 的逐层 K/V 后再计算 token 1。只做实验测试，不加入 EOS、temperature、多请求、coordinator/runtime、QUIC 或远端硬件。
-
-_updated: 2026-07-31 17:22:35_
-### 末层 finisher 原地 sampling/embedding 并启动下一 token
-
-type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-01`
-
-【动机六问】1.问题：当前 TCP 证据在末层 logits 处终止，尚未证明自驱动 packet 能跨 token 边界形成最小 decode loop，也未让 schedule 的 token_offset=1 进入真实数据路径。2.现状：两层 finisher 已唯一产生 logits，所有 worker 都复制 embedding/层权重；packet 支持 finisher-to-starter 层间 handoff，但测试仅运行 token 0。3.目标：N=3、L=2、两个连续 forward；token 0/1 各有唯一 logits+greedy sample；token 0 finisher 原地 embedding sampled token 并启动 token 1；position 从 history_len 增至 history_len+1；schedule 覆盖 4 append events；每层每 token 仅指定 KV shard +1；总 sends=2 tokens*2 layers*(N-1)=8；两步 hidden/logits/sample 对齐显式累积 KV 的未切分参考。4.他者：标准 autoregressive decode 在末层执行 LM head/sampling，再把 token embedding 作为下一 forward 输入；pipeline 系统一般由最后 stage 采样后广播 token，或在权重复制时由持 token 的 stage 继续。Ring Attention 本身不规定 token 边界。5.本方案：仅扩现有 localhost 测试为 token×layer 双循环；末层 finisher argmax 后直接 Tensor::embedding，并保留 hidden 作为下个 token layer 0 的本地 starter 输入；其余节点进入 predecessor recv；参考侧用相同 K/V projection 显式追加每层历史。6.为什么：全节点已有 embedding 权重且 sampled token 已在 finisher，本地 continuation 不需新消息，保持每层 N-1 hop 路线；两 token 足以验证边界而不引入生成器生命周期。VERDICT: IMPLEMENT EXPERIMENT ONLY。边界：只验证 greedy、固定两层、两个 token、localhost CPU；不处理 EOS、随机采样状态、用户可见 token 回传、多请求 fairness、错误恢复或性能。
-
-_updated: 2026-07-31 17:22:35_
 ### 当前唯一实施任务：自驱动 decode ring 最小核心切片
 
 type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-07-30`
 
-范围只包含：1. 简单、冻结且可复现的 capacity-weighted KV assignee schedule（按 token×layer append event），并用 stable request_id 分散初始 phase；第一版不引入 layer 维二维 calendar 或运行期动态迁移。2. 单请求、单 token 的真实 tensor 垂直路径：starter 生成 Q，packet 用 N-1 hops 合并所有本地 KV partial，唯一 assignee 计算并持久保存 current K/V，finisher 唯一执行 W_o + residual + norm + MLP，末层唯一产生 logits。3. 最小机器验证：与单节点参考一致；hop、Q、KV project/append、partial、MLP、logits exact-once；无完整远端历史 KV 临时副本。每完成一个小节点即汇报结果、下一节点和方向判断，未经用户确认不跨入生产化能力。当前工作树中的大型 placement/ledger 草稿不自动视为本任务成果，需先单独审查取舍。
+范围只包含：1. 简单、冻结且可复现的 capacity-weighted KV assignee schedule（按 token×layer append event），并用 stable request_id 分散初始 phase；第一版不引入 layer 维二维 calendar 或运行期动态迁移。2. 单请求、最小两-token 的真实 tensor decode 路径：starter 生成 Q，packet 用 N-1 hops 合并所有本地 KV partial，唯一 assignee 计算并持久保存 current K/V，finisher 唯一执行 W_o + residual + norm + MLP，末层唯一产生 logits。3. 最小机器验证：与单节点参考一致；hop、Q、KV project/append、partial、MLP、logits exact-once；无完整远端历史 KV 临时副本。每完成一个小节点即汇报结果、下一节点和方向判断，未经用户确认不跨入生产化能力。当前工作树中的大型 placement/ledger 草稿不自动视为本任务成果，需先单独审查取舍。
 
 [2026-07-30 checkpoint 1] 任意 N 的单层真实 tensor ring 已验证 attention + residual/norm/MLP 数学与 exact-once 角色。
 
@@ -58,7 +44,16 @@ type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · sourc
 
 [2026-08-01 checkpoint 11] 冻结 KV assignee schedule 已接入两层 localhost TCP 实验并推送（271de7f）：[1,3,2] tickets、request phase=1 在两层 horizon 生成 [2,1]，每层仅指定 domain KV +1；两层 route、4 sends、finisher handoff、唯一 final logits 与参考数值不变。完整 Rust 测试 94/94 通过。边界仍为单 token 实验，尚未进入 sampling/下一 token continuation。
 
-_updated: 2026-07-31 16:50:14_
+[2026-08-01 checkpoint 12] 两 token localhost TCP 自驱动 continuation 已验证并推送（b237266）：token 0 末层 finisher domain 2 原地 greedy sampling+embedding，零边界消息启动 token 1；sampler/finisher 轮转到 domain 0。四个 append assignee=[[2,1],[1,0]]，每项 exact-once；position 连续，参考侧累积 token 0 K/V 后两步 hidden/logits/token 均对齐；总 sends=8=2*2*(N-1)。边界仍为固定 L=2、greedy、单请求实验。
+
+_updated: 2026-07-31 17:55:51_
+### 末层 finisher 原地 sampling/embedding 并启动下一 token
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-01`
+
+【动机六问】1.问题：当前 TCP 证据在末层 logits 处终止，尚未证明自驱动 packet 能跨 token 边界形成最小 decode loop，也未让 schedule 的 token_offset=1 进入真实数据路径。2.现状：两层 finisher 已唯一产生 logits，所有 worker 都复制 embedding/层权重；packet 支持 finisher-to-starter 层间 handoff，但测试仅运行 token 0。3.目标：N=3、L=2、两个连续 forward；token 0/1 各有唯一 logits+greedy sample；token 0 finisher 原地 embedding sampled token 并启动 token 1；position 从 history_len 增至 history_len+1；schedule 覆盖 4 append events；每层每 token 仅指定 KV shard +1；总 sends=2 tokens*2 layers*(N-1)=8；两步 hidden/logits/sample 对齐显式累积 KV 的未切分参考。4.他者：标准 autoregressive decode 在末层执行 LM head/sampling，再把 token embedding 作为下一 forward 输入；pipeline 系统一般由最后 stage 采样后广播 token，或在权重复制时由持 token 的 stage 继续。Ring Attention 本身不规定 token 边界。5.本方案：仅扩现有 localhost 测试为 token×layer 双循环；末层 finisher argmax 后直接 Tensor::embedding，并保留 hidden 作为下个 token layer 0 的本地 starter 输入；其余节点进入 predecessor recv；参考侧用相同 K/V projection 显式追加每层历史。6.为什么：全节点已有 embedding 权重且 sampled token 已在 finisher，本地 continuation 不需新消息，保持每层 N-1 hop 路线；两 token 足以验证边界而不引入生成器生命周期。VERDICT: IMPLEMENT EXPERIMENT ONLY。边界：只验证 greedy、固定两层、两个 token、localhost CPU；不处理 EOS、随机采样状态、用户可见 token 回传、多请求 fairness、错误恢复或性能。
+
+_updated: 2026-07-31 17:22:35_
 ### 将冻结 KV assignee schedule 接入既有两层 TCP 实验
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-01`

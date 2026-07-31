@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### Rust 两 token TCP 自驱动 continuation 验证通过
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@b237266`
+
+实现提交 b237266 仅修改 rust/src/model/self_driving.rs 的 cfg(test) 实验。既有 N=3、L=2 localhost TCP 测试扩为两个连续 decode forward：token 0 routes=1->2->0、0->1->2，末层 finisher domain 2 唯一计算 logits 与 greedy argmax，并用本地 embedding 权重产生下一 hidden；token 1 无边界消息，直接由 domain 2 启动，routes=2->0->1、1->2->0，末层 finisher/sampler 轮转到 domain 0。FrozenKvAssigneeSchedule 使用 tickets=[1,3,2]、request_id=2、4 append units，counts=[1,2,1]，token×layer assignee=[[2,1],[1,0]]；每个事件断言只有对应 domain KV +1。position_ids 为 history_len 与 history_len+1。参考侧为每层显式投影并追加 token 0 current K/V，再计算 token 1；两个 token 的 hidden/logits 最大差均低于 4e-4，greedy sampled token 完全一致。发送数精确为 2 tokens*2 layers*(3-1)=8，证明 finisher 原地 sampling/embedding 没有增加 token-boundary hop。新鲜验证：LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib:/opt/homebrew/opt/libomp/lib HCP_ENABLE_TORCH=1 CARGO_NET_OFFLINE=true cargo test --manifest-path rust/Cargo.toml --features tch-backend two_token_tcp_ring_continues_from_finisher_with_scheduled_assignees -- --nocapture => 1 passed, 0 failed；同环境 cargo test --manifest-path rust/Cargo.toml --features tch-backend => 94 passed, 0 failed, 3 doctests ignored；同环境 cargo clippy --manifest-path rust/Cargo.toml --features tch-backend --all-targets -- -A warnings => exit 0；rustfmt --edition 2021 --check rust/src/model/self_driving.rs 与 git diff --check => exit 0。边界：仅固定两层、两个 token、greedy、localhost CPU；不声明 EOS、随机采样、多请求、用户 token 回传、QUIC、远端硬件或性能。
+
+_updated: 2026-07-31 17:55:51_
 ### Rust 两层 TCP ring 已消费冻结 KV assignee schedule
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@271de7f`
