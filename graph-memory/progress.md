@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### Rust 冻结 capacity-weighted KV assignee schedule 验证通过
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@cfe25d9`
+
+实现提交 cfe25d9 仅修改 rust/src/model/self_driving.rs，新增纯 FrozenKvAssigneeSchedule 与两个单元测试。schedule 以 append_ordinal=token_offset*num_layers+layer_idx 展平 KV append event；largest-remainder 将 capacity tickets 量化为 total_kv_units 内的精确整数份额，smooth weighted sequence 平滑交织 assignee，request_id 仅旋转 phase。验证覆盖：[1,3,2] 在 24 units 上精确计数 [4,12,8]；同 request 稳定；不同 request phase 不同但份额不变；任意前缀比例误差不超过一个 KV unit；零容量节点不获分配；N=1/2/4；空 worker、全零 capacity、零 units 与越界索引。新鲜验证命令与结果：LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib:/opt/homebrew/opt/libomp/lib HCP_ENABLE_TORCH=1 CARGO_NET_OFFLINE=true cargo test --manifest-path rust/Cargo.toml --features tch-backend frozen_kv_assignee_schedule -- --nocapture => 2 passed, 0 failed；同环境 cargo test --manifest-path rust/Cargo.toml --features tch-backend => 94 passed, 0 failed, 3 doctests ignored；同环境 cargo clippy --manifest-path rust/Cargo.toml --features tch-backend --all-targets -- -A warnings => exit 0；rustfmt --edition 2021 --check rust/src/model/self_driving.rs 与 git diff --check -- rust/src/model/self_driving.rs => exit 0。证据边界：只证明纯 schedule 的确定性、容量份额和 API 边界；尚未接入 TCP runner，不证明物理 KV reservation、动态迁移、吞吐均衡、并发 runtime 或远端硬件性能。
+
+_updated: 2026-07-31 15:27:30_
 ### 未提交 production placement 草稿的范围审计
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `working-tree-audit-2026-07-31`

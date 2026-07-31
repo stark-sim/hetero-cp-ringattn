@@ -6,7 +6,7 @@
 
 type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-07-30`
 
-范围只包含：1. 简单、冻结且可复现的 capacity-weighted KV owner map，并用 stable request_id 分散初始 phase；第一版不引入 layer 维二维 calendar 或运行期动态迁移。2. 单请求、单 token 的真实 tensor 垂直路径：starter 生成 Q，packet 用 N-1 hops 合并所有本地 KV partial，唯一 assignee 计算并持久保存 current K/V，finisher 唯一执行 W_o + residual + norm + MLP，末层唯一产生 logits。3. 最小机器验证：与单节点参考一致；hop、Q、KV project/append、partial、MLP、logits exact-once；无完整远端历史 KV 临时副本。每完成一个小节点即汇报结果、下一节点和方向判断，未经用户确认不跨入生产化能力。当前工作树中的大型 placement/ledger 草稿不自动视为本任务成果，需先单独审查取舍。
+范围只包含：1. 简单、冻结且可复现的 capacity-weighted KV assignee schedule（按 token×layer append event），并用 stable request_id 分散初始 phase；第一版不引入 layer 维二维 calendar 或运行期动态迁移。2. 单请求、单 token 的真实 tensor 垂直路径：starter 生成 Q，packet 用 N-1 hops 合并所有本地 KV partial，唯一 assignee 计算并持久保存 current K/V，finisher 唯一执行 W_o + residual + norm + MLP，末层唯一产生 logits。3. 最小机器验证：与单节点参考一致；hop、Q、KV project/append、partial、MLP、logits exact-once；无完整远端历史 KV 临时副本。每完成一个小节点即汇报结果、下一节点和方向判断，未经用户确认不跨入生产化能力。当前工作树中的大型 placement/ledger 草稿不自动视为本任务成果，需先单独审查取舍。
 
 [2026-07-30 checkpoint 1] 任意 N 的单层真实 tensor ring 已验证 attention + residual/norm/MLP 数学与 exact-once 角色。
 
@@ -40,7 +40,9 @@ type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · sourc
 
 [2026-07-31 checkpoint 10 revision] 取消 owner 命名及 token-wide owner 粒度，改为按 append ordinal=(token_offset*num_layers)+layer_idx 的 FrozenKvAssigneeSchedule；待实现。
 
-_updated: 2026-07-31 13:53:28_
+[2026-07-31 checkpoint 10] 冻结 capacity-weighted KV assignee schedule 已验证并推送（cfe25d9）：分配粒度为 (token_offset, layer_idx) append event，不是固定 owner；[1,3,2] 在 24 units 上精确为 [4,12,8]，smooth 序列前缀偏差不超过 1 unit，request_id 只分散 phase，零容量节点无分配，N=1/2/4 通用。完整 Rust 测试 94/94 通过。当前仍未接入 TCP runner。
+
+_updated: 2026-07-31 15:27:30_
 ### 候选下一小节点：一维冻结 capacity-weighted KV owner map
 
 type: `hypothesis` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `analysis-after-6ef5a18`
@@ -60,13 +62,6 @@ _updated: 2026-07-31 13:53:28_
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-07-31`
 
 【动机六问】1.问题：capacity-weighted ownership 尚未落实，现有 TCP runner 的每层 assignee 仍是手写数组；同时 owner 术语会暗示固定控制节点。2.现状：self_driving 已验证每层唯一 assignee 的 KV project/append；未提交 production placement draft 已明确延后；旧候选 token->owner 被本 revision 修正。3.目标：输入 capacity tickets、request_id、total_kv_units；生成固定、可复现的一维 assignee schedule。append ordinal=(token_offset*num_layers)+layer_idx；每个位置一个 assignee；计数按容量比例确定；request_id 只旋转 phase；零容量节点无分配；任意 N。4.他者：weighted round-robin/smooth scheduling 生成比例化工作序列；生产 KV allocators 还需 admission/ledger，但不属于本节点。5.本方案：在 self_driving.rs 内加入纯 FrozenKvAssigneeSchedule，小规模 largest-remainder 计数 + smooth 交织 + stable request hash phase；只做单元测试，不接 TCP、不引入 layer calendar、throughput、迁移或 ledger。6.为什么：直接实现用户修订后的唯一 KV 落点语义，保留环数据面不变量并避免 owner 概念和生产 planner。VERDICT: IMPLEMENT EXPERIMENT ONLY。【牺牲四问】不实现 production byte admission、active-request accounting、throughput balancing、OOM 保证；这些由后续生产 allocator 负责，当前 capacity tickets 被视为已计算输入。
-
-_updated: 2026-07-31 13:53:28_
-### Rust 第十个实验切片：冻结 capacity-weighted KV assignee schedule
-
-type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-07-31`
-
-实现并验证一维纯 schedule：capacity tickets -> fixed append-ordinal assignee sequence；覆盖 capacity proportional counts、zero-ticket exclusion、stable request_id phase、invalid inputs 与任意 worker count。只新增实验数据结构和单测，不接 TCP 或 runtime。
 
 _updated: 2026-07-31 13:53:28_
 ### 当前阶段延后未提交的生产级 placement/ledger 草稿
