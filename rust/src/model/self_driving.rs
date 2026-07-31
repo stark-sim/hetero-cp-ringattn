@@ -1160,7 +1160,7 @@ mod tests {
     }
 
     #[test]
-    fn two_layer_tcp_ring_continues_on_first_layer_finisher() {
+    fn two_layer_tcp_ring_finisher_produces_final_logits() {
         let domains = 3_usize;
         let layers_count = 2_usize;
         let initial_starter = 1_usize;
@@ -1240,13 +1240,15 @@ mod tests {
             &reference_histories[1].0,
             &reference_histories[1].1,
         );
+        let reference_final_norm =
+            RmsNorm::from_weights(&weights, WeightNames::layer_norm(), config.rms_norm_eps)
+                .unwrap();
+        let reference_logits = reference_final_norm
+            .forward(&reference_layer_1)
+            .matmul(&weights.get(WeightNames::lm_head()).unwrap().transpose(0, 1));
 
-        let worker_layers = (0..domains)
-            .map(|_| {
-                LlamaModel::from_weights(config.clone(), &weights, device, domains)
-                    .unwrap()
-                    .layers
-            })
+        let worker_models = (0..domains)
+            .map(|_| LlamaModel::from_weights(config.clone(), &weights, device, domains).unwrap())
             .collect::<Vec<_>>();
         let mut worker_shards = (0..domains)
             .map(|_| Vec::with_capacity(layers_count))
@@ -1272,14 +1274,14 @@ mod tests {
             .map(|listener| listener.accept().unwrap().0)
             .collect::<Vec<_>>();
 
-        let workers = worker_layers
+        let workers = worker_models
             .into_iter()
             .zip(worker_shards)
             .zip(incoming)
             .zip(outgoing)
             .enumerate()
             .map(
-                |(domain, (((mut layers, mut shards), incoming), outgoing))| {
+                |(domain, (((mut model, mut shards), incoming), outgoing))| {
                     let initial_hidden =
                         (domain == initial_starter).then(|| hidden.shallow_clone());
                     let worker_position_ids = position_ids.shallow_clone();
@@ -1289,12 +1291,13 @@ mod tests {
                         let mut next_layer_hidden = initial_hidden;
                         let mut events = Vec::with_capacity(layers_count);
                         let mut final_hidden = None;
+                        let mut final_logits = None;
 
                         for layer_idx in 0..layers_count {
                             let started = next_layer_hidden.is_some();
                             let packet = if let Some(layer_hidden) = next_layer_hidden.take() {
                                 LayerPacket::start(
-                                    &mut layers[layer_idx],
+                                    &mut model.layers[layer_idx],
                                     &layer_hidden,
                                     &worker_position_ids,
                                     domain,
@@ -1314,7 +1317,7 @@ mod tests {
                             let visit_index = packet.visited_domains;
                             let kv_before = shards[layer_idx].0.size()[2];
                             let (finished, sent_bytes) = match process_layer_packet(
-                                &mut layers[layer_idx],
+                                &mut model.layers[layer_idx],
                                 packet,
                                 &mut shards[layer_idx],
                             )
@@ -1328,6 +1331,8 @@ mod tests {
                                 }
                                 LayerStepOutcome::Finished { hidden_states, .. } => {
                                     if layer_idx + 1 == layers_count {
+                                        final_logits =
+                                            Some(project_final_logits(&model, &hidden_states));
                                         final_hidden = Some(hidden_states);
                                     } else {
                                         next_layer_hidden = Some(hidden_states);
@@ -1347,7 +1352,7 @@ mod tests {
                             });
                         }
 
-                        (events, final_hidden)
+                        (events, final_hidden, final_logits)
                     })
                 },
             )
@@ -1355,12 +1360,16 @@ mod tests {
 
         let mut events = Vec::with_capacity(domains * layers_count);
         let mut final_outputs = Vec::new();
+        let mut logits_outputs = Vec::new();
         for (domain, worker) in workers.into_iter().enumerate() {
-            let (worker_events, final_hidden) = worker.join().unwrap();
+            let (worker_events, final_hidden, final_logits) = worker.join().unwrap();
             assert_eq!(worker_events.len(), layers_count);
             events.extend(worker_events);
             if let Some(hidden_states) = final_hidden {
                 final_outputs.push((domain, hidden_states));
+            }
+            if let Some(logits) = final_logits {
+                logits_outputs.push((domain, logits));
             }
         }
 
@@ -1417,6 +1426,17 @@ mod tests {
         assert!(
             hidden_diff < 4e-4,
             "two-layer TCP hidden diff: {hidden_diff}"
+        );
+        assert_eq!(logits_outputs.len(), 1);
+        let (logits_domain, actual_logits) = logits_outputs.pop().unwrap();
+        assert_eq!(logits_domain, final_domain);
+        let logits_diff = (actual_logits - reference_logits)
+            .abs()
+            .max()
+            .double_value(&[]);
+        assert!(
+            logits_diff < 4e-4,
+            "two-layer TCP final logits diff: {logits_diff}"
         );
     }
 
