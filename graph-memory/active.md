@@ -18,16 +18,30 @@ type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · sourc
 
 [2026-07-30 checkpoint 5] 任意 L 的单 token 全模型 runner 已验证：N=3 下 L=3 回到 starter、L=4 轮转 producer，满足 producer=(starter-L) mod N、总 hops=L*(N-1)、逐层 exact-once，完整 Rust 测试 87/87 通过。
 
-尚未实现真实 P2P 或 sampling/token continuation。代码审计确认现有 transport RingPacket 仅有 Q/O/LSE，不能承载 self-driving LayerPacket 的 residual/normalized/position/route 状态；下一候选为 N=3 localhost 单层真实 P2P 垂直切片，待用户确认。
+当前实施 N=3 localhost 单层真实 TCP P2P 垂直切片；sampling/token continuation、任意 L 网络循环、QUIC 与 runtime 仍未开始。
 
-_updated: 2026-07-30 16:10:16_
+_updated: 2026-07-31 03:55:20_
 ### 候选下一小节点：N=3 localhost 单层真实 P2P self-driving ring
 
-type: `hypothesis` · status: `open` · confidence: 0.97 · importance: 1.0 · source: `analysis-after-c2a0483`
+type: `hypothesis` · status: `superseded` · confidence: 0.97 · importance: 1.0 · source: `analysis-after-c2a0483`
 
 【动机六问】1.问题：任意 L 的模型控制循环已成立，但所有 domain step 仍在同一进程直接调用；尚未证明 LayerPacket 能沿只有前驱/后继的真实字节流传递，当前最核心的 P2P 拓扑主张仍缺机器证据。2.现状：self_driving::LayerPacket 需要 residual、normalized hidden、position_ids、Q、O/LSE、assignee/current_domain/domains/visited；现有 model::transport::RingPacket 和 TCP/QUIC codec 只承载 layer_idx、Q、O、LSE、scale，无法直接恢复 finisher 的 residual/norm/MLP continuation。3.目标：做一个单层、单 token、N=3 localhost 的真实 TCP P2P 垂直切片；三个 worker 各只持自己的 local KV shard，只连接 predecessor/successor，packet 经过 N-1=2 个网络 hop 后由 finisher 完成 W_o+residual+norm+MLP；输出与单节点参考一致，只有 assignee shard 增长，wire payload 不随历史 KV 长度增长。4.他者：Ring Attention 通过 P2P send/recv 传 online-softmax accumulator，pipeline parallel 通过 stage link 传 activation；项目现有 TCP/QUIC RingPacket codec 已实现 Tensor 字节化，可复用 framed transport 与 dtype/shape roundtrip，但其 payload 合同不足以承载两者组合。5.本方案：先扩展一个最小 self-driving wire packet，并用 localhost N=3 单层线程/连接测试贯通 encode-send-recv-decode-domain-step；复用现有 tensor codec，不接任意 L 网络循环、sampling、多请求、QUIC、远端硬件、重试、版本协商或 runtime。6.为什么：codec-only 测试不能证明两 peer ring 数据流，直接网络化任意 L 又会同时扩大协议与层循环失败面；单层 N=3 TCP 垂直切片是能证明真实 P2P 核心主张的最小可归因步骤。VERDICT: PROPOSE IMPLEMENT EXPERIMENT ONLY；待用户确认。
 
-_updated: 2026-07-30 16:10:16_
+_updated: 2026-07-31 03:55:20_
+### Rust 第六个实验切片：N=3 localhost 单层真实 TCP P2P ring
+
+type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-07-31`
+
+实现单层、单 token、N=3 localhost TCP self-driving ring。三个 worker 各自持有完整相同层权重和唯一 local KV shard，并各建立 predecessor/successor 两条 peer 连接；starter 本地处理后发送独立 SelfDrivingPacket，第二节点接收/处理/转发，finisher 在第 2 个网络 hop 后完成 W_o+residual+norm+MLP。验证输出与单节点参考一致、只有 assignee shard 增长、hop=2、wire payload 不随历史 KV 长度增长。仅使用 mac-local-shell + local libtorch CPU correctness；不加入任意 L 网络循环、sampling、多请求、QUIC、远端硬件、重试、版本协商或 runtime。
+
+_updated: 2026-07-31 03:55:20_
+### 实施独立 SelfDrivingPacket 的 N=3 localhost TCP 垂直切片
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-07-31`
+
+【动机六问】1.问题：任意 L 的模型控制循环已成立，但所有 domain step 仍在同一进程直接调用；尚未证明 LayerPacket 能沿只有前驱/后继的真实字节流传递，当前最核心的 P2P 拓扑主张仍缺机器证据。2.现状：self_driving::LayerPacket 需要 residual、normalized hidden、position_ids、Q、O/LSE、assignee/current_domain/domains/visited；现有 model::transport::RingPacket 和 TCP/QUIC codec 只承载 layer_idx、Q、O、LSE、scale，无法直接恢复 finisher 的 residual/norm/MLP continuation。3.目标：单层、单 token、N=3 localhost TCP；三个 worker 各只持自己的 local KV shard，只连接 predecessor/successor，packet 经过 N-1=2 个网络 hop 后由 finisher 完成 W_o+residual+norm+MLP；输出与单节点参考一致，只有 assignee shard 增长，wire payload 不随历史 KV 长度增长。4.他者：Ring Attention 通过 P2P send/recv 传 online-softmax accumulator，pipeline parallel 通过 stage link 传 activation；项目现有 TCP RingPacket codec 已实现 Tensor 字节化，可复用 framing 与 dtype/shape roundtrip，但 payload 合同不足以承载两者组合。5.本方案：新增独立 SelfDrivingPacket wire struct；LayerPacket 只在发送前/接收后转换。TcpKvTransport 使用私有 TcpFrame 分派和实验性固有 send/recv 方法，复用 tensor codec；不修改 KvTransport trait、旧 RingPacket 或 QUIC。N=3 loopback 测试建立完整定向 ring，每 worker 各有 incoming predecessor 与 outgoing successor 连接，但单请求只使用 starter→successor→finisher 两条边。6.为什么：直接扩旧 RingPacket 会污染已验证 Q-ring 合同；测试内自写 socket codec 会形成一次性重复；独立 packet + TCP 私有帧是最小可复用边界。codec-only 测试不能证明两 peer ring 数据流，直接网络化任意 L 又扩大失败面，因此选择单层 N=3 垂直切片。执行环境按 infrastructure-inventory 选择 mac-local-shell + local libtorch CPU，只声明 correctness 与 loopback 字节流，不声明硬件性能。VERDICT: IMPLEMENT EXPERIMENT ONLY。
+
+_updated: 2026-07-31 03:55:20_
 ### 候选下一小节点：任意 L 的单 token 全模型 ring
 
 type: `hypothesis` · status: `superseded` · confidence: 0.98 · importance: 1.0 · source: `analysis-after-e2c6cd6`
