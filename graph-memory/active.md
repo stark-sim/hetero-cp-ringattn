@@ -38,19 +38,42 @@ type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · sourc
 
 [候选 checkpoint 10] 一维冻结 capacity-weighted KV owner map：capacity tickets + stable request_id phase，纯函数/纯数据结构；明确不采用当前 1079 行 production placement/ledger 草稿，不含 layer calendar、throughput、动态迁移或 admission。待用户确认。
 
-_updated: 2026-07-31 09:52:06_
+[2026-07-31 checkpoint 10 revision] 取消 owner 命名及 token-wide owner 粒度，改为按 append ordinal=(token_offset*num_layers)+layer_idx 的 FrozenKvAssigneeSchedule；待实现。
+
+_updated: 2026-07-31 13:53:28_
+### 候选下一小节点：一维冻结 capacity-weighted KV owner map
+
+type: `hypothesis` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `analysis-after-6ef5a18`
+
+【动机六问】1.问题：TCP 单 token 垂直路径已闭到 logits，但 assignees 仍由测试手写数组，尚未落实异构容量加权与按 request_id 分散初始 phase。2.现状：现有 self_driving runner 接收显式 assignee；未提交 production placement 草稿超出当前范围。3.目标：在 self_driving 实验边界新增纯 FrozenKvOwnerMap：输入 capacity tickets、request_id、已知 total_positions，输出固定的一维 token->owner vector；每个 token 仅一个 owner，计数按容量比例做确定性整数分配，stable request_id 只旋转初始 phase，不改变各节点总份额；同输入跨运行一致，任意 N 通用，零容量节点不分配。4.他者：weighted round-robin/smooth weighted scheduling 用固定权重生成近似均匀序列；生产引擎另有 admission ledger，但不能直接复用为本实验最小 owner map。5.本方案：在 self_driving.rs 内实现小型纯数据结构；先按 largest remainder 得到请求长度内的精确整数份额，再平滑交织 owner 序列并按稳定 request hash 旋转；不含 layer 维度、throughput、动态迁移、ledger 或协议。6.为什么：它直接满足用户当前 capacity-weighted+request phase 目标，能被纯单测完整验证，且不触碰用户未提交草稿；后续单独节点再把生成的 assignee 接入现有 TCP 路径。【牺牲四问】生产 placement 默认复杂是为显存硬界与并发吞吐；最小 map 不提供 byte admission、active-request accounting、throughput balance 或 OOM 保证；这些能力一般用于生产安全与效率；当前只把 capacity tickets 当已给定实验输入，因此只能证明确定性 ownership 语义，不能声称生产显存安全。VERDICT: PROPOSE IMPLEMENT EXPERIMENT ONLY；待用户确认。
+
+_updated: 2026-07-31 13:53:28_
+### 修订：从 KV owner map 改为 KV assignee schedule
+
+type: `revision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-07-31`
+
+用户确认：owner 不是固定控制角色，但该命名混淆了 request/control owner 与唯一 KV 落点；原 token->owner 粒度还会把同一 token 的所有 layer K/V 集中到一个节点。修订为 FrozenKvAssigneeSchedule：对每个 append ordinal=(token_offset*num_layers)+layer_idx 产生唯一 KV assignee；starter、finisher、sampler 与 assignee 彼此独立且可轮转。
+
+_updated: 2026-07-31 13:53:28_
+### 实施一维冻结 KV assignee schedule 实验
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-07-31`
+
+【动机六问】1.问题：capacity-weighted ownership 尚未落实，现有 TCP runner 的每层 assignee 仍是手写数组；同时 owner 术语会暗示固定控制节点。2.现状：self_driving 已验证每层唯一 assignee 的 KV project/append；未提交 production placement draft 已明确延后；旧候选 token->owner 被本 revision 修正。3.目标：输入 capacity tickets、request_id、total_kv_units；生成固定、可复现的一维 assignee schedule。append ordinal=(token_offset*num_layers)+layer_idx；每个位置一个 assignee；计数按容量比例确定；request_id 只旋转 phase；零容量节点无分配；任意 N。4.他者：weighted round-robin/smooth scheduling 生成比例化工作序列；生产 KV allocators 还需 admission/ledger，但不属于本节点。5.本方案：在 self_driving.rs 内加入纯 FrozenKvAssigneeSchedule，小规模 largest-remainder 计数 + smooth 交织 + stable request hash phase；只做单元测试，不接 TCP、不引入 layer calendar、throughput、迁移或 ledger。6.为什么：直接实现用户修订后的唯一 KV 落点语义，保留环数据面不变量并避免 owner 概念和生产 planner。VERDICT: IMPLEMENT EXPERIMENT ONLY。【牺牲四问】不实现 production byte admission、active-request accounting、throughput balancing、OOM 保证；这些由后续生产 allocator 负责，当前 capacity tickets 被视为已计算输入。
+
+_updated: 2026-07-31 13:53:28_
+### Rust 第十个实验切片：冻结 capacity-weighted KV assignee schedule
+
+type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-07-31`
+
+实现并验证一维纯 schedule：capacity tickets -> fixed append-ordinal assignee sequence；覆盖 capacity proportional counts、zero-ticket exclusion、stable request_id phase、invalid inputs 与任意 worker count。只新增实验数据结构和单测，不接 TCP 或 runtime。
+
+_updated: 2026-07-31 13:53:28_
 ### 当前阶段延后未提交的生产级 placement/ledger 草稿
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `working-tree-audit-2026-07-31`
 
 【动机六问】1.问题：核心还缺 capacity-weighted KV owner map，但工作树存在一份未接纳的大型 placement 草稿，若直接使用会把已收缩的实验重新扩成生产 admission 系统。2.现状：placement.rs 共 1079 行，包含精确 byte profile、active-request ledger、workspace max、throughput bounded allocation、prompt+decode calendar、逐层计费、整数修复与 hash；capacity.rs/mod.rs/Cargo.toml 还有配套未提交修改。3.目标：保留这些用户修改不回退，但当前核心实验不依赖、不提交；先实现可单独证明的简单一维冻结 owner map。4.他者：vLLM 等生产引擎需要 paged KV admission、reservation 和 continuous scheduling；这些机制解决真实并发 OOM 与利用率。5.本方案：把生产 draft 明确延后，下一节点只在 self_driving 实验边界实现 capacity tickets->固定 token owner vector，并用 stable request_id 旋转 phase。6.为什么：实验当前只有 synthetic shard 与单请求 CPU correctness，没有可靠 allocator/profile/active-request 输入，无法诚实验证 1079 行生产合同。【牺牲四问】默认复杂 draft 存在是为了精确显存硬界、并发 reservation 与异构 throughput 优化；延后会牺牲 byte-level admission、workspace accounting、compute-balanced water-filling、运行期 ledger 与协议 hash；这些能力的一般用途是防 OOM 和提高生产吞吐；对当前单请求单 token/localhost 实验，它们既不可被真实验证，也不是 ring 数学成立的前提。VERDICT: DEFER production draft, preserve working-tree changes, do not integrate now。
-
-_updated: 2026-07-31 09:52:06_
-### 候选下一小节点：一维冻结 capacity-weighted KV owner map
-
-type: `hypothesis` · status: `proposed` · confidence: 1.0 · importance: 1.0 · source: `analysis-after-6ef5a18`
-
-【动机六问】1.问题：TCP 单 token 垂直路径已闭到 logits，但 assignees 仍由测试手写数组，尚未落实异构容量加权与按 request_id 分散初始 phase。2.现状：现有 self_driving runner 接收显式 assignee；未提交 production placement 草稿超出当前范围。3.目标：在 self_driving 实验边界新增纯 FrozenKvOwnerMap：输入 capacity tickets、request_id、已知 total_positions，输出固定的一维 token->owner vector；每个 token 仅一个 owner，计数按容量比例做确定性整数分配，stable request_id 只旋转初始 phase，不改变各节点总份额；同输入跨运行一致，任意 N 通用，零容量节点不分配。4.他者：weighted round-robin/smooth weighted scheduling 用固定权重生成近似均匀序列；生产引擎另有 admission ledger，但不能直接复用为本实验最小 owner map。5.本方案：在 self_driving.rs 内实现小型纯数据结构；先按 largest remainder 得到请求长度内的精确整数份额，再平滑交织 owner 序列并按稳定 request hash 旋转；不含 layer 维度、throughput、动态迁移、ledger 或协议。6.为什么：它直接满足用户当前 capacity-weighted+request phase 目标，能被纯单测完整验证，且不触碰用户未提交草稿；后续单独节点再把生成的 assignee 接入现有 TCP 路径。【牺牲四问】生产 placement 默认复杂是为显存硬界与并发吞吐；最小 map 不提供 byte admission、active-request accounting、throughput balance 或 OOM 保证；这些能力一般用于生产安全与效率；当前只把 capacity tickets 当已给定实验输入，因此只能证明确定性 ownership 语义，不能声称生产显存安全。VERDICT: PROPOSE IMPLEMENT EXPERIMENT ONLY；待用户确认。
 
 _updated: 2026-07-31 09:52:06_
 ### 候选下一小节点：末层 TCP finisher 本地唯一产生 final logits
