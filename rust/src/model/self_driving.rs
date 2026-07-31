@@ -7,6 +7,112 @@ use crate::model::transport::SelfDrivingPacket;
 use crate::model::ModelError;
 use tch::{Kind, Tensor};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrozenKvAssigneeSchedule {
+    sequence: Vec<usize>,
+    counts: Vec<usize>,
+    phase: usize,
+}
+
+impl FrozenKvAssigneeSchedule {
+    pub fn new(
+        capacity_tickets: &[u64],
+        request_id: u64,
+        total_kv_units: usize,
+    ) -> Result<Self, String> {
+        if capacity_tickets.is_empty() {
+            return Err("KV assignee schedule requires at least one worker".to_string());
+        }
+        if total_kv_units == 0 {
+            return Err("KV assignee schedule requires at least one KV unit".to_string());
+        }
+        let capacity_sum = capacity_tickets
+            .iter()
+            .try_fold(0_u128, |sum, &tickets| sum.checked_add(tickets as u128))
+            .ok_or_else(|| "KV assignee capacity sum overflow".to_string())?;
+        if capacity_sum == 0 {
+            return Err("KV assignee schedule requires non-zero capacity".to_string());
+        }
+
+        let total = total_kv_units as u128;
+        let mut counts = Vec::with_capacity(capacity_tickets.len());
+        let mut remainders = Vec::with_capacity(capacity_tickets.len());
+        for (domain, &tickets) in capacity_tickets.iter().enumerate() {
+            let numerator = total
+                .checked_mul(tickets as u128)
+                .ok_or_else(|| "KV assignee allocation overflow".to_string())?;
+            counts.push((numerator / capacity_sum) as usize);
+            remainders.push((domain, numerator % capacity_sum));
+        }
+        remainders.sort_by(|(left_domain, left), (right_domain, right)| {
+            right.cmp(left).then_with(|| left_domain.cmp(right_domain))
+        });
+        let assigned = counts.iter().sum::<usize>();
+        let remaining = total_kv_units
+            .checked_sub(assigned)
+            .ok_or_else(|| "KV assignee allocation overflow".to_string())?;
+        for &(domain, _) in remainders.iter().take(remaining) {
+            counts[domain] += 1;
+        }
+
+        let mut scores = vec![0_i128; counts.len()];
+        let total_score = total_kv_units as i128;
+        let mut sequence = Vec::with_capacity(total_kv_units);
+        for _ in 0..total_kv_units {
+            for (score, &count) in scores.iter_mut().zip(&counts) {
+                *score += count as i128;
+            }
+            let selected = scores
+                .iter()
+                .enumerate()
+                .max_by(|(left_domain, left), (right_domain, right)| {
+                    left.cmp(right).then_with(|| right_domain.cmp(left_domain))
+                })
+                .map(|(domain, _)| domain)
+                .ok_or_else(|| "KV assignee schedule is empty".to_string())?;
+            scores[selected] -= total_score;
+            sequence.push(selected);
+        }
+
+        Ok(Self {
+            sequence,
+            counts,
+            phase: (request_id as u128 % total) as usize,
+        })
+    }
+
+    pub fn counts(&self) -> &[usize] {
+        &self.counts
+    }
+
+    pub fn total_units(&self) -> usize {
+        self.sequence.len()
+    }
+
+    pub fn phase(&self) -> usize {
+        self.phase
+    }
+
+    pub fn assignee_for(
+        &self,
+        token_offset: usize,
+        layer_idx: usize,
+        num_layers: usize,
+    ) -> Option<usize> {
+        if num_layers == 0 || layer_idx >= num_layers {
+            return None;
+        }
+        let ordinal = token_offset
+            .checked_mul(num_layers)?
+            .checked_add(layer_idx)?;
+        if ordinal >= self.sequence.len() {
+            return None;
+        }
+        let index = self.phase.checked_add(ordinal)? % self.sequence.len();
+        self.sequence.get(index).copied()
+    }
+}
+
 #[derive(Debug)]
 pub struct LayerPacket {
     residual: Tensor,
@@ -618,6 +724,67 @@ mod tests {
         let post_attention = &attention_output + hidden;
         let mlp_output = mlp.forward(&post_norm.forward(&post_attention));
         (attention_output, post_attention + mlp_output)
+    }
+
+    #[test]
+    fn frozen_kv_assignee_schedule_is_capacity_weighted_and_phase_stable() {
+        let first = FrozenKvAssigneeSchedule::new(&[1, 3, 2], 41, 24).unwrap();
+        assert_eq!(first.counts(), &[4, 12, 8]);
+        assert_eq!(first.total_units(), 24);
+
+        let mut observed = vec![0_usize; 3];
+        for token_offset in 0..8 {
+            for layer_idx in 0..3 {
+                let assignee = first.assignee_for(token_offset, layer_idx, 3).unwrap();
+                observed[assignee] += 1;
+            }
+        }
+        assert_eq!(observed, first.counts());
+
+        let same_request = FrozenKvAssigneeSchedule::new(&[1, 3, 2], 41, 24).unwrap();
+        assert_eq!(first, same_request);
+        let other_request = FrozenKvAssigneeSchedule::new(&[1, 3, 2], 42, 24).unwrap();
+        assert_ne!(first.phase(), other_request.phase());
+        assert_eq!(first.counts(), other_request.counts());
+
+        let mut prefix_counts = [0_i128; 3];
+        for ordinal in 0..first.total_units() {
+            let assignee = first.sequence[(first.phase() + ordinal) % first.total_units()];
+            prefix_counts[assignee] += 1;
+            let prefix_units = (ordinal + 1) as i128;
+            for (domain, &target_count) in first.counts().iter().enumerate() {
+                let scaled_error = (prefix_counts[domain] * first.total_units() as i128
+                    - prefix_units * target_count as i128)
+                    .abs();
+                assert!(scaled_error <= first.total_units() as i128);
+            }
+        }
+
+        assert!(FrozenKvAssigneeSchedule::new(&[], 41, 24).is_err());
+        assert!(FrozenKvAssigneeSchedule::new(&[0, 0, 0], 41, 24).is_err());
+        assert!(FrozenKvAssigneeSchedule::new(&[1, 3, 2], 41, 0).is_err());
+        assert_eq!(first.assignee_for(0, 3, 3), None);
+        assert_eq!(first.assignee_for(8, 0, 3), None);
+    }
+
+    #[test]
+    fn frozen_kv_assignee_schedule_excludes_zero_capacity_for_arbitrary_n() {
+        let with_zero = FrozenKvAssigneeSchedule::new(&[1, 0, 3], 7, 16).unwrap();
+        assert_eq!(with_zero.counts(), &[4, 0, 12]);
+        assert!(!with_zero.sequence.contains(&1));
+
+        for (tickets, total_units, expected_counts) in [
+            (vec![7], 5, vec![5]),
+            (vec![1, 1], 6, vec![3, 3]),
+            (vec![1, 1, 1, 1], 8, vec![2, 2, 2, 2]),
+        ] {
+            let schedule = FrozenKvAssigneeSchedule::new(&tickets, 3, total_units).unwrap();
+            assert_eq!(schedule.counts(), expected_counts);
+            assert!(schedule
+                .sequence
+                .iter()
+                .all(|&assignee| assignee < tickets.len()));
+        }
     }
 
     #[test]
