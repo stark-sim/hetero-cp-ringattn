@@ -940,16 +940,12 @@ mod tests {
         assert!(short_context_payload > 0);
     }
 
-    #[test]
-    fn three_domain_tcp_ring_runs_one_real_layer_in_two_hops() {
-        let domains = 3_usize;
-        let starter = 0_usize;
-        let assignee = 1_usize;
+    fn assert_tcp_ring_case(domains: usize, starter: usize, assignee: usize) -> Vec<usize> {
         let device = Device::Cpu;
         let config = test_config();
         let weights = deterministic_weights(&config, device);
         let hidden = deterministic_tensor(&[1, 1, config.hidden_size as i64], 125.0, device);
-        let shard_lengths = [2_i64, 5, 3];
+        let shard_lengths = [2_i64, 5, 3, 4][..domains].to_vec();
         let history_len = shard_lengths.iter().sum::<i64>();
         let position_ids = Tensor::from_slice(&[history_len]).unsqueeze(0);
         let shards = shard_lengths
@@ -1045,17 +1041,27 @@ mod tests {
                         LayerPacket::from_self_driving_packet(wire).unwrap()
                     };
                     assert_eq!(packet.current_domain, domain);
+                    let visit_index = packet.visited_domains;
                     let before = shard.0.size()[2];
                     match process_layer_packet(&mut layer, packet, &mut shard).unwrap() {
                         LayerStepOutcome::Forward(packet) => {
                             let wire = packet.into_self_driving_packet(0).unwrap();
                             let sent_bytes = successor.send_self_driving_packet(&wire).unwrap();
-                            (domain, started, before, shard.0.size()[2], sent_bytes, None)
+                            (
+                                visit_index,
+                                domain,
+                                started,
+                                before,
+                                shard.0.size()[2],
+                                sent_bytes,
+                                None,
+                            )
                         }
                         LayerStepOutcome::Finished {
                             attention_output,
                             hidden_states,
                         } => (
+                            visit_index,
                             domain,
                             started,
                             before,
@@ -1071,17 +1077,21 @@ mod tests {
         let mut started = 0_usize;
         let mut sends = 0_usize;
         let mut finished = 0_usize;
+        let mut finisher_domain = None;
+        let mut route = Vec::with_capacity(domains);
         let mut actual_attention = None;
         let mut actual_hidden = None;
         for worker in workers {
-            let (domain, worker_started, before, after, sent_bytes, output) =
+            let (visit_index, domain, worker_started, before, after, sent_bytes, output) =
                 worker.join().unwrap();
+            route.push((visit_index, domain));
             started += usize::from(worker_started);
             sends += usize::from(sent_bytes > 0);
             let expected_growth = i64::from(domain == assignee);
             assert_eq!(after, before + expected_growth);
             if let Some((attention, hidden)) = output {
                 finished += 1;
+                finisher_domain = Some(domain);
                 actual_attention = Some(attention);
                 actual_hidden = Some(hidden);
             }
@@ -1090,6 +1100,18 @@ mod tests {
         assert_eq!(started, 1);
         assert_eq!(sends, domains - 1);
         assert_eq!(finished, 1);
+        assert_eq!(finisher_domain, Some((starter + domains - 1) % domains));
+        route.sort_by_key(|(visit_index, _)| *visit_index);
+        let route = route
+            .into_iter()
+            .map(|(_, domain)| domain)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            route,
+            (0..domains)
+                .map(|step| (starter + step) % domains)
+                .collect::<Vec<_>>()
+        );
         let attention_diff = (actual_attention.unwrap() - reference_attention)
             .abs()
             .max()
@@ -1103,6 +1125,26 @@ mod tests {
             "TCP ring attention diff: {attention_diff}"
         );
         assert!(hidden_diff < 2e-4, "TCP ring layer diff: {hidden_diff}");
+        route
+    }
+
+    #[test]
+    fn three_domain_tcp_ring_runs_one_real_layer_in_two_hops() {
+        assert_eq!(assert_tcp_ring_case(3, 0, 1), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn tcp_ring_handles_arbitrary_domain_counts_and_wraparound() {
+        for domains in [2_usize, 3, 4] {
+            let starter = domains - 1;
+            let assignee = (starter + 1) % domains;
+            let route = assert_tcp_ring_case(domains, starter, assignee);
+            assert_eq!(route[0], starter);
+            assert_eq!(
+                route[1], 0,
+                "N={domains} did not cross the wrap-around edge"
+            );
+        }
     }
 
     #[test]
