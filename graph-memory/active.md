@@ -9,6 +9,27 @@ type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · sour
 【动机六问】1.问题：24 层实验已证明 exact slab 与 capacity-weighted prefill/decode continuation，但 localhost TCP 两-token ring 的 distributed worker 仍调用 process_layer_packet 中的 Tensor::cat；两条核心证据尚未组合。2.现状：Tensor::cat 位于公开 process_layer_packet 的 tuple history 写入；直接替换需改变公共 cache 合同，过宽。ReservedPositionedKvShard 已在 cfg(test) 中验证。3.目标：TCP worker 使用精确预留 slab，所有 decode growth 原地写且 data_ptr 不变；packet 路由、8 次 send、唯一 assignee、两 token continuation、hidden/logits/token 对齐保持。4.他者：serving engine 用 reserved arena 或 paged cache，再让 attention 读取 committed view；测试通常通过 cache adapter 组合网络与存储路径。5.本方案：提取私有的 post-commit packet continuation 原语供 legacy process_layer_packet 和 test-only reserved adapter 共用；公开函数仍保留 cat。TCP 测试按 layer×domain 冻结 assignee 次数精确预留并记录 cursor/capacity/pointer。6.为什么：它避免复制 online-softmax 与 layer finish 数学，也避免提前设计生产 cache trait；只填补 TCP 数据流与 slab mechanics 的组合缺口。【牺牲四问】legacy cat 为未知长度和简单 tuple ownership 提供动态增长，本节点不删除它；test-only slab 牺牲 horizon 外增长和运行期重分配，这些能力服务开放式生成与生产 allocator；当前固定两-token实验不需要。因此本节点只能证明 reserved 变体可驱动同一 TCP packet 数学，不能声称公共 process_layer_packet 或生产 runtime 已无 cat。VERDICT: IMPLEMENT EXPERIMENT ONLY。
 
 _updated: 2026-08-01 18:34:17_
+### HCP 系统定位：互联无关的细粒度异构 Context Parallelism
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-correction-2026-08-02`
+
+【动机六问】1.问题：上一版把系统愿景集中在 CXL-class，容易让 HCP 看起来依赖一种特定硬件，也没有充分表达真正的系统缺口：现有分布式推理通常把同构设备作为同一请求内的细粒度协作单元，异构资源更多用于请求级、模型级或 prefill/decode 阶段级分配，难以把不同代际、不同品牌和不同容量的加速卡聚合到同一个 attention context。2.现状：当前 HCP 已由数学推导、Rust tensor correctness、localhost P2P、capacity-weighted reservation 以及 24 层 prefill-decode-continuation mixed-history 实验证明核心数据流可组合；旧 CUDA+HIP 1M context 属于先前工程实现，不能作为当前方案的跨后端硬件证据。带宽矩阵仍能说明网络性能是关键系统变量，但尚无 TCO、能耗或单位吞吐成本实验。3.目标：论文将 HCP 定义为 transport-agnostic 的完整推理生命周期异构 Context Parallelism。算法只要求每个 worker 与 predecessor/successor 进行 P2P 传输；CXL、RDMA/RoCE、InfiniBand、UALink、PCIe peer access 或未来通用高速互联均可作为承载。论文严格区分当前实验性核心证据、旧工程历史、开放的跨硬件验证和待验证的成本优势。4.他者：主流 TP、PP、CP 与 collective 通常围绕同构设备、对称分片和一致 kernel 能力优化；异构 serving 常通过请求路由、模型放置或 prefill/decode disaggregation 利用不同资源池。这些方式降低设备内核和负载不对称带来的复杂度，但通常不聚合同一 attention context 的不均等 KV 容量。该研究定位已获用户确认，进入论文时仍需文献与实现审计限定范围。5.本方案：以逐层 position-indexed KV context 为统一对象，prefill 按 capacity-weighted positions 永久分片并环传 KV，decode 保持历史 KV 原地且让 Q、O/LSE 与 activation packet 遍历所有 shard，新 KV 按 capacity-weighted layer×position event 唯一归属；continuation prefill继续追加同一逻辑 context。物理互联只需实现邻居 P2P 合同。6.为什么：HCP 的价值不来自押注某种网卡，而是尝试把难以高效组成同一细粒度并行组的代际混合、品牌混合和容量不对称设备转化为一个 context-capacity pool。互联带宽和时延的持续提升会扩大这一方法的可用区间；长上下文使 KVCache 成为持续增长的主要显存压力，因此是当前最直接的应用目标。边界：模型权重仍由每个 worker 完整持有；真实跨后端硬件协作、成本优势与未来超大模型适应性仍待验证。VERDICT: IMPLEMENT AS REVISED PAPER POSITIONING；DEFER HARDWARE AND LOW-COST CLAIMS UNTIL MATCHING EVIDENCE。
+
+_updated: 2026-08-01 17:46:39_
+### 当前 HCP 主方法不得继承旧 1M 工程实现的异构硬件证据
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-correction-2026-08-02`
+
+【动机六问】1.问题：旧工程路线曾在 CUDA+HIP 上完成 1M context 和 3:1 分片，但当前论文主方法已经改变了 decode 数据流、KV 增长归属和完整生命周期组合；继续引用旧结果会把不同实现的证据错误迁移到当前方案。2.现状：prog-1m-white-pearl 是真实历史里程碑，但 graph 中仍以 SUPPORTS 连接当前全生命周期 CP decision 与 fabric-agnostic system positioning，导致论文可能误写为当前方案已完成跨后端异构硬件验证。3.目标：保留旧实验及其历史关系，解除其对当前主方法的直接支持；当前证据只声明 Rust correctness、localhost P2P、24 层 mixed-history 与 capacity-weighted reservation 等已实际验证范围，并明确真实跨品牌、跨后端、跨节点硬件验证仍开放。4.他者：系统论文要求结果对应被描述的确切算法和实现；旧原型可以作为演进背景或基线，但除非关键不变量和执行路径相同，不能直接证明修订后方法。5.本方案：删除 prog-1m-white-pearl 指向当前两个 decision 的 SUPPORTS 边；创建 evidence-scope revision 和跨后端验证 uncertainty；旧节点、报告以及其对旧决策和基础 uneven-CP blueprint 的历史支持保持不变。6.为什么：这保留项目历史又阻止过强论文 claim，不需要删除有效旧数据，也不把尚未运行的新实验描述成已完成。VERDICT: IMPLEMENT EVIDENCE DE-SCOPING。
+
+_updated: 2026-08-01 17:46:39_
+### 当前全生命周期 HCP 尚缺真实跨后端异构硬件验证
+
+type: `uncertainty` · status: `open` · confidence: 1.0 · importance: 1.0 · source: `user-correction-2026-08-02`
+
+当前修订方案已有数学、Rust tensor correctness、localhost P2P、任意 N/L、capacity-weighted schedule/reservation、prefill-decode-continuation mixed-history 等模块证据，但尚未在真实不同品牌或不同后端加速卡上执行同一版本的完整 prefill + self-driving decode + continuation 流程。旧 CUDA+HIP 1M context 结果属于已放弃的工程实现，不能填补此验证空缺。在完成对应实验前，论文只能把细粒度异构协作写成方法目标和实验性核心可行性，不能写成当前方案已经跨硬件验证。
+
+_updated: 2026-08-01 17:46:39_
 ### 将 schedule 显存保证限定为完整 horizon reservation
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-01`
@@ -28,13 +49,6 @@ _updated: 2026-08-01 16:51:10_
 type: `decision` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-01`
 
 【动机六问】1.问题：论文需要把 Ring Attention 显存分担思想、异构 capacity weighting、线性 P2P ring 和未来硬件目标统一成一个准确的系统命题，避免只像 decode 优化，也避免把 HCP 误写成通用模型并行。2.现状：核心算法已经定义完整推理生命周期的异构 Context Parallelism，1M 实验与带宽矩阵分别证明异构 KV 容量聚合可行以及传统低带宽网络会成为瓶颈；但现有表述尚未明确目标互联与参数内存边界。3.目标：论文将 HCP 定位为基于 Ring Attention 的 context/KV 显存分担思想，在每 worker 仅连接 predecessor/successor 的线性 P2P ring 上，对 prefill、decode 和 continuation prefill 的同一逻辑 context 做 capacity-weighted 分片；系统愿景是借助 CXL-class、memory-semantic、高带宽低时延 P2P fabric，使低成本异构加速卡池能够承载单设备 KV 显存不足的超长上下文推理。4.他者：Ring Attention 主要以 sequence/context shard 和环传 KV 扩展长序列；主流并行推理常依赖同构高速互联与 collective；CXL/类内存语义互联提供设备内存共享或低开销访问的硬件方向，但并不自动给出异构 attention 的 placement、精确归并和全生命周期 KV 所有权。5.本方案：HCP 保持统一的 position-indexed KV context，prefill 环传 KV block，decode 环传 Q、online-softmax accumulator 与 activation，新 KV 由 capacity-weighted 唯一 assignee 原地保留；通信合同只要求邻居 P2P，不要求 collective 或全连接。6.为什么：它直接聚合异构设备最稀缺且随 context 增长的 KV 容量，同时使连接数与单请求流量随节点数线性；相比照搬同构 CP 或把 CXL 当透明共享内存，它保留设备本地计算和明确所有权，更符合不均等显存与算力。边界：当前每个 worker 仍复制完整模型权重，因此已支持的是超长上下文和 KV-heavy inference，不是参数量超过单节点权重容量的模型；CXL-class 是目标硬件类别与待验证条件，不是现有实验已经证明的充分条件。VERDICT: IMPLEMENT AS PAPER SYSTEM POSITIONING。
-
-_updated: 2026-08-01 16:51:10_
-### HCP 系统定位：互联无关的细粒度异构 Context Parallelism
-
-type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-correction-2026-08-02`
-
-【动机六问】1.问题：上一版把系统愿景集中在 CXL-class，容易让 HCP 看起来依赖一种特定硬件，也没有充分表达真正的系统缺口：现有分布式推理通常把同构设备作为同一请求内的细粒度协作单元，异构资源更多用于请求级、模型级或 prefill/decode 阶段级分配，难以把不同代际、不同品牌和不同容量的加速卡聚合到同一个 attention context。2.现状：HCP 已用 capacity-weighted shard、精确 online softmax 和线性 P2P ring 证明 CUDA、HIP 等异构 worker 可以共同处理同一逻辑 context；1M context 3:1 分片证明技术可行性，带宽矩阵证明传统低带宽网络是主要瓶颈。但尚未完成系统性相关工作检索，也没有 TCO、能耗或单位吞吐成本实验，因此不能绝对声称其他系统无法异构协作，也不能把低成本写成已证实事实。3.目标：论文将 HCP 定义为 transport-agnostic 的完整推理生命周期异构 Context Parallelism。算法只要求每个 worker 与 predecessor/successor 进行 P2P 传输；CXL、RDMA/RoCE、InfiniBand、UALink、PCIe peer access 或未来通用高速互联均可作为承载。论文区分已证明的单请求细粒度异构协作、已观察的带宽瓶颈，以及待验证的成本优势。4.他者：主流 TP、PP、CP 与 collective 通常围绕同构设备、对称分片和一致 kernel 能力优化；异构 serving 常通过请求路由、模型放置或 prefill/decode disaggregation 利用不同资源池。这些方式降低设备内核和负载不对称带来的复杂度，但通常不聚合同一 attention context 的不均等 KV 容量。该背景在进入论文 claim 前必须通过系统性文献与实现审计验证。5.本方案：以逐层 position-indexed KV context 为统一对象，prefill 按 capacity-weighted positions 永久分片并环传 KV，decode 保持历史 KV 原地且让 Q、O/LSE 与 activation packet 遍历所有 shard，新 KV 按 capacity-weighted layer×position event 唯一归属；continuation prefill继续追加同一逻辑 context。物理互联只需实现邻居 P2P 合同。6.为什么：HCP 的价值不来自押注某种网卡，而是把原本不能高效组成同一细粒度并行组的代际混合、品牌混合和容量不对称设备转化为一个 context-capacity pool。互联带宽和时延的持续提升会扩大这一方法的可用区间；长上下文使 KVCache 成为持续增长的主要显存压力，因此是当前最直接的应用目标。边界：模型权重仍由每个 worker完整持有；成本优势与未来超大模型适应性是待测系统潜力，不等于已完成参数分片或已证明 TCO。VERDICT: IMPLEMENT AS REVISED PAPER POSITIONING；DEFER ABSOLUTE PRIOR-ART AND LOW-COST CLAIMS UNTIL EVIDENCE。
 
 _updated: 2026-08-01 16:51:10_
 ### HCP 论文核心候选：保持 KV 分片并按阶段切换环上传输对象
@@ -447,11 +461,11 @@ type: `task` · status: `superseded` · confidence: 0.95 · importance: 0.95 · 
 _updated: 2026-06-29 06:01:28_
 ### 主流单请求细粒度分布式推理仍以同构并行组为主要设计点
 
-type: `assumption` · status: `open` · confidence: 0.65 · importance: 0.9 · source: `user-observation-requires-literature-audit-2026-08-02`
+type: `assumption` · status: `held` · confidence: 0.85 · importance: 0.9 · source: `user-confirmed-research-position-2026-08-02`
 
-待文献审计的背景假设：主流 tensor、pipeline、context parallel 和 collective 通常假设设备容量、kernel 能力及通信性能近似对称；异构 serving 更常见的利用方式是将不同请求、模型或 prefill/decode 阶段放到不同资源池，而不是让不同代际或不同品牌加速卡以不均等份额共同处理同一 attention context。论文不得写成异构 GPU 绝对不能合作；需要检索并区分框架支持、理论可运行、实际优化目标和公开验证范围。
+用户确认的研究定位：主流 tensor、pipeline、context parallel 和 collective 通常假设设备容量、kernel 能力及通信性能近似对称；异构 serving 更常见的利用方式是将不同请求、模型或 prefill/decode 阶段放到不同资源池，而不是让不同代际或不同品牌加速卡以不均等份额共同处理同一 attention context。论文不得写成异构 GPU 绝对不能合作；正式表述仍需检索并区分框架支持、理论可运行、实际优化目标和公开验证范围。
 
-_updated: 2026-08-01 16:54:51_
+_updated: 2026-08-01 17:46:39_
 ### 层数与节点数模数共振可能形成 sampler 计算热点,但不破坏冻结 KV quota
 
 type: `risk` · status: `open` · confidence: 0.98 · importance: 0.9 · source: `docs/plans/2026-07-29-self-driving-ring-theory.md`
