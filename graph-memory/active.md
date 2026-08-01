@@ -2,6 +2,20 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### Rust positioned KV 精确预分配 slab 实验
+
+type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `docs/plans/2026-08-01-positioned-kv-slab-experiment-design.md`
+
+当前小节点：只把已验证 24 层四阶段实验的分布式 KV append 从 Tensor::cat 改为冻结计划精确预留的 test-only slab。每个 layer×domain 容量由两次 [1,3,2] prefill 与两轮 decode assignee 推导；prefill/decode 均用 write cursor + narrow().copy_()；最终每个 slab 恰好写满，越界原子拒绝，四阶段继续对齐 dense GQA。边界：不改生产 cache trait，不声明 GPU 物理显存，不做 allocator/admission/runtime/network/multi-request。
+
+_updated: 2026-08-01 08:02:53_
+### 用冻结计划精确 slab 验证无 Tensor::cat KV append
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-01`
+
+【动机六问】1.问题：Tensor::cat 每次 append 都分配并复制完整本地历史，语义复用虽已证明，但峰值会暂时同时持有旧 shard 和新 shard。2.现状：test-only PositionedKvShard 的 prefill append 直接 cat；decode adapter 也借用现有 cat-based runner。3.目标：分布式 prefill/decode 都以精确 reservation + cursor 原地写；每层每域 capacity 与最终 usage 相等；overflow 写入前拒绝；原 24 层四阶段数值、position union、144 个 continuation 投影和 [56,168,112] 总量全部保持。4.他者：vLLM 等用 paged KV/block table 或 reserved arena 将逻辑增长与物理分配分离。5.本方案：test-only ReservedPositionedKvShard，容量由固定四阶段计划精确推导，append 用 narrow().copy_()，attention 只看 committed prefix；decode 使用同样的 test-only positioned runner，不经过 cat-based production cache。6.为什么：固定 14-position horizon 允许最小而严格的预留证明，不需要引入生产 page allocator、admission 或 runtime。【牺牲四问】默认 cat 为未知长度提供简单动态增长与拥有型连续 tensor；精确 slab 牺牲超出冻结 horizon 的增长和运行期重分配；这些能力服务开放式生成、动态 batch 与 allocator 调度；当前固定 correctness 实验不需要，但因此结果不能外推为生产 allocator。备选：各域统一最大 slab 会浪费小节点容量，拒绝；paged allocator 当前过宽，延后。VERDICT: IMPLEMENT EXPERIMENT ONLY。
+
+_updated: 2026-08-01 08:02:53_
 ### 实施 24 层 positioned KV 四阶段复用实验
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-01`
