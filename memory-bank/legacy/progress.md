@@ -2,16 +2,6 @@
 
 ## 已完成功能
 
-- [x] [2026-06-19] **1M context 本地异构分布式推理历史性成功**（white RTX 4090 CUDA + pearl RX 9060 XT HIP，2.5G 有线直连）：
-  - 模型：`Qwen2-0.5B-1M`（0.5B，24 layers，BF16，权重 ~1GB）
-  - 分片：capacity-aware 3:1 不均等分片（white 750,000 tokens / pearl 250,000 tokens）
-  - Prompt：精确 1,000,000 tokens（`gen_prompt` 生成并 decode→encode round-trip 校验）
-  - 关键配置：`HCP_KV_CHANNEL_BUFFER_SIZE=512`、`HCP_QUIC_TIMEOUT_SECS=14400`、`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`、`max_position_embeddings=1048576`
-  - 结果：coordinator 输出 `generated:  the.`，prefill 24/24 层全通，decode 5 tokens 全通，exit=0，workers 优雅退出。
-  - 性能：总耗时 ~2h 8m；prefill ~1h 52m；decode ~16m（每 token ~3m，1M context memory-bound）；white 显存峰值 23,999 MB（RTX 4090 24GB 刚好 fit）；pearl 16GB 内未 OOM。
-  - 意义：**首次在本地消费级异构设备（CUDA + HIP）上通过 HCP Ring Attention 完成 1,000,000 token context 的端到端推理**，验证了「单节点显存墙 + 高速 P2P 异构扩展」路径的可行性。
-  - 报告：`reports/1m-white-pearl-20260619/README.md`
-
 - [x] [2026-06-17] **昇腾 910B NPU 适配踏出第一步 — Python vLLM worker ↔ Rust coordinator 控制面 E2E 打通**：
   - 硬件：单机 1× Ascend 910B4 (32 GB HBM)，Kunpeng-920 192-core，1.5 TiB RAM
   - 环境：`torch 2.7.1+cpu` + `torch_npu 2.7.1` + `vllm 0.11.0` + `vllm-ascend 0.11.0`
@@ -580,4 +570,3 @@
 | pearl (AMD RX 9060 XT) Rust + libtorch GPU 路径 | **已跑通** | [2026-06-02] libtorch 2.11.0+rocm7.2 + tch-rs 0.24.0 + HIP patch。关键突破：`LD_PRELOAD=libtorch_hip.so` 强制加载 HIP kernel 注册库（ROCm 构建中 `libtorch_cpu.so` 不自动加载 `libtorch_hip.so`）。单节点推理 ✅、本地 2-node loopback smoke ✅、`cargo test` 55/55 ✅、`tch_smoke` 3/3 ✅。新增 `scripts/patch_torch_sys_hip.sh`。 |
 | **三平台异构分布式推理** | **已完成** | [2026-06-02] Mac MPS + white RTX 4090 CUDA + pearl RX 9060 XT HIP 三平台 3-domain ring attention 首次联合成功。Coordinator 生成 `"The quick brown"`。证明 HCP 协议完全不依赖同构假设。 |
 | M13 Phase 3-5: Full Continuous Batching with PagedAttention | **待启动** | 在 PagedAttention 基础上实现 kernel-level batch decode + dynamic join/leave |
-| **M14: 1M Context + 2.5G 有线直连本地异构验证** | **攻坚中** | [2026-06-17] white RTX 4090 CUDA + pearl RX 9060 XT HIP 通过 2.5G 有线直连验证 HCP 在 1M context 的可行性。256K/512K distributed 已 success；1M 3:2 split 因 pearl 16GB OOM 跑到 layer 17/24 失败；已实施 QUIC timeout 可配置、KV channel buffer 可配置（默认 512）、精确 1M token prompt；当前尝试 2:1 split（white 666,666 / pearl 333,334）。计划文档：`docs/1M_CONTEXT_THUNDERBOLT_PLAN.md` |

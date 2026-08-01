@@ -147,28 +147,14 @@ insert_edge(node_id('bp', 'plugin-architecture'), node_id('bp', 'arch-overview')
 insert_node(
     node_id('bp', 'uneven-cp'), 'decision', 'blueprint',
     '容量感知非均等 CP 分片是异构长 context 的必需',
-    '2026-06-19 1M context 验证：24GB CUDA + 16GB HIP 无法通过 1:1 分片完成 1M。'
-    '必须使用 capacity-aware 不均等分片（white 750K / pearl 250K，即 3:1）。'
-    '均匀分片在异构显存下会因小显存设备 OOM 而失败；按可用显存比例分配 chunk 才能使 heterogeneous ring 达到可行性边界。',
-    importance=0.9, confidence=0.9, source='memory-bank/systemPatterns.md'
+    '异构设备的可用 KV 容量不同，均匀分片会由容量最小的 worker 决定整体上限。'
+    'HCP 按设备可用容量为 position 或 token×layer KV event 分配互斥且完备的 ownership，'
+    '并用完整 horizon reservation 保证单 worker 不临时承担其他 worker 的永久 KV 压力。',
+    importance=0.9, confidence=1.0, source='current-hcp-design-2026-08-02'
 )
 insert_edge(node_id('bp', 'uneven-cp'), node_id('bp', 'arch-overview'), 'PART_OF')
 
 # ---------- progress layer ----------
-insert_node(
-    node_id('prog', '1m-white-pearl'), 'session', 'progress',
-    '[2026-06-19] 1M context 本地异构分布式推理成功',
-    'white RTX 4090 CUDA + pearl RX 9060 XT HIP，2.5G 有线直连。'
-    'Qwen2-0.5B-1M，capacity-aware 3:1 分片（white 750K / pearl 250K）。'
-    'Prefill 24/24 全通，decode 5 tokens 全通，exit=0。'
-    '总耗时 ~2h 11m，white 显存峰值 23,999 MB。'
-    '攻克：KV channel buffer 512、QUIC timeout 14400s、max_position_embeddings=1048576 patch、pearl 碎片化 OOM 通过 3:1 分片缓解。',
-    importance=1.0, confidence=1.0, status='closed', source='memory-bank/progress.md'
-)
-insert_edge(node_id('prog', '1m-white-pearl'), PROJECT, 'PART_OF')
-insert_edge(node_id('prog', '1m-white-pearl'), node_id('bp', 'uneven-cp'), 'SUPPORTS', weight=0.9,
-            note='1M 端到端成功验证 capacity-aware uneven CP 的必要性')
-
 insert_node(
     node_id('prog', 'npu-poc'), 'session', 'progress',
     '[2026-06-17] 昇腾 910B NPU 控制面 E2E 打通',
@@ -180,38 +166,7 @@ insert_node(
 insert_edge(node_id('prog', 'npu-poc'), PROJECT, 'PART_OF')
 
 # ---------- active layer ----------
-insert_node(
-    node_id('active', 'focus'), 'task', 'active',
-    '当前焦点：1M 异构分布式推理已闭环',
-    '1M v9（3:1 split）成功，prefill 24/24 + decode 5/5，exit=0。'
-    '文档已同步：1M_CONTEXT_THUNDERBOLT_PLAN.md、SCALING_ARGUMENT.md、systemPatterns.md。'
-    '当前无未完成的 1M 攻坚任务；下一步决定是否需要更大模型 / 更多 domain 验证。',
-    importance=0.95, confidence=0.95, status='ongoing', source='memory-bank/activeContext.md'
-)
-insert_edge(node_id('active', 'focus'), PROJECT, 'PART_OF')
-insert_edge(node_id('active', 'focus'), node_id('prog', '1m-white-pearl'), 'BASED_ON')
-
-insert_node(
-    node_id('active', 'next-decision'), 'uncertainty', 'active',
-    '下一步决策：更大模型 / 更多 domain？',
-    '1M 里程碑已达成，需决定后续方向：'
-    '1) 引入第三台设备做 3-domain 1M 降低单设备压力；'
-    '2) 7B 1M context 可行性评估；'
-    '3) KV cache 量化/压缩以缩短 decode 时间和降低显存占用。',
-    importance=0.8, confidence=0.5, status='open', source='memory-bank/activeContext.md'
-)
-insert_edge(node_id('active', 'next-decision'), node_id('active', 'focus'), 'QUESTIONS', weight=0.5)
-
 # ---------- evidence links ----------
-insert_node(
-    node_id('ev', '1m-oom-even'), 'evidence', 'progress',
-    '证据：1:1/2:1/3:2 split 均导致 pearl OOM',
-    '在 1M context 尝试中，均分 500K 及 2:1、3:2 split 均在 layer 23/24 因 pearl 16GB 显存分配失败而 OOM。'
-    '只有 3:1 split 成功。',
-    importance=0.85, confidence=0.9, source='memory-bank/progress.md'
-)
-insert_edge(node_id('ev', '1m-oom-even'), node_id('bp', 'uneven-cp'), 'CONFIRMS', weight=0.9)
-
 insert_node(
     node_id('ev', 'blas-diff'), 'evidence', 'progress',
     '证据：同构分布式 BF16 也有 ~0.3-0.4 logits 差异',

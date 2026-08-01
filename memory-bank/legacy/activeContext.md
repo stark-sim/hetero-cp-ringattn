@@ -2,25 +2,6 @@
 
 ## 当前焦点
 
-[2026-06-19] **1M context 本地异构分布式验证成功** ✅
-- v9（3:1 split：white 750,000 / pearl 250,000；KV channel buffer 512；`max_position_embeddings=1048576`；`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`）跑通 1M context 端到端。
-- Coordinator 输出 `generated:  the.`，prefill 24/24 层全通，decode 5 tokens 全通，exit=0，workers 优雅退出。
-- 关键数据：
-  - 总耗时约 **2 小时 8 分钟**（04:08 UTC → 06:16 UTC）
-  - prefill：约 **1 小时 52 分钟**（24 层全通）
-  - decode：约 **16 分钟**（5 tokens，每 token ~3 分钟，受 1M KV cache memory-bound 限制）
-  - white 显存峰值：**23,999 MB**（RTX 4090 24GB 刚好 fit）
-  - pearl 显存：未 OOM，GPU 利用率 decode 阶段 ~5%（memory-bound 特征）
-- 攻克的关键问题：
-  - 1M 死锁：KV transport `mpsc` buffer 64 对 >64 micro blocks 不足，通过 `HCP_KV_CHANNEL_BUFFER_SIZE=512` 解决。
-  - 超长超时：QUIC 默认 600s 不够，通过 `HCP_QUIC_TIMEOUT_SECS=14400` 解决。
-  - Decode 越界：原 config `max_position_embeddings=1000000` 导致 position 1,000,000 触发 RoPE index 错误；patch 为 `1048576` 后解决。
-  - pearl 碎片化 OOM：2:1 split 在 layer 23/24 因 pearl 16GB 分配失败；改用 3:1 split 后 pearl 压力降低，white 24GB 刚好 fit。
-- 证明：在 2.5G 有线直连 + capacity-aware 不均等分片下，white（CUDA）+ pearl（HIP）可协同完成 1M context 推理。
-- 报告：`reports/1m-white-pearl-20260619/README.md`
-- 文档已同步：`docs/1M_CONTEXT_THUNDERBOLT_PLAN.md` 补充执行结果；`docs/SCALING_ARGUMENT.md` 加入 1M 数据点与 capacity-aware 不均等分片分析；`memory-bank/systemPatterns.md` 新增「容量感知非均等 CP 分片是异构长 context 的必需」架构决策。
-- 当前无未完成的 1M 攻坚任务；下一步是整理文档 / memory-bank，并决定是否需要更大模型 / 更多 domain 的验证。
-
 [2026-06-17] **昇腾 910B NPU 适配踏出第一步 — Python vLLM worker ↔ Rust coordinator 控制面 E2E 已打通**（背景上下文）：
 - 在单机 1× Ascend 910B4 (32 GB HBM) 上完成 HCP NPU 适配验证，作为 HCP 支持更多平台生态的一小半步。
 - **已完成**：
@@ -32,29 +13,6 @@
   - `scripts/test_npu_worker_rust_coord.sh` E2E 通过：coordinator 输出 `generated: ! I'm`
 - **当前限制**：`VllmBackend` 仍返回 one-hot logits；每次测试前必须清理 stale `VLLMEngineCor` 进程以避免 NPU 内存 profiling assert。
 - **下一步（可选）**：Phase 4 同进程 2-domain mixed backend smoke（NPU vLLM + CPU mock），Phase 5 真实 KV ring 数据面 + online softmax。
-
-[2026-06-16] **战略转向：1M context + 2.5G 有线直连本地异构验证**
-- 用户决定将下一阶段核心目标定为：**在 white (RTX 4090 CUDA) 和 pearl (RX 9060 XT HIP) 两台本地机器上，通过 2.5G 有线直连验证 HCP Ring Attention 在 1M context 级别的可行性**。
-- 原 Thunderbolt 5/4 方案因主板无雷雳口放弃。
-- **网络基线已完成**（2026-06-16）：
-  - 2.5G 有线直连：~2.35 Gbps 双向对称，RTT ~0.1-0.2 ms
-  - WiFi：~250 Mbps，RTT 36-89 ms
-  - Tailscale 严重不对称：white→pearl ~1.8 Gbps / 0.77 ms，pearl→white ~300 Mbps / 39 ms（疑似走 relay/WiFi）
-- **决策**：HCP 验证使用有线直连 IP（white: `192.168.100.1`，pearl: `192.168.100.2`）。
-- 这是为了证明 HCP 的「未来意义」——当单节点显存墙不可避免时，异构设备 + 高速 P2P 互联是通向百万 token 的差异化路径。
-- 其他工程完善项（vLLM CUDA E2E、量化、多请求并发）被明确后置。
-- 详细计划：`docs/1M_CONTEXT_THUNDERBOLT_PLAN.md`。
-
-[2026-06-13] **超长 context 探索已暂停**：
-  - 用户决定优先推超长 context，必要时换模型。
-  - 选定模型：**Qwen/Qwen2.5-7B-Instruct-1M**（15.2 GB，max_position_embeddings=1,010,000，支持 1M context）。
-  - 下载尝试：
-    - `hf download` 因 xet-hub 超时/锁竞争失败。
-    - 改用 `aria2c` 从 hf-mirror 下载，仍被重定向到 xet-hub，速度不稳定。
-    - 已下载约 2.2 GB 后用户决定停机前停止下载。
-  - 磁盘状态：196G 总量，109G 已用，79G 可用，足够放下 15.2 GB 模型。
-  - 风险点：该模型 config 含 `dual_chunk_attention_config`（chunk_size=262144），我们的 Rust 实现在 256k 以内可能按标准 attention 工作，但 262k+ 需要额外支持。
-  - 下次恢复时：可直接用 `aria2c` 续传剩余 safetensors，或换用 modelscope / 其他镜像。
 
 [2026-06-13] **A100 (4x A100-SXM4-40GB) HCP 验证全部完成** ✅：
   - **SSH**: `ssh root@223.109.239.30 -p 25412`

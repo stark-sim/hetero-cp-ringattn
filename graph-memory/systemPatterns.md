@@ -166,11 +166,11 @@ Ring Attention 原始论文（Liu et al. 2023）的通信本就是 P2P send/recv
 _updated: 2026-06-29 05:34:19_
 ### 容量感知非均等 CP 分片是异构长 context 的必需
 
-type: `decision` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `memory-bank/systemPatterns.md`
+type: `decision` · status: `held` · confidence: 1.0 · importance: 0.9 · source: `current-hcp-design-2026-08-02`
 
-2026-06-19 1M context 验证：24GB CUDA + 16GB HIP 无法通过 1:1 分片完成 1M。必须使用 capacity-aware 不均等分片（white 750K / pearl 250K，即 3:1）。均匀分片在异构显存下会因小显存设备 OOM 而失败；按可用显存比例分配 chunk 才能使 heterogeneous ring 达到可行性边界。
+异构设备的可用 KV 容量不同，均匀分片会由容量最小的 worker 决定整体上限。HCP 按设备可用容量为 position 或 token×layer KV event 分配互斥且完备的 ownership，并用完整 horizon reservation 保证单 worker 不临时承担其他 worker 的永久 KV 压力。
 
-_updated: 2026-06-29 05:34:19_
+_updated: 2026-08-01 18:40:49_
 ### 产品决策：P2P、correctness 优先、结构化实验产物
 
 type: `decision` · status: `held` · confidence: 0.85 · importance: 0.85 · source: `memory-bank/productContext.md`

@@ -1,8 +1,8 @@
-# HCP Scaling Argument: Why Distributed Heterogeneous is the Only Path to Million-Token Inference
+# HCP Scaling Model for Heterogeneous Long-Context Inference
 
 ## Executive Summary
 
-This document quantifies the memory and bandwidth scaling characteristics of HCP Ring Attention, using Qwen2-0.5B as a concrete reference model. We demonstrate that single-node inference hits an unavoidable memory wall between 128K–1M tokens, and that HCP's heterogeneous distributed architecture is the only viable path to context lengths beyond this threshold without requiring dedicated homogeneous GPU clusters.
+This document derives the memory and bandwidth scaling characteristics of HCP Ring Attention, using Qwen2-0.5B as a concrete reference model. It is a capacity model, not evidence that the current implementation has completed million-token inference. Hardware limits, allocator overhead, kernels, and transport must be measured again with the current implementation.
 
 ---
 
@@ -106,25 +106,23 @@ For 1M tokens across N domains:
 | 64K | 2 | RTX 4090 ×2 (local) | ~4 min | ✅ `progress.md` 2026-05-05 |
 | 512 | 3 | MPS + CUDA + HIP (cross-node) | ~2 min | ✅ This document |
 | 4K | 4 | MPS + CUDA×3 (cross-node VPN) | ~83 min | ✅ `progress.md` 2026-05-22 |
-| 1M | 2 | RTX 4090 (CUDA) + RX 9060 XT (HIP), 3:1 uneven | ~2h 8min | ✅ `reports/1m-white-pearl-20260619` |
 
 ### 3.3 Capacity-Aware Uneven Sharding
 
-上述表格中的 2-domain 1M 成功案例**不是均分**的。white（RTX 4090, 24GB）承担 750K tokens，pearl（RX 9060 XT, 16GB）承担 250K tokens，比例为 **3:1**。
+Let `C_i` be worker `i`'s usable KV capacity after weights and fixed runtime
+overheads. A feasible placement assigns shard bytes `M_i` such that:
 
-**为什么必须不均等**：
+```
+0 <= M_i <= C_i
+sum_i M_i = M_total
+```
 
-- 均分 1M tokens 时，每个 domain 需存储 500K tokens 的 KV cache（BF16 约 6GB）+ 权重 ~1GB + activation / 工作集 / allocator 碎片。
-- pearl 16GB 在 500K chunk 下于 layer 23/24 因连续分配失败而 OOM；2:1 与 3:2 split 同样失败。
-- 将 pearl 负载降到 250K tokens 后，其显存压力进入安全区；white 24GB 接近满载（峰值 23,999 MB），刚好 fit。
-
-**这推翻了 §6.1 中的简单假设**：单看 KV cache 时，2-domain 1M 似乎 fits 24GB；但实际运行中 activation、工作集和显存碎片会让 even-split 在 16GB 设备上失败。容量感知不均等分片不是优化，而是异构长 context 的**可行性前提**。
-
-**对 HCP 叙事的意义**：
-
-- 增加 domain 数量可以降低每个 domain 的 KV cache。
-- 在异构 cluster 中，分片比例必须按设备可用显存（以及算力、带宽）动态决定，而不是简单均分。
-- HCP 的 P2P ring + online softmax 天然支持任意 chunk size；collective-based CP 通常假设均分。
+Uniform sharding is only feasible when `M_total / N <= min_i C_i`; otherwise
+the smallest worker limits the entire group even when aggregate free capacity
+is sufficient. HCP therefore derives capacity-weighted ownership and reserves
+each worker's complete decode horizon before execution. This is a design
+invariant. Its physical-memory effectiveness still requires validation on the
+current hardware implementation.
 
 ---
 
@@ -239,15 +237,17 @@ No two devices are identical in architecture, memory, or speed. Yet HCP's online
 
 Assuming Qwen2-0.5B with fp32 KV cache (24 KB/token):
 
-| Seq Len | 1× RTX 4090 | 2-domain (even) | 2-domain (capacity-aware) | 4-domain | 8-domain | 16-domain |
-|---------|-------------|-----------------|---------------------------|----------|----------|-----------|
-| 128K | ✅ 3.0 GB | ✅ 1.5 GB | ✅ 1.5 GB (any split) | ✅ 0.75 GB | ✅ 0.38 GB | ✅ 0.19 GB |
-| 512K | ❌ OOM (~12GB) | ❌ OOM | ✅ ~4 GB (3:1 on 24+16GB) | ✅ 3.0 GB | ✅ 1.5 GB | ✅ 0.75 GB |
-| 1M | ❌ OOM | ❌ OOM | ✅ ~12 GB (3:1 on 24+16GB) | ✅ 6.0 GB | ✅ 3.0 GB | ✅ 1.5 GB |
-| 2M | ❌ OOM | ❌ OOM | ❌ OOM | ❌ OOM | ✅ 6.0 GB | ✅ 3.0 GB |
-| 10M | ❌ OOM | ❌ OOM | ❌ OOM | ❌ OOM | ❌ OOM | ✅ 15.0 GB |
+| Seq Len | Total KV (fp32 upper bound) | Even 4-domain share | Even 8-domain share | Even 16-domain share |
+|---------|------------------------------|---------------------|---------------------|----------------------|
+| 128K | 3.0 GB | 0.75 GB | 0.38 GB | 0.19 GB |
+| 512K | 12.0 GB | 3.0 GB | 1.5 GB | 0.75 GB |
+| 1M | 24.0 GB | 6.0 GB | 3.0 GB | 1.5 GB |
+| 2M | 48.0 GB | 12.0 GB | 6.0 GB | 3.0 GB |
+| 10M | 240.0 GB | 60.0 GB | 30.0 GB | 15.0 GB |
 
-> 注：表中数值仅为 KV cache（fp32 上界）；实际 BF16 减半。"capacity-aware" 列表示不均等分片在 24GB+16GB 异构组合上的可行性，已由 1M / 3:1 split 验证。
+> These are KV-only analytical values. Capacity-weighted placement can use
+> unequal shares, but model weights, activations, allocator granularity, and
+> runtime workspaces must be measured before declaring a hardware setup feasible.
 
 ### 6.2 Network Feasibility Matrix
 
@@ -283,7 +283,6 @@ Per-domain total prefill transfer (Qwen2-0.5B, 24 layers):
 | 2026-05-05 | 2-domain local 64K | 64K | 2× RTX 4090 | ✅ ~4min |
 | 2026-05-22 | 4-domain cross-node 4K | 4K | MPS + 3× CUDA | ✅ ~83min (VPN) |
 | 2026-06-02 | 3-domain heterogeneous | 64–512 | MPS + CUDA + HIP | ✅ All exit=0 |
-| 2026-06-19 | 2-domain heterogeneous 1M | 1M | RTX 4090 (CUDA) + RX 9060 XT (HIP), 3:1 | ✅ ~2h 8min, white peak 23,999 MB |
 | 2026-06-30 | Ring derivatives comparison | 4K | RTX 4090 (CUDA) + RX 9060 XT (HIP) | ✅ Vanilla/Striped/ZigZag all pass |
 
 ---
@@ -303,4 +302,8 @@ HCP Ring Attention's value proposition is not incremental performance optimizati
 3. **Capacity-aware sharding** (memory-proportional token distribution)
 4. **Cross-platform transport** (QUIC over any network)
 
-As context lengths grow from 128K → 1M → 10M, the memory wall becomes unavoidable. HCP transforms this wall into a scheduling problem: add more domains, any domains, and the ring scales. The 2026-06-19 1M milestone proves this scheduling problem is solvable in practice on real heterogeneous hardware — but only with **capacity-aware uneven sharding**.
+As context lengths grow from 128K to 1M and beyond, KV memory grows linearly.
+HCP turns the resulting aggregate-capacity problem into capacity-weighted
+placement plus exact distributed attention. The analytical scaling argument is
+complete; large-scale feasibility and performance must be established again
+with the current implementation.

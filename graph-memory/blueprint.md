@@ -24,9 +24,8 @@ Coordinator (Rust) ──QUIC──► Worker / Domain ──► 域内后端（
 - **域内黑盒**：HCP 只关心跨域数据流，不规定 CUDA / MPS / NPU 内部实现。
 - **调度面**：coordinator 根据设备 capacity 动态分配 chunk sizes，worker 上报可用显存/内存。
 
-## 当前状态（2026-06-29）
+## 当前状态（2026-08-02）
 
-- ✅ 1M context 本地异构分布式推理成功（RTX 4090 CUDA + RX 9060 XT HIP，3:1 分片）
 - ✅ 昇腾 910B NPU 控制面 E2E 打通
 - ✅ Rust correctness model、QUIC transport、capacity-aware 分片均已验证
 - ✅ Striped Attention 原型已验证：在 white/pearl 单进程 3:1 场景下未改善负载均衡，已挂起
@@ -47,4 +46,3 @@ Coordinator (Rust) ──QUIC──► Worker / Domain ──► 域内后端（
 - `docs/HLPP_VS_HCP.md`：与 HLPP 的边界
 - `docs/SCALING_ARGUMENT.md`：context 长度与显存/网络/域数的 scaling 分析
 - `docs/PLUGIN_ARCHITECTURE.md`：可插拔域内后端架构
-- `reports/1m-white-pearl-20260619/`：1M 里程碑报告
