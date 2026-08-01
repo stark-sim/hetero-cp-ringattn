@@ -2,6 +2,20 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 生成 HCP 方法草稿中文版并暂缓论文线
+
+type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-02`
+
+为已审查通过的 docs/paper/HCP_METHOD_DRAFT.md 创建逐节对应的中文版。保留全部公式、数据流、证据标签、局限和 Evaluation Design，不新增实验、性能论断或工程适配。完成后将论文核心框架任务标为 paused，并把下一工作焦点切回 Rust 核心框架。
+
+_updated: 2026-08-01 19:52:13_
+### 中文版只做等价翻译，完成后暂缓论文线
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `motivation-analysis-2026-08-02`
+
+【动机六问】1.问题：英文方法稿已通过用户审查，但中文审阅和后续框架开发需要一份术语一致、可直接对照的中文版；同时论文线若继续保持 ongoing，会误导后续会话继续扩写。2.现状：英文稿已固定问题定义、系统模型、capacity-weighted prefill、自驱动 decode、continuation、正确性/复杂度、证据边界与评测设计；尚无中文版，论文总任务仍为 ongoing。3.目标：新增 docs/paper/HCP_METHOD_DRAFT_ZH.md，章节、公式、代码块、claim 标签和边界与英文稿对应；结构/禁用论断审计通过；提交后把论文总任务设为 paused，并明确框架线恢复。4.他者：双语技术文档通常保持稳定源稿和逐节对应译稿，术语与公式不在翻译中重新设计，避免两个版本形成不同方法。5.本方案：直接翻译已批准英文稿，保留英文术语作为必要括注，公式原样复制；不加入摘要、结果、最终结论或新引用。6.为什么：这是满足中文审阅需求且不重新开启论文设计的最小方案；把论文状态同步为 paused 可防止后续 agent 误把写作当当前主线。VERDICT: IMPLEMENT EQUIVALENT TRANSLATION AND PAUSE PAPER LINE。
+
+_updated: 2026-08-01 19:52:13_
 ### 方法草稿只固化当前算法与证据边界
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `motivation-analysis-2026-08-02`
