@@ -4,25 +4,22 @@
 
 ### prefill 协议缺少逐层 finite-horizon KV reservation 合同
 
-type: `risk` · status: `open` · confidence: 1.0 · importance: 1.0 · source: `code-audit-2026-08-02`
+type: `risk` · status: `resolved` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@b4db994`
 
 代码审计确认 WorkerCommand::Prefill 只携带 chunk、seq_offset、position_ids，TchWorkerBackend::do_prefill 固定创建可增长 contiguous cache。改用 reserved cache 后，worker 若只按 prompt chunk 长度预留会在首次 decode assignee append 时越界；若按 max_position_embeddings 猜测则破坏 capacity hard bound。由于 decode ownership 由 token×layer 决定，所需容量是每 worker 的逐层向量。该缺口不否定 ring 数学，但阻断 worker-local reserved prefill 进入后续 decode。
 
-_updated: 2026-08-01 21:02:43_
-### 为 worker-local prefill 建立逐层 KV reservation 合同
+[2026-08-02 解决] worker 现可从 Prefill 命令接收逐层 finite-horizon capacities，不再需要根据 chunk 或模型上限猜测。coordinator 生成真实矩阵仍是下一任务。
 
-type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `analysis-2026-08-02`
-
-在不改变 ring 数学和 placement 计算的前提下，为 Prefill/WorkerBackend 增加可选逐层 local KV capacities；TchWorkerBackend 在 forward 前校验向量长度与 prompt 下界，并创建 ReservedPositioned cache。先用 synthetic 24 层/不均 capacities 验证 request context 只持本 worker 的 reserved shards；coordinator 生成 capacity 向量是后续独立节点。
-
-_updated: 2026-08-01 21:02:43_
+_updated: 2026-08-01 21:10:25_
 ### Prefill 由 coordinator 显式提供可选逐层 local KV capacities
 
-type: `decision` · status: `held` · confidence: 0.99 · importance: 1.0 · source: `analysis-2026-08-02`
+type: `decision` · status: `held` · confidence: 0.99 · importance: 1.0 · source: `hetero-cp-ringattn@b4db994`
 
 【动机六问】1.问题：worker-local reserved prefill 必须在 forward 前知道每层 finite-horizon 容量，否则无法同时保证后续 decode 可 append 与显存硬界。2.现状：协议只有 chunk/position；Tch backend 创建 contiguous cache，worker 无法区分 prompt ownership 与未来 decode ownership。3.目标：runtime 可把逐层 capacity 向量交给 backend；Tch 在任何 tensor 写入前校验 num_layers 和 capacity>=local prompt tokens，并创建对应 BF16/运行 dtype reserved shards；缺失向量时 legacy 行为不变。4.他者：vLLM 等 serving engine 在 prefill 前由 scheduler/admission 分配 block table，worker 消费明确物理配额而非根据模型上限猜测。5.本方案：WorkerCommand::Prefill 增加 optional layer_kv_capacities；WorkerBackend 新增带默认回退的 prefill_request_with_reservation；Tch override 使用 reserved caches，vLLM/旧实现无需改；本节点只消费显式计划，不计算计划。6.为什么：逐层向量与 token×layer ownership 精确同构，避免单标量过度预留；optional/default 保留现有实验路径并把 planner 与执行器分开。【边界】bincode schema 会要求 coordinator/worker 同版本；当前非生产实验服务不提供滚动升级兼容，version negotiation 风险已另有记录。VERDICT: IMPLEMENT。
 
-_updated: 2026-08-01 21:02:43_
+[2026-08-02 实现] b4db994 完成 optional 协议字段、默认 backend 回退、runtime 透传和 Tch reserved cache 消费端；coordinator 暂发 None，容量生成保持为后续独立节点。VERDICT: IMPLEMENTED。
+
+_updated: 2026-08-01 21:10:25_
 ### 通过 KvCacheImpl adapter 接入真实 prefill
 
 type: `decision` · status: `held` · confidence: 0.98 · importance: 1.0 · source: `hetero-cp-ringattn@d86ac47`
@@ -583,6 +580,13 @@ type: `belief` · status: `held` · confidence: 0.85 · importance: 0.95 · sour
 基于 white-pearl 限速矩阵：\n- 2.35 Gbps 基线 20.5 s\n- 1 Gbps 29.5 s（1.44x）\n- 500 Mbps 50 s（2.44x）\n- 100 Mbps 445 s（21.7x）\n\n在 Qwen2-0.5B-1M、seq=4096、max_tokens=5 的异构推理任务中，端到端 latency 随跨节点带宽下降呈非线性增长。低于 1 Gbps 时，P2P KV ring 的通信时间显著超过计算时间；100 Mbps 时通信完全主导总时间。\n\n推论：若要在生产环境中部署异构 CP 推理，需要 CXL / RDMA / 高速 NVLink 等级别的互联带宽，否则网络将把多卡聚合的显存优势抵消为极高的延迟惩罚。
 
 _updated: 2026-06-29 14:32:15_
+### Tch reserved Tensor 分配尚不是可恢复的 admission 操作
+
+type: `risk` · status: `open` · confidence: 0.95 · importance: 0.9 · source: `code-audit-2026-08-02`
+
+ReservedPositionedKvShard::new_with_kind 通过 Tensor::zeros 直接分配 K/V storage，API 不返回 Result；逐层 capacity 合同能在写入前拒绝逻辑 under-capacity，但真实设备 OOM 是否可被 tch 安全转换为 request error 尚未证明。该张力不影响当前 CPU correctness，也不改变 capacity 数学；在稳定服务的物理 admission/release 节点前需要验证或封装 fallible allocation。
+
+_updated: 2026-08-01 21:10:25_
 ### All-domain positioned helper 不能成为 worker runtime API
 
 type: `risk` · status: `mitigated` · confidence: 1.0 · importance: 0.9 · source: `code-audit-2026-08-02`

@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-08-02] Prefill 支持显式逐层 local KV reservation
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@b4db994`
+
+实现提交 b4db994：WorkerCommand::Prefill 增加 optional layer_kv_capacities；WorkerBackend 增加默认回退的 prefill_request_with_reservation；WorkerRuntime 透传；TchWorkerBackend 在修改 request/model 状态前校验 layer count 和 capacity>=local prompt len，并按实际 model dtype 创建 ReservedPositioned caches；coordinator 当前显式发送 None，旧路径不变。TDD RED：focused test 因缺少 prefill_request_with_reservation 以 E0599 失败。GREEN：24 层不均 capacities 和 layer 7 under-capacity 原子拒绝 1 passed；protocol bincode roundtrip 1 passed；Tch backend suite 2 passed；完整 cargo test --features tch-backend 101 passed、0 failed、1 ignored；cargo clippy --features tch-backend --all-targets exit 0，仅既有 warnings；git diff --check 通过。证据不包含 coordinator capacity 计算、多 worker P2P prefill 或真实 OOM 恢复。
+
+_updated: 2026-08-01 21:10:25_
 ### [2026-08-02] 真实 Qwen initial prefill 原地写入 reserved positioned KV
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@d86ac47`
