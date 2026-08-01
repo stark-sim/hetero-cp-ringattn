@@ -4,8 +4,8 @@ use crate::model::attention::HcpRingAttentionBackend;
 use crate::model::layers::DecoderLayer;
 use crate::model::model::LlamaModel;
 use crate::model::transport::SelfDrivingPacket;
-use crate::model::ModelError;
-use tch::{Kind, Tensor};
+use crate::model::{ModelConfig, ModelError};
+use tch::{Device, Kind, Tensor};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrozenKvAssigneeSchedule {
@@ -110,6 +110,113 @@ impl FrozenKvAssigneeSchedule {
         }
         let index = self.phase.checked_add(ordinal)? % self.sequence.len();
         self.sequence.get(index).copied()
+    }
+}
+
+/// Experimental finite-horizon KV shard with stable, position-indexed storage.
+#[derive(Debug)]
+pub(crate) struct ReservedPositionedKvShard {
+    k_storage: Tensor,
+    v_storage: Tensor,
+    positions: Vec<i64>,
+    committed_len: usize,
+}
+
+impl ReservedPositionedKvShard {
+    pub(crate) fn new(config: &ModelConfig, capacity: usize, device: Device) -> Self {
+        let shape = [
+            1,
+            config.num_kv_heads() as i64,
+            capacity as i64,
+            config.head_dim() as i64,
+        ];
+        Self {
+            k_storage: Tensor::zeros(shape, (Kind::Float, device)),
+            v_storage: Tensor::zeros(shape, (Kind::Float, device)),
+            positions: Vec::with_capacity(capacity),
+            committed_len: 0,
+        }
+    }
+
+    pub(crate) fn append(
+        &mut self,
+        k: &Tensor,
+        v: &Tensor,
+        positions: &[i64],
+    ) -> Result<(), String> {
+        if k.size() != v.size() {
+            return Err("positioned KV slab requires matching K/V shapes".to_string());
+        }
+        let shape = k.size();
+        if shape.len() != 4
+            || shape[0] != self.k_storage.size()[0]
+            || shape[1] != self.k_storage.size()[1]
+            || shape[3] != self.k_storage.size()[3]
+            || shape[2] as usize != positions.len()
+            || k.kind() != self.k_storage.kind()
+            || v.kind() != self.v_storage.kind()
+            || k.device() != self.k_storage.device()
+            || v.device() != self.v_storage.device()
+        {
+            return Err("positioned KV slab append shape, dtype, or device mismatch".to_string());
+        }
+        let append_len = positions.len();
+        let next_len = self
+            .committed_len
+            .checked_add(append_len)
+            .ok_or_else(|| "positioned KV slab capacity overflow".to_string())?;
+        if next_len > self.reserved_capacity() {
+            return Err(format!(
+                "positioned KV slab capacity exceeded: committed={}, append={}, capacity={}",
+                self.committed_len,
+                append_len,
+                self.reserved_capacity()
+            ));
+        }
+
+        let mut k_slot = self
+            .k_storage
+            .narrow(2, self.committed_len as i64, append_len as i64);
+        let mut v_slot = self
+            .v_storage
+            .narrow(2, self.committed_len as i64, append_len as i64);
+        k_slot.copy_(k);
+        v_slot.copy_(v);
+        self.positions.extend_from_slice(positions);
+        self.committed_len = next_len;
+        Ok(())
+    }
+
+    pub(crate) fn reserved_capacity(&self) -> usize {
+        self.k_storage.size()[2] as usize
+    }
+
+    pub(crate) fn committed_len(&self) -> usize {
+        self.committed_len
+    }
+
+    pub(crate) fn positions(&self) -> &[i64] {
+        &self.positions
+    }
+
+    pub(crate) fn active_k(&self) -> Tensor {
+        self.k_storage.narrow(2, 0, self.committed_len as i64)
+    }
+
+    pub(crate) fn active_v(&self) -> Tensor {
+        self.v_storage.narrow(2, 0, self.committed_len as i64)
+    }
+
+    pub(crate) fn position_tensor(&self) -> Tensor {
+        Tensor::from_slice(&self.positions).to_kind(Kind::Int64)
+    }
+
+    #[cfg(test)]
+    fn storage_ptrs(&self) -> (usize, usize) {
+        (
+            self.k_storage.data_ptr() as usize,
+            self.v_storage.data_ptr() as usize,
+        )
     }
 }
 
@@ -292,6 +399,40 @@ pub fn process_layer_packet(
     }
 
     continue_layer_packet(layer, packet, &local_history.0, &local_history.1)
+}
+
+pub(crate) fn process_layer_packet_with_reserved_history(
+    layer: &mut DecoderLayer,
+    packet: LayerPacket,
+    local_history: &mut ReservedPositionedKvShard,
+) -> Result<LayerStepOutcome, ModelError> {
+    let active_k = local_history.active_k();
+    let active_v = local_history.active_v();
+    if active_k.size() != active_v.size() {
+        return Err(ModelError::Backend(format!(
+            "domain {} has mismatched K/V shapes",
+            packet.current_domain
+        )));
+    }
+
+    if packet.current_domain == packet.assignee {
+        let ring = ring_backend(layer)?;
+        let (current_k, current_v) =
+            ring.project_decode_current_kv(&packet.normalized, &packet.position_ids)?;
+        let positions = (0..current_k.size()[2])
+            .map(|offset| packet.position_ids.int64_value(&[0, offset]))
+            .collect::<Vec<_>>();
+        local_history
+            .append(&current_k, &current_v, &positions)
+            .map_err(ModelError::Backend)?;
+    }
+
+    continue_layer_packet(
+        layer,
+        packet,
+        &local_history.active_k(),
+        &local_history.active_v(),
+    )
 }
 
 fn continue_layer_packet(
@@ -757,136 +898,28 @@ mod tests {
             .unwrap()
     }
 
-    #[derive(Debug)]
-    struct ReservedPositionedKvShard {
-        k_storage: Tensor,
-        v_storage: Tensor,
-        positions: Vec<i64>,
-        committed_len: usize,
-    }
+    #[test]
+    fn reserved_positioned_kv_core_api_preserves_committed_prefix() {
+        let config = test_config();
+        let device = Device::Cpu;
+        let mut slab = super::ReservedPositionedKvShard::new(&config, 2, device);
+        let shape = [1, config.num_kv_heads() as i64, 2, config.head_dim() as i64];
+        let k = deterministic_tensor(&shape, 299.0, device);
+        let v = deterministic_tensor(&shape, 300.0, device);
 
-    impl ReservedPositionedKvShard {
-        fn new(config: &ModelConfig, capacity: usize, device: Device) -> Self {
-            let shape = [
-                1,
-                config.num_kv_heads() as i64,
-                capacity as i64,
-                config.head_dim() as i64,
-            ];
-            Self {
-                k_storage: Tensor::zeros(shape, (Kind::Float, device)),
-                v_storage: Tensor::zeros(shape, (Kind::Float, device)),
-                positions: Vec::with_capacity(capacity),
-                committed_len: 0,
-            }
-        }
+        slab.append(&k, &v, &[4, 5]).unwrap();
 
-        fn append(&mut self, k: &Tensor, v: &Tensor, positions: &[i64]) -> Result<(), String> {
-            if k.size() != v.size() {
-                return Err("positioned KV slab requires matching K/V shapes".to_string());
-            }
-            let shape = k.size();
-            if shape.len() != 4
-                || shape[0] != self.k_storage.size()[0]
-                || shape[1] != self.k_storage.size()[1]
-                || shape[3] != self.k_storage.size()[3]
-                || shape[2] as usize != positions.len()
-                || k.kind() != self.k_storage.kind()
-                || v.kind() != self.v_storage.kind()
-                || k.device() != self.k_storage.device()
-                || v.device() != self.v_storage.device()
-            {
-                return Err(
-                    "positioned KV slab append shape, dtype, or device mismatch".to_string()
-                );
-            }
-            let append_len = positions.len();
-            let next_len = self
-                .committed_len
-                .checked_add(append_len)
-                .ok_or_else(|| "positioned KV slab capacity overflow".to_string())?;
-            if next_len > self.reserved_capacity() {
-                return Err(format!(
-                    "positioned KV slab capacity exceeded: committed={}, append={}, capacity={}",
-                    self.committed_len,
-                    append_len,
-                    self.reserved_capacity()
-                ));
-            }
-
-            let mut k_slot = self
-                .k_storage
-                .narrow(2, self.committed_len as i64, append_len as i64);
-            let mut v_slot = self
-                .v_storage
-                .narrow(2, self.committed_len as i64, append_len as i64);
-            k_slot.copy_(k);
-            v_slot.copy_(v);
-            self.positions.extend_from_slice(positions);
-            self.committed_len = next_len;
-            Ok(())
-        }
-
-        fn reserved_capacity(&self) -> usize {
-            self.k_storage.size()[2] as usize
-        }
-
-        fn committed_len(&self) -> usize {
-            self.committed_len
-        }
-
-        fn active_k(&self) -> Tensor {
-            self.k_storage.narrow(2, 0, self.committed_len as i64)
-        }
-
-        fn active_v(&self) -> Tensor {
-            self.v_storage.narrow(2, 0, self.committed_len as i64)
-        }
-
-        fn position_tensor(&self) -> Tensor {
-            Tensor::from_slice(&self.positions).to_kind(Kind::Int64)
-        }
-
-        fn storage_ptrs(&self) -> (usize, usize) {
-            (
-                self.k_storage.data_ptr() as usize,
-                self.v_storage.data_ptr() as usize,
-            )
-        }
-    }
-
-    fn process_layer_packet_with_reserved_history(
-        layer: &mut DecoderLayer,
-        packet: LayerPacket,
-        local_history: &mut ReservedPositionedKvShard,
-    ) -> Result<LayerStepOutcome, ModelError> {
-        let active_k = local_history.active_k();
-        let active_v = local_history.active_v();
-        if active_k.size() != active_v.size() {
-            return Err(ModelError::Backend(format!(
-                "domain {} has mismatched K/V shapes",
-                packet.current_domain
-            )));
-        }
-
-        if packet.current_domain == packet.assignee {
-            let ring = ring_backend(layer)?;
-            let (current_k, current_v) =
-                ring.project_decode_current_kv(&packet.normalized, &packet.position_ids)?;
-            let positions = (0..current_k.size()[2])
-                .map(|offset| packet.position_ids.int64_value(&[0, offset]))
-                .collect::<Vec<_>>();
-            local_history
-                .append(&current_k, &current_v, &positions)
-                .map_err(ModelError::Backend)?;
-        }
-
-        continue_layer_packet(
-            layer,
-            packet,
-            &local_history.active_k(),
-            &local_history.active_v(),
-        )
+        assert_eq!(slab.reserved_capacity(), 2);
+        assert_eq!(slab.committed_len(), 2);
+        assert_eq!(slab.positions(), &[4, 5]);
+        assert_eq!(slab.active_k().size(), shape);
+        assert_eq!(slab.active_v().size(), shape);
+        let _processor: fn(
+            &mut DecoderLayer,
+            LayerPacket,
+            &mut super::ReservedPositionedKvShard,
+        ) -> Result<LayerStepOutcome, ModelError> =
+            super::process_layer_packet_with_reserved_history;
     }
 
     fn reserved_positioned_layer_shards(
