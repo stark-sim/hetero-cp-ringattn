@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-08-02] 真实 Qwen initial prefill 原地写入 reserved positioned KV
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@d86ac47`
+
+实现提交 d86ac47：KvCache 增加默认 no-op prepare_positions；KvCacheImpl 增加 ReservedPositioned adapter；LlamaModel 每层 forward 前提供绝对 position_ids；ReservedPositionedKvShard 原地 append 并返回 committed active view，keep=false 的 legacy decode 路径明确拒绝。验证：focused synthetic prefill 1 passed；self-driving 20 passed、1 ignored；完整 cargo test --features tch-backend 100 passed、0 failed、1 ignored；手动 ignored 真实模型测试 real_qwen_prefill_matches_reserved_positioned_cache 1 passed，覆盖本地 Qwen2-0.5B、24 层、CPU BF16、reserved/contiguous logits 与最后 token argmax、每层 K/V 内容、positions、committed length 和预留容量；cargo clippy --features tch-backend --all-targets exit 0，仅既有 warnings；git diff --check 通过。证据只证明单 worker 真实 prefill cache 格式闭环，不证明多 worker P2P prefill、完整服务或硬件性能。
+
+_updated: 2026-08-01 20:58:52_
 ### [2026-08-02] 本地真实 Qwen BF16 单节点基线可运行
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 0.85 · source: `local-command-2026-08-02`

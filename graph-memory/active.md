@@ -2,20 +2,15 @@
 
 当前活跃的任务、决策、风险和假设。
 
-### 真实 Qwen initial prefill 直接写 reserved positioned cache
-
-type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `analysis-2026-08-02`
-
-把 ReservedPositionedKvShard 接入现有 KvCacheImpl/LlamaModel::forward，使本地真实 Qwen2-0.5B initial prefill 直接原地写入逐层 reserved positioned KV，不经过 legacy contiguous cache 再搬运。该节点先证明单 worker 真实权重与数据格式闭环；多 worker P2P prefill 是后续独立节点。
-
-_updated: 2026-08-01 20:42:55_
 ### 通过 KvCacheImpl adapter 接入真实 prefill
 
-type: `decision` · status: `held` · confidence: 0.98 · importance: 1.0 · source: `analysis-2026-08-02`
+type: `decision` · status: `held` · confidence: 0.98 · importance: 1.0 · source: `hetero-cp-ringattn@d86ac47`
 
 【动机六问】1.问题：真实 LlamaModel::forward 只能消费 KvCaches，reserved shard 虽已支持 BF16但仍无法进入真实 prefill。2.现状：test-only all-domain helper 能证明数学，却同时看见所有 worker shard；直接提升会违反每 worker 只持本地 KV。另写 model forward 会复制 Norm/Attention/MLP 主流程。3.目标：真实 Qwen initial prefill 通过唯一 LlamaModel::forward 直接写入每层 reserved positioned cache；positions/dtype/committed prefix 正确，logits 与 contiguous reference 一致。4.他者：serving engine 通过统一 cache adapter/block table 让模型 forward 写入不同物理 cache；位置与 cache metadata 由 request state 提供。5.本方案：扩展 KvCache trait 一个默认 no-op 的 position preparation hook；ReservedPositionedKvShard 实现该 trait；KvCacheImpl 增加 reserved variant。LlamaModel 在每层 forward 前把本轮 position_ids 交给 cache。reserved variant 的 legacy update_sharded 明确拒绝，decode 继续走 self-driving core。6.为什么：该 adapter 复用现有真实模型和 ring attention forward，不复制计算主流程，也不把全局 shard 可见性带入 runtime。默认 hook 保持 contiguous/block 行为不变。VERDICT: IMPLEMENT。
 
-_updated: 2026-08-01 20:42:55_
+[2026-08-02 实现] d86ac47 完成 position preparation hook、reserved KvCache adapter 与真实 Qwen 24 层验证。legacy contiguous/block 行为保持；reserved update_sharded(keep=false) 继续拒绝并要求 self-driving decode。VERDICT: IMPLEMENTED。
+
+_updated: 2026-08-01 20:58:52_
 ### Rust 线优先完成完整推理服务框架
 
 type: `preference` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-02`
