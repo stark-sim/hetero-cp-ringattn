@@ -2,6 +2,20 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 撰写 HCP 方法与数据流论文草稿
+
+type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-02`
+
+创建 docs/paper/HCP_METHOD_DRAFT.md，只整理当前稳定的研究内容：问题定义、系统模型与符号、prefill/decode/continuation 的统一 HCP 方法、正确性与复杂度、局限和 Evaluation Design。明确区分 Method claim、Proved invariant、Prototype evidence、Open empirical question。不写 Abstract、最终 Conclusion、Implementation Results、性能数字、旧 1M 实验或 vLLM 工程适配。
+
+_updated: 2026-08-01 19:37:46_
+### 方法草稿只固化当前算法与证据边界
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `motivation-analysis-2026-08-02`
+
+【动机六问】1.问题：HCP 的核心定义、两阶段 KV 分片和自驱动 decode 证据已分散在计划、代码实验与 Graph Memory 中，若不统一成论文级方法稿，后续实现和评测容易偏离项目目标；若直接写完整论文，又会把尚未完成的硬件与性能验证误写成结果。2.现状：已有 transport-agnostic 异构 CP 定位、position-indexed KV 模型、capacity-weighted ownership/reservation、Ring Attention prefill、自驱动 decode、continuation prefill、online-softmax 合并、任意 N/L 与 N-1 hops 的数学及 Rust 模块证据；缺少当前方案的真实跨后端硬件 E2E、大 context、物理显存、性能/TCO、多请求 runtime 和系统基线。3.目标：新增一份可由用户逐节审查的英文方法草稿，统一符号、完整数据流、正确性不变量和复杂度；所有陈述按 Method claim、Proved invariant、Prototype evidence、Open empirical question 分级；搜索确认没有旧 1M 结果、性能数字或 vLLM 工程适配。4.他者：Ring Attention 论文以分块 attention、online softmax 和环通信描述 context parallelism；系统论文通常先稳定 problem/system model、algorithm、proof obligations 与 evaluation questions，再在实现闭合后补 implementation/results/abstract/conclusion。其现成结构可复用，但同构均分、collective 或阶段级异构调度不能直接表达 HCP 的不均等同请求 context ownership。5.本方案：只创建 docs/paper/HCP_METHOD_DRAFT.md，覆盖问题定义、系统模型、capacity-weighted placement、prefill、self-driving decode、continuation、正确性、复杂度、证据边界和 Evaluation Design；不修改实现，不补文献编号，不产生经验结论。6.为什么：这是让理论、实验合同和论文目标对齐的最小产物；它保留未来替换 runtime 与硬件的自由，同时使后续实验可以直接对应明确的 research questions 和不变量。VERDICT: IMPLEMENT METHOD DRAFT；DEFER ABSTRACT、FINAL CONCLUSION、IMPLEMENTATION RESULTS 与 PERFORMANCE CLAIMS。
+
+_updated: 2026-08-01 19:37:46_
 ### 整理 HCP 论文的完整核心推理框架
 
 type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-01`
