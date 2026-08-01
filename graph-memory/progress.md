@@ -2,6 +2,23 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-08-02] Graph Memory SQLite 写入 transport 规则与回归已验证
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `local-graph-memory-skill-2026-08-02`
+
+数据库诊断：PRAGMA integrity_check=ok，foreign_key_check 无违规，nodes 与 FTS 外部内容映射计数一致且无 missing/orphan/content mismatch；数据库副本上的 FTS5 integrity-check 与 quick_check 均通过。
+根因裁定：SQLite 页、事务和索引未损坏；曾经损坏的是交互 PTY 在 SQLite 接收前传输的 Unicode 多行 evidence 正文，当前第 3、4 条验证记录已修正且 UTF-8 原始字节正常。
+修复：graph-memory skill 新增 SQLite Write Transport，强制参数绑定或 non-PTY stdin、禁止交互 PTY 与字面反斜杠换行、失败后先查稳定 ID 再重试、写后校验 exact content/hash/哨兵与换行数；tests/run.sh 新增合同断言和中文多行精确 roundtrip。
+验证：bash /Users/stark_sim/.agents/skills/graph-memory/tests/run.sh => PASS；python3.11 quick_validate.py /Users/stark_sim/.agents/skills/graph-memory => Skill is valid；Unicode roundtrip exact equality=1/newlines=4；skill SHA256=2902ba421cda2a2bdecb84ae0daf46a1bd801c850e5bb5a27f8a44b70169aa3e，test SHA256=3327f114fb2b82498a79ff105b8e70a2e0154e0c692c65bbe2d68512c84133a1。shellcheck unavailable，未声明 shellcheck 通过。
+
+_updated: 2026-08-01 21:33:21_
+### Graph Memory 长文本正确性必须在 SQLite 上下游两侧验证
+
+type: `lesson` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `ev-graph-memory-sqlite-write-transport-hardening-20260802`
+
+SQLite integrity_check、事务提交和节点存在只证明数据库结构及收到的字节可持久化，不证明上游输入在 PTY 中没有被串改。多行、长文本或非 ASCII mutation 必须用参数绑定或 non-PTY stdin；禁止交互 PTY 和把字面反斜杠 n 当换行。失败后先查稳定 ID 与事务结果，防止盲目重放；成功后必须回读 exact content/hash，或至少验证多个确定性哨兵与换行数，再导出和提交。此前仅保留项目 lesson、不修改通用 skill 的边界已被本次用户裁定与 skill 缺口审计取代。
+
+_updated: 2026-08-01 21:33:21_
 ### [2026-08-02] 真实 Qwen 两 worker 1:3 reserved prefill 通过
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@c465244`
@@ -46,11 +63,11 @@ type: `evidence` · status: `held` · confidence: 1.0 · importance: 0.98 · sou
 _updated: 2026-08-01 20:38:25_
 ### Graph Memory 大段 Unicode SQL 不经交互 PTY 写入
 
-type: `lesson` · status: `held` · confidence: 1.0 · importance: 0.8 · source: `incident-2026-08-02-graph-memory-sql-transport`
+type: `lesson` · status: `superseded` · confidence: 1.0 · importance: 0.8 · source: `incident-2026-08-02-graph-memory-sql-transport`
 
 症状：通过交互式 sqlite3 PTY 写入包含多行中文与长命令的 evidence 时，终端回显出现重复/截断，查询确认第 3、4 条验证记录被串坏。影响：节点状态和边已提交，但证据正文不可信。根因边界：SQL 事务本身正确，损坏发生在大段 Unicode 文本经交互 PTY 传输；此前把含字面反斜杠换行的 SQL 作为 shell 参数也被 SQLite 拒绝且零写入。已验证解决：改用非交互单行 sqlite3 命令，通过 char(10) 在 SQLite 内构造换行；写后用 instr 检查预期哨兵存在、损坏片段不存在，再运行外键与悬空 evidence 检查。预防条件：Graph Memory 的结构化长文本写入避免 PTY；优先非交互 SQL/项目脚本，并把正文读回校验后再导出和提交。证据仅支持项目级操作 lesson，不修改通用 skill。
 
-_updated: 2026-08-01 20:23:44_
+_updated: 2026-08-01 21:33:21_
 ### [2026-08-02] ReservedPositionedKvShard 提升为 experimental core API
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 0.98 · source: `hetero-cp-ringattn@91df8c4`

@@ -463,6 +463,14 @@ type: `decision` · status: `held` · confidence: 1.0 · importance: 0.98 · sou
 [2026-08-02 实现] b6902ba 验证显式 runtime Kind；VERDICT: IMPLEMENTED。
 
 _updated: 2026-08-01 20:38:25_
+### Graph Memory 强制使用非 PTY 长文本写入与正文回读校验
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `sqlite-forensics-2026-08-02`
+
+【动机六问】1.问题：skill 只要求事务和节点存在，不能防止正文在到达 SQLite 前已被 PTY 行编辑或 Unicode 传输破坏。2.现状：项目 lesson 已记录 evidence 第 3、4 条被串坏并已修正，但通用 skill 没有禁止 PTY、字面反斜杠换行或盲目重放，也未要求正文级验证。3.目标：skill 明确非 PTY stdin 写入、事务与失败处理、写后原文或 hash/哨兵验证；回归测试锁定合同并执行 Unicode 多行 roundtrip。4.他者：SQLite CLI 常用非交互脚本加 .bail on 和显式事务，应用则用参数绑定；SQLite 只能保证收到的字节，无法识别上游文本语义错误。5.本方案：最小修改现有 graph-memory SKILL.md 和 tests/run.sh，不新增存储层。6.为什么：根因是 transport/process contract 而非 schema；新 writer 框架会扩大范围，仍不能替代正文回读。VERDICT: IMPLEMENT。
+[2026-08-02 验证] 规则、回归测试与 skill validator 全部通过；VERDICT: IMPLEMENTED。
+
+_updated: 2026-08-01 21:33:21_
 ### 历史扩展线：网络、Striped 与 vLLM 探索
 
 type: `task` · status: `superseded` · confidence: 0.8 · importance: 0.95 · source: `user-direction`
