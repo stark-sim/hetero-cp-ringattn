@@ -23,6 +23,20 @@ type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · sour
 实现 commit f6da957。固定实验 N=3、L=24、tickets=[1,3,2]，同一请求执行 prefill_1(6) -> decode_1(1) -> continuation prefill_2(6) -> decode_2(1)。分布式侧每个 layer×domain 按冻结四阶段计划一次性精确预留 K/V tensor，prefill 和 decode 均通过 write cursor + narrow().copy_() 原地 append，attention 只读取 committed prefix；所有 storage data_ptr 跨四阶段保持不变，每个 slab 最终 committed_len 等于 reservation，最终 domain KV slot 总数仍为 [56,168,112]=1:3:2。独立 slab 测试确认分段 append 内容正确，overflow 在写入前拒绝，cursor、positions、K/V 内容和 storage pointer 均不变。24 层四阶段 hidden/logits 继续与独立 dense GQA + persistent ContiguousKvCache 参考在 1e-3 内对齐，continuation prefill 仍只投影 6×24=144 个新位置。验证：LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib cargo test --manifest-path rust/Cargo.toml --features tch-backend，96 passed/0 failed，doc tests 0 failed/3 ignored；同环境 cargo clippy --manifest-path rust/Cargo.toml --features tch-backend exit 0，仅仓库既有 warning；rustfmt --edition 2021 --check rust/src/model/self_driving.rs、git diff --check 均 exit 0；reserved slab/prefill/decode 实现区间无 Tensor::cat。边界：test-only、in-process CPU correctness；未改生产 cache trait，不证明 allocator、admission、runtime、网络、多请求、GPU 物理显存或开放式生成 reservation。
 
 _updated: 2026-08-01 17:00:05_
+### 自驱动 decode ring 模块化核心闭环审查通过
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@96ec868`
+
+只读核对 rust/src/model/self_driving.rs 与 rust/src/model/transport/tcp.rs：schedule ordinal 为 token_offset×num_layers+layer_idx；reserved slab 通过 narrow().copy_() 原地 append 并读取 committed prefix；reserved TCP adapter 与 legacy 路径共用 continue_layer_packet；TCP worker 每层只在 starter 本地创建 packet，其余从 predecessor 接收，finisher hidden 原地启动下一层或下一 token；wire frame 序列化 layer_idx、route 与 residual/normalized/position/Q/O/LSE，不包含历史 KV。新鲜验证命令：LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib:/opt/homebrew/opt/libomp/lib HCP_ENABLE_TORCH=1 CARGO_NET_OFFLINE=true cargo test --manifest-path rust/Cargo.toml --features tch-backend model::self_driving::tests:: -- --nocapture。结果：17 passed、0 failed、80 filtered out；仅既有 warnings。本机 libtorch CPU correctness，不是性能或加速器物理显存证据。未发现层数与 TCP/reservation 间新的不可分解耦合，因此 24 层 TCP 是重复规模验证，不是当前必要证据。
+
+_updated: 2026-08-01 11:33:57_
+### 恢复会话后写 Graph Memory 前先查询目标 ID
+
+type: `lesson` · status: `held` · confidence: 1.0 · importance: 0.8 · source: `incident-2026-08-01`
+
+症状：交接摘要称审查节点尚未创建，但当前 graph.db 已含同名完成态节点；直接事务插入在重复 edge 唯一键处失败并回滚。根因：摘要落后于源数据库。已验证解决：先查询 nodes/edges，使用新的模块化复审 task ID，避免覆盖既有历史。预防条件：恢复会话时即使已有摘要，也必须把 graph.db 当源数据，在插入稳定 ID 前查询节点和关系是否存在。此规则属于 Graph Memory 项目事实，不修改通用 skill。
+
+_updated: 2026-08-01 11:33:57_
 ### Rust 24 层 positioned KV 四阶段复用验证通过
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@5e95af1`

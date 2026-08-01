@@ -16,6 +16,20 @@ type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · sour
 【动机六问】1.问题：旧测试在一个 [1,3,2]、24 units、单 phase 样例上检查前缀比例误差小于等于 1，容易继续暗示该结论对任意 phase 成立；反例已证明这不是普遍定理。2.现状：largest remainder 产生完整 horizon 精确 counts，phase 只循环旋转同一 sequence；exact slab 已证明已知 horizon 可以按 layer×domain 精确预留并原地 append，但 schedule 测试尚未把 counts 明确验证为每域 reservation 上界。3.目标：对多组 tickets/horizon 和所有 phase，任意 prefix 的消费计数都不超过 counts，完整 horizon 后精确等于 counts；现有确定性、容量份额、唯一 assignee和零容量语义不变。4.他者：vLLM 等 serving engine 依赖 admission reservation、block quota 或预分配 arena 保证显存，调度顺序负责平滑吞吐而不是充当显存硬界。5.本方案：不改算法或 API，只用纯单元测试把 counts 解释并验证为完整 horizon reservation，删除旧样例中的 scaled prefix-error 断言。6.为什么：这是把已修订数学结论落实到代码合同的最小方案；无需发明 cyclic discrepancy 算法，也不引入生产 allocator。【牺牲四问】旧前缀检查的目的，是约束单请求短期 event 分布和平滑计算；本节点放弃把小于等于 1 当作普遍保证，但不删除 phase 轮转或 smooth sequence；短期平滑本质上服务并发负载均衡，而不是物理显存安全；本项目现阶段优先保证可证明的 capacity hard bound，多请求效果以后单独实验。VERDICT: IMPLEMENT EXPERIMENT ONLY。
 
 _updated: 2026-08-01 17:31:51_
+### 模块化证据已闭合自驱动 decode ring 实验核心
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `code-audit-2026-08-01`
+
+【审查六问】1.问题：判断现有 24 层、TCP、任意 N、reserved slab 与 schedule 证据能否组合，是否必须增加 24 层 TCP。2.现状：各实验分别覆盖规模、网络、存储和生命周期，公共 runtime 仍未接入。3.目标：证明或否定 schedule→reservation→append→packet continuation→逐层与跨 token 递推→positioned continuation prefill 的组合。4.他者：分布式实现通常用局部不变量加少量边界集成测试建立归纳证据，只有规模引入新状态时才追加大集成测试。5.本方案：逐行核对同一 continue_layer_packet、reserved adapter、layer loop、TCP frame 和 24 层四阶段测试，并运行全部 17 项 self-driving 回归。6.为什么：层数只增加相同状态转移次数；layer_idx、shard/model 数组索引和同步 TCP 流没有随 L 改变的额外协议状态。组合结论：FrozenKvAssigneeSchedule 为完整固定 horizon 给出 capacity-weighted counts；每 layer×domain reservation 从实际 prefill split 与 decode assignee 次数导出；reserved append 写前拒绝 overflow 且只暴露 committed prefix；packet 传 residual、normalized、position、Q、O/LSE，不传历史 KV；assignee 唯一投影并留存 current K/V；finisher 唯一执行 W_o、residual、post norm、MLP，末层执行 final norm、head、greedy sampling 和 embedding；两层 TCP 已覆盖 finisher-to-starter 归纳步，任意 L runner 覆盖重复，任意 N TCP 覆盖 successor 与 wrap-around；24 层四阶段覆盖 prefill→decode→continuation prefill→decode 的 positioned mixed history 和最终 [56,168,112]=1:3:2。每请求网络为 L×(N-1) 个固定 context-independent packet，随 N 线性。未覆盖：公共 process_layer_packet 仍有 Tensor::cat、真实 WorkerRuntime、开放式 horizon、byte-level admission、多请求、QUIC、远端异构设备和 GPU 物理显存。VERDICT: MODULAR CORE CLOSED; DEFER 24-LAYER TCP。
+
+_updated: 2026-08-01 11:33:57_
+### 以模块不变量组合审查决定是否补 24 层 TCP 实验
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-01`
+
+【动机六问】1.问题：24 层四阶段与两-token TCP 分别成立，但尚需判断它们是否能组合成完整实验性核心，避免遗漏跨模块耦合，也避免为规模而重复测试。2.现状：24 层 in-process 证据覆盖 capacity-weighted positioned KV、prefill-decode-continuation 与 exact slab；TCP 证据覆盖真实 P2P packet、两 token、reserved append、sampling；任意 N 与任意 L 各有独立证据。公共 runtime 仍保留 legacy Tensor::cat。3.目标：逐项审查 schedule、slab、packet continuation、逐层递推、跨 token 与任意 N 的接口不变量；只有存在不能由现有证据推导的新耦合风险才建议最小新实验。4.他者：分布式系统通常以单元/属性测试证明局部不变量，再用少量集成测试证明边界组合；扩大层数的网络集成测试只有在层数改变协议状态或资源布局时才增加信息。5.本方案：只读对照 Graph Memory 证据、实现与测试，构造组合证明和未覆盖边界清单；不改 Rust、不进入 runtime、多请求、QUIC 或远端硬件。6.为什么：它直接回答当前核心是否闭环，并遵守小步与最小证据原则；24 层 TCP 若只是重复相同 continuation 分支，不应作为默认下一步。VERDICT: IMPLEMENT AUDIT ONLY。
+
+_updated: 2026-08-01 11:22:12_
 ### 用冻结计划精确 slab 验证无 Tensor::cat KV append
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-01`
@@ -44,51 +58,6 @@ type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · sour
 【动机六问】1.问题：连续实验已走到两 token TCP，但需要确认它证明的是完整核心数据流，还是被同步测试结构掩盖了缺口。2.现状：LayerPacket 显式携带 residual、normalized、position、Q、O/LSE；assignee 唯一追加 current K/V；finisher 唯一执行 W_o、residual、post norm、MLP；末层本地 logits、greedy sampling、embedding 后继续下一 token。真实 TCP 证据仅为单请求 N=3、L=2、两 token。3.目标：分别判断单请求数学/数据流、HCP 异构显存目标和可运行系统三层是否闭环，并用代码位置、反例和新鲜测试支撑。4.他者：Ring Attention 显式传递 Q 与 online-softmax accumulator，pipeline parallel 显式传 activation；vLLM 类运行时另外用 request-keyed KV/page state、调度队列和 admission 处理多请求与显存硬界。Ring Attention 本身不提供这些生命周期能力。5.本方案：保留当前最小实验设计；把已证明的 exact-once、N-1 hops、context-independent packet 与未证明的物理峰值、多请求 demux、runtime 集成严格分层，不把生产能力前置。6.为什么：这既回答核心方案是否自洽，又遵守核心优先、小步验证约束；现阶段没有证据要求重写数据面，也没有证据允许宣称系统完成。VERDICT: DEFER 后续实现；接受单请求核心设计，下一节点须另行确认。
 
 _updated: 2026-07-31 19:13:51_
-### 当前唯一实施任务：自驱动 decode ring 最小核心切片
-
-type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-07-30`
-
-范围只包含：1. 简单、冻结且可复现的 capacity-weighted KV assignee schedule（按 token×layer append event），并用 stable request_id 分散初始 phase；第一版不引入 layer 维二维 calendar 或运行期动态迁移。2. 单请求、最小两-token 的真实 tensor decode 路径：starter 生成 Q，packet 用 N-1 hops 合并所有本地 KV partial，唯一 assignee 计算并持久保存 current K/V，finisher 唯一执行 W_o + residual + norm + MLP，末层唯一产生 logits。3. 最小机器验证：与单节点参考一致；hop、Q、KV project/append、partial、MLP、logits exact-once；无完整远端历史 KV 临时副本。每完成一个小节点即汇报结果、下一节点和方向判断，未经用户确认不跨入生产化能力。当前工作树中的大型 placement/ledger 草稿不自动视为本任务成果，需先单独审查取舍。
-
-[2026-07-30 checkpoint 1] 任意 N 的单层真实 tensor ring 已验证 attention + residual/norm/MLP 数学与 exact-once 角色。
-
-[2026-07-30 checkpoint 2] 显式 LayerPacket 已验证：runner 只编排 packet+local shard step；历史长度 2 与 47 的首跳 payload 元素数相同。
-
-[2026-07-30 checkpoint 3] 固定两层 N=3 handoff 已验证：角色 1->0->2，总 hops=4；每层 Q/KV/partial/finisher exact-once，输出与两层单节点参考一致。
-
-[2026-07-30 checkpoint 4] 末层 finisher 已唯一执行 final RMSNorm + 独立或 tied LM head；logits projection=1，N=3 两层总 hops 仍为 4，完整 Rust 测试 85/85 通过。
-
-[2026-07-30 checkpoint 5] 任意 L 的单 token 全模型 runner 已验证：N=3 下 L=3 回到 starter、L=4 轮转 producer，满足 producer=(starter-L) mod N、总 hops=L*(N-1)、逐层 exact-once，完整 Rust 测试 87/87 通过。
-
-[2026-07-31 checkpoint 6] N=3 localhost 单层真实 TCP self-driving ring 已验证：独立 packet 经 0->1->2 两个 hop，三个 worker 各处理一次 local partial，只有 capacity map 指定的 assignee shard 增长，finisher 唯一完成 W_o+residual+norm+MLP；输出对齐参考，实际 wire bytes 对历史长度 2/47 恒定，完整 Rust 测试 90/90 通过。实现 71c8698 已推送。
-
-下一候选仅为任意 N localhost 网络证据：用 N=2/3/4 与非零 starter 覆盖 successor wrap-around；未经用户确认不实施。sampling/token continuation、任意 L 网络循环、QUIC、远端硬件与 runtime 仍未开始。
-
-[2026-07-31 checkpoint 7] localhost 单层 TCP ring 的任意 N 与闭环边已验证：N=2/3/4 使用 starter=N-1，实际 route 为 1->0、2->0->1、3->0->1->2，均经过 wrap-around；每例 N-1 sends、local partial/assignee KV/finisher exact-once 与参考输出断言通过。没有新增生产路由代码，仅参数化试验。完整 Rust 测试 91/91 通过，实现 2150d7a 已推送。
-
-下一候选为 N=3 固定两层 localhost TCP handoff：让 layer 0 finisher 原地成为 layer 1 starter，验证跨层无需 coordinator return；未经用户确认不实施。
-
-[2026-07-31 checkpoint 8] N=3 固定两层 localhost TCP handoff 已验证：layer 0 route=1->2->0，domain 0 finisher 不经 coordinator 回传，直接用本地输出 hidden 启动 layer 1 route=0->1->2；两层总 sends=4，每层 partial/assignee KV/finisher exact-once，最终 hidden 对齐两层参考。完整 Rust 测试 92/92 通过，实现 c5751f1 已推送。
-
-下一候选尚未实施：先对最小后续证据节点做动机剖析，仍不进入生产化。
-
-[候选 checkpoint 9] 末层 TCP finisher 本地唯一产生 final logits：保持 N=3 两层 localhost，证明 final head 不增加 hop；待用户确认，不进入 sampling、token continuation、任意 L 网络化或 placement planner。
-
-[2026-07-31 checkpoint 9] 末层 TCP finisher 本地唯一 final logits 已验证：N=3 两层 route 仍为 1->2->0 与 0->1->2；仅 domain 2 本地执行 final RMSNorm+LM head，logits producer=1、数值对齐参考，总 sends 保持 4。完整 Rust 测试 92/92 通过，实现 6ef5a18 已推送。
-
-下一候选尚未实施：重新评估核心剩余项，优先保持实验性与小步。
-
-[候选 checkpoint 10] 一维冻结 capacity-weighted KV owner map：capacity tickets + stable request_id phase，纯函数/纯数据结构；明确不采用当前 1079 行 production placement/ledger 草稿，不含 layer calendar、throughput、动态迁移或 admission。待用户确认。
-
-[2026-07-31 checkpoint 10 revision] 取消 owner 命名及 token-wide owner 粒度，改为按 append ordinal=(token_offset*num_layers)+layer_idx 的 FrozenKvAssigneeSchedule；待实现。
-
-[2026-07-31 checkpoint 10] 冻结 capacity-weighted KV assignee schedule 已验证并推送（cfe25d9）：分配粒度为 (token_offset, layer_idx) append event，不是固定 owner；[1,3,2] 在 24 units 上精确为 [4,12,8]，smooth 序列前缀偏差不超过 1 unit，request_id 只分散 phase，零容量节点无分配，N=1/2/4 通用。完整 Rust 测试 94/94 通过。当前仍未接入 TCP runner。
-
-[2026-08-01 checkpoint 11] 冻结 KV assignee schedule 已接入两层 localhost TCP 实验并推送（271de7f）：[1,3,2] tickets、request phase=1 在两层 horizon 生成 [2,1]，每层仅指定 domain KV +1；两层 route、4 sends、finisher handoff、唯一 final logits 与参考数值不变。完整 Rust 测试 94/94 通过。边界仍为单 token 实验，尚未进入 sampling/下一 token continuation。
-
-[2026-08-01 checkpoint 12] 两 token localhost TCP 自驱动 continuation 已验证并推送（b237266）：token 0 末层 finisher domain 2 原地 greedy sampling+embedding，零边界消息启动 token 1；sampler/finisher 轮转到 domain 0。四个 append assignee=[[2,1],[1,0]]，每项 exact-once；position 连续，参考侧累积 token 0 K/V 后两步 hidden/logits/token 均对齐；总 sends=8=2*2*(N-1)。边界仍为固定 L=2、greedy、单请求实验。
-
-_updated: 2026-07-31 17:55:51_
 ### 末层 finisher 原地 sampling/embedding 并启动下一 token
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-01`
