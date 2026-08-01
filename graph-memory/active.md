@@ -2,13 +2,6 @@
 
 当前活跃的任务、决策、风险和假设。
 
-### Rust 24 层 prefill-decode-continuation 语义闭环实验
-
-type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `docs/plans/2026-08-01-24-layer-prefill-decode-continuation-design.md`
-
-当前小里程碑：N=3、L=24、capacity tickets=[1,3,2]；同一请求依次执行 prefill_1(6 tokens)、decode_1(1 token)、continuation prefill_2(6 tokens)、decode_2(1 token)。第二次 prefill 必须复用前两阶段形成的分布式 positioned KV，不能重算历史。验证完整参考数值、24 层 position 无遗漏无重复、prefill_2 只投影新 token、两次 decode 的 48 个 append events 总计 [8,24,16] 且每步 [4,12,8]。仅限 in-process CPU correctness；不处理 Tensor::cat、预分配、schedule 平滑、网络/runtime 或多请求。
-
-_updated: 2026-08-01 05:54:01_
 ### 实施 24 层 positioned KV 四阶段复用实验
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-01`

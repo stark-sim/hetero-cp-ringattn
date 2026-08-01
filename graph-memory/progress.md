@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### Rust 24 层 positioned KV 四阶段复用验证通过
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@5e95af1`
+
+实现 commit 5e95af1。N=3、L=24、capacity tickets=[1,3,2] 的同一请求完成 prefill_1(positions 0..5) -> decode_1(position 6) -> continuation prefill_2(positions 7..12) -> decode_2(position 13)。分布式侧使用每个 layer×domain 的显式 position shard 和现有 online-softmax；独立参考侧使用标准 dense GQA + 持久 ContiguousKvCache。四阶段 hidden/logits 与参考误差均低于 1e-3，两次 decode 采样一致；每层最终 position union 严格为 0..13，无遗漏无重复；prefill_2 只投影 6×24=144 个新位置；两轮 decode append 各为 [4,12,8]、合计 [8,24,16]；最终跨 24 层的 domain KV slot 数为 [56,168,112]=1:3:2。验证：LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib cargo test --manifest-path rust/Cargo.toml --features tch-backend --quiet，95 passed/0 failed，doc tests 0 failed/3 ignored；同环境 cargo clippy --manifest-path rust/Cargo.toml --features tch-backend --all-targets --quiet exit 0，仅既有 warning；rustfmt --edition 2021 --check rust/src/model/self_driving.rs 与 git diff --check exit 0。边界：in-process CPU correctness；未处理 Tensor::cat、预分配、schedule 平滑、网络/runtime 或多请求。
+
+_updated: 2026-08-01 07:38:02_
 ### 自驱动 decode ring 核心闭环代码审查与聚焦回归
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@5681216`
