@@ -2,13 +2,36 @@
 
 当前活跃的任务、决策、风险和假设。
 
-### 生成 HCP 方法草稿中文版并暂缓论文线
+### 整理 HCP 论文的完整核心推理框架
+
+type: `task` · status: `paused` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-02`
+
+从整个请求生命周期整理 HCP 核心方案：非均等 Ring Attention prefill、自驱动 decode ring、两种 KVCache 切分规则的兼容、capacity-weighted 显存合同、线性 P2P 数据流与阶段转换不变量。论文系统定位为互联无关的异构全生命周期 Context Parallelism：每个 worker 只需 predecessor/successor P2P，CXL、RDMA/RoCE、InfiniBand、UALink、PCIe peer access 或未来高速 fabric 均可承载；当前聚合 KV/context capacity，模型权重仍由每个 worker 完整持有。先形成可审查的方案决策和论文骨架，再写正文。\n\n[2026-08-02 写作边界] 先完成问题定义、系统模型、方法、正确性/复杂度、局限和评测设计；真实实现细节、实验结果、成本结论、摘要与最终结论等待当前框架和新证据。
+
+[2026-08-02 暂缓] 英文和中文方法草稿已形成检查点。论文线暂不继续扩写，等待框架实现和新实证后再恢复。
+
+_updated: 2026-08-01 19:58:15_
+### 双语方法稿完成后暂缓论文线并恢复 Rust 核心框架
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-02`
+
+用户已确认英文草稿可接受，并要求中文版完成后暂时停止论文推进。现阶段不写 Abstract、Implementation Results、性能结果、最终 Conclusion 或新相关工作。下一主线回到 Rust 实验性核心框架；仍遵守核心和必要能力优先，不进入多请求 pipeline、真实 runtime 接入或生产级 allocator，除非用户后续明确恢复这些范围。
+
+_updated: 2026-08-01 19:58:15_
+### 审计 Rust 核心框架并选择下一个最小节点
 
 type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-02`
 
-为已审查通过的 docs/paper/HCP_METHOD_DRAFT.md 创建逐节对应的中文版。保留全部公式、数据流、证据标签、局限和 Evaluation Design，不新增实验、性能论断或工程适配。完成后将论文核心框架任务标为 paused，并把下一工作焦点切回 Rust 核心框架。
+只读审查当前 Rust self-driving decode、positioned KV、capacity schedule、transport 与已有 Graph Memory 证据，找出一个仍未闭合且不依赖多请求、真实 runtime 或生产 allocator 的必要能力。用户未提交的 Rust 修改只读、不覆盖。输出下一节点的改动、原因、对总体计划的贡献和明确边界。
 
-_updated: 2026-08-01 19:52:13_
+_updated: 2026-08-01 19:58:15_
+### 先做只读缺口审计，再选择一个实验性核心节点
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `motivation-analysis-2026-08-02`
+
+【动机六问】1.问题：论文方法已经固定，但需要回到框架实现；若直接照旧生产计划推进，会重新引入用户已拒绝的 planner、runtime 和大步改造。2.现状：Rust 已有 self-driving tensor 数学、wire packet、localhost TCP、frozen capacity schedule、positioned exact slab 和 24-layer mixed-history 等模块证据；公开路径仍可能保留 test-only 边界和 Tensor::cat，且工作区存在用户未提交的 capacity/placement 改动，不能凭旧记忆决定下一步。3.目标：只读核对当前代码、测试与 Graph 节点，选择一个必要、可独立验证、不会触碰生产级范围的最小实现节点；若核心已经闭合，则明确指出并选择最薄的组合缺口。4.他者：成熟 serving framework 通常下一步会接 paged cache、admission、runtime queue 和 backpressure，但这些机制解决生产生命周期，不是当前实验性算法可行性的必要条件。5.本方案：优先检查当前 modular proof 是否仍有一个未组合的算法/数据边界；避开多请求、runtime、动态 allocator 和硬件性能。6.为什么：这能让实现继续为 HCP 核心论点增加独立证据，而不是为尚未验证收益的生产框架增加复杂度。VERDICT: IMPLEMENT READ-ONLY AUDIT, THEN PROPOSE ONE SMALL NODE。
+
+_updated: 2026-08-01 19:58:15_
 ### 中文版只做等价翻译，完成后暂缓论文线
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `motivation-analysis-2026-08-02`
@@ -23,13 +46,6 @@ type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · sour
 【动机六问】1.问题：HCP 的核心定义、两阶段 KV 分片和自驱动 decode 证据已分散在计划、代码实验与 Graph Memory 中，若不统一成论文级方法稿，后续实现和评测容易偏离项目目标；若直接写完整论文，又会把尚未完成的硬件与性能验证误写成结果。2.现状：已有 transport-agnostic 异构 CP 定位、position-indexed KV 模型、capacity-weighted ownership/reservation、Ring Attention prefill、自驱动 decode、continuation prefill、online-softmax 合并、任意 N/L 与 N-1 hops 的数学及 Rust 模块证据；缺少当前方案的真实跨后端硬件 E2E、大 context、物理显存、性能/TCO、多请求 runtime 和系统基线。3.目标：新增一份可由用户逐节审查的英文方法草稿，统一符号、完整数据流、正确性不变量和复杂度；所有陈述按 Method claim、Proved invariant、Prototype evidence、Open empirical question 分级；搜索确认没有旧 1M 结果、性能数字或 vLLM 工程适配。4.他者：Ring Attention 论文以分块 attention、online softmax 和环通信描述 context parallelism；系统论文通常先稳定 problem/system model、algorithm、proof obligations 与 evaluation questions，再在实现闭合后补 implementation/results/abstract/conclusion。其现成结构可复用，但同构均分、collective 或阶段级异构调度不能直接表达 HCP 的不均等同请求 context ownership。5.本方案：只创建 docs/paper/HCP_METHOD_DRAFT.md，覆盖问题定义、系统模型、capacity-weighted placement、prefill、self-driving decode、continuation、正确性、复杂度、证据边界和 Evaluation Design；不修改实现，不补文献编号，不产生经验结论。6.为什么：这是让理论、实验合同和论文目标对齐的最小产物；它保留未来替换 runtime 与硬件的自由，同时使后续实验可以直接对应明确的 research questions 和不变量。VERDICT: IMPLEMENT METHOD DRAFT；DEFER ABSTRACT、FINAL CONCLUSION、IMPLEMENTATION RESULTS 与 PERFORMANCE CLAIMS。
 
 _updated: 2026-08-01 19:37:46_
-### 整理 HCP 论文的完整核心推理框架
-
-type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-01`
-
-从整个请求生命周期整理 HCP 核心方案：非均等 Ring Attention prefill、自驱动 decode ring、两种 KVCache 切分规则的兼容、capacity-weighted 显存合同、线性 P2P 数据流与阶段转换不变量。论文系统定位为互联无关的异构全生命周期 Context Parallelism：每个 worker 只需 predecessor/successor P2P，CXL、RDMA/RoCE、InfiniBand、UALink、PCIe peer access 或未来高速 fabric 均可承载；当前聚合 KV/context capacity，模型权重仍由每个 worker 完整持有。先形成可审查的方案决策和论文骨架，再写正文。\n\n[2026-08-02 写作边界] 先完成问题定义、系统模型、方法、正确性/复杂度、局限和评测设计；真实实现细节、实验结果、成本结论、摘要与最终结论等待当前框架和新证据。
-
-_updated: 2026-08-01 18:51:11_
 ### 当前先整理 HCP 论文的方法主体，推迟实现结果与最终结论
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `paper-readiness-audit-2026-08-02`

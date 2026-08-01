@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### HCP 方法草稿中文版完成并与英文稿结构对齐
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@d2562b3`
+
+提交 d2562b3 新增 docs/paper/HCP_METHOD_DRAFT_ZH.md。验证：公式块与英文稿逐字 diff exit 0；中文版 h2=11、h3=22、fences=6、math_open=27、math_close=27；证据标签 method=5、proved=6、prototype=2、open=2、boundary=1；必需章节、禁用论断、尾随空白和 staged diff check 均 exit 0。未新增摘要、结果、最终结论、旧 1M 结果或后端工程适配。
+
+_updated: 2026-08-01 19:58:15_
 ### HCP 方法与数据流论文草稿完成并通过边界审计
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@4179a50`
