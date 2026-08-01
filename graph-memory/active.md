@@ -16,6 +16,27 @@ type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · sour
 【动机六问】1.问题：旧测试在一个 [1,3,2]、24 units、单 phase 样例上检查前缀比例误差小于等于 1，容易继续暗示该结论对任意 phase 成立；反例已证明这不是普遍定理。2.现状：largest remainder 产生完整 horizon 精确 counts，phase 只循环旋转同一 sequence；exact slab 已证明已知 horizon 可以按 layer×domain 精确预留并原地 append，但 schedule 测试尚未把 counts 明确验证为每域 reservation 上界。3.目标：对多组 tickets/horizon 和所有 phase，任意 prefix 的消费计数都不超过 counts，完整 horizon 后精确等于 counts；现有确定性、容量份额、唯一 assignee和零容量语义不变。4.他者：vLLM 等 serving engine 依赖 admission reservation、block quota 或预分配 arena 保证显存，调度顺序负责平滑吞吐而不是充当显存硬界。5.本方案：不改算法或 API，只用纯单元测试把 counts 解释并验证为完整 horizon reservation，删除旧样例中的 scaled prefix-error 断言。6.为什么：这是把已修订数学结论落实到代码合同的最小方案；无需发明 cyclic discrepancy 算法，也不引入生产 allocator。【牺牲四问】旧前缀检查的目的，是约束单请求短期 event 分布和平滑计算；本节点放弃把小于等于 1 当作普遍保证，但不删除 phase 轮转或 smooth sequence；短期平滑本质上服务并发负载均衡，而不是物理显存安全；本项目现阶段优先保证可证明的 capacity hard bound，多请求效果以后单独实验。VERDICT: IMPLEMENT EXPERIMENT ONLY。
 
 _updated: 2026-08-01 17:31:51_
+### HCP 论文核心候选：保持 KV 分片并按阶段切换环上传输对象
+
+type: `hypothesis` · status: `ongoing` · confidence: 0.95 · importance: 1.0 · source: `analysis-2026-08-01`
+
+待用户审查的统一方案：HCP 将每层 KV 定义为按 global position 索引的逻辑关系 C_l[p]=(K_l,p,V_l,p)，每个 position×layer 恰好归属一个 worker。Prefill 以 capacity-weighted position/context shards P_i 写入本地 KV；每个 worker 保留本地 Q 与 activation，KV micro-block 沿 predecessor/successor ring 流动并以全局 position 因果掩码和 online softmax 合并，随后各 worker对本地 token chunk 完成 W_o、residual、norm、MLP。Decode 不移动历史 KV：单个 activation packet 携带 residual、normalized hidden、Q、O/LSE 与瞬时角色，访问所有本地 shard；唯一 assignee 按 capacity-weighted token×layer event schedule 投影并原地追加 current K/V，finisher 在 N-1 hop 后完成 W_o、residual、norm、MLP并成为下一层 starter，末层 finisher 完成 final norm、LM head、sampling、embedding。Prefill shard 与 decode layer-striped growth 的物理归属可以不同；每层 position union 完备互斥且保留显式 position 即可，无需 KV reshuffle。Continuation prefill把新 positions 再按 context shard append，同一 positioned online-softmax 可读取 prefill+decode mixed history。Prefill 集群网络量每层约为 (N-1)×S×KVBytesPerToken，decode 每层为 (N-1)×PacketBytes 且与历史长度无关；每 worker 只有两个 peer。模型权重仍复制，capacity guarantee 仅针对 KV。vLLM context-passing 是无法直接暴露 partial-attention 时的后端适配，不作为主算法。真实 runtime 的 prefill tail→decode starter 直接交接、开放式 horizon、多请求与跨机 self-driving decode 仍是边界。
+
+_updated: 2026-08-01 13:03:36_
+### 整理 HCP 论文的完整核心推理框架
+
+type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-01`
+
+从整个请求生命周期整理 HCP 核心方案：非均等 Ring Attention prefill、自驱动 decode ring、两种 KVCache 切分规则的兼容、capacity-weighted 显存合同、线性 P2P 数据流与阶段转换不变量。先形成可审查的方案决策和论文骨架，再写正文。
+
+_updated: 2026-08-01 12:40:06_
+### 论文核心必须覆盖 HCP 端到端推理框架而非仅 decode 实验
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-01`
+
+【动机六问】1.问题：若只从最近的自驱动 decode 实验写论文，会遗漏 HCP 原始贡献，即非均等 context-parallel prefill、异构 capacity weighting、P2P ring attention 与 decode 新增长分片如何共同服务同一 KVCache。2.现状：prefill 设计与真实异构证据分散在 DESIGN、RINGATTN_MODEL、INFERENCE_PIPELINE、历史报告和 Graph Memory；decode 数学与 positioned mixed-history 证据集中在近期 self_driving 实验，尚未统一成一套论文级端到端模型。3.目标：给出从输入 token 到 prefill、首 token、逐 token decode、continuation prefill 的完整数学和数据流；明确每阶段传输对象、KV 永久归属、显存/通信复杂度、阶段转换条件、已验证证据和未覆盖边界。4.他者：Ring Attention 用 KV block 环传与 online softmax 完成 context-parallel prefill；常规推理引擎用 paged/block KV 管理 decode 增长，pipeline/collective 体系通常依赖同构拓扑。5.本方案：保留 HCP prefill 的 capacity-weighted token/context shard；decode 将每个 token×layer 新 KV event 按容量权重分配到唯一节点，Q 与 online-softmax accumulator 随 activation packet 遍历所有本地历史；显式 global position 使两类物理布局成为同一逻辑 KV 序列；finisher 原地完成 W_o、residual、norm、MLP 与层间/跨 token continuation。6.为什么：它保持每节点只永久持有自己的 KV 份额、每 worker 仅有 predecessor/successor、单请求通信随 N 线性，同时避免要求 prefill 和 decode 使用相同物理分片坐标。VERDICT: IMPLEMENT ANALYSIS AND PAPER DESIGN FIRST；不把 test-only cache、runtime、多请求或硬件性能写成已完成贡献。
+
+_updated: 2026-08-01 12:40:06_
 ### 模块化证据已闭合自驱动 decode ring 实验核心
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `code-audit-2026-08-01`
