@@ -1,6 +1,7 @@
 //! Experimental single-layer self-driving decode ring.
 
 use crate::model::attention::HcpRingAttentionBackend;
+use crate::model::cache::KvCache;
 use crate::model::layers::DecoderLayer;
 use crate::model::model::LlamaModel;
 use crate::model::transport::SelfDrivingPacket;
@@ -115,11 +116,12 @@ impl FrozenKvAssigneeSchedule {
 
 /// Experimental finite-horizon KV shard with stable, position-indexed storage.
 #[derive(Debug)]
-pub(crate) struct ReservedPositionedKvShard {
+pub struct ReservedPositionedKvShard {
     k_storage: Tensor,
     v_storage: Tensor,
     positions: Vec<i64>,
     committed_len: usize,
+    pending_positions: Option<Vec<i64>>,
 }
 
 impl ReservedPositionedKvShard {
@@ -144,6 +146,7 @@ impl ReservedPositionedKvShard {
             v_storage: Tensor::zeros(shape, (kind, device)),
             positions: Vec::with_capacity(capacity),
             committed_len: 0,
+            pending_positions: None,
         }
     }
 
@@ -226,6 +229,62 @@ impl ReservedPositionedKvShard {
             self.k_storage.data_ptr() as usize,
             self.v_storage.data_ptr() as usize,
         )
+    }
+}
+
+impl KvCache for ReservedPositionedKvShard {
+    fn prepare_positions(&mut self, position_ids: &Tensor) -> Result<(), ModelError> {
+        let shape = position_ids.size();
+        if shape.len() != 2 || shape[0] != 1 {
+            return Err(ModelError::Backend(
+                "reserved positioned KV requires position_ids shaped [1, seq_len]".to_string(),
+            ));
+        }
+        self.pending_positions = Some(
+            (0..shape[1])
+                .map(|offset| position_ids.int64_value(&[0, offset]))
+                .collect(),
+        );
+        Ok(())
+    }
+
+    fn update(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<(Tensor, Tensor), ModelError> {
+        let positions = self.pending_positions.take().ok_or_else(|| {
+            ModelError::Backend(
+                "reserved positioned KV update requires prepared positions".to_string(),
+            )
+        })?;
+        self.append(new_k, new_v, &positions)
+            .map_err(ModelError::Backend)?;
+        Ok((self.active_k(), self.active_v()))
+    }
+
+    fn update_sharded(
+        &mut self,
+        new_k: &Tensor,
+        new_v: &Tensor,
+        keep: bool,
+    ) -> Result<(Tensor, Tensor), ModelError> {
+        if keep {
+            return self.update(new_k, new_v);
+        }
+        Err(ModelError::Backend(
+            "reserved positioned KV decode must use the self-driving ring".to_string(),
+        ))
+    }
+
+    fn seq_len(&self) -> usize {
+        self.committed_len
+    }
+
+    fn clear(&mut self) {
+        self.positions.clear();
+        self.committed_len = 0;
+        self.pending_positions = None;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.committed_len == 0
     }
 }
 
@@ -728,7 +787,7 @@ pub fn run_two_layer_ring_with_logits(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::cache::{ContiguousKvCache, KvCache};
+    use crate::model::cache::{ContiguousKvCache, KvCache, KvCacheImpl};
     use crate::model::layers::{GqaAttention, Mlp, RmsNorm, RotaryEmbedding};
     use crate::model::model::LlamaModel;
     use crate::model::transport::TcpKvTransport;
@@ -947,6 +1006,123 @@ mod tests {
         assert_eq!(slab.active_v().kind(), Kind::BFloat16);
         assert_eq!(slab.committed_len(), 2);
         assert_eq!(slab.positions(), &[6, 7]);
+    }
+
+    #[test]
+    fn llama_prefill_writes_reserved_positioned_cache() {
+        let device = Device::Cpu;
+        let mut config = test_config();
+        config.num_layers = 2;
+        let weights = deterministic_weights(&config, device);
+        let mut model = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+        let mut caches = (0..config.num_layers)
+            .map(|_| {
+                Some(KvCacheImpl::ReservedPositioned(
+                    ReservedPositionedKvShard::new_with_kind(&config, 4, device, model.dtype),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let input_ids = Tensor::from_slice(&[3_i64, 5]).unsqueeze(0);
+
+        let logits = model.forward(&input_ids, &mut caches).unwrap();
+
+        assert_eq!(logits.size(), [1, 2, config.vocab_size as i64]);
+        for cache in &caches {
+            let Some(KvCacheImpl::ReservedPositioned(shard)) = cache else {
+                panic!("expected reserved positioned cache");
+            };
+            assert_eq!(shard.committed_len(), 2);
+            assert_eq!(shard.positions(), &[0, 1]);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the local Qwen2-0.5B model weights"]
+    fn real_qwen_prefill_matches_reserved_positioned_cache() {
+        let device = Device::Cpu;
+        let model_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("models")
+            .join("Qwen2-0.5B");
+        let config = ModelConfig::from_file(model_dir.join("config.json")).unwrap();
+        assert_eq!(config.num_layers, 24);
+        assert_eq!(config.torch_dtype.as_deref(), Some("bfloat16"));
+
+        let weights = ModelWeights::from_dir(&model_dir, device).unwrap();
+        let mut reference = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+        let mut reserved = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+        assert_eq!(reserved.dtype, Kind::BFloat16);
+
+        let prompt = [151644_i64, 9707, 0, 16];
+        let input_ids = Tensor::from_slice(&prompt).unsqueeze(0);
+        let mut reference_caches = reference.create_kv_caches();
+        let mut reserved_caches = (0..config.num_layers)
+            .map(|_| {
+                Some(KvCacheImpl::ReservedPositioned(
+                    ReservedPositionedKvShard::new_with_kind(
+                        &config,
+                        prompt.len() + 2,
+                        device,
+                        reserved.dtype,
+                    ),
+                ))
+            })
+            .collect::<Vec<_>>();
+
+        let reference_logits = reference
+            .forward(&input_ids, &mut reference_caches)
+            .unwrap();
+        let reserved_logits = reserved.forward(&input_ids, &mut reserved_caches).unwrap();
+
+        let logits_diff = (&reference_logits - &reserved_logits)
+            .abs()
+            .max()
+            .double_value(&[]);
+        assert!(
+            logits_diff < 1e-3,
+            "real Qwen reserved prefill logits differ from contiguous reference: {logits_diff}"
+        );
+        assert_eq!(
+            reference_logits
+                .narrow(1, prompt.len() as i64 - 1, 1)
+                .argmax(-1, false)
+                .int64_value(&[0, 0]),
+            reserved_logits
+                .narrow(1, prompt.len() as i64 - 1, 1)
+                .argmax(-1, false)
+                .int64_value(&[0, 0])
+        );
+
+        for (layer_idx, (reference_cache, reserved_cache)) in
+            reference_caches.iter().zip(&reserved_caches).enumerate()
+        {
+            let (reference_k, reference_v) = reference_cache
+                .as_ref()
+                .and_then(KvCacheImpl::get_kv)
+                .unwrap();
+            let Some(KvCacheImpl::ReservedPositioned(shard)) = reserved_cache else {
+                panic!("layer {layer_idx} did not use reserved positioned cache");
+            };
+            let reserved_k = shard.active_k();
+            let reserved_v = shard.active_v();
+            assert_eq!(shard.reserved_capacity(), prompt.len() + 2);
+            assert_eq!(shard.committed_len(), prompt.len());
+            assert_eq!(shard.positions(), &[0, 1, 2, 3]);
+            assert_eq!(reserved_k.kind(), Kind::BFloat16);
+            assert_eq!(reserved_v.kind(), Kind::BFloat16);
+            assert_eq!(reference_k.size(), reserved_k.size());
+            assert_eq!(reference_v.size(), reserved_v.size());
+            assert_eq!(
+                (&reference_k - &reserved_k).abs().max().double_value(&[]),
+                0.0,
+                "layer {layer_idx} K cache differs"
+            );
+            assert_eq!(
+                (&reference_v - &reserved_v).abs().max().double_value(&[]),
+                0.0,
+                "layer {layer_idx} V cache differs"
+            );
+        }
     }
 
     fn reserved_positioned_layer_shards(

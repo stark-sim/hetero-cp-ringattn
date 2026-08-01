@@ -10,6 +10,11 @@ use tch::Tensor;
 #[cfg(feature = "tch-backend")]
 #[allow(dead_code)]
 pub trait KvCache: Send {
+    /// Provide the absolute positions associated with the next K/V update.
+    fn prepare_positions(&mut self, _position_ids: &Tensor) -> Result<(), ModelError> {
+        Ok(())
+    }
+
     /// Append new K/V tokens and return the full K/V tensors for attention compute.
     ///
     /// `new_k` / `new_v`: [batch, num_kv_heads, new_seq_len, head_dim]
@@ -259,6 +264,8 @@ impl KvCache for BlockTableKvCache {
 pub enum KvCacheImpl {
     Contiguous(ContiguousKvCache),
     BlockTable(BlockTableKvCache),
+    #[allow(dead_code)]
+    ReservedPositioned(crate::model::self_driving::ReservedPositionedKvShard),
 }
 
 #[cfg(feature = "tch-backend")]
@@ -285,16 +292,32 @@ impl KvCacheImpl {
                 );
                 Some((k, v))
             }
+            KvCacheImpl::ReservedPositioned(c) => {
+                if c.is_empty() {
+                    None
+                } else {
+                    Some((c.active_k(), c.active_v()))
+                }
+            }
         }
     }
 }
 
 #[cfg(feature = "tch-backend")]
 impl KvCache for KvCacheImpl {
+    fn prepare_positions(&mut self, position_ids: &Tensor) -> Result<(), ModelError> {
+        match self {
+            KvCacheImpl::Contiguous(c) => c.prepare_positions(position_ids),
+            KvCacheImpl::BlockTable(c) => c.prepare_positions(position_ids),
+            KvCacheImpl::ReservedPositioned(c) => c.prepare_positions(position_ids),
+        }
+    }
+
     fn update(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<(Tensor, Tensor), ModelError> {
         match self {
             KvCacheImpl::Contiguous(c) => c.update(new_k, new_v),
             KvCacheImpl::BlockTable(c) => c.update(new_k, new_v),
+            KvCacheImpl::ReservedPositioned(c) => c.update(new_k, new_v),
         }
     }
 
@@ -302,6 +325,7 @@ impl KvCache for KvCacheImpl {
         match self {
             KvCacheImpl::Contiguous(c) => c.update_sharded(new_k, new_v, keep),
             KvCacheImpl::BlockTable(c) => c.update_sharded(new_k, new_v, keep),
+            KvCacheImpl::ReservedPositioned(c) => c.update_sharded(new_k, new_v, keep),
         }
     }
 
@@ -309,6 +333,7 @@ impl KvCache for KvCacheImpl {
         match self {
             KvCacheImpl::Contiguous(c) => c.seq_len(),
             KvCacheImpl::BlockTable(c) => c.seq_len(),
+            KvCacheImpl::ReservedPositioned(c) => c.seq_len(),
         }
     }
 
@@ -316,6 +341,7 @@ impl KvCache for KvCacheImpl {
         match self {
             KvCacheImpl::Contiguous(c) => c.clear(),
             KvCacheImpl::BlockTable(c) => c.clear(),
+            KvCacheImpl::ReservedPositioned(c) => c.clear(),
         }
     }
 
@@ -323,6 +349,7 @@ impl KvCache for KvCacheImpl {
         match self {
             KvCacheImpl::Contiguous(c) => c.is_empty(),
             KvCacheImpl::BlockTable(c) => c.is_empty(),
+            KvCacheImpl::ReservedPositioned(c) => c.is_empty(),
         }
     }
 }

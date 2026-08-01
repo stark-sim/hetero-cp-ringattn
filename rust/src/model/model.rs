@@ -1,10 +1,12 @@
 use crate::model::{
     // LocalAttentionBackend removed: all paths now use HcpRingAttentionBackend
     // with fixed chunk-size上限 to avoid O(seq²) scores materialization.
-    cache::{create_kv_caches, KvCaches},
+    cache::{create_kv_caches, KvCache, KvCaches},
     config::ModelConfig,
     layers::{DecoderLayer, GqaAttention, Mlp, RmsNorm, RotaryEmbedding},
-    ModelError, ModelWeights, WeightNames,
+    ModelError,
+    ModelWeights,
+    WeightNames,
 };
 
 #[cfg(feature = "tch-backend")]
@@ -249,9 +251,16 @@ impl LlamaModel {
 
         // Layer stack
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-            let kv_cache: Option<&mut dyn crate::model::cache::KvCache> = kv_caches
+            let kv_cache_impl = kv_caches
                 .get_mut(layer_idx)
-                .and_then(|c| c.as_mut().map(|c| c as &mut dyn crate::model::cache::KvCache));
+                .and_then(Option::as_mut);
+            let kv_cache: Option<&mut dyn crate::model::cache::KvCache> = match kv_cache_impl {
+                Some(cache) => {
+                    cache.prepare_positions(&position_ids)?;
+                    Some(cache)
+                }
+                None => None,
+            };
             hidden_states = layer.forward(&hidden_states, &position_ids, kv_cache, attention_mask.as_ref())?;
         }
 
