@@ -2,13 +2,6 @@
 
 当前活跃的任务、决策、风险和假设。
 
-### 验证冻结 schedule 的完整 horizon reservation 合同
-
-type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-01`
-
-当前小节点：只修订 FrozenKvAssigneeSchedule 的测试合同。对多组 tickets、任意 N、多个 horizon 和每个 request phase，逐 prefix 消费 assignee event 时每域 observed 必须始终不超过 counts 提供的完整 horizon reservation，遍历完 horizon 后 observed 必须精确等于 counts。删除把单一 [1,3,2] 样例的前缀比例误差检查当作核心合同的测试段。保留 schedule 算法、request_id phase、唯一 assignee、零容量排除和现有 API。边界：纯 Rust 单元测试；不做 allocator、byte admission、runtime、网络、多请求执行或 GPU 显存声明。
-
-_updated: 2026-08-01 17:31:51_
 ### 将 schedule 显存保证限定为完整 horizon reservation
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-01`

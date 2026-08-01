@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### 冻结 schedule 的完整 horizon reservation 合同验证通过
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@d1124a8`
+
+实现 commit d1124a8，仅修改 self_driving.rs 的测试合同，FrozenKvAssigneeSchedule 算法与 API 未变。RED：将旧前缀误差小于等于 1 检查推广到 tickets=[1,1,1]、7 units 的全部 phase，定向测试在 phase=1、prefix=5、domain=0 以 scaled error=8 > total_units=7 失败，复现既有数学反例。GREEN：删除单一 [1,3,2] 样例中的 scaled prefix-error 断言，改为对 N=1/2/3/4、零容量节点、多组 tickets/horizon 和全部 phase 枚举每个 prefix；每域 consumed 始终小于等于完整 horizon counts reservation，遍历结束 consumed 精确等于 reservation，越过 horizon 返回 None。同 request 确定性、不同 request phase、capacity-weighted 完整 counts 和零容量排除仍保留。验证：聚焦 frozen_kv_assignee_schedule 3 passed/0 failed；self-driving 17 passed/0 failed；LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib cargo test --manifest-path rust/Cargo.toml --features tch-backend 为 97 passed/0 failed，doc tests 0 failed/3 ignored；同环境 cargo clippy exit 0，仅仓库既有 warning；rustfmt --edition 2021 --check rust/src/model/self_driving.rs 和 git diff --check 均 exit 0。结论边界：counts 是已知完整 horizon 的 event reservation 上界；不证明 byte admission、开放式生成、运行期扩容、多请求吞吐平滑、GPU 物理显存或 production allocator。
+
+_updated: 2026-08-01 18:14:03_
 ### Rust 24 层 positioned KV 精确预分配 slab 验证通过
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@f6da957`
