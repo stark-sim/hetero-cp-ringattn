@@ -2,6 +2,20 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 验证冻结 schedule 的完整 horizon reservation 合同
+
+type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-01`
+
+当前小节点：只修订 FrozenKvAssigneeSchedule 的测试合同。对多组 tickets、任意 N、多个 horizon 和每个 request phase，逐 prefix 消费 assignee event 时每域 observed 必须始终不超过 counts 提供的完整 horizon reservation，遍历完 horizon 后 observed 必须精确等于 counts。删除把单一 [1,3,2] 样例的前缀比例误差检查当作核心合同的测试段。保留 schedule 算法、request_id phase、唯一 assignee、零容量排除和现有 API。边界：纯 Rust 单元测试；不做 allocator、byte admission、runtime、网络、多请求执行或 GPU 显存声明。
+
+_updated: 2026-08-01 17:31:51_
+### 将 schedule 显存保证限定为完整 horizon reservation
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-01`
+
+【动机六问】1.问题：旧测试在一个 [1,3,2]、24 units、单 phase 样例上检查前缀比例误差小于等于 1，容易继续暗示该结论对任意 phase 成立；反例已证明这不是普遍定理。2.现状：largest remainder 产生完整 horizon 精确 counts，phase 只循环旋转同一 sequence；exact slab 已证明已知 horizon 可以按 layer×domain 精确预留并原地 append，但 schedule 测试尚未把 counts 明确验证为每域 reservation 上界。3.目标：对多组 tickets/horizon 和所有 phase，任意 prefix 的消费计数都不超过 counts，完整 horizon 后精确等于 counts；现有确定性、容量份额、唯一 assignee和零容量语义不变。4.他者：vLLM 等 serving engine 依赖 admission reservation、block quota 或预分配 arena 保证显存，调度顺序负责平滑吞吐而不是充当显存硬界。5.本方案：不改算法或 API，只用纯单元测试把 counts 解释并验证为完整 horizon reservation，删除旧样例中的 scaled prefix-error 断言。6.为什么：这是把已修订数学结论落实到代码合同的最小方案；无需发明 cyclic discrepancy 算法，也不引入生产 allocator。【牺牲四问】旧前缀检查的目的，是约束单请求短期 event 分布和平滑计算；本节点放弃把小于等于 1 当作普遍保证，但不删除 phase 轮转或 smooth sequence；短期平滑本质上服务并发负载均衡，而不是物理显存安全；本项目现阶段优先保证可证明的 capacity hard bound，多请求效果以后单独实验。VERDICT: IMPLEMENT EXPERIMENT ONLY。
+
+_updated: 2026-08-01 17:31:51_
 ### 用冻结计划精确 slab 验证无 Tensor::cat KV append
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-01`
