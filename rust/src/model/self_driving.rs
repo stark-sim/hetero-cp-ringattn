@@ -124,6 +124,15 @@ pub(crate) struct ReservedPositionedKvShard {
 
 impl ReservedPositionedKvShard {
     pub(crate) fn new(config: &ModelConfig, capacity: usize, device: Device) -> Self {
+        Self::new_with_kind(config, capacity, device, Kind::Float)
+    }
+
+    pub(crate) fn new_with_kind(
+        config: &ModelConfig,
+        capacity: usize,
+        device: Device,
+        kind: Kind,
+    ) -> Self {
         let shape = [
             1,
             config.num_kv_heads() as i64,
@@ -131,8 +140,8 @@ impl ReservedPositionedKvShard {
             config.head_dim() as i64,
         ];
         Self {
-            k_storage: Tensor::zeros(shape, (Kind::Float, device)),
-            v_storage: Tensor::zeros(shape, (Kind::Float, device)),
+            k_storage: Tensor::zeros(shape, (kind, device)),
+            v_storage: Tensor::zeros(shape, (kind, device)),
             positions: Vec::with_capacity(capacity),
             committed_len: 0,
         }
@@ -920,6 +929,24 @@ mod tests {
             &mut super::ReservedPositionedKvShard,
         ) -> Result<LayerStepOutcome, ModelError> =
             super::process_layer_packet_with_reserved_history;
+    }
+
+    #[test]
+    fn reserved_positioned_kv_accepts_explicit_runtime_dtype() {
+        let config = test_config();
+        let device = Device::Cpu;
+        let mut slab =
+            super::ReservedPositionedKvShard::new_with_kind(&config, 2, device, Kind::BFloat16);
+        let shape = [1, config.num_kv_heads() as i64, 2, config.head_dim() as i64];
+        let k = deterministic_tensor(&shape, 301.0, device).to_kind(Kind::BFloat16);
+        let v = deterministic_tensor(&shape, 302.0, device).to_kind(Kind::BFloat16);
+
+        slab.append(&k, &v, &[6, 7]).unwrap();
+
+        assert_eq!(slab.active_k().kind(), Kind::BFloat16);
+        assert_eq!(slab.active_v().kind(), Kind::BFloat16);
+        assert_eq!(slab.committed_len(), 2);
+        assert_eq!(slab.positions(), &[6, 7]);
     }
 
     fn reserved_positioned_layer_shards(
