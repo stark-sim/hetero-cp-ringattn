@@ -1243,7 +1243,7 @@ mod tests {
     }
 
     #[test]
-    fn frozen_kv_assignee_schedule_is_capacity_weighted_and_phase_stable() {
+    fn frozen_kv_assignee_schedule_is_capacity_weighted_and_request_stable() {
         let first = FrozenKvAssigneeSchedule::new(&[1, 3, 2], 41, 24).unwrap();
         assert_eq!(first.counts(), &[4, 12, 8]);
         assert_eq!(first.total_units(), 24);
@@ -1263,24 +1263,47 @@ mod tests {
         assert_ne!(first.phase(), other_request.phase());
         assert_eq!(first.counts(), other_request.counts());
 
-        let mut prefix_counts = [0_i128; 3];
-        for ordinal in 0..first.total_units() {
-            let assignee = first.sequence[(first.phase() + ordinal) % first.total_units()];
-            prefix_counts[assignee] += 1;
-            let prefix_units = (ordinal + 1) as i128;
-            for (domain, &target_count) in first.counts().iter().enumerate() {
-                let scaled_error = (prefix_counts[domain] * first.total_units() as i128
-                    - prefix_units * target_count as i128)
-                    .abs();
-                assert!(scaled_error <= first.total_units() as i128);
-            }
-        }
-
         assert!(FrozenKvAssigneeSchedule::new(&[], 41, 24).is_err());
         assert!(FrozenKvAssigneeSchedule::new(&[0, 0, 0], 41, 24).is_err());
         assert!(FrozenKvAssigneeSchedule::new(&[1, 3, 2], 41, 0).is_err());
         assert_eq!(first.assignee_for(0, 3, 3), None);
         assert_eq!(first.assignee_for(8, 0, 3), None);
+    }
+
+    #[test]
+    fn frozen_kv_assignee_schedule_full_horizon_reservation_bounds_every_phase_prefix() {
+        for (tickets, total_units) in [
+            (vec![7], 5_usize),
+            (vec![1, 1], 6),
+            (vec![1, 1, 1], 7),
+            (vec![1, 3, 2], 24),
+            (vec![1, 0, 3], 16),
+            (vec![2, 5, 1, 4], 19),
+        ] {
+            for request_id in 0..total_units as u64 {
+                let schedule =
+                    FrozenKvAssigneeSchedule::new(&tickets, request_id, total_units).unwrap();
+                let reservation = schedule.counts().to_vec();
+                let mut consumed = vec![0_usize; tickets.len()];
+
+                for ordinal in 0..total_units {
+                    let assignee = schedule.assignee_for(ordinal, 0, 1).unwrap();
+                    consumed[assignee] += 1;
+                    for domain in 0..tickets.len() {
+                        assert!(
+                            consumed[domain] <= reservation[domain],
+                            "tickets={tickets:?}, phase={request_id}, prefix={}, domain={domain}, consumed={}, reservation={}",
+                            ordinal + 1,
+                            consumed[domain],
+                            reservation[domain]
+                        );
+                    }
+                }
+
+                assert_eq!(consumed, reservation);
+                assert_eq!(schedule.assignee_for(total_units, 0, 1), None);
+            }
+        }
     }
 
     #[test]
