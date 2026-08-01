@@ -20,16 +20,23 @@ _updated: 2026-08-01 17:31:51_
 
 type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-01`
 
-从整个请求生命周期整理 HCP 核心方案：非均等 Ring Attention prefill、自驱动 decode ring、两种 KVCache 切分规则的兼容、capacity-weighted 显存合同、线性 P2P 数据流与阶段转换不变量。论文系统定位为面向 CXL-class 高带宽低时延 memory-semantic P2P fabric 的异构全生命周期 Context Parallelism；当前聚合 KV/context capacity，模型权重仍由每个 worker 完整持有。先形成可审查的方案决策和论文骨架，再写正文。
+从整个请求生命周期整理 HCP 核心方案：非均等 Ring Attention prefill、自驱动 decode ring、两种 KVCache 切分规则的兼容、capacity-weighted 显存合同、线性 P2P 数据流与阶段转换不变量。论文系统定位为互联无关的异构全生命周期 Context Parallelism：每个 worker 只需 predecessor/successor P2P，CXL、RDMA/RoCE、InfiniBand、UALink、PCIe peer access 或未来高速 fabric 均可承载；当前聚合 KV/context capacity，模型权重仍由每个 worker 完整持有。先形成可审查的方案决策和论文骨架，再写正文。
 
-_updated: 2026-08-01 14:42:10_
+_updated: 2026-08-01 16:51:10_
 ### HCP 系统定位：面向 CXL-class 互联的异构全生命周期 Context Parallelism
 
-type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-01`
+type: `decision` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-01`
 
 【动机六问】1.问题：论文需要把 Ring Attention 显存分担思想、异构 capacity weighting、线性 P2P ring 和未来硬件目标统一成一个准确的系统命题，避免只像 decode 优化，也避免把 HCP 误写成通用模型并行。2.现状：核心算法已经定义完整推理生命周期的异构 Context Parallelism，1M 实验与带宽矩阵分别证明异构 KV 容量聚合可行以及传统低带宽网络会成为瓶颈；但现有表述尚未明确目标互联与参数内存边界。3.目标：论文将 HCP 定位为基于 Ring Attention 的 context/KV 显存分担思想，在每 worker 仅连接 predecessor/successor 的线性 P2P ring 上，对 prefill、decode 和 continuation prefill 的同一逻辑 context 做 capacity-weighted 分片；系统愿景是借助 CXL-class、memory-semantic、高带宽低时延 P2P fabric，使低成本异构加速卡池能够承载单设备 KV 显存不足的超长上下文推理。4.他者：Ring Attention 主要以 sequence/context shard 和环传 KV 扩展长序列；主流并行推理常依赖同构高速互联与 collective；CXL/类内存语义互联提供设备内存共享或低开销访问的硬件方向，但并不自动给出异构 attention 的 placement、精确归并和全生命周期 KV 所有权。5.本方案：HCP 保持统一的 position-indexed KV context，prefill 环传 KV block，decode 环传 Q、online-softmax accumulator 与 activation，新 KV 由 capacity-weighted 唯一 assignee 原地保留；通信合同只要求邻居 P2P，不要求 collective 或全连接。6.为什么：它直接聚合异构设备最稀缺且随 context 增长的 KV 容量，同时使连接数与单请求流量随节点数线性；相比照搬同构 CP 或把 CXL 当透明共享内存，它保留设备本地计算和明确所有权，更符合不均等显存与算力。边界：当前每个 worker 仍复制完整模型权重，因此已支持的是超长上下文和 KV-heavy inference，不是参数量超过单节点权重容量的模型；CXL-class 是目标硬件类别与待验证条件，不是现有实验已经证明的充分条件。VERDICT: IMPLEMENT AS PAPER SYSTEM POSITIONING。
 
-_updated: 2026-08-01 14:42:10_
+_updated: 2026-08-01 16:51:10_
+### HCP 系统定位：互联无关的细粒度异构 Context Parallelism
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-correction-2026-08-02`
+
+【动机六问】1.问题：上一版把系统愿景集中在 CXL-class，容易让 HCP 看起来依赖一种特定硬件，也没有充分表达真正的系统缺口：现有分布式推理通常把同构设备作为同一请求内的细粒度协作单元，异构资源更多用于请求级、模型级或 prefill/decode 阶段级分配，难以把不同代际、不同品牌和不同容量的加速卡聚合到同一个 attention context。2.现状：HCP 已用 capacity-weighted shard、精确 online softmax 和线性 P2P ring 证明 CUDA、HIP 等异构 worker 可以共同处理同一逻辑 context；1M context 3:1 分片证明技术可行性，带宽矩阵证明传统低带宽网络是主要瓶颈。但尚未完成系统性相关工作检索，也没有 TCO、能耗或单位吞吐成本实验，因此不能绝对声称其他系统无法异构协作，也不能把低成本写成已证实事实。3.目标：论文将 HCP 定义为 transport-agnostic 的完整推理生命周期异构 Context Parallelism。算法只要求每个 worker 与 predecessor/successor 进行 P2P 传输；CXL、RDMA/RoCE、InfiniBand、UALink、PCIe peer access 或未来通用高速互联均可作为承载。论文区分已证明的单请求细粒度异构协作、已观察的带宽瓶颈，以及待验证的成本优势。4.他者：主流 TP、PP、CP 与 collective 通常围绕同构设备、对称分片和一致 kernel 能力优化；异构 serving 常通过请求路由、模型放置或 prefill/decode disaggregation 利用不同资源池。这些方式降低设备内核和负载不对称带来的复杂度，但通常不聚合同一 attention context 的不均等 KV 容量。该背景在进入论文 claim 前必须通过系统性文献与实现审计验证。5.本方案：以逐层 position-indexed KV context 为统一对象，prefill 按 capacity-weighted positions 永久分片并环传 KV，decode 保持历史 KV 原地且让 Q、O/LSE 与 activation packet 遍历所有 shard，新 KV 按 capacity-weighted layer×position event 唯一归属；continuation prefill继续追加同一逻辑 context。物理互联只需实现邻居 P2P 合同。6.为什么：HCP 的价值不来自押注某种网卡，而是把原本不能高效组成同一细粒度并行组的代际混合、品牌混合和容量不对称设备转化为一个 context-capacity pool。互联带宽和时延的持续提升会扩大这一方法的可用区间；长上下文使 KVCache 成为持续增长的主要显存压力，因此是当前最直接的应用目标。边界：模型权重仍由每个 worker完整持有；成本优势与未来超大模型适应性是待测系统潜力，不等于已完成参数分片或已证明 TCO。VERDICT: IMPLEMENT AS REVISED PAPER POSITIONING；DEFER ABSOLUTE PRIOR-ART AND LOW-COST CLAIMS UNTIL EVIDENCE。
+
+_updated: 2026-08-01 16:51:10_
 ### HCP 论文核心候选：保持 KV 分片并按阶段切换环上传输对象
 
 type: `hypothesis` · status: `superseded` · confidence: 0.95 · importance: 1.0 · source: `analysis-2026-08-01`
@@ -298,18 +305,25 @@ B. vLLM decode ≥2 并发+增长分片保持(修 004,PoC 最小要求);
 C. Rust decode 移植 Q+LSE 累积器环+增长分片(修 007+008)。
 
 _updated: 2026-07-27 15:10:25_
+### CXL-class P2P fabric 可使 HCP 的异构 KV 容量聚合获得系统经济性
+
+type: `hypothesis` · status: `superseded` · confidence: 0.75 · importance: 0.95 · source: `user-vision-and-network-evidence-2026-08-01`
+
+待验证假设：当 CXL-class 或同等级 memory-semantic 高带宽低时延 P2P fabric 将邻居通信成本压到足够低时，HCP 能把闲置或代际混合的异构加速卡组织成低连接度的 context-capacity pool，以较低硬件成本服务单设备 KV 显存无法容纳的超长上下文。现有带宽矩阵只证明低带宽传统网络是瓶颈并支持高速互联的必要性；它没有在真实 CXL-class 设备上测量延迟、带宽、memory ordering、peer access、拓扑规模或端到端成本，因此不能证明该硬件条件充分，也不能外推到模型权重本身无法装入单节点的场景。
+
+_updated: 2026-08-01 16:51:10_
+### 通用高速 P2P 互联可释放 HCP 的异构资源经济性
+
+type: `hypothesis` · status: `open` · confidence: 0.75 · importance: 0.95 · source: `user-vision-2026-08-02`
+
+待验证假设：只要一种互联能够为相邻 worker 提供足够高带宽、低时延且可用的 P2P tensor 传输，无论其具体是 CXL、RDMA/RoCE、InfiniBand、UALink、PCIe peer access 还是未来通用 fabric，HCP 都可能把闲置、代际混合或品牌混合的加速卡组织成 context-capacity pool。网络演进降低环上传输成本后，异构资源的采购价格、存量复用和容量互补可能转化为更低的长上下文服务成本。现有证据只确认技术可行性和传统网络瓶颈；要证明经济性，还需至少比较单位 token 吞吐、首 token/逐 token 延迟、能耗、互联成本、设备价格、利用率以及同等 KV 容量下的同构基线。
+
+_updated: 2026-08-01 16:51:10_
 ### 异构 CP 对网络速度敏感，CXL / 类 RDMA 互联可显著突破网线局限
 
 type: `hypothesis` · status: `superseded` · confidence: 0.85 · importance: 0.95 · source: `user-direction`
 
 HCP 跨节点推理性能对网络带宽极度敏感。\n\n证据（正常规模工作负载）：\n1. Qwen2.5-3B/1K 单节点 CUDA 0.14s，分布式 ~12s（~85× 慢）。\n2. Qwen2.5-3B/4K 单节点 CUDA 0.27s，分布式 ~40s（~148× 慢）。\n3. 分布式 3B 甚至慢于单节点 CPU（3B/1K 12s vs 7.8s；3B/4K 40s vs 29s）。\n4. 策略差异仅在 3B/1K 可见（ZigZag ~5%），4K 时被网络完全掩盖。\n5. 7B bf16 无法装入 pearl 16GB HIP，分布式 7B 在当前无量化路径下不可行。\n\n结论：对正常规模的 3B/7B 模型和 1K/4K seq，跨节点网络仍是首要瓶颈；CXL/类 RDMA 高速互联是 HCP 实用的必要前提。
-
-_updated: 2026-08-01 14:42:10_
-### CXL-class P2P fabric 可使 HCP 的异构 KV 容量聚合获得系统经济性
-
-type: `hypothesis` · status: `open` · confidence: 0.75 · importance: 0.95 · source: `user-vision-and-network-evidence-2026-08-01`
-
-待验证假设：当 CXL-class 或同等级 memory-semantic 高带宽低时延 P2P fabric 将邻居通信成本压到足够低时，HCP 能把闲置或代际混合的异构加速卡组织成低连接度的 context-capacity pool，以较低硬件成本服务单设备 KV 显存无法容纳的超长上下文。现有带宽矩阵只证明低带宽传统网络是瓶颈并支持高速互联的必要性；它没有在真实 CXL-class 设备上测量延迟、带宽、memory ordering、peer access、拓扑规模或端到端成本，因此不能证明该硬件条件充分，也不能外推到模型权重本身无法装入单节点的场景。
 
 _updated: 2026-08-01 14:42:10_
 ### 冻结 assignee schedule 的可靠保证是完整 horizon 精确份额，不是任意旋转前缀误差小于等于 1
@@ -431,6 +445,13 @@ type: `task` · status: `superseded` · confidence: 0.95 · importance: 0.95 · 
 1M v9（3:1 split）成功，prefill 24/24 + decode 5/5，exit=0。文档已同步：1M_CONTEXT_THUNDERBOLT_PLAN.md、SCALING_ARGUMENT.md、systemPatterns.md。当前无未完成的 1M 攻坚任务；下一步决定是否需要更大模型 / 更多 domain 验证。
 
 _updated: 2026-06-29 06:01:28_
+### 主流单请求细粒度分布式推理仍以同构并行组为主要设计点
+
+type: `assumption` · status: `open` · confidence: 0.65 · importance: 0.9 · source: `user-observation-requires-literature-audit-2026-08-02`
+
+待文献审计的背景假设：主流 tensor、pipeline、context parallel 和 collective 通常假设设备容量、kernel 能力及通信性能近似对称；异构 serving 更常见的利用方式是将不同请求、模型或 prefill/decode 阶段放到不同资源池，而不是让不同代际或不同品牌加速卡以不均等份额共同处理同一 attention context。论文不得写成异构 GPU 绝对不能合作；需要检索并区分框架支持、理论可运行、实际优化目标和公开验证范围。
+
+_updated: 2026-08-01 16:54:51_
 ### 层数与节点数模数共振可能形成 sampler 计算热点,但不破坏冻结 KV quota
 
 type: `risk` · status: `open` · confidence: 0.98 · importance: 0.9 · source: `docs/plans/2026-07-29-self-driving-ring-theory.md`
