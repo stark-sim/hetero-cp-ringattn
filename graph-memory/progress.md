@@ -2,6 +2,22 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-08-02] ReservedPositionedKvShard 提升为 experimental core API
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 0.98 · source: `hetero-cp-ringattn@91df8c4`
+
+实现提交 91df8c4 将 ReservedPositionedKvShard 与 process_layer_packet_with_reserved_history 从 cfg(test) 抽取到正常 tch-backend 编译路径，visibility 保持 crate 内部；新增 core API 测试证明 committed prefix、global positions、active K/V view 和 adapter 符号可用。保留 legacy process_layer_packet 的 Tensor::cat，不修改 KvCache trait、runtime、allocator、placement 或多请求路径。
+
+验证：
+1. LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib:/opt/homebrew/opt/libomp/lib HCP_ENABLE_TORCH=1 CARGO_NET_OFFLINE=true cargo test --manifest-path rust/Cargo.toml --features tch-backend reserved_positioned_kv_core_api_preserves_committed_prefix -- --nocapture -> 1 passed。
+2. 同环境 cargo test --manifest-path rust/Cargo.toml --features tch-backend model::self_driving::tests:: -- --nocapture -> 18 passed。
+3. 同环境 cargo test --manifest-path rust/Cargo.toml --features tch-backend -> 98 passed, 0 failed。
+4. 同环境 cargo clippy --manifest-path rust/Cargo.toml --features tch-backend --all-targets -> exit 0，只有既有 warnings。
+5. rustfmt --edition 2021 --check rust/src/model/self_driving.rs 与 git diff --check -- rust/src/model/self_driving.rs -> exit 0。
+
+边界：cargo fmt --manifest-path rust/Cargo.toml --all -- --check 仍因仓库大量既有未格式化文件失败，未做无关格式化。当前证据是本地 libtorch CPU correctness/compile 证据，不是 MPS/CUDA/HIP 性能或跨节点硬件证据。
+
+_updated: 2026-08-01 20:18:21_
 ### Rust 核心框架恢复审计定位 test-only positioned KV 边界
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `analysis-2026-08-02`
