@@ -2,6 +2,27 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### prefill 协议缺少逐层 finite-horizon KV reservation 合同
+
+type: `risk` · status: `open` · confidence: 1.0 · importance: 1.0 · source: `code-audit-2026-08-02`
+
+代码审计确认 WorkerCommand::Prefill 只携带 chunk、seq_offset、position_ids，TchWorkerBackend::do_prefill 固定创建可增长 contiguous cache。改用 reserved cache 后，worker 若只按 prompt chunk 长度预留会在首次 decode assignee append 时越界；若按 max_position_embeddings 猜测则破坏 capacity hard bound。由于 decode ownership 由 token×layer 决定，所需容量是每 worker 的逐层向量。该缺口不否定 ring 数学，但阻断 worker-local reserved prefill 进入后续 decode。
+
+_updated: 2026-08-01 21:02:43_
+### 为 worker-local prefill 建立逐层 KV reservation 合同
+
+type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `analysis-2026-08-02`
+
+在不改变 ring 数学和 placement 计算的前提下，为 Prefill/WorkerBackend 增加可选逐层 local KV capacities；TchWorkerBackend 在 forward 前校验向量长度与 prompt 下界，并创建 ReservedPositioned cache。先用 synthetic 24 层/不均 capacities 验证 request context 只持本 worker 的 reserved shards；coordinator 生成 capacity 向量是后续独立节点。
+
+_updated: 2026-08-01 21:02:43_
+### Prefill 由 coordinator 显式提供可选逐层 local KV capacities
+
+type: `decision` · status: `held` · confidence: 0.99 · importance: 1.0 · source: `analysis-2026-08-02`
+
+【动机六问】1.问题：worker-local reserved prefill 必须在 forward 前知道每层 finite-horizon 容量，否则无法同时保证后续 decode 可 append 与显存硬界。2.现状：协议只有 chunk/position；Tch backend 创建 contiguous cache，worker 无法区分 prompt ownership 与未来 decode ownership。3.目标：runtime 可把逐层 capacity 向量交给 backend；Tch 在任何 tensor 写入前校验 num_layers 和 capacity>=local prompt tokens，并创建对应 BF16/运行 dtype reserved shards；缺失向量时 legacy 行为不变。4.他者：vLLM 等 serving engine 在 prefill 前由 scheduler/admission 分配 block table，worker 消费明确物理配额而非根据模型上限猜测。5.本方案：WorkerCommand::Prefill 增加 optional layer_kv_capacities；WorkerBackend 新增带默认回退的 prefill_request_with_reservation；Tch override 使用 reserved caches，vLLM/旧实现无需改；本节点只消费显式计划，不计算计划。6.为什么：逐层向量与 token×layer ownership 精确同构，避免单标量过度预留；optional/default 保留现有实验路径并把 planner 与执行器分开。【边界】bincode schema 会要求 coordinator/worker 同版本；当前非生产实验服务不提供滚动升级兼容，version negotiation 风险已另有记录。VERDICT: IMPLEMENT。
+
+_updated: 2026-08-01 21:02:43_
 ### 通过 KvCacheImpl adapter 接入真实 prefill
 
 type: `decision` · status: `held` · confidence: 0.98 · importance: 1.0 · source: `hetero-cp-ringattn@d86ac47`
