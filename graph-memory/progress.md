@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### Rust 24 层 positioned KV 精确预分配 slab 验证通过
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@f6da957`
+
+实现 commit f6da957。固定实验 N=3、L=24、tickets=[1,3,2]，同一请求执行 prefill_1(6) -> decode_1(1) -> continuation prefill_2(6) -> decode_2(1)。分布式侧每个 layer×domain 按冻结四阶段计划一次性精确预留 K/V tensor，prefill 和 decode 均通过 write cursor + narrow().copy_() 原地 append，attention 只读取 committed prefix；所有 storage data_ptr 跨四阶段保持不变，每个 slab 最终 committed_len 等于 reservation，最终 domain KV slot 总数仍为 [56,168,112]=1:3:2。独立 slab 测试确认分段 append 内容正确，overflow 在写入前拒绝，cursor、positions、K/V 内容和 storage pointer 均不变。24 层四阶段 hidden/logits 继续与独立 dense GQA + persistent ContiguousKvCache 参考在 1e-3 内对齐，continuation prefill 仍只投影 6×24=144 个新位置。验证：LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib cargo test --manifest-path rust/Cargo.toml --features tch-backend，96 passed/0 failed，doc tests 0 failed/3 ignored；同环境 cargo clippy --manifest-path rust/Cargo.toml --features tch-backend exit 0，仅仓库既有 warning；rustfmt --edition 2021 --check rust/src/model/self_driving.rs、git diff --check 均 exit 0；reserved slab/prefill/decode 实现区间无 Tensor::cat。边界：test-only、in-process CPU correctness；未改生产 cache trait，不证明 allocator、admission、runtime、网络、多请求、GPU 物理显存或开放式生成 reservation。
+
+_updated: 2026-08-01 17:00:05_
 ### Rust 24 层 positioned KV 四阶段复用验证通过
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@5e95af1`

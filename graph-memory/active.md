@@ -2,13 +2,6 @@
 
 当前活跃的任务、决策、风险和假设。
 
-### Rust positioned KV 精确预分配 slab 实验
-
-type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `docs/plans/2026-08-01-positioned-kv-slab-experiment-design.md`
-
-当前小节点：只把已验证 24 层四阶段实验的分布式 KV append 从 Tensor::cat 改为冻结计划精确预留的 test-only slab。每个 layer×domain 容量由两次 [1,3,2] prefill 与两轮 decode assignee 推导；prefill/decode 均用 write cursor + narrow().copy_()；最终每个 slab 恰好写满，越界原子拒绝，四阶段继续对齐 dense GQA。边界：不改生产 cache trait，不声明 GPU 物理显存，不做 allocator/admission/runtime/network/multi-request。
-
-_updated: 2026-08-01 08:02:53_
 ### 用冻结计划精确 slab 验证无 Tensor::cat KV append
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-01`
