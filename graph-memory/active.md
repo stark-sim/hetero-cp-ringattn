@@ -2,13 +2,6 @@
 
 当前活跃的任务、决策、风险和假设。
 
-### 撰写 HCP 方法与数据流论文草稿
-
-type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-02`
-
-创建 docs/paper/HCP_METHOD_DRAFT.md，只整理当前稳定的研究内容：问题定义、系统模型与符号、prefill/decode/continuation 的统一 HCP 方法、正确性与复杂度、局限和 Evaluation Design。明确区分 Method claim、Proved invariant、Prototype evidence、Open empirical question。不写 Abstract、最终 Conclusion、Implementation Results、性能数字、旧 1M 实验或 vLLM 工程适配。
-
-_updated: 2026-08-01 19:37:46_
 ### 方法草稿只固化当前算法与证据边界
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `motivation-analysis-2026-08-02`

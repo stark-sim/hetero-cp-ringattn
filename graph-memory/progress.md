@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### HCP 方法与数据流论文草稿完成并通过边界审计
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@4179a50`
+
+提交 4179a50 新增 docs/paper/HCP_METHOD_DRAFT.md。草稿覆盖问题定义、系统模型、capacity-weighted ownership、完整 prefill/decode/continuation 数据流、online-softmax、N-1 hops、positioned mixed-history、正确性与复杂度、限制和 Evaluation Design；用 Method claim、Proved invariant、Prototype evidence、Open empirical question 区分论断层级。验证：git diff --cached --check exit 0；必需章节检查 exit 0；Markdown fences=6、math_open=27、math_close=27；旧 1M/旧后端工程适配/硬件结果禁用词审计 exit 0；SQLite integrity_check=ok 且 foreign_key_check 无输出。暂存检查曾发现新文件 EOF 多余空白行；根因是普通 git diff --check 不包含未跟踪文件，删除空行并重新暂存后 cached check 通过。该一次性事件不升级为新规则，后续新文件提交继续以 staged diff check 作为提交门。
+
+_updated: 2026-08-01 19:46:50_
 ### 两-token localhost TCP ring 已使用 exact reserved KV slab
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@50465da`
