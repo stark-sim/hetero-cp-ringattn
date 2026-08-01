@@ -23,6 +23,20 @@ type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · sour
 实现 commit f6da957。固定实验 N=3、L=24、tickets=[1,3,2]，同一请求执行 prefill_1(6) -> decode_1(1) -> continuation prefill_2(6) -> decode_2(1)。分布式侧每个 layer×domain 按冻结四阶段计划一次性精确预留 K/V tensor，prefill 和 decode 均通过 write cursor + narrow().copy_() 原地 append，attention 只读取 committed prefix；所有 storage data_ptr 跨四阶段保持不变，每个 slab 最终 committed_len 等于 reservation，最终 domain KV slot 总数仍为 [56,168,112]=1:3:2。独立 slab 测试确认分段 append 内容正确，overflow 在写入前拒绝，cursor、positions、K/V 内容和 storage pointer 均不变。24 层四阶段 hidden/logits 继续与独立 dense GQA + persistent ContiguousKvCache 参考在 1e-3 内对齐，continuation prefill 仍只投影 6×24=144 个新位置。验证：LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib cargo test --manifest-path rust/Cargo.toml --features tch-backend，96 passed/0 failed，doc tests 0 failed/3 ignored；同环境 cargo clippy --manifest-path rust/Cargo.toml --features tch-backend exit 0，仅仓库既有 warning；rustfmt --edition 2021 --check rust/src/model/self_driving.rs、git diff --check 均 exit 0；reserved slab/prefill/decode 实现区间无 Tensor::cat。边界：test-only、in-process CPU correctness；未改生产 cache trait，不证明 allocator、admission、runtime、网络、多请求、GPU 物理显存或开放式生成 reservation。
 
 _updated: 2026-08-01 17:00:05_
+### 修订 CXL 系统论断：区分已证实的带宽瓶颈与待验证的硬件充分性
+
+type: `revision` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `evidence-boundary-review-2026-08-01`
+
+旧假设 hyp-net-speed 将网络敏感性与 CXL/类 RDMA 的潜在收益写在同一结论中。现根据论文系统定位拆分：belief-net-speed-bottleneck-20260629 继续承载已由带宽矩阵支持的事实性结论；hypothesis-hcp-cxl-class-economic-enabler-20260801 单独承载未来互联可带来系统经济性的待验证假设。CXL 不等同普通网卡，论文采用 CXL-class 或 memory-semantic high-bandwidth low-latency P2P fabric 的硬件类别表述，并明确尚无真实 CXL-class 实机证据。
+
+_updated: 2026-08-01 14:42:10_
+### 修订论文核心：HCP 是覆盖完整推理生命周期的异构上下文并行
+
+type: `revision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-correction-2026-08-01`
+
+用户纠正旧候选把 phase-adaptive ring 误当成最高层贡献。经 blueprint、SCALING_ARGUMENT 与现有 prefill/decode 证据核对，HCP 的中心对象始终是逻辑 attention context，其主要物理载体为逐层 KVCache。Prefill 的 position/context shard 与 decode 的 layer×position shard 都是在异构集群上分割同一个 context；环上传输 KV 或 Q/O/LSE 只是不同阶段实现该 CP 的数据流选择。核心算法不包含 vLLM、context-passing connector 或其他工程适配。
+
+_updated: 2026-08-01 13:31:11_
 ### 自驱动 decode ring 模块化核心闭环审查通过
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@96ec868`

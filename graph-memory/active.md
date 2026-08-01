@@ -16,20 +16,34 @@ type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · sour
 【动机六问】1.问题：旧测试在一个 [1,3,2]、24 units、单 phase 样例上检查前缀比例误差小于等于 1，容易继续暗示该结论对任意 phase 成立；反例已证明这不是普遍定理。2.现状：largest remainder 产生完整 horizon 精确 counts，phase 只循环旋转同一 sequence；exact slab 已证明已知 horizon 可以按 layer×domain 精确预留并原地 append，但 schedule 测试尚未把 counts 明确验证为每域 reservation 上界。3.目标：对多组 tickets/horizon 和所有 phase，任意 prefix 的消费计数都不超过 counts，完整 horizon 后精确等于 counts；现有确定性、容量份额、唯一 assignee和零容量语义不变。4.他者：vLLM 等 serving engine 依赖 admission reservation、block quota 或预分配 arena 保证显存，调度顺序负责平滑吞吐而不是充当显存硬界。5.本方案：不改算法或 API，只用纯单元测试把 counts 解释并验证为完整 horizon reservation，删除旧样例中的 scaled prefix-error 断言。6.为什么：这是把已修订数学结论落实到代码合同的最小方案；无需发明 cyclic discrepancy 算法，也不引入生产 allocator。【牺牲四问】旧前缀检查的目的，是约束单请求短期 event 分布和平滑计算；本节点放弃把小于等于 1 当作普遍保证，但不删除 phase 轮转或 smooth sequence；短期平滑本质上服务并发负载均衡，而不是物理显存安全；本项目现阶段优先保证可证明的 capacity hard bound，多请求效果以后单独实验。VERDICT: IMPLEMENT EXPERIMENT ONLY。
 
 _updated: 2026-08-01 17:31:51_
-### HCP 论文核心候选：保持 KV 分片并按阶段切换环上传输对象
-
-type: `hypothesis` · status: `ongoing` · confidence: 0.95 · importance: 1.0 · source: `analysis-2026-08-01`
-
-待用户审查的统一方案：HCP 将每层 KV 定义为按 global position 索引的逻辑关系 C_l[p]=(K_l,p,V_l,p)，每个 position×layer 恰好归属一个 worker。Prefill 以 capacity-weighted position/context shards P_i 写入本地 KV；每个 worker 保留本地 Q 与 activation，KV micro-block 沿 predecessor/successor ring 流动并以全局 position 因果掩码和 online softmax 合并，随后各 worker对本地 token chunk 完成 W_o、residual、norm、MLP。Decode 不移动历史 KV：单个 activation packet 携带 residual、normalized hidden、Q、O/LSE 与瞬时角色，访问所有本地 shard；唯一 assignee 按 capacity-weighted token×layer event schedule 投影并原地追加 current K/V，finisher 在 N-1 hop 后完成 W_o、residual、norm、MLP并成为下一层 starter，末层 finisher 完成 final norm、LM head、sampling、embedding。Prefill shard 与 decode layer-striped growth 的物理归属可以不同；每层 position union 完备互斥且保留显式 position 即可，无需 KV reshuffle。Continuation prefill把新 positions 再按 context shard append，同一 positioned online-softmax 可读取 prefill+decode mixed history。Prefill 集群网络量每层约为 (N-1)×S×KVBytesPerToken，decode 每层为 (N-1)×PacketBytes 且与历史长度无关；每 worker 只有两个 peer。模型权重仍复制，capacity guarantee 仅针对 KV。vLLM context-passing 是无法直接暴露 partial-attention 时的后端适配，不作为主算法。真实 runtime 的 prefill tail→decode starter 直接交接、开放式 horizon、多请求与跨机 self-driving decode 仍是边界。
-
-_updated: 2026-08-01 13:03:36_
 ### 整理 HCP 论文的完整核心推理框架
 
 type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-01`
 
-从整个请求生命周期整理 HCP 核心方案：非均等 Ring Attention prefill、自驱动 decode ring、两种 KVCache 切分规则的兼容、capacity-weighted 显存合同、线性 P2P 数据流与阶段转换不变量。先形成可审查的方案决策和论文骨架，再写正文。
+从整个请求生命周期整理 HCP 核心方案：非均等 Ring Attention prefill、自驱动 decode ring、两种 KVCache 切分规则的兼容、capacity-weighted 显存合同、线性 P2P 数据流与阶段转换不变量。论文系统定位为面向 CXL-class 高带宽低时延 memory-semantic P2P fabric 的异构全生命周期 Context Parallelism；当前聚合 KV/context capacity，模型权重仍由每个 worker 完整持有。先形成可审查的方案决策和论文骨架，再写正文。
 
-_updated: 2026-08-01 12:40:06_
+_updated: 2026-08-01 14:42:10_
+### HCP 系统定位：面向 CXL-class 互联的异构全生命周期 Context Parallelism
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-01`
+
+【动机六问】1.问题：论文需要把 Ring Attention 显存分担思想、异构 capacity weighting、线性 P2P ring 和未来硬件目标统一成一个准确的系统命题，避免只像 decode 优化，也避免把 HCP 误写成通用模型并行。2.现状：核心算法已经定义完整推理生命周期的异构 Context Parallelism，1M 实验与带宽矩阵分别证明异构 KV 容量聚合可行以及传统低带宽网络会成为瓶颈；但现有表述尚未明确目标互联与参数内存边界。3.目标：论文将 HCP 定位为基于 Ring Attention 的 context/KV 显存分担思想，在每 worker 仅连接 predecessor/successor 的线性 P2P ring 上，对 prefill、decode 和 continuation prefill 的同一逻辑 context 做 capacity-weighted 分片；系统愿景是借助 CXL-class、memory-semantic、高带宽低时延 P2P fabric，使低成本异构加速卡池能够承载单设备 KV 显存不足的超长上下文推理。4.他者：Ring Attention 主要以 sequence/context shard 和环传 KV 扩展长序列；主流并行推理常依赖同构高速互联与 collective；CXL/类内存语义互联提供设备内存共享或低开销访问的硬件方向，但并不自动给出异构 attention 的 placement、精确归并和全生命周期 KV 所有权。5.本方案：HCP 保持统一的 position-indexed KV context，prefill 环传 KV block，decode 环传 Q、online-softmax accumulator 与 activation，新 KV 由 capacity-weighted 唯一 assignee 原地保留；通信合同只要求邻居 P2P，不要求 collective 或全连接。6.为什么：它直接聚合异构设备最稀缺且随 context 增长的 KV 容量，同时使连接数与单请求流量随节点数线性；相比照搬同构 CP 或把 CXL 当透明共享内存，它保留设备本地计算和明确所有权，更符合不均等显存与算力。边界：当前每个 worker 仍复制完整模型权重，因此已支持的是超长上下文和 KV-heavy inference，不是参数量超过单节点权重容量的模型；CXL-class 是目标硬件类别与待验证条件，不是现有实验已经证明的充分条件。VERDICT: IMPLEMENT AS PAPER SYSTEM POSITIONING。
+
+_updated: 2026-08-01 14:42:10_
+### HCP 论文核心候选：保持 KV 分片并按阶段切换环上传输对象
+
+type: `hypothesis` · status: `superseded` · confidence: 0.95 · importance: 1.0 · source: `analysis-2026-08-01`
+
+待用户审查的统一方案：HCP 将每层 KV 定义为按 global position 索引的逻辑关系 C_l[p]=(K_l,p,V_l,p)，每个 position×layer 恰好归属一个 worker。Prefill 以 capacity-weighted position/context shards P_i 写入本地 KV；每个 worker 保留本地 Q 与 activation，KV micro-block 沿 predecessor/successor ring 流动并以全局 position 因果掩码和 online softmax 合并，随后各 worker对本地 token chunk 完成 W_o、residual、norm、MLP。Decode 不移动历史 KV：单个 activation packet 携带 residual、normalized hidden、Q、O/LSE 与瞬时角色，访问所有本地 shard；唯一 assignee 按 capacity-weighted token×layer event schedule 投影并原地追加 current K/V，finisher 在 N-1 hop 后完成 W_o、residual、norm、MLP并成为下一层 starter，末层 finisher 完成 final norm、LM head、sampling、embedding。Prefill shard 与 decode layer-striped growth 的物理归属可以不同；每层 position union 完备互斥且保留显式 position 即可，无需 KV reshuffle。Continuation prefill把新 positions 再按 context shard append，同一 positioned online-softmax 可读取 prefill+decode mixed history。Prefill 集群网络量每层约为 (N-1)×S×KVBytesPerToken，decode 每层为 (N-1)×PacketBytes 且与历史长度无关；每 worker 只有两个 peer。模型权重仍复制，capacity guarantee 仅针对 KV。vLLM context-passing 是无法直接暴露 partial-attention 时的后端适配，不作为主算法。真实 runtime 的 prefill tail→decode starter 直接交接、开放式 horizon、多请求与跨机 self-driving decode 仍是边界。
+
+_updated: 2026-08-01 13:31:11_
+### HCP 论文主方法：完整推理生命周期的异构 Context Parallelism
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-01`
+
+HCP 将 Context Parallelism 从狭义的 prefill sequence partition 推广到完整推理生命周期：对每层逻辑 context C_l[p]=(K_l,p,V_l,p)，异构 worker 按 capacity-weighted policy 互斥且完备地持有 layer×position shards。Prefill 时，当前 token 序列可切分，各节点计算本地 activation/Q/K/V、永久保存本地 KV，并通过 P2P Ring Attention 聚合其他 context shard；decode 时当前 query 长度为 1，无法再沿 sequence 切 Q，但历史 context/KV 仍保持分片，单个 query、online-softmax accumulator 与 activation packet 访问全部本地 shard，新 KV 按 capacity-weighted token×layer event 分配并原地追加。两阶段都是 HCP：被并行化的本质对象是同一个逻辑 attention context，而不是某一种固定通信张量。Prefill 传 KV block、decode 传 Q/O/LSE/activation 是阶段特定的数据流机制；position-indexed cache 使两种物理布局无需重排即可组合。论文核心算法排除 vLLM、context-passing connector、runtime negotiation、allocator 和其他工程适配；这些只能进入实现或未来工作，不能定义主方法。
+
+_updated: 2026-08-01 13:31:11_
 ### 论文核心必须覆盖 HCP 端到端推理框架而非仅 decode 实验
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-01`
@@ -284,6 +298,20 @@ B. vLLM decode ≥2 并发+增长分片保持(修 004,PoC 最小要求);
 C. Rust decode 移植 Q+LSE 累积器环+增长分片(修 007+008)。
 
 _updated: 2026-07-27 15:10:25_
+### 异构 CP 对网络速度敏感，CXL / 类 RDMA 互联可显著突破网线局限
+
+type: `hypothesis` · status: `superseded` · confidence: 0.85 · importance: 0.95 · source: `user-direction`
+
+HCP 跨节点推理性能对网络带宽极度敏感。\n\n证据（正常规模工作负载）：\n1. Qwen2.5-3B/1K 单节点 CUDA 0.14s，分布式 ~12s（~85× 慢）。\n2. Qwen2.5-3B/4K 单节点 CUDA 0.27s，分布式 ~40s（~148× 慢）。\n3. 分布式 3B 甚至慢于单节点 CPU（3B/1K 12s vs 7.8s；3B/4K 40s vs 29s）。\n4. 策略差异仅在 3B/1K 可见（ZigZag ~5%），4K 时被网络完全掩盖。\n5. 7B bf16 无法装入 pearl 16GB HIP，分布式 7B 在当前无量化路径下不可行。\n\n结论：对正常规模的 3B/7B 模型和 1K/4K seq，跨节点网络仍是首要瓶颈；CXL/类 RDMA 高速互联是 HCP 实用的必要前提。
+
+_updated: 2026-08-01 14:42:10_
+### CXL-class P2P fabric 可使 HCP 的异构 KV 容量聚合获得系统经济性
+
+type: `hypothesis` · status: `open` · confidence: 0.75 · importance: 0.95 · source: `user-vision-and-network-evidence-2026-08-01`
+
+待验证假设：当 CXL-class 或同等级 memory-semantic 高带宽低时延 P2P fabric 将邻居通信成本压到足够低时，HCP 能把闲置或代际混合的异构加速卡组织成低连接度的 context-capacity pool，以较低硬件成本服务单设备 KV 显存无法容纳的超长上下文。现有带宽矩阵只证明低带宽传统网络是瓶颈并支持高速互联的必要性；它没有在真实 CXL-class 设备上测量延迟、带宽、memory ordering、peer access、拓扑规模或端到端成本，因此不能证明该硬件条件充分，也不能外推到模型权重本身无法装入单节点的场景。
+
+_updated: 2026-08-01 14:42:10_
 ### 冻结 assignee schedule 的可靠保证是完整 horizon 精确份额，不是任意旋转前缀误差小于等于 1
 
 type: `belief` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `code-audit-2026-08-01`
@@ -389,13 +417,6 @@ type: `task` · status: `ongoing` · confidence: 0.8 · importance: 0.95 · sour
 当前核心方向：以 Ring Attention 为策略基础，推进与 vLLM 的 Block KV cache 集成。\n\n已完成/持有：\n1. hyp-net-speed：white-pearl 带宽矩阵与稳定性复测证明网络是首要瓶颈。\n2. claim-ring-derivatives：在 HCP 上实现并对比 Vanilla/Striped/ZigZag；Ring Flash 挂起。\n3. decision-ring-attn-chosen：用户确认以 Ring Attention 为模型策略继续推进。\n\n下一步开放工程线：\n- hyp-block-kv-vllm：Block KV cache + vLLM 集成。
 
 _updated: 2026-06-30 09:00:34_
-### 异构 CP 对网络速度敏感，CXL / 类 RDMA 互联可显著突破网线局限
-
-type: `hypothesis` · status: `held` · confidence: 0.85 · importance: 0.95 · source: `user-direction`
-
-HCP 跨节点推理性能对网络带宽极度敏感。\n\n证据（正常规模工作负载）：\n1. Qwen2.5-3B/1K 单节点 CUDA 0.14s，分布式 ~12s（~85× 慢）。\n2. Qwen2.5-3B/4K 单节点 CUDA 0.27s，分布式 ~40s（~148× 慢）。\n3. 分布式 3B 甚至慢于单节点 CPU（3B/1K 12s vs 7.8s；3B/4K 40s vs 29s）。\n4. 策略差异仅在 3B/1K 可见（ZigZag ~5%），4K 时被网络完全掩盖。\n5. 7B bf16 无法装入 pearl 16GB HIP，分布式 7B 在当前无量化路径下不可行。\n\n结论：对正常规模的 3B/7B 模型和 1K/4K seq，跨节点网络仍是首要瓶颈；CXL/类 RDMA 高速互联是 HCP 实用的必要前提。
-
-_updated: 2026-06-30 06:27:31_
 ### HCP P2P KV ring 在 ≤1 Gbps 跨节点以太网下会成为端到端瓶颈
 
 type: `belief` · status: `held` · confidence: 0.85 · importance: 0.95 · source: `ev-net-speed-matrix-20260629`
