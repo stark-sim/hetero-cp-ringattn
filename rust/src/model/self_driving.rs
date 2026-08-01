@@ -752,6 +752,291 @@ mod tests {
             .unwrap()
     }
 
+    #[derive(Debug)]
+    struct PositionedKvShard {
+        k: Tensor,
+        v: Tensor,
+        positions: Vec<i64>,
+    }
+
+    impl PositionedKvShard {
+        fn empty(config: &ModelConfig, device: Device) -> Self {
+            let shape = [1, config.num_kv_heads() as i64, 0, config.head_dim() as i64];
+            Self {
+                k: Tensor::zeros(shape, (Kind::Float, device)),
+                v: Tensor::zeros(shape, (Kind::Float, device)),
+                positions: Vec::new(),
+            }
+        }
+
+        fn append(&mut self, k: &Tensor, v: &Tensor, positions: &[i64]) {
+            assert_eq!(k.size(), v.size());
+            assert_eq!(k.size()[2] as usize, positions.len());
+            self.k = Tensor::cat(&[&self.k, k], 2);
+            self.v = Tensor::cat(&[&self.v, v], 2);
+            self.positions.extend_from_slice(positions);
+        }
+
+        fn position_tensor(&self) -> Tensor {
+            Tensor::from_slice(&self.positions).to_kind(Kind::Int64)
+        }
+    }
+
+    fn empty_positioned_layer_shards(
+        config: &ModelConfig,
+        domains: usize,
+        device: Device,
+    ) -> Vec<Vec<PositionedKvShard>> {
+        (0..config.num_layers)
+            .map(|_| {
+                (0..domains)
+                    .map(|_| PositionedKvShard::empty(config, device))
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn local_reference_model(
+        config: &ModelConfig,
+        weights: &ModelWeights,
+        device: Device,
+    ) -> LlamaModel {
+        let mut model = LlamaModel::from_weights(config.clone(), weights, device, 1).unwrap();
+        let rope = RotaryEmbedding::new(
+            config.head_dim(),
+            config.max_position_embeddings.unwrap(),
+            config.rope_theta,
+            device,
+        );
+        for (layer_idx, layer) in model.layers.iter_mut().enumerate() {
+            layer.attention = Box::new(crate::model::attention::backend::LocalAttentionBackend {
+                attention: GqaAttention::from_weights(weights, layer_idx, config, &rope).unwrap(),
+            });
+        }
+        model
+    }
+
+    fn run_contiguous_reference_block(
+        model: &mut LlamaModel,
+        hidden_states: &Tensor,
+        position_ids: &Tensor,
+        caches: &mut [ContiguousKvCache],
+    ) -> (Tensor, Tensor) {
+        let query_len = hidden_states.size()[1];
+        assert_eq!(position_ids.size(), vec![1, query_len]);
+        assert_eq!(caches.len(), model.layers.len());
+        let mut current_hidden = hidden_states.shallow_clone();
+
+        for (layer_idx, cache) in caches.iter_mut().enumerate() {
+            let history_len = cache.seq_len() as i64;
+            let key_len = history_len + query_len;
+            let query_positions =
+                Tensor::arange(query_len, (Kind::Int64, hidden_states.device())) + history_len;
+            let key_positions = Tensor::arange(key_len, (Kind::Int64, hidden_states.device()));
+            let causal = query_positions
+                .unsqueeze(1)
+                .ge_tensor(&key_positions.unsqueeze(0));
+            let mask = Tensor::zeros([query_len, key_len], (Kind::Float, hidden_states.device()))
+                .masked_fill(&causal.logical_not(), f64::NEG_INFINITY)
+                .unsqueeze(0)
+                .unsqueeze(0);
+            current_hidden = model.layers[layer_idx]
+                .forward(&current_hidden, position_ids, Some(cache), Some(&mask))
+                .unwrap();
+        }
+
+        let logits = project_final_logits(model, &current_hidden);
+        (current_hidden, logits)
+    }
+
+    fn run_positioned_prefill_block(
+        model: &mut LlamaModel,
+        hidden_states: &Tensor,
+        position_ids: &Tensor,
+        layer_shards: &mut [Vec<PositionedKvShard>],
+        token_splits: &[usize],
+    ) -> (Tensor, Tensor, usize) {
+        let seq_len = hidden_states.size()[1] as usize;
+        assert_eq!(position_ids.size(), vec![1, seq_len as i64]);
+        assert_eq!(layer_shards.len(), model.layers.len());
+        assert_eq!(token_splits.iter().sum::<usize>(), seq_len);
+        assert!(layer_shards
+            .iter()
+            .all(|shards| shards.len() == token_splits.len()));
+
+        let new_positions = (0..seq_len)
+            .map(|offset| position_ids.int64_value(&[0, offset as i64]))
+            .collect::<Vec<_>>();
+        let mut current_hidden = hidden_states.shallow_clone();
+        let mut projected_positions = 0_usize;
+
+        for (layer_idx, shards) in layer_shards.iter_mut().enumerate() {
+            let residual = current_hidden.shallow_clone();
+            let normalized = model.layers[layer_idx]
+                .input_layernorm
+                .forward(&current_hidden);
+            let projected_attention = {
+                let ring = ring_backend(&mut model.layers[layer_idx]).unwrap();
+                let (q, current_k, current_v) = ring
+                    .project_positioned_qkv(&normalized, position_ids)
+                    .unwrap();
+                projected_positions += seq_len;
+
+                let mut offset = 0_i64;
+                for (domain, &count) in token_splits.iter().enumerate() {
+                    let count = count as i64;
+                    shards[domain].append(
+                        &current_k.narrow(2, offset, count),
+                        &current_v.narrow(2, offset, count),
+                        &new_positions[offset as usize..(offset + count) as usize],
+                    );
+                    offset += count;
+                }
+
+                let mut partial = None;
+                for shard in shards.iter() {
+                    let k_positions = shard.position_tensor();
+                    partial = Some(match partial {
+                        None => ring.positioned_local_compact_partial(
+                            &q,
+                            position_ids,
+                            &shard.k,
+                            &shard.v,
+                            &k_positions,
+                        ),
+                        Some((output, lse)) => ring.positioned_merge_compact_partial(
+                            &q,
+                            position_ids,
+                            &output,
+                            &lse,
+                            &shard.k,
+                            &shard.v,
+                            &k_positions,
+                        ),
+                    });
+                }
+                let (attention_output, _) = partial.expect("prefill requires at least one domain");
+                ring.project_decode_output(&attention_output)
+            };
+
+            let post_attention = projected_attention + residual;
+            let mlp_output = model.layers[layer_idx].mlp.forward(
+                &model.layers[layer_idx]
+                    .post_attention_layernorm
+                    .forward(&post_attention),
+            );
+            current_hidden = post_attention + mlp_output;
+        }
+
+        let logits = project_final_logits(model, &current_hidden);
+        (current_hidden, logits, projected_positions)
+    }
+
+    fn run_positioned_decode(
+        model: &mut LlamaModel,
+        hidden_states: &Tensor,
+        position: i64,
+        layer_shards: &mut [Vec<PositionedKvShard>],
+        starter: usize,
+        assignees: &[usize],
+    ) -> ModelRingResult {
+        let mut raw_shards = layer_shards
+            .iter()
+            .map(|shards| {
+                shards
+                    .iter()
+                    .map(|shard| (shard.k.shallow_clone(), shard.v.shallow_clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let position_ids = Tensor::from_slice(&[position]).unsqueeze(0);
+        let result = run_model_ring(
+            model,
+            hidden_states,
+            &position_ids,
+            &mut raw_shards,
+            starter,
+            assignees,
+        )
+        .unwrap();
+
+        for (layer_idx, (positioned, raw)) in layer_shards
+            .iter_mut()
+            .zip(raw_shards.into_iter())
+            .enumerate()
+        {
+            for (domain, (shard, (k, v))) in positioned.iter_mut().zip(raw.into_iter()).enumerate()
+            {
+                shard.k = k;
+                shard.v = v;
+                if domain == assignees[layer_idx] {
+                    shard.positions.push(position);
+                }
+            }
+        }
+        result
+    }
+
+    fn assert_phase_matches(
+        phase: &str,
+        distributed_hidden: &Tensor,
+        distributed_logits: &Tensor,
+        reference_hidden: &Tensor,
+        reference_logits: &Tensor,
+    ) {
+        let hidden_diff = (distributed_hidden - reference_hidden)
+            .abs()
+            .max()
+            .double_value(&[]);
+        assert!(hidden_diff < 1e-3, "{phase} hidden diff: {hidden_diff}");
+        let logits_diff = (distributed_logits - reference_logits)
+            .abs()
+            .max()
+            .double_value(&[]);
+        assert!(logits_diff < 1e-3, "{phase} logits diff: {logits_diff}");
+    }
+
+    fn sample_last_token(logits: &Tensor) -> i64 {
+        let last = logits.select(1, logits.size()[1] - 1);
+        last.argmax(-1, false).int64_value(&[0])
+    }
+
+    fn assert_positioned_history(
+        layer_shards: &[Vec<PositionedKvShard>],
+        expected_positions: std::ops::Range<i64>,
+    ) {
+        let expected = expected_positions.collect::<Vec<_>>();
+        for (layer_idx, shards) in layer_shards.iter().enumerate() {
+            let mut actual = Vec::new();
+            for (domain, shard) in shards.iter().enumerate() {
+                assert_eq!(
+                    shard.k.size(),
+                    shard.v.size(),
+                    "layer {layer_idx} domain {domain} K/V shape"
+                );
+                assert_eq!(
+                    shard.k.size()[2] as usize,
+                    shard.positions.len(),
+                    "layer {layer_idx} domain {domain} position length"
+                );
+                actual.extend_from_slice(&shard.positions);
+            }
+            actual.sort_unstable();
+            assert_eq!(actual, expected, "layer {layer_idx} position union");
+        }
+    }
+
+    fn positioned_domain_totals(layer_shards: &[Vec<PositionedKvShard>]) -> Vec<usize> {
+        let domains = layer_shards[0].len();
+        let mut totals = vec![0_usize; domains];
+        for shards in layer_shards {
+            for (domain, shard) in shards.iter().enumerate() {
+                totals[domain] += shard.positions.len();
+            }
+        }
+        totals
+    }
+
     #[test]
     fn frozen_kv_assignee_schedule_is_capacity_weighted_and_phase_stable() {
         let first = FrozenKvAssigneeSchedule::new(&[1, 3, 2], 41, 24).unwrap();
@@ -2093,6 +2378,202 @@ mod tests {
     #[test]
     fn full_model_ring_rotates_producer_when_layers_do_not_divide_domains() {
         assert_full_model_ring_case(4, 1);
+    }
+
+    #[test]
+    fn twenty_four_layers_reuse_positioned_kv_across_prefill_decode_cycles() {
+        let device = Device::Cpu;
+        let domains = 3_usize;
+        let layers = 24_usize;
+        let mut config = test_config();
+        config.num_layers = layers;
+        let weights = deterministic_weights(&config, device);
+        let mut distributed_model =
+            LlamaModel::from_weights(config.clone(), &weights, device, domains).unwrap();
+        let mut reference_model = local_reference_model(&config, &weights, device);
+        let mut distributed_shards = empty_positioned_layer_shards(&config, domains, device);
+        let mut reference_caches = (0..layers)
+            .map(|_| ContiguousKvCache::new())
+            .collect::<Vec<_>>();
+
+        let decode_schedule = FrozenKvAssigneeSchedule::new(&[1, 3, 2], 41, 2 * layers).unwrap();
+        assert_eq!(decode_schedule.counts(), &[8, 24, 16]);
+        let decode_assignees = (0..2)
+            .map(|token_offset| {
+                (0..layers)
+                    .map(|layer_idx| {
+                        decode_schedule
+                            .assignee_for(token_offset, layer_idx, layers)
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        for assignees in &decode_assignees {
+            let mut counts = vec![0_usize; domains];
+            for &domain in assignees {
+                counts[domain] += 1;
+            }
+            assert_eq!(counts, [4, 12, 8]);
+        }
+
+        let prefill_1_ids = Tensor::from_slice(&[3_i64, 5, 7, 9, 11, 13]).unsqueeze(0);
+        let prefill_1_positions = Tensor::arange(6, (Kind::Int64, device)).unsqueeze(0);
+        let distributed_prefill_1_hidden = Tensor::embedding(
+            &distributed_model.embedding,
+            &prefill_1_ids,
+            -1,
+            false,
+            false,
+        );
+        let reference_prefill_1_hidden =
+            Tensor::embedding(&reference_model.embedding, &prefill_1_ids, -1, false, false);
+        let (distributed_hidden, distributed_logits, prefill_1_projections) =
+            run_positioned_prefill_block(
+                &mut distributed_model,
+                &distributed_prefill_1_hidden,
+                &prefill_1_positions,
+                &mut distributed_shards,
+                &[1, 3, 2],
+            );
+        let (reference_hidden, reference_logits) = run_contiguous_reference_block(
+            &mut reference_model,
+            &reference_prefill_1_hidden,
+            &prefill_1_positions,
+            &mut reference_caches,
+        );
+        assert_eq!(prefill_1_projections, 6 * layers);
+        assert!(reference_caches.iter().all(|cache| cache.seq_len() == 6));
+        assert_phase_matches(
+            "prefill_1",
+            &distributed_hidden,
+            &distributed_logits,
+            &reference_hidden,
+            &reference_logits,
+        );
+        assert_positioned_history(&distributed_shards, 0..6);
+
+        let decode_1_token = sample_last_token(&distributed_logits);
+        assert_eq!(decode_1_token, sample_last_token(&reference_logits));
+        let decode_1_ids = Tensor::from_slice(&[decode_1_token]).unsqueeze(0);
+        let distributed_decode_1_hidden = Tensor::embedding(
+            &distributed_model.embedding,
+            &decode_1_ids,
+            -1,
+            false,
+            false,
+        );
+        let reference_decode_1_hidden =
+            Tensor::embedding(&reference_model.embedding, &decode_1_ids, -1, false, false);
+        let distributed_decode_1 = run_positioned_decode(
+            &mut distributed_model,
+            &distributed_decode_1_hidden,
+            6,
+            &mut distributed_shards,
+            1,
+            &decode_assignees[0],
+        );
+        let decode_1_positions = Tensor::from_slice(&[6_i64]).unsqueeze(0);
+        let (reference_decode_1_hidden, reference_decode_1_logits) = run_contiguous_reference_block(
+            &mut reference_model,
+            &reference_decode_1_hidden,
+            &decode_1_positions,
+            &mut reference_caches,
+        );
+        assert_phase_matches(
+            "decode_1",
+            &distributed_decode_1.hidden_states,
+            &distributed_decode_1.logits,
+            &reference_decode_1_hidden,
+            &reference_decode_1_logits,
+        );
+        assert_eq!(
+            sample_last_token(&distributed_decode_1.logits),
+            sample_last_token(&reference_decode_1_logits)
+        );
+        assert!(reference_caches.iter().all(|cache| cache.seq_len() == 7));
+        assert_positioned_history(&distributed_shards, 0..7);
+
+        let prefill_2_ids = Tensor::from_slice(&[17_i64, 19, 23, 29, 31, 37]).unsqueeze(0);
+        let prefill_2_positions = (Tensor::arange(6, (Kind::Int64, device)) + 7).unsqueeze(0);
+        let distributed_prefill_2_hidden = Tensor::embedding(
+            &distributed_model.embedding,
+            &prefill_2_ids,
+            -1,
+            false,
+            false,
+        );
+        let reference_prefill_2_hidden =
+            Tensor::embedding(&reference_model.embedding, &prefill_2_ids, -1, false, false);
+        let (distributed_hidden, distributed_logits, prefill_2_projections) =
+            run_positioned_prefill_block(
+                &mut distributed_model,
+                &distributed_prefill_2_hidden,
+                &prefill_2_positions,
+                &mut distributed_shards,
+                &[1, 3, 2],
+            );
+        let (reference_hidden, reference_logits) = run_contiguous_reference_block(
+            &mut reference_model,
+            &reference_prefill_2_hidden,
+            &prefill_2_positions,
+            &mut reference_caches,
+        );
+        assert_eq!(prefill_2_projections, 6 * layers);
+        assert!(reference_caches.iter().all(|cache| cache.seq_len() == 13));
+        assert_phase_matches(
+            "prefill_2",
+            &distributed_hidden,
+            &distributed_logits,
+            &reference_hidden,
+            &reference_logits,
+        );
+        assert_positioned_history(&distributed_shards, 0..13);
+
+        let decode_2_token = sample_last_token(&distributed_logits);
+        assert_eq!(decode_2_token, sample_last_token(&reference_logits));
+        let decode_2_ids = Tensor::from_slice(&[decode_2_token]).unsqueeze(0);
+        let distributed_decode_2_hidden = Tensor::embedding(
+            &distributed_model.embedding,
+            &decode_2_ids,
+            -1,
+            false,
+            false,
+        );
+        let reference_decode_2_hidden =
+            Tensor::embedding(&reference_model.embedding, &decode_2_ids, -1, false, false);
+        let distributed_decode_2 = run_positioned_decode(
+            &mut distributed_model,
+            &distributed_decode_2_hidden,
+            13,
+            &mut distributed_shards,
+            distributed_decode_1.logits_producer_domain,
+            &decode_assignees[1],
+        );
+        let decode_2_positions = Tensor::from_slice(&[13_i64]).unsqueeze(0);
+        let (reference_decode_2_hidden, reference_decode_2_logits) = run_contiguous_reference_block(
+            &mut reference_model,
+            &reference_decode_2_hidden,
+            &decode_2_positions,
+            &mut reference_caches,
+        );
+        assert_phase_matches(
+            "decode_2",
+            &distributed_decode_2.hidden_states,
+            &distributed_decode_2.logits,
+            &reference_decode_2_hidden,
+            &reference_decode_2_logits,
+        );
+        assert_eq!(
+            sample_last_token(&distributed_decode_2.logits),
+            sample_last_token(&reference_decode_2_logits)
+        );
+        assert!(reference_caches.iter().all(|cache| cache.seq_len() == 14));
+        assert_positioned_history(&distributed_shards, 0..14);
+        assert_eq!(
+            positioned_domain_totals(&distributed_shards),
+            [56, 168, 112]
+        );
     }
 
     #[test]

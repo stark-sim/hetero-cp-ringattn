@@ -421,6 +421,57 @@ impl HcpRingAttentionBackend {
         Ok((k, v))
     }
 
+    #[cfg(test)]
+    pub(crate) fn project_positioned_qkv(
+        &self,
+        hidden_states: &Tensor,
+        position_ids: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor), ModelError> {
+        let batch = hidden_states.size()[0];
+        let seq_len = hidden_states.size()[1];
+        if position_ids.size() != [batch, seq_len] {
+            return Err(ModelError::Backend(format!(
+                "positioned QKV projection requires position_ids [{batch}, {seq_len}], got {:?}",
+                position_ids.size()
+            )));
+        }
+
+        let mut q = hidden_states.matmul(&self.q_proj.transpose(0, 1));
+        if let Some(ref bias) = self.q_bias {
+            q += bias;
+        }
+        let mut k = hidden_states.matmul(&self.k_proj.transpose(0, 1));
+        if let Some(ref bias) = self.k_bias {
+            k += bias;
+        }
+        let mut v = hidden_states.matmul(&self.v_proj.transpose(0, 1));
+        if let Some(ref bias) = self.v_bias {
+            v += bias;
+        }
+
+        let q = q
+            .view([batch, seq_len, self.num_heads as i64, self.head_dim as i64])
+            .transpose(1, 2);
+        let k = k
+            .view([
+                batch,
+                seq_len,
+                self.num_kv_heads as i64,
+                self.head_dim as i64,
+            ])
+            .transpose(1, 2);
+        let v = v
+            .view([
+                batch,
+                seq_len,
+                self.num_kv_heads as i64,
+                self.head_dim as i64,
+            ])
+            .transpose(1, 2);
+        let (q, k) = self.rope.apply(&q, &k, Some(position_ids));
+        Ok((q, k, v))
+    }
+
     #[allow(dead_code)]
     fn repeat_decode_kv_heads(&self, k: &Tensor, v: &Tensor) -> (Tensor, Tensor) {
         let num_rep = self.num_heads / self.num_kv_heads;
@@ -473,6 +524,78 @@ impl HcpRingAttentionBackend {
     ) -> (Tensor, Tensor) {
         let (k, v) = self.repeat_decode_kv_heads(k, v);
         self.decode_merge_packet(q, o, lse, &k, &v)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn positioned_local_compact_partial(
+        &self,
+        q: &Tensor,
+        q_positions: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        k_positions: &Tensor,
+    ) -> (Tensor, Tensor) {
+        let (k, v) = self.repeat_decode_kv_heads(k, v);
+        let batch = q.size()[0];
+        let num_heads = q.size()[1];
+        let query_len = q.size()[2];
+        let head_dim = q.size()[3];
+        let q_kind = q.kind();
+        let device = q.device();
+        let mut rm = Tensor::full([batch, num_heads, query_len], -1e4_f64, (q_kind, device));
+        let mut rs = Tensor::zeros([batch, num_heads, query_len], (q_kind, device));
+        let mut obh = Tensor::zeros(
+            [batch, num_heads, query_len, head_dim],
+            (q_kind, device),
+        );
+        let q_positions = q_positions.view([-1]).to_device(Device::Cpu);
+        let k_positions = k_positions.view([-1]).to_device(Device::Cpu);
+        self.process_kv_block(
+            q,
+            &q_positions,
+            &k,
+            &v,
+            &k_positions,
+            &mut rm,
+            &mut rs,
+            &mut obh,
+            true,
+        );
+        let lse = (&rm + rs.log()).to_kind(Kind::Float);
+        (obh, lse)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn positioned_merge_compact_partial(
+        &self,
+        q: &Tensor,
+        q_positions: &Tensor,
+        o: &Tensor,
+        lse: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        k_positions: &Tensor,
+    ) -> (Tensor, Tensor) {
+        let (k, v) = self.repeat_decode_kv_heads(k, v);
+        let mut rm = lse.to_kind(q.kind());
+        let mut rs = Tensor::ones_like(&rm);
+        let mut obh = o.shallow_clone();
+        let q_positions = q_positions.view([-1]).to_device(Device::Cpu);
+        let k_positions = k_positions.view([-1]).to_device(Device::Cpu);
+        self.process_kv_block(
+            q,
+            &q_positions,
+            &k,
+            &v,
+            &k_positions,
+            &mut rm,
+            &mut rs,
+            &mut obh,
+            true,
+        );
+        let new_lse = (&rm + rs.log()).to_kind(Kind::Float);
+        (obh, new_lse)
     }
 
     #[allow(dead_code)]
