@@ -2,13 +2,6 @@
 
 当前活跃的任务、决策、风险和假设。
 
-### 在两-token localhost TCP ring 中桥接 reserved KV slab
-
-type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-01`
-
-当前小节点：只修改 self_driving.rs 的实验边界。现有 N=3、L=2、两-token localhost TCP 测试的分布式 worker 改用按冻结 assignee 计划精确预留的 test-only positioned KV slab；初始历史一次性复制入 slab，decode growth 用 narrow().copy_() 原地写。每个 layer×domain slab 的额外容量等于两 token 中该层被分配到该 domain 的 event 数；每次 TCP layer event 验证 committed_len 增量、capacity 上界和 storage pointer 稳定，最终所有 slab 精确写满。保留 reference 侧 Tensor::cat、公开 process_layer_packet legacy 行为、wire protocol、N-1 hops、数值与 sampling 断言。边界：不证明 1:3:2 比例，不改生产 cache trait，不做 24 层 TCP、runtime、QUIC、远端硬件或 GPU 显存声明。
-
-_updated: 2026-08-01 18:34:17_
 ### 用 test-only reserved commit adapter 连接 TCP ring 与原地 KV append
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-01`
