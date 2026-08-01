@@ -537,4 +537,109 @@ mod tests {
             assert_eq!(shard.positions(), &[0, 1]);
         }
     }
+
+    #[test]
+    #[ignore = "requires the local Qwen2-0.5B model weights"]
+    fn real_qwen_two_worker_reserved_prefill_matches_reference() {
+        let device = Device::Cpu;
+        let model_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("models")
+            .join("Qwen2-0.5B");
+        let config = ModelConfig::from_file(model_dir.join("config.json")).unwrap();
+        assert_eq!(config.num_layers, 24);
+        let weights = ModelWeights::from_dir(&model_dir, device).unwrap();
+
+        let mut reference = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+        let model0 = LlamaModel::from_weights(config.clone(), &weights, device, 2).unwrap();
+        let model1 = LlamaModel::from_weights(config.clone(), &weights, device, 2).unwrap();
+        let mut backend0 = TchWorkerBackend::from_model(model0, device, 0);
+        let mut backend1 = TchWorkerBackend::from_model(model1, device, 1);
+
+        let mut transports0: Vec<Box<dyn KvTransport>> = Vec::with_capacity(config.num_layers);
+        let mut transports1: Vec<Box<dyn KvTransport>> = Vec::with_capacity(config.num_layers);
+        for _ in 0..config.num_layers {
+            let (transport0, transport1) =
+                crate::model::transport::LinkedMockKvTransport::create_pair();
+            transports0.push(Box::new(transport0));
+            transports1.push(Box::new(transport1));
+        }
+        backend0.setup_kv_transports(transports0);
+        backend1.setup_kv_transports(transports1);
+
+        let request_id = 73;
+        let prompt = [151644_i64, 9707, 0, 16];
+        let input_ids = Tensor::from_slice(&prompt).unsqueeze(0);
+        let mut reference_caches = reference.create_kv_caches();
+        let reference_logits = reference
+            .forward(&input_ids, &mut reference_caches)
+            .unwrap()
+            .narrow(1, prompt.len() as i64 - 1, 1)
+            .squeeze();
+
+        let capacities0 = (0..config.num_layers)
+            .map(|layer_idx| 1 + layer_idx % 2)
+            .collect::<Vec<_>>();
+        let capacities1 = (0..config.num_layers)
+            .map(|layer_idx| 3 + (layer_idx + 1) % 2)
+            .collect::<Vec<_>>();
+        let (_, global_len0) = backend0
+            .prefill_request_with_reservation(
+                request_id,
+                &prompt[..1],
+                0,
+                Some(&[0]),
+                Some(&capacities0),
+            )
+            .unwrap();
+        let (last_logits1, global_len1) = backend1
+            .prefill_request_with_reservation(
+                request_id,
+                &prompt[1..],
+                1,
+                Some(&[1, 2, 3]),
+                Some(&capacities1),
+            )
+            .unwrap();
+        assert_eq!(global_len0, 1);
+        assert_eq!(global_len1, prompt.len());
+
+        let distributed_logits = Tensor::from_slice(&last_logits1);
+        let max_diff = (&reference_logits - &distributed_logits)
+            .abs()
+            .max()
+            .double_value(&[]);
+        let mean_diff = (&reference_logits - &distributed_logits)
+            .abs()
+            .mean(Kind::Float)
+            .double_value(&[]);
+        let reference_token = reference_logits.argmax(-1, false).int64_value(&[]);
+        let distributed_token = distributed_logits.argmax(-1, false).int64_value(&[]);
+        println!(
+            "two-worker real prefill: max_diff={max_diff:.6}, mean_diff={mean_diff:.6}, tokens={reference_token}/{distributed_token}"
+        );
+        assert_eq!(reference_token, distributed_token);
+        assert!(max_diff < 0.5, "distributed max logits diff: {max_diff}");
+        assert!(mean_diff < 0.1, "distributed mean logits diff: {mean_diff}");
+
+        let context0 = backend0.request_contexts.get(&request_id).unwrap();
+        let context1 = backend1.request_contexts.get(&request_id).unwrap();
+        for layer_idx in 0..config.num_layers {
+            let Some(KvCacheImpl::ReservedPositioned(shard0)) = &context0.kv_caches[layer_idx]
+            else {
+                panic!("worker 0 layer {layer_idx} did not use reserved KV");
+            };
+            let Some(KvCacheImpl::ReservedPositioned(shard1)) = &context1.kv_caches[layer_idx]
+            else {
+                panic!("worker 1 layer {layer_idx} did not use reserved KV");
+            };
+            assert_eq!(shard0.reserved_capacity(), capacities0[layer_idx]);
+            assert_eq!(shard1.reserved_capacity(), capacities1[layer_idx]);
+            assert_eq!(shard0.positions(), &[0]);
+            assert_eq!(shard1.positions(), &[1, 2, 3]);
+            assert_eq!(shard0.committed_len() + shard1.committed_len(), prompt.len());
+            assert_eq!(shard0.active_k().kind(), Kind::BFloat16);
+            assert_eq!(shard1.active_k().kind(), Kind::BFloat16);
+        }
+    }
 }
