@@ -753,44 +753,115 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct PositionedKvShard {
-        k: Tensor,
-        v: Tensor,
+    struct ReservedPositionedKvShard {
+        k_storage: Tensor,
+        v_storage: Tensor,
         positions: Vec<i64>,
+        committed_len: usize,
     }
 
-    impl PositionedKvShard {
-        fn empty(config: &ModelConfig, device: Device) -> Self {
-            let shape = [1, config.num_kv_heads() as i64, 0, config.head_dim() as i64];
+    impl ReservedPositionedKvShard {
+        fn new(config: &ModelConfig, capacity: usize, device: Device) -> Self {
+            let shape = [
+                1,
+                config.num_kv_heads() as i64,
+                capacity as i64,
+                config.head_dim() as i64,
+            ];
             Self {
-                k: Tensor::zeros(shape, (Kind::Float, device)),
-                v: Tensor::zeros(shape, (Kind::Float, device)),
-                positions: Vec::new(),
+                k_storage: Tensor::zeros(shape, (Kind::Float, device)),
+                v_storage: Tensor::zeros(shape, (Kind::Float, device)),
+                positions: Vec::with_capacity(capacity),
+                committed_len: 0,
             }
         }
 
-        fn append(&mut self, k: &Tensor, v: &Tensor, positions: &[i64]) {
-            assert_eq!(k.size(), v.size());
-            assert_eq!(k.size()[2] as usize, positions.len());
-            self.k = Tensor::cat(&[&self.k, k], 2);
-            self.v = Tensor::cat(&[&self.v, v], 2);
+        fn append(&mut self, k: &Tensor, v: &Tensor, positions: &[i64]) -> Result<(), String> {
+            if k.size() != v.size() {
+                return Err("positioned KV slab requires matching K/V shapes".to_string());
+            }
+            let shape = k.size();
+            if shape.len() != 4
+                || shape[0] != self.k_storage.size()[0]
+                || shape[1] != self.k_storage.size()[1]
+                || shape[3] != self.k_storage.size()[3]
+                || shape[2] as usize != positions.len()
+                || k.kind() != self.k_storage.kind()
+                || v.kind() != self.v_storage.kind()
+                || k.device() != self.k_storage.device()
+                || v.device() != self.v_storage.device()
+            {
+                return Err(
+                    "positioned KV slab append shape, dtype, or device mismatch".to_string()
+                );
+            }
+            let append_len = positions.len();
+            let next_len = self
+                .committed_len
+                .checked_add(append_len)
+                .ok_or_else(|| "positioned KV slab capacity overflow".to_string())?;
+            if next_len > self.reserved_capacity() {
+                return Err(format!(
+                    "positioned KV slab capacity exceeded: committed={}, append={}, capacity={}",
+                    self.committed_len,
+                    append_len,
+                    self.reserved_capacity()
+                ));
+            }
+
+            let mut k_slot = self
+                .k_storage
+                .narrow(2, self.committed_len as i64, append_len as i64);
+            let mut v_slot = self
+                .v_storage
+                .narrow(2, self.committed_len as i64, append_len as i64);
+            k_slot.copy_(k);
+            v_slot.copy_(v);
             self.positions.extend_from_slice(positions);
+            self.committed_len = next_len;
+            Ok(())
+        }
+
+        fn reserved_capacity(&self) -> usize {
+            self.k_storage.size()[2] as usize
+        }
+
+        fn committed_len(&self) -> usize {
+            self.committed_len
+        }
+
+        fn active_k(&self) -> Tensor {
+            self.k_storage.narrow(2, 0, self.committed_len as i64)
+        }
+
+        fn active_v(&self) -> Tensor {
+            self.v_storage.narrow(2, 0, self.committed_len as i64)
         }
 
         fn position_tensor(&self) -> Tensor {
             Tensor::from_slice(&self.positions).to_kind(Kind::Int64)
         }
+
+        fn storage_ptrs(&self) -> (usize, usize) {
+            (
+                self.k_storage.data_ptr() as usize,
+                self.v_storage.data_ptr() as usize,
+            )
+        }
     }
 
-    fn empty_positioned_layer_shards(
+    fn reserved_positioned_layer_shards(
         config: &ModelConfig,
-        domains: usize,
+        reservation_plan: &[Vec<usize>],
         device: Device,
-    ) -> Vec<Vec<PositionedKvShard>> {
-        (0..config.num_layers)
-            .map(|_| {
-                (0..domains)
-                    .map(|_| PositionedKvShard::empty(config, device))
+    ) -> Vec<Vec<ReservedPositionedKvShard>> {
+        assert_eq!(reservation_plan.len(), config.num_layers);
+        reservation_plan
+            .iter()
+            .map(|capacities| {
+                capacities
+                    .iter()
+                    .map(|&capacity| ReservedPositionedKvShard::new(config, capacity, device))
                     .collect()
             })
             .collect()
@@ -849,11 +920,11 @@ mod tests {
         (current_hidden, logits)
     }
 
-    fn run_positioned_prefill_block(
+    fn run_reserved_positioned_prefill_block(
         model: &mut LlamaModel,
         hidden_states: &Tensor,
         position_ids: &Tensor,
-        layer_shards: &mut [Vec<PositionedKvShard>],
+        layer_shards: &mut [Vec<ReservedPositionedKvShard>],
         token_splits: &[usize],
     ) -> (Tensor, Tensor, usize) {
         let seq_len = hidden_states.size()[1] as usize;
@@ -885,23 +956,27 @@ mod tests {
                 let mut offset = 0_i64;
                 for (domain, &count) in token_splits.iter().enumerate() {
                     let count = count as i64;
-                    shards[domain].append(
-                        &current_k.narrow(2, offset, count),
-                        &current_v.narrow(2, offset, count),
-                        &new_positions[offset as usize..(offset + count) as usize],
-                    );
+                    shards[domain]
+                        .append(
+                            &current_k.narrow(2, offset, count),
+                            &current_v.narrow(2, offset, count),
+                            &new_positions[offset as usize..(offset + count) as usize],
+                        )
+                        .unwrap();
                     offset += count;
                 }
 
                 let mut partial = None;
                 for shard in shards.iter() {
                     let k_positions = shard.position_tensor();
+                    let active_k = shard.active_k();
+                    let active_v = shard.active_v();
                     partial = Some(match partial {
                         None => ring.positioned_local_compact_partial(
                             &q,
                             position_ids,
-                            &shard.k,
-                            &shard.v,
+                            &active_k,
+                            &active_v,
                             &k_positions,
                         ),
                         Some((output, lse)) => ring.positioned_merge_compact_partial(
@@ -909,8 +984,8 @@ mod tests {
                             position_ids,
                             &output,
                             &lse,
-                            &shard.k,
-                            &shard.v,
+                            &active_k,
+                            &active_v,
                             &k_positions,
                         ),
                     });
@@ -932,49 +1007,99 @@ mod tests {
         (current_hidden, logits, projected_positions)
     }
 
-    fn run_positioned_decode(
+    fn run_reserved_positioned_decode(
         model: &mut LlamaModel,
         hidden_states: &Tensor,
         position: i64,
-        layer_shards: &mut [Vec<PositionedKvShard>],
+        layer_shards: &mut [Vec<ReservedPositionedKvShard>],
         starter: usize,
         assignees: &[usize],
     ) -> ModelRingResult {
-        let mut raw_shards = layer_shards
-            .iter()
-            .map(|shards| {
-                shards
-                    .iter()
-                    .map(|shard| (shard.k.shallow_clone(), shard.v.shallow_clone()))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let position_ids = Tensor::from_slice(&[position]).unsqueeze(0);
-        let result = run_model_ring(
-            model,
-            hidden_states,
-            &position_ids,
-            &mut raw_shards,
-            starter,
-            assignees,
-        )
-        .unwrap();
+        assert_eq!(layer_shards.len(), model.layers.len());
+        assert_eq!(assignees.len(), model.layers.len());
+        let domains = layer_shards[0].len();
+        assert!(domains > 0);
+        assert!(layer_shards.iter().all(|shards| shards.len() == domains));
 
-        for (layer_idx, (positioned, raw)) in layer_shards
-            .iter_mut()
-            .zip(raw_shards.into_iter())
-            .enumerate()
-        {
-            for (domain, (shard, (k, v))) in positioned.iter_mut().zip(raw.into_iter()).enumerate()
-            {
-                shard.k = k;
-                shard.v = v;
-                if domain == assignees[layer_idx] {
-                    shard.positions.push(position);
+        let position_ids = Tensor::from_slice(&[position]).unsqueeze(0);
+        let mut current_hidden = hidden_states.shallow_clone();
+        let mut current_starter = starter;
+        let mut layer_stats = Vec::with_capacity(model.layers.len());
+
+        for (layer_idx, shards) in layer_shards.iter_mut().enumerate() {
+            let residual = current_hidden.shallow_clone();
+            let normalized = model.layers[layer_idx]
+                .input_layernorm
+                .forward(&current_hidden);
+            let assignee = assignees[layer_idx];
+            let finisher = (current_starter + domains - 1) % domains;
+            let (projected_attention, visited_domains) = {
+                let ring = ring_backend(&mut model.layers[layer_idx]).unwrap();
+                let q = ring.project_decode_q(&normalized, &position_ids).unwrap();
+                let mut partial = None;
+                let mut visited_domains = Vec::with_capacity(domains);
+
+                for visit_index in 0..domains {
+                    let domain = (current_starter + visit_index) % domains;
+                    visited_domains.push(domain);
+                    if domain == assignee {
+                        let (current_k, current_v) = ring
+                            .project_decode_current_kv(&normalized, &position_ids)
+                            .unwrap();
+                        shards[domain]
+                            .append(&current_k, &current_v, &[position])
+                            .unwrap();
+                    }
+                    let active_k = shards[domain].active_k();
+                    let active_v = shards[domain].active_v();
+                    partial = Some(match partial {
+                        None => ring.decode_local_compact_partial(&q, &active_k, &active_v),
+                        Some((output, lse)) => ring
+                            .decode_merge_compact_partial(&q, &output, &lse, &active_k, &active_v),
+                    });
                 }
-            }
+
+                let (attention_output, _) =
+                    partial.expect("decode requires at least one reserved KV shard");
+                (
+                    ring.project_decode_output(&attention_output),
+                    visited_domains,
+                )
+            };
+
+            let post_attention = projected_attention + residual;
+            let mlp_output = model.layers[layer_idx].mlp.forward(
+                &model.layers[layer_idx]
+                    .post_attention_layernorm
+                    .forward(&post_attention),
+            );
+            current_hidden = post_attention + mlp_output;
+            layer_stats.push(SingleLayerRingStats {
+                domains,
+                hops: domains - 1,
+                visited_domains,
+                local_partials: domains,
+                q_projections: 1,
+                q_projection_domain: current_starter,
+                current_kv_projections: 1,
+                current_kv_projection_domain: assignee,
+                current_kv_commits: 1,
+                layer_finishes: 1,
+                starter: current_starter,
+                assignee,
+                finisher,
+            });
+            current_starter = finisher;
         }
-        result
+
+        let logits = project_final_logits(model, &current_hidden);
+        ModelRingResult {
+            hidden_states: current_hidden,
+            logits,
+            layer_stats,
+            logits_producer_domain: current_starter,
+            logits_projections: 1,
+        }
     }
 
     fn assert_phase_matches(
@@ -1001,23 +1126,30 @@ mod tests {
         last.argmax(-1, false).int64_value(&[0])
     }
 
-    fn assert_positioned_history(
-        layer_shards: &[Vec<PositionedKvShard>],
+    fn assert_reserved_positioned_history(
+        layer_shards: &[Vec<ReservedPositionedKvShard>],
         expected_positions: std::ops::Range<i64>,
     ) {
         let expected = expected_positions.collect::<Vec<_>>();
         for (layer_idx, shards) in layer_shards.iter().enumerate() {
             let mut actual = Vec::new();
             for (domain, shard) in shards.iter().enumerate() {
+                let active_k = shard.active_k();
+                let active_v = shard.active_v();
                 assert_eq!(
-                    shard.k.size(),
-                    shard.v.size(),
+                    active_k.size(),
+                    active_v.size(),
                     "layer {layer_idx} domain {domain} K/V shape"
                 );
                 assert_eq!(
-                    shard.k.size()[2] as usize,
+                    shard.committed_len(),
                     shard.positions.len(),
                     "layer {layer_idx} domain {domain} position length"
+                );
+                assert_eq!(
+                    active_k.size()[2] as usize,
+                    shard.committed_len(),
+                    "layer {layer_idx} domain {domain} committed prefix length"
                 );
                 actual.extend_from_slice(&shard.positions);
             }
@@ -1026,7 +1158,9 @@ mod tests {
         }
     }
 
-    fn positioned_domain_totals(layer_shards: &[Vec<PositionedKvShard>]) -> Vec<usize> {
+    fn reserved_positioned_domain_totals(
+        layer_shards: &[Vec<ReservedPositionedKvShard>],
+    ) -> Vec<usize> {
         let domains = layer_shards[0].len();
         let mut totals = vec![0_usize; domains];
         for shards in layer_shards {
@@ -1035,6 +1169,77 @@ mod tests {
             }
         }
         totals
+    }
+
+    #[test]
+    fn positioned_kv_slab_appends_in_place_and_rejects_overflow() {
+        let device = Device::Cpu;
+        let config = test_config();
+        let mut slab = ReservedPositionedKvShard::new(&config, 3, device);
+        let shape = [1, config.num_kv_heads() as i64, 3, config.head_dim() as i64];
+        let expected_k = deterministic_tensor(&shape, 301.0, device);
+        let expected_v = deterministic_tensor(&shape, 302.0, device);
+        let storage_ptrs = slab.storage_ptrs();
+
+        slab.append(
+            &expected_k.narrow(2, 0, 1),
+            &expected_v.narrow(2, 0, 1),
+            &[7],
+        )
+        .unwrap();
+        slab.append(
+            &expected_k.narrow(2, 1, 2),
+            &expected_v.narrow(2, 1, 2),
+            &[9, 12],
+        )
+        .unwrap();
+
+        assert_eq!(slab.reserved_capacity(), 3);
+        assert_eq!(slab.committed_len(), 3);
+        assert_eq!(slab.positions, [7, 9, 12]);
+        assert_eq!(slab.storage_ptrs(), storage_ptrs);
+        assert_eq!(
+            (&slab.active_k() - &expected_k)
+                .abs()
+                .max()
+                .double_value(&[]),
+            0.0
+        );
+        assert_eq!(
+            (&slab.active_v() - &expected_v)
+                .abs()
+                .max()
+                .double_value(&[]),
+            0.0
+        );
+
+        let committed_k = slab.active_k().copy();
+        let committed_v = slab.active_v().copy();
+        let error = slab
+            .append(
+                &expected_k.narrow(2, 0, 1),
+                &expected_v.narrow(2, 0, 1),
+                &[13],
+            )
+            .unwrap_err();
+        assert!(error.contains("capacity"));
+        assert_eq!(slab.committed_len(), 3);
+        assert_eq!(slab.positions, [7, 9, 12]);
+        assert_eq!(slab.storage_ptrs(), storage_ptrs);
+        assert_eq!(
+            (&slab.active_k() - committed_k)
+                .abs()
+                .max()
+                .double_value(&[]),
+            0.0
+        );
+        assert_eq!(
+            (&slab.active_v() - committed_v)
+                .abs()
+                .max()
+                .double_value(&[]),
+            0.0
+        );
     }
 
     #[test]
@@ -2391,7 +2596,6 @@ mod tests {
         let mut distributed_model =
             LlamaModel::from_weights(config.clone(), &weights, device, domains).unwrap();
         let mut reference_model = local_reference_model(&config, &weights, device);
-        let mut distributed_shards = empty_positioned_layer_shards(&config, domains, device);
         let mut reference_caches = (0..layers)
             .map(|_| ContiguousKvCache::new())
             .collect::<Vec<_>>();
@@ -2416,6 +2620,27 @@ mod tests {
             }
             assert_eq!(counts, [4, 12, 8]);
         }
+        let reservation_plan = (0..layers)
+            .map(|layer_idx| {
+                let mut capacities = vec![2_usize, 6, 4];
+                for token_assignees in &decode_assignees {
+                    capacities[token_assignees[layer_idx]] += 1;
+                }
+                assert_eq!(capacities.iter().sum::<usize>(), 14);
+                capacities
+            })
+            .collect::<Vec<_>>();
+        let mut distributed_shards =
+            reserved_positioned_layer_shards(&config, &reservation_plan, device);
+        let initial_storage_ptrs = distributed_shards
+            .iter()
+            .map(|shards| {
+                shards
+                    .iter()
+                    .map(ReservedPositionedKvShard::storage_ptrs)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
 
         let prefill_1_ids = Tensor::from_slice(&[3_i64, 5, 7, 9, 11, 13]).unsqueeze(0);
         let prefill_1_positions = Tensor::arange(6, (Kind::Int64, device)).unsqueeze(0);
@@ -2429,7 +2654,7 @@ mod tests {
         let reference_prefill_1_hidden =
             Tensor::embedding(&reference_model.embedding, &prefill_1_ids, -1, false, false);
         let (distributed_hidden, distributed_logits, prefill_1_projections) =
-            run_positioned_prefill_block(
+            run_reserved_positioned_prefill_block(
                 &mut distributed_model,
                 &distributed_prefill_1_hidden,
                 &prefill_1_positions,
@@ -2451,7 +2676,7 @@ mod tests {
             &reference_hidden,
             &reference_logits,
         );
-        assert_positioned_history(&distributed_shards, 0..6);
+        assert_reserved_positioned_history(&distributed_shards, 0..6);
 
         let decode_1_token = sample_last_token(&distributed_logits);
         assert_eq!(decode_1_token, sample_last_token(&reference_logits));
@@ -2465,7 +2690,7 @@ mod tests {
         );
         let reference_decode_1_hidden =
             Tensor::embedding(&reference_model.embedding, &decode_1_ids, -1, false, false);
-        let distributed_decode_1 = run_positioned_decode(
+        let distributed_decode_1 = run_reserved_positioned_decode(
             &mut distributed_model,
             &distributed_decode_1_hidden,
             6,
@@ -2492,7 +2717,7 @@ mod tests {
             sample_last_token(&reference_decode_1_logits)
         );
         assert!(reference_caches.iter().all(|cache| cache.seq_len() == 7));
-        assert_positioned_history(&distributed_shards, 0..7);
+        assert_reserved_positioned_history(&distributed_shards, 0..7);
 
         let prefill_2_ids = Tensor::from_slice(&[17_i64, 19, 23, 29, 31, 37]).unsqueeze(0);
         let prefill_2_positions = (Tensor::arange(6, (Kind::Int64, device)) + 7).unsqueeze(0);
@@ -2506,7 +2731,7 @@ mod tests {
         let reference_prefill_2_hidden =
             Tensor::embedding(&reference_model.embedding, &prefill_2_ids, -1, false, false);
         let (distributed_hidden, distributed_logits, prefill_2_projections) =
-            run_positioned_prefill_block(
+            run_reserved_positioned_prefill_block(
                 &mut distributed_model,
                 &distributed_prefill_2_hidden,
                 &prefill_2_positions,
@@ -2528,7 +2753,7 @@ mod tests {
             &reference_hidden,
             &reference_logits,
         );
-        assert_positioned_history(&distributed_shards, 0..13);
+        assert_reserved_positioned_history(&distributed_shards, 0..13);
 
         let decode_2_token = sample_last_token(&distributed_logits);
         assert_eq!(decode_2_token, sample_last_token(&reference_logits));
@@ -2542,7 +2767,7 @@ mod tests {
         );
         let reference_decode_2_hidden =
             Tensor::embedding(&reference_model.embedding, &decode_2_ids, -1, false, false);
-        let distributed_decode_2 = run_positioned_decode(
+        let distributed_decode_2 = run_reserved_positioned_decode(
             &mut distributed_model,
             &distributed_decode_2_hidden,
             13,
@@ -2569,11 +2794,24 @@ mod tests {
             sample_last_token(&reference_decode_2_logits)
         );
         assert!(reference_caches.iter().all(|cache| cache.seq_len() == 14));
-        assert_positioned_history(&distributed_shards, 0..14);
+        assert_reserved_positioned_history(&distributed_shards, 0..14);
         assert_eq!(
-            positioned_domain_totals(&distributed_shards),
+            reserved_positioned_domain_totals(&distributed_shards),
             [56, 168, 112]
         );
+        for (layer_idx, shards) in distributed_shards.iter().enumerate() {
+            for (domain, shard) in shards.iter().enumerate() {
+                assert_eq!(
+                    shard.reserved_capacity(),
+                    reservation_plan[layer_idx][domain]
+                );
+                assert_eq!(shard.committed_len(), reservation_plan[layer_idx][domain]);
+                assert_eq!(
+                    shard.storage_ptrs(),
+                    initial_storage_ptrs[layer_idx][domain]
+                );
+            }
+        }
     }
 
     #[test]
