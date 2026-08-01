@@ -2,6 +2,27 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### Rust 24 层 prefill-decode-continuation 语义闭环实验
+
+type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `docs/plans/2026-08-01-24-layer-prefill-decode-continuation-design.md`
+
+当前小里程碑：N=3、L=24、capacity tickets=[1,3,2]；同一请求依次执行 prefill_1(6 tokens)、decode_1(1 token)、continuation prefill_2(6 tokens)、decode_2(1 token)。第二次 prefill 必须复用前两阶段形成的分布式 positioned KV，不能重算历史。验证完整参考数值、24 层 position 无遗漏无重复、prefill_2 只投影新 token、两次 decode 的 48 个 append events 总计 [8,24,16] 且每步 [4,12,8]。仅限 in-process CPU correctness；不处理 Tensor::cat、预分配、schedule 平滑、网络/runtime 或多请求。
+
+_updated: 2026-08-01 05:54:01_
+### 实施 24 层 positioned KV 四阶段复用实验
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-01`
+
+【动机六问】1.问题：capacity-weighted CP prefill KV 与按 token×layer event 分配的 decode growth tensor 形状相容，但当前持久 cache 不保存 slot 的全局 position，也没有证明混合历史能被 continuation prefill 正确复用；若这一点不成立，后续 schedule 与物理 append 优化没有意义。2.现状：decode 单 token 对历史顺序不敏感，现有两 token实验只需 K/V tensor；KvBlock 与 Ring Attention 已支持显式 position 和按 q_pos>=k_pos causal，但 self_driving local history 只有 K/V，模型生命周期也未覆盖 prefill-decode-prefill。3.目标：N=3、L=24、tickets=[1,3,2]；prefill_1=6 tokens、decode_1=1、prefill_2=6、decode_2=1；24 个真实 DecoderLayer；第二次 prefill 只投影六个新位置并读取已有 distributed positioned KV；hidden/logits/argmax 对齐完整有序参考；每层 position union 完整唯一。4.他者：PagedAttention/block-table 系统用逻辑位置到物理 slot 的映射复用历史 KV；Ring/Striped Attention 用显式 q/k positions 保持任意 shard layout 的 causal correctness。可复用其 position-aware 数据合同，但本节点不引入生产 block allocator。5.本方案：在实验边界加入 PositionedKvShard 和多 query positioned online-softmax 原语；先用 Tensor::cat 形成语义证据；初始与 continuation prefill 每层按 [1,3,2] token split 持久化，新 decode KV 沿现有 self-driving path 唯一落点。6.为什么：24 层覆盖真实逐层 hidden 依赖，6-token prefill 与 24-layer decode 都能无舍入地表达 [1,3,2]；它是验证能否 append 的最小完整里程碑，同时把怎样无副本 append 延后。VERDICT: IMPLEMENT EXPERIMENT ONLY。
+
+_updated: 2026-08-01 05:54:01_
+### 术语约束：decode KV 按 token×layer event 分配，不称为 pipeline parallel
+
+type: `preference` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-01`
+
+用户明确要求后续不再用 pipeline parallel 描述 decode KV 分配。规范术语为 layer-striped KV growth、decode KV event assignment 或按 token×layer 事件分配；pipeline parallel 仅保留给固定模型 stage 与 activation stage handoff 的标准含义。
+
+_updated: 2026-08-01 05:54:01_
 ### 分层裁定：单请求核心闭环，系统闭环仍待后续小节点
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `code-audit-2026-08-01`
