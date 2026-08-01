@@ -2,6 +2,20 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-08-02] 真实 Qwen 两 worker 1:3 reserved prefill 通过
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@c465244`
+
+提交 c465244 新增 ignored integration oracle：本地 Qwen2-0.5B、24 层、CPU BF16，两个独立 TchWorkerBackend 每层仅持自己的 ReservedPositioned KV，worker0 positions=[0]、worker1 positions=[1,2,3]，每层 union 恰好覆盖 4-token prompt；worker1 每层经 predecessor P2P 接收一个 3584-byte KV block。末位置 reference/distributed argmax 均为 token 198，max logits diff=0.25，mean diff=0.042441，落在既有同构 BF16 online-softmax 重排包络内。真实 ignored test 1 passed；完整 cargo test --features tch-backend 101 passed、0 failed、2 ignored；cargo clippy --features tch-backend --all-targets exit 0，仅既有 warnings；git diff --check 通过。该证据证明 backend-level 多 worker initial prefill 和 local ownership，不证明 coordinator 已启用 reservation 或 self-driving decode runtime。
+
+_updated: 2026-08-01 21:22:10_
+### BF16 分布式 prefill oracle 必须沿用已验证数值包络
+
+type: `lesson` · status: `held` · confidence: 1.0 · importance: 0.9 · source: `hetero-cp-ringattn@c465244`
+
+症状：真实两 worker prefill 首跑因临时设定 mean logits diff<0.01 失败。影响：正确的 worker-local/P2P 实现被误判。复现：实际 max=0.25、mean=0.042441，但 reference/distributed argmax 同为198。根因：把 FP32 风格 mean 阈值套到 BF16 online-softmax 分块重排，忽略项目已有同构 BF16 max约0.3-0.4证据。修正：先输出 max/mean/argmax，确认 token exact 且误差落入既有包络；oracle 使用 argmax exact为主，max<0.5、mean<0.1作为失控门。预防条件：新增 BF16分布式测试前先查询项目已验证 tolerance，不凭局部直觉发明更严阈值。
+
+_updated: 2026-08-01 21:22:10_
 ### [2026-08-02] Prefill 支持显式逐层 local KV reservation
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@b4db994`

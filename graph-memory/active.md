@@ -2,20 +2,15 @@
 
 当前活跃的任务、决策、风险和假设。
 
-### 真实 Qwen 两 worker 不均匀 reserved initial prefill
-
-type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `analysis-2026-08-02`
-
-用两个独立 TchWorkerBackend、24 层真实 Qwen2-0.5B、逐层 LinkedMock P2P ring 和显式 local capacities 完成 1:3 initial prefill。验证末位置 logits/token 与 contiguous reference 对齐，每个 backend 的每层 context 只持本地 positions，跨 worker union 恰好覆盖 prompt；测试可汇总检查但 runtime API 不接收全局 shards。
-
-_updated: 2026-08-01 21:12:57_
 ### 以两个独立 backend 验证真实 worker-local reserved prefill
 
-type: `decision` · status: `held` · confidence: 0.99 · importance: 1.0 · source: `analysis-2026-08-02`
+type: `decision` · status: `held` · confidence: 0.99 · importance: 1.0 · source: `hetero-cp-ringattn@c465244`
 
 【动机六问】1.问题：单 worker 真实 prefill 和 reservation 消费端已成立，但还没有证据证明不均匀 CP prefill 经 P2P ring 后，每个 worker 只持自己的真实 24 层 reserved shard。2.现状：LlamaModel 的 legacy distributed prefill 已支持 local chunk KV ring；Tch backend 现可消费显式逐层 capacity；直接让 coordinator 发送 Some 会因后续 legacy decode 与 reserved cache 不兼容而提前失败。3.目标：真实 Qwen 1:3 initial prefill 在两个独立 backend 上完成；last-position logits/argmax 与 contiguous reference 对齐；24 层每个位置只在一个 worker durable，capacity/dtype/positions 正确。4.他者：分布式 CP correctness 通常用多 rank local state加集中 reference oracle；serving runtime 自身不暴露全 rank cache。5.本方案：新增 ignored integration test，逐层 LinkedMock 只模拟 P2P，先跑早位置 worker再跑晚位置 worker；测试结束后只作为 oracle 汇总两个 context。6.为什么：复用现有真实 prefill 网络数学与新 reservation 合同，不新增全局 runtime helper，也不在 self-driving decode 尚未接线时破坏现有服务。VERDICT: IMPLEMENT。
 
-_updated: 2026-08-01 21:12:57_
+[2026-08-02 实现] c465244 完成 test-only oracle；runtime API 仍只持本 worker context，没有提升 all-shard helper。VERDICT: IMPLEMENTED。
+
+_updated: 2026-08-01 21:22:10_
 ### reserved prefill 不能在 self-driving decode 接线前启用 coordinator
 
 type: `risk` · status: `open` · confidence: 1.0 · importance: 1.0 · source: `code-audit-2026-08-02`
