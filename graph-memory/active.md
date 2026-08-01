@@ -2,6 +2,27 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### Rust 线优先完成完整推理服务框架
+
+type: `preference` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-02`
+
+用户确认：保持已经验证成立的 self-driving ring 核心方案稳定，Rust 线持续纵向完成 prefill、decode、continuation prefill、后续 decode、多请求隔离与稳定服务循环。服务接线过程中若出现与核心的接口张力或局部矛盾，先记录为 risk/uncertainty 并继续推进；只有数值错误、KV 容量越界、请求串扰或无法运行才升级为 blocker。当前阶段只实现核心和必要能力，不自动追求生产级治理、性能优化或完整生态兼容。
+
+_updated: 2026-08-01 20:27:19_
+### Rust 完整推理服务框架主线
+
+type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-02`
+
+持续以小型纵向节点完成真实模型 initial prefill -> self-driving decode -> continuation prefill -> decode -> 多请求隔离 -> 稳定请求生命周期与网络服务循环。每个节点独立验证和提交；已验证核心默认不重开。非 correctness 的接口张力记录后继续，关键节点执行动机剖析并绑定 Graph Memory evidence。
+
+_updated: 2026-08-01 20:27:19_
+### 以纵向闭环持续完成 Rust 推理服务框架
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-02`
+
+【动机六问】1.问题：当前 ring 数学、packet、reserved positioned KV 与多层/多 token correctness 已分别成立，但仍主要存在于实验 helper/test，尚无一个真实模型请求能贯穿 prefill、decode、continuation 和多请求服务生命周期。2.现状：LlamaModel/WorkerBackend/transport 已有若干独立能力，self-driving core 也已抽出；缺口是服务状态、真实模型 KV 数据边界和阶段组合，而不是重新设计 attention 数学。3.目标：真实权重请求可在 Rust 服务中完成 initial prefill -> self-driving decode -> continuation prefill -> decode；随后支持多个 request_id 的独立 KV、交错推进、释放与重复服务，结果与单请求参考一致。4.他者：vLLM 等成熟 engine 使用 paged KV、block table、scheduler、request state 与 continuous batching 形成一体化服务；这些机制可作为生命周期和隔离参考，但其同构设备假设和内部通信路径不能直接表达 HCP 的 capacity-weighted 异构 P2P ring ownership。5.本方案：保持已验证核心冻结，以逐段可运行的 tracer bullet 接线真实模型和服务状态；先打通最薄单请求真实模型流程，再加 continuation、多请求隔离、网络循环与稳定性。发现非致命张力写入 risk/uncertainty 并继续；correctness、显存硬界和隔离失败才阻断。6.为什么：重做核心会重复已经获得的证据；一次性复制成熟 serving engine 又会引入不需要的 production 复杂度。纵向小节点能持续暴露真实接口缺口，同时让每个新增能力直接服务最终闭环。VERDICT: IMPLEMENT。
+
+_updated: 2026-08-01 20:27:19_
 ### 候选下一节点：只提升已验证的 reserved positioned KV 数据边界
 
 type: `decision` · status: `held` · confidence: 0.98 · importance: 1.0 · source: `hetero-cp-ringattn@91df8c4`
