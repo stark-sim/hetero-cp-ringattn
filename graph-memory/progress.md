@@ -9,6 +9,13 @@ type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · sour
 实现 commit 50465da。公开 process_layer_packet 保留 legacy Tensor::cat；仅提取私有 continue_layer_packet 作为 KV 已提交后的共同 attention/finish 原语，并在 cfg(test) 中新增 reserved history adapter。现有 N=3、L=2、两-token localhost TCP worker 按冻结 assignees [[2,1],[1,0]] 为每个 layer×domain 精确预留初始 history + 该层 growth event 数，初始 K/V 一次性 copy 入 positioned slab，decode growth 通过 narrow().copy_() 原地 append，attention 读取 committed view。RED：在原 cat worker 上新增 event pointer-stability 断言，定向测试在 assignee growth 处失败，K/V storage 地址发生变化。GREEN：每个 TCP event 的 K/V data_ptr 前后相同，committed_len 不超过 reservation；第二 token 后所有 layer×domain slab 精确写满。原有 8=2 tokens×2 layers×(3-1) 次 send、四条 successor routes、唯一 assignee 增长、finisher-to-starter continuation、hidden/logits 最大误差小于 4e-4 和 greedy token 对齐均保持。两-token distributed worker 区间无 Tensor::cat；reference dense history 仍用 cat。验证：聚焦测试 1 passed/0 failed；self-driving 17 passed/0 failed；LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib cargo test --manifest-path rust/Cargo.toml --features tch-backend 为 97 passed/0 failed，doc tests 0 failed/3 ignored；同环境 cargo clippy exit 0，仅仓库既有 warning；rustfmt --edition 2021 --check 与 git diff --check 均 exit 0。边界：只证明 fixed N=3/L=2/two-token localhost CPU 的 reserved TCP 变体；capacity-weighted 1:3:2 仍由 24 层实验承担，不证明公共 cache path、24 层 TCP、开放式生成、runtime、QUIC、远端硬件或 GPU 物理显存。
 
 _updated: 2026-08-01 19:03:42_
+### 旧实现专用的大规模实验 artifact 与结果节点已移除
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@59e9944`
+
+提交 59e9944 删除旧实现专用的计划、报告、展示页面、图表和 Graph Memory 重建脚本，并从 blueprint、scaling 文档与 legacy memory 中移除结果引用。验证：精确旧标识 rg 无输出；目标 Graph nodes/edges 计数均为 0；SQLite integrity_check=ok、foreign_key_check 无输出、孤立 evidence 计数 0；graph-memory/migrate.py AST parse 通过；Graph 导出前后五个视图哈希一致；git diff --check 通过。未跟踪的相关二进制资产和生成工作区已移入系统废纸篓。
+
+_updated: 2026-08-01 18:46:47_
 ### 冻结 schedule 的完整 horizon reservation 合同验证通过
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@d1124a8`

@@ -30,13 +30,6 @@ type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · sour
 【动机六问】1.问题：24 层实验已证明 exact slab 与 capacity-weighted prefill/decode continuation，但 localhost TCP 两-token ring 的 distributed worker 仍调用 process_layer_packet 中的 Tensor::cat；两条核心证据尚未组合。2.现状：Tensor::cat 位于公开 process_layer_packet 的 tuple history 写入；直接替换需改变公共 cache 合同，过宽。ReservedPositionedKvShard 已在 cfg(test) 中验证。3.目标：TCP worker 使用精确预留 slab，所有 decode growth 原地写且 data_ptr 不变；packet 路由、8 次 send、唯一 assignee、两 token continuation、hidden/logits/token 对齐保持。4.他者：serving engine 用 reserved arena 或 paged cache，再让 attention 读取 committed view；测试通常通过 cache adapter 组合网络与存储路径。5.本方案：提取私有的 post-commit packet continuation 原语供 legacy process_layer_packet 和 test-only reserved adapter 共用；公开函数仍保留 cat。TCP 测试按 layer×domain 冻结 assignee 次数精确预留并记录 cursor/capacity/pointer。6.为什么：它避免复制 online-softmax 与 layer finish 数学，也避免提前设计生产 cache trait；只填补 TCP 数据流与 slab mechanics 的组合缺口。【牺牲四问】legacy cat 为未知长度和简单 tuple ownership 提供动态增长，本节点不删除它；test-only slab 牺牲 horizon 外增长和运行期重分配，这些能力服务开放式生成与生产 allocator；当前固定两-token实验不需要。因此本节点只能证明 reserved 变体可驱动同一 TCP packet 数学，不能声称公共 process_layer_packet 或生产 runtime 已无 cat。VERDICT: IMPLEMENT EXPERIMENT ONLY。
 
 _updated: 2026-08-01 18:34:17_
-### 删除旧 1M 工程路线的结果与实验材料
-
-type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-request-2026-08-02`
-
-删除旧实现专用的实验计划、报告、展示材料、Graph Memory 结果节点及重建入口，并清除仍存文档中的结果引用。保留通用算法、当前 Rust 核心、通用网络实验和不依赖旧结果的长上下文理论分析。完成标准：仓库和 Graph Memory 不再包含旧 1M 实验结果或可重新导入该结果的 seed；删除清单经过 rg、SQLite integrity/foreign-key、导出幂等和 Git diff 验证。
-
-_updated: 2026-08-01 18:32:53_
 ### 旧 1M 工程证据直接退出当前仓库与知识图谱
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-02`
