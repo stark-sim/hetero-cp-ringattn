@@ -2,6 +2,20 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 整理 HCP 论文的完整核心推理框架
+
+type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-01`
+
+从整个请求生命周期整理 HCP 核心方案：非均等 Ring Attention prefill、自驱动 decode ring、两种 KVCache 切分规则的兼容、capacity-weighted 显存合同、线性 P2P 数据流与阶段转换不变量。论文系统定位为互联无关的异构全生命周期 Context Parallelism：每个 worker 只需 predecessor/successor P2P，CXL、RDMA/RoCE、InfiniBand、UALink、PCIe peer access 或未来高速 fabric 均可承载；当前聚合 KV/context capacity，模型权重仍由每个 worker 完整持有。先形成可审查的方案决策和论文骨架，再写正文。\n\n[2026-08-02 写作边界] 先完成问题定义、系统模型、方法、正确性/复杂度、局限和评测设计；真实实现细节、实验结果、成本结论、摘要与最终结论等待当前框架和新证据。
+
+_updated: 2026-08-01 18:51:11_
+### 当前先整理 HCP 论文的方法主体，推迟实现结果与最终结论
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `paper-readiness-audit-2026-08-02`
+
+【动机六问】1.问题：框架尚未接入真实跨后端 runtime 和新硬件实验，需要判断现在写论文能推进多少，避免等待全部工程完成，也避免提前固化未经验证的结果。2.现状：HCP 的研究问题、transport-agnostic 异构 CP 定位、position-indexed KV 模型、prefill/decode/continuation 数据流、online-softmax 正确性、capacity-weighted ownership/reservation、任意 N/L 路由与通信复杂度已有数学和 Rust 模块证据；缺少当前实现的真实跨后端硬件 E2E、大规模 context、性能/TCO、多请求 runtime 和系统基线。相关工作定位已确认但引用审计未完成。3.目标：先形成稳定的论文骨架和方法正文，所有 empirical claim 使用明确 placeholder；当新实现完成后只补 implementation/evaluation/results，而不重写主方法。4.他者：系统论文通常先固定 problem model、design、algorithm 和 evaluation questions，结果、abstract 与 conclusion 在实现和实验闭合后完成；workshop/position paper可以用较轻实证，完整 systems paper 需要端到端与量化对比。5.本方案：现在可定稿 system/problem model、method、correctness/complexity 和 limitations；可起草 introduction、related-work taxonomy 与 evaluation design；推迟 implementation details、results、economic claims、abstract 和 final conclusion。按 8-10 页完整系统论文估算，可整理 65-70% 的结构化正文，当前可真正定稿约 35-40%；若改投 position/workshop paper，可完成约 80-90%。6.为什么：方法不依赖尚未稳定的 runtime API，提前整理能暴露数学和论证缺口；结果章节直接依赖最终实现与硬件，提前写只会制造伪证据和返工。VERDICT: IMPLEMENT METHOD-FIRST PAPER SCAFFOLD；DEFER EMPIRICAL COMPLETION。
+
+_updated: 2026-08-01 18:51:11_
 ### HCP 系统定位：面向 CXL-class 互联的异构全生命周期 Context Parallelism
 
 type: `decision` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-01`
@@ -44,13 +58,6 @@ type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · sour
 【动机六问】1.问题：旧测试在一个 [1,3,2]、24 units、单 phase 样例上检查前缀比例误差小于等于 1，容易继续暗示该结论对任意 phase 成立；反例已证明这不是普遍定理。2.现状：largest remainder 产生完整 horizon 精确 counts，phase 只循环旋转同一 sequence；exact slab 已证明已知 horizon 可以按 layer×domain 精确预留并原地 append，但 schedule 测试尚未把 counts 明确验证为每域 reservation 上界。3.目标：对多组 tickets/horizon 和所有 phase，任意 prefix 的消费计数都不超过 counts，完整 horizon 后精确等于 counts；现有确定性、容量份额、唯一 assignee和零容量语义不变。4.他者：vLLM 等 serving engine 依赖 admission reservation、block quota 或预分配 arena 保证显存，调度顺序负责平滑吞吐而不是充当显存硬界。5.本方案：不改算法或 API，只用纯单元测试把 counts 解释并验证为完整 horizon reservation，删除旧样例中的 scaled prefix-error 断言。6.为什么：这是把已修订数学结论落实到代码合同的最小方案；无需发明 cyclic discrepancy 算法，也不引入生产 allocator。【牺牲四问】旧前缀检查的目的，是约束单请求短期 event 分布和平滑计算；本节点放弃把小于等于 1 当作普遍保证，但不删除 phase 轮转或 smooth sequence；短期平滑本质上服务并发负载均衡，而不是物理显存安全；本项目现阶段优先保证可证明的 capacity hard bound，多请求效果以后单独实验。VERDICT: IMPLEMENT EXPERIMENT ONLY。
 
 _updated: 2026-08-01 17:31:51_
-### 整理 HCP 论文的完整核心推理框架
-
-type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-01`
-
-从整个请求生命周期整理 HCP 核心方案：非均等 Ring Attention prefill、自驱动 decode ring、两种 KVCache 切分规则的兼容、capacity-weighted 显存合同、线性 P2P 数据流与阶段转换不变量。论文系统定位为互联无关的异构全生命周期 Context Parallelism：每个 worker 只需 predecessor/successor P2P，CXL、RDMA/RoCE、InfiniBand、UALink、PCIe peer access 或未来高速 fabric 均可承载；当前聚合 KV/context capacity，模型权重仍由每个 worker 完整持有。先形成可审查的方案决策和论文骨架，再写正文。
-
-_updated: 2026-08-01 16:51:10_
 ### HCP 论文核心候选：保持 KV 分片并按阶段切换环上传输对象
 
 type: `hypothesis` · status: `superseded` · confidence: 0.95 · importance: 1.0 · source: `analysis-2026-08-01`
