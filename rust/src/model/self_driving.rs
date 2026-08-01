@@ -273,7 +273,7 @@ fn project_final_logits(model: &LlamaModel, hidden_states: &Tensor) -> Tensor {
 
 pub fn process_layer_packet(
     layer: &mut DecoderLayer,
-    mut packet: LayerPacket,
+    packet: LayerPacket,
     local_history: &mut (Tensor, Tensor),
 ) -> Result<LayerStepOutcome, ModelError> {
     if local_history.0.size() != local_history.1.size() {
@@ -283,27 +283,32 @@ pub fn process_layer_packet(
         )));
     }
 
+    if packet.current_domain == packet.assignee {
+        let ring = ring_backend(layer)?;
+        let (current_k, current_v) =
+            ring.project_decode_current_kv(&packet.normalized, &packet.position_ids)?;
+        local_history.0 = Tensor::cat(&[&local_history.0, &current_k], 2);
+        local_history.1 = Tensor::cat(&[&local_history.1, &current_v], 2);
+    }
+
+    continue_layer_packet(layer, packet, &local_history.0, &local_history.1)
+}
+
+fn continue_layer_packet(
+    layer: &mut DecoderLayer,
+    mut packet: LayerPacket,
+    local_k: &Tensor,
+    local_v: &Tensor,
+) -> Result<LayerStepOutcome, ModelError> {
     let finished = packet.visited_domains + 1 == packet.domains;
     let projected_output = {
         let ring = ring_backend(layer)?;
-        if packet.current_domain == packet.assignee {
-            let (current_k, current_v) =
-                ring.project_decode_current_kv(&packet.normalized, &packet.position_ids)?;
-            local_history.0 = Tensor::cat(&[&local_history.0, &current_k], 2);
-            local_history.1 = Tensor::cat(&[&local_history.1, &current_v], 2);
-        }
 
         let (next_output, next_lse) = match (packet.attention_output.take(), packet.lse.take()) {
-            (None, None) => {
-                ring.decode_local_compact_partial(&packet.q, &local_history.0, &local_history.1)
+            (None, None) => ring.decode_local_compact_partial(&packet.q, local_k, local_v),
+            (Some(output), Some(lse)) => {
+                ring.decode_merge_compact_partial(&packet.q, &output, &lse, local_k, local_v)
             }
-            (Some(output), Some(lse)) => ring.decode_merge_compact_partial(
-                &packet.q,
-                &output,
-                &lse,
-                &local_history.0,
-                &local_history.1,
-            ),
             _ => {
                 return Err(ModelError::Backend(
                     "self-driving packet has incomplete attention accumulator".to_string(),
@@ -848,6 +853,40 @@ mod tests {
                 self.v_storage.data_ptr() as usize,
             )
         }
+    }
+
+    fn process_layer_packet_with_reserved_history(
+        layer: &mut DecoderLayer,
+        packet: LayerPacket,
+        local_history: &mut ReservedPositionedKvShard,
+    ) -> Result<LayerStepOutcome, ModelError> {
+        let active_k = local_history.active_k();
+        let active_v = local_history.active_v();
+        if active_k.size() != active_v.size() {
+            return Err(ModelError::Backend(format!(
+                "domain {} has mismatched K/V shapes",
+                packet.current_domain
+            )));
+        }
+
+        if packet.current_domain == packet.assignee {
+            let ring = ring_backend(layer)?;
+            let (current_k, current_v) =
+                ring.project_decode_current_kv(&packet.normalized, &packet.position_ids)?;
+            let positions = (0..current_k.size()[2])
+                .map(|offset| packet.position_ids.int64_value(&[0, offset]))
+                .collect::<Vec<_>>();
+            local_history
+                .append(&current_k, &current_v, &positions)
+                .map_err(ModelError::Backend)?;
+        }
+
+        continue_layer_packet(
+            layer,
+            packet,
+            &local_history.active_k(),
+            &local_history.active_v(),
+        )
     }
 
     fn reserved_positioned_layer_shards(
@@ -1864,6 +1903,9 @@ mod tests {
         sent_bytes: usize,
         kv_before: i64,
         kv_after: i64,
+        reserved_capacity: usize,
+        storage_ptrs_before: (usize, usize),
+        storage_ptrs_after: (usize, usize),
     }
 
     #[derive(Debug)]
@@ -1895,6 +1937,19 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(schedule.counts(), &[1, 2, 1]);
         assert_eq!(assignees, [vec![2, 1], vec![1, 0]]);
+        let mut growth_reservations = vec![vec![0_usize; domains]; layers_count];
+        for token_assignees in &assignees {
+            for (layer_idx, &assignee) in token_assignees.iter().enumerate() {
+                growth_reservations[layer_idx][assignee] += 1;
+            }
+        }
+        let mut domain_growth = vec![0_usize; domains];
+        for layer_reservations in &growth_reservations {
+            for (domain, &reserved) in layer_reservations.iter().enumerate() {
+                domain_growth[domain] += reserved;
+            }
+        }
+        assert_eq!(domain_growth, schedule.counts());
         let device = Device::Cpu;
         let mut config = test_config();
         config.num_layers = layers_count;
@@ -2011,10 +2066,18 @@ mod tests {
         let mut worker_shards = (0..domains)
             .map(|_| Vec::with_capacity(layers_count))
             .collect::<Vec<_>>();
-        for shards in layer_shards {
-            for (domain, shard) in shards.into_iter().enumerate() {
-                worker_shards[domain].push(shard);
+        for (layer_idx, shards) in layer_shards.into_iter().enumerate() {
+            let mut position_offset = 0_i64;
+            for (domain, (k, v)) in shards.into_iter().enumerate() {
+                let history_positions =
+                    (position_offset..position_offset + k.size()[2]).collect::<Vec<_>>();
+                let capacity = k.size()[2] as usize + growth_reservations[layer_idx][domain];
+                let mut slab = ReservedPositionedKvShard::new(&config, capacity, device);
+                slab.append(&k, &v, &history_positions).unwrap();
+                position_offset += k.size()[2];
+                worker_shards[domain].push(slab);
             }
+            assert_eq!(position_offset, history_len);
         }
 
         let listeners = (0..domains)
@@ -2077,51 +2140,57 @@ mod tests {
                                 };
                                 assert_eq!(packet.current_domain, domain);
                                 let visit_index = packet.visited_domains;
-                                let kv_before = shards[layer_idx].0.size()[2];
-                                let (finished, sent_bytes) = match process_layer_packet(
-                                    &mut model.layers[layer_idx],
-                                    packet,
-                                    &mut shards[layer_idx],
-                                )
-                                .unwrap()
-                                {
-                                    LayerStepOutcome::Forward(packet) => {
-                                        let wire =
-                                            packet.into_self_driving_packet(layer_idx).unwrap();
-                                        let sent_bytes =
-                                            successor.send_self_driving_packet(&wire).unwrap();
-                                        (false, sent_bytes)
-                                    }
-                                    LayerStepOutcome::Finished { hidden_states, .. } => {
-                                        if layer_idx + 1 == layers_count {
-                                            let logits =
-                                                project_final_logits(&model, &hidden_states);
-                                            let sampled_token =
-                                                logits.squeeze().argmax(-1, false).int64_value(&[]);
-                                            if token_offset + 1 < token_steps {
-                                                let token_ids =
-                                                    Tensor::from_slice(&[sampled_token])
-                                                        .unsqueeze(0);
-                                                next_token_hidden = Some(Tensor::embedding(
-                                                    &model.embedding,
-                                                    &token_ids,
-                                                    -1,
-                                                    false,
-                                                    false,
-                                                ));
-                                            }
-                                            outputs.push(TcpTokenOutput {
-                                                token_offset,
-                                                hidden_states,
-                                                logits,
-                                                sampled_token,
-                                            });
-                                        } else {
-                                            next_layer_hidden = Some(hidden_states);
+                                let kv_before = shards[layer_idx].committed_len() as i64;
+                                let reserved_capacity = shards[layer_idx].reserved_capacity();
+                                let storage_ptrs_before = shards[layer_idx].storage_ptrs();
+                                let (finished, sent_bytes) =
+                                    match process_layer_packet_with_reserved_history(
+                                        &mut model.layers[layer_idx],
+                                        packet,
+                                        &mut shards[layer_idx],
+                                    )
+                                    .unwrap()
+                                    {
+                                        LayerStepOutcome::Forward(packet) => {
+                                            let wire =
+                                                packet.into_self_driving_packet(layer_idx).unwrap();
+                                            let sent_bytes =
+                                                successor.send_self_driving_packet(&wire).unwrap();
+                                            (false, sent_bytes)
                                         }
-                                        (true, 0)
-                                    }
-                                };
+                                        LayerStepOutcome::Finished { hidden_states, .. } => {
+                                            if layer_idx + 1 == layers_count {
+                                                let logits =
+                                                    project_final_logits(&model, &hidden_states);
+                                                let sampled_token = logits
+                                                    .squeeze()
+                                                    .argmax(-1, false)
+                                                    .int64_value(&[]);
+                                                if token_offset + 1 < token_steps {
+                                                    let token_ids =
+                                                        Tensor::from_slice(&[sampled_token])
+                                                            .unsqueeze(0);
+                                                    next_token_hidden = Some(Tensor::embedding(
+                                                        &model.embedding,
+                                                        &token_ids,
+                                                        -1,
+                                                        false,
+                                                        false,
+                                                    ));
+                                                }
+                                                outputs.push(TcpTokenOutput {
+                                                    token_offset,
+                                                    hidden_states,
+                                                    logits,
+                                                    sampled_token,
+                                                });
+                                            } else {
+                                                next_layer_hidden = Some(hidden_states);
+                                            }
+                                            (true, 0)
+                                        }
+                                    };
+                                let storage_ptrs_after = shards[layer_idx].storage_ptrs();
                                 events.push(TcpLayerEvent {
                                     token_offset,
                                     layer_idx,
@@ -2131,7 +2200,10 @@ mod tests {
                                     finished,
                                     sent_bytes,
                                     kv_before,
-                                    kv_after: shards[layer_idx].0.size()[2],
+                                    kv_after: shards[layer_idx].committed_len() as i64,
+                                    reserved_capacity,
+                                    storage_ptrs_before,
+                                    storage_ptrs_after,
                                 });
                             }
                         }
@@ -2212,11 +2284,16 @@ mod tests {
                     vec![expected_routes[token_offset][layer_idx][domains - 1]]
                 );
                 for event in layer_events {
+                    assert_eq!(event.storage_ptrs_after, event.storage_ptrs_before);
+                    assert!(event.kv_after as usize <= event.reserved_capacity);
                     assert_eq!(
                         event.kv_after,
                         event.kv_before
                             + i64::from(event.domain == assignees[token_offset][layer_idx])
                     );
+                    if token_offset + 1 == token_steps {
+                        assert_eq!(event.kv_after as usize, event.reserved_capacity);
+                    }
                 }
             }
         }
