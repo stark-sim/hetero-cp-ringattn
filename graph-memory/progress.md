@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-08-02] Reserved positioned KV 支持显式运行 dtype
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 0.98 · source: `hetero-cp-ringattn@b6902ba`
+
+实现提交 b6902ba 为 ReservedPositionedKvShard 增加 new_with_kind(config, capacity, device, kind)，现有 new 保持 Float 兼容并委托新构造器。BF16 storage 可原地 append BF16 K/V，active view 保持 BF16；shape/device/dtype mismatch、position、capacity 和 committed prefix 语义不变。TDD RED：focused test 以 E0599 缺少 new_with_kind 失败。GREEN 验证：reserved_positioned_kv_accepts_explicit_runtime_dtype 1 passed；model::self_driving::tests:: 19 passed；完整 cargo test --features tch-backend 99 passed、0 failed；cargo clippy --features tch-backend --all-targets exit 0，仅既有 warnings；rustfmt --edition 2021 --check rust/src/model/self_driving.rs 与 git diff --check 通过。证据为本地 libtorch CPU correctness，不是硬件性能。
+
+_updated: 2026-08-01 20:38:25_
 ### Graph Memory 大段 Unicode SQL 不经交互 PTY 写入
 
 type: `lesson` · status: `held` · confidence: 1.0 · importance: 0.8 · source: `incident-2026-08-02-graph-memory-sql-transport`

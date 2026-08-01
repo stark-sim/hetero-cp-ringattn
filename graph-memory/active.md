@@ -397,25 +397,22 @@ C. Rust decode 移植 Q+LSE 累积器环+增长分片(修 007+008)。
 _updated: 2026-07-27 15:10:25_
 ### 真实模型 KV dtype 与 reserved slab 固定 Float 不兼容
 
-type: `risk` · status: `open` · confidence: 1.0 · importance: 0.98 · source: `code-audit-2026-08-02`
+type: `risk` · status: `resolved` · confidence: 1.0 · importance: 0.98 · source: `hetero-cp-ringattn@b6902ba`
 
 代码审计确认 ReservedPositionedKvShard::new 固定以 Kind::Float 预分配；本地真实 Qwen2-0.5B config 和 LlamaModel dtype 为 BFloat16。append 会严格校验 dtype，因此真实 Qwen K/V 无法进入当前 slab。该问题不否定 reserved/positioned ownership、capacity hard bound 或 ring 数学，只阻断真实模型数据接线。
 
-_updated: 2026-08-01 20:31:12_
-### Reserved positioned KV 支持真实模型运行 dtype
+[2026-08-02 解决] new_with_kind 允许实际模型 dtype 预分配，不改变核心数据流。
 
-type: `task` · status: `ongoing` · confidence: 1.0 · importance: 0.98 · source: `analysis-2026-08-02`
-
-为 ReservedPositionedKvShard 增加显式 runtime Kind 构造入口；保留现有 Float 构造和全部数学/ownership 行为。先用 BF16 append 回归测试 RED/GREEN，再运行 self-driving 与完整 Rust 回归。该节点只解除真实模型 prefill 前置 blocker，不接 runtime 或模型权重。
-
-_updated: 2026-08-01 20:31:12_
+_updated: 2026-08-01 20:38:25_
 ### Reserved positioned KV 由调用者显式指定运行 dtype
 
-type: `decision` · status: `held` · confidence: 1.0 · importance: 0.98 · source: `analysis-2026-08-02`
+type: `decision` · status: `held` · confidence: 1.0 · importance: 0.98 · source: `hetero-cp-ringattn@b6902ba`
 
 【动机六问】1.问题：真实 Qwen2-0.5B 的 current K/V 是 BFloat16，当前 slab 固定 Float，append 必然失败。2.现状：Float 固定值来自 synthetic correctness 测试；shape/device/overflow/position 语义已成立，不应重写。3.目标：调用者可用实际模型 Kind 预分配 slab，BF16 K/V 可原地 append；默认 Float 构造与 dtype mismatch rejection 保持。4.他者：vLLM/paged KV 等缓存按模型或 cache runtime dtype 分配，不根据测试默认值固定。5.本方案：保留 new(config, capacity, device) 作为 Float 兼容入口，新增 new_with_kind(config, capacity, device, kind)，仅替换 Tensor::zeros 的 Kind 来源。6.为什么：显式 runtime Kind 是权重加载后的事实，可兼容未来 dtype override；从 config.torch_dtype 再推导会复制 LlamaModel 映射并可能与实际加载 dtype 偏离。该改动不改变 attention、分片、capacity 或 position 语义。VERDICT: IMPLEMENT。
 
-_updated: 2026-08-01 20:31:12_
+[2026-08-02 实现] b6902ba 验证显式 runtime Kind；VERDICT: IMPLEMENTED。
+
+_updated: 2026-08-01 20:38:25_
 ### 历史扩展线：网络、Striped 与 vLLM 探索
 
 type: `task` · status: `superseded` · confidence: 0.8 · importance: 0.95 · source: `user-direction`
