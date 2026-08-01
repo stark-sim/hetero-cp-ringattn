@@ -83,6 +83,20 @@ pub trait WorkerBackend: Send {
         self.prefill(chunk, seq_offset, position_ids)
     }
 
+    /// Request-aware prefill with an optional per-layer local KV reservation.
+    ///
+    /// Backends without reservation-backed storage keep their existing behavior.
+    fn prefill_request_with_reservation(
+        &mut self,
+        request_id: u64,
+        chunk: &[i64],
+        seq_offset: usize,
+        position_ids: Option<&[i64]>,
+        _layer_kv_capacities: Option<&[usize]>,
+    ) -> Result<(Vec<f32>, usize), String> {
+        self.prefill_request(request_id, chunk, seq_offset, position_ids)
+    }
+
     /// 【请求感知的 decode】支持多请求隔离的 decode。
     ///
     /// 默认实现调用 `decode()`（向后兼容单请求后端）。

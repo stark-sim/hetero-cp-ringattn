@@ -272,6 +272,7 @@ fn process_single_request(
             chunk: chunk.clone(),
             seq_offset: *seq_offset,
             position_ids: Some(position_ids.clone()),
+            layer_kv_capacities: None,
         };
         send_command_quic(send, &cmd, rt.handle()).map_err(|e| format!("send Prefill failed: {e}"))?;
     }
@@ -496,6 +497,7 @@ fn prefill_single_request(
             chunk: chunk.clone(),
             seq_offset: *seq_offset,
             position_ids: Some(position_ids.clone()),
+            layer_kv_capacities: None,
         };
         if let Err(e) = send_command_quic(send, &cmd, rt.handle()) {
             let _ = job.tx.send(InferenceResult {

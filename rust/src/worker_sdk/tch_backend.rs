@@ -17,7 +17,8 @@
 //! 通过已设置的 `KvTransport` 自动完成 KV ring 交换。
 //! 所以 `TchWorkerBackend` 本身不需要关心网络细节。
 
-use crate::model::cache::KvCaches;
+use crate::model::cache::{KvCacheImpl, KvCaches};
+use crate::model::self_driving::ReservedPositionedKvShard;
 use crate::model::transport::KvTransport;
 use crate::model::model::LlamaModel;
 use crate::model::{ModelConfig, ModelWeights};
@@ -121,9 +122,43 @@ impl TchWorkerBackend {
         chunk: &[i64],
         seq_offset: usize,
         position_ids: Option<&[i64]>,
+        layer_kv_capacities: Option<&[usize]>,
     ) -> Result<(Vec<f32>, usize), String> {
+        let next_kv_caches = if let Some(capacities) = layer_kv_capacities {
+            if capacities.len() != self.model.config.num_layers {
+                return Err(format!(
+                    "reserved prefill requires {} layer capacities, got {}",
+                    self.model.config.num_layers,
+                    capacities.len()
+                ));
+            }
+            for (layer_idx, &capacity) in capacities.iter().enumerate() {
+                if capacity < chunk.len() {
+                    return Err(format!(
+                        "reserved prefill layer {layer_idx} capacity {capacity} is smaller than local prompt length {}",
+                        chunk.len()
+                    ));
+                }
+            }
+            capacities
+                .iter()
+                .map(|&capacity| {
+                    Some(KvCacheImpl::ReservedPositioned(
+                        ReservedPositionedKvShard::new_with_kind(
+                            &self.model.config,
+                            capacity,
+                            self.device,
+                            self.model.dtype,
+                        ),
+                    ))
+                })
+                .collect()
+        } else {
+            self.model.create_kv_caches()
+        };
+
         // Reset KV cache for a new request.
-        self.kv_caches = self.model.create_kv_caches();
+        self.kv_caches = next_kv_caches;
         self.model.is_prefill_done = false;
         self.model.global_seq_len = 0;
         self.model.prefill_position_ids = None;
@@ -179,7 +214,7 @@ impl WorkerBackend for TchWorkerBackend {
         seq_offset: usize,
         position_ids: Option<&[i64]>,
     ) -> Result<(Vec<f32>, usize), String> {
-        self.do_prefill(chunk, seq_offset, position_ids)
+        self.do_prefill(chunk, seq_offset, position_ids, None)
     }
 
     fn decode(&mut self, token: i64) -> Result<Vec<f32>, String> {
@@ -205,9 +240,34 @@ impl WorkerBackend for TchWorkerBackend {
         seq_offset: usize,
         position_ids: Option<&[i64]>,
     ) -> Result<(Vec<f32>, usize), String> {
-        let (logits_vec, global_seq_len) = self.do_prefill(chunk, seq_offset, position_ids)?;
+        let (logits_vec, global_seq_len) =
+            self.do_prefill(chunk, seq_offset, position_ids, None)?;
 
         // Save the freshly computed KV cache and model state into per-request context.
+        self.request_contexts.insert(request_id, RequestContext {
+            kv_caches: std::mem::replace(&mut self.kv_caches, self.model.create_kv_caches()),
+            global_seq_len: self.model.global_seq_len,
+            is_prefill_done: self.model.is_prefill_done,
+        });
+
+        Ok((logits_vec, global_seq_len))
+    }
+
+    fn prefill_request_with_reservation(
+        &mut self,
+        request_id: u64,
+        chunk: &[i64],
+        seq_offset: usize,
+        position_ids: Option<&[i64]>,
+        layer_kv_capacities: Option<&[usize]>,
+    ) -> Result<(Vec<f32>, usize), String> {
+        let (logits_vec, global_seq_len) = self.do_prefill(
+            chunk,
+            seq_offset,
+            position_ids,
+            layer_kv_capacities,
+        )?;
+
         self.request_contexts.insert(request_id, RequestContext {
             kv_caches: std::mem::replace(&mut self.kv_caches, self.model.create_kv_caches()),
             global_seq_len: self.model.global_seq_len,
@@ -280,6 +340,7 @@ impl WorkerBackend for TchWorkerBackend {
 #[cfg(feature = "tch-backend")]
 mod tests {
     use super::*;
+    use crate::model::cache::KvCacheImpl;
     use crate::model::config::ModelConfig;
     use crate::model::model::{LlamaModel, create_synthetic_weights};
     use crate::worker_sdk::backend::WorkerBackend;
@@ -416,6 +477,64 @@ mod tests {
 
             next_token_a = token_ref_a as i64;
             next_token_b = token_ref_b as i64;
+        }
+    }
+
+    #[test]
+    fn reserved_prefill_uses_explicit_per_layer_capacities() {
+        let device = Device::Cpu;
+        let config = ModelConfig {
+            architectures: Some(vec!["LlamaForCausalLM".to_string()]),
+            hidden_size: 32,
+            num_layers: 24,
+            num_heads: 4,
+            num_kv_heads: Some(1),
+            intermediate_size: 64,
+            vocab_size: 100,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-6,
+            tie_word_embeddings: false,
+            torch_dtype: Some("float32".to_string()),
+            hidden_act: "silu".to_string(),
+            max_position_embeddings: Some(128),
+            attention_dropout: 0.0,
+            bos_token_id: None,
+            eos_token_id: None,
+            use_cache: true,
+            sliding_window: None,
+            use_sliding_window: None,
+            partial_rotary_factor: 1.0,
+        };
+        let weights = create_synthetic_weights(&config, device);
+        let model = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+        let mut backend = TchWorkerBackend::from_model(model, device, 0);
+        let prompt = [3_i64, 5];
+        let capacities = (0..config.num_layers)
+            .map(|layer_idx| prompt.len() + layer_idx % 3)
+            .collect::<Vec<_>>();
+
+        let mut under_capacity = capacities.clone();
+        under_capacity[7] = prompt.len() - 1;
+        let error = backend
+            .prefill_request_with_reservation(8, &prompt, 0, None, Some(&under_capacity))
+            .unwrap_err();
+        assert!(error.contains("layer 7"));
+        assert!(!backend.request_contexts.contains_key(&8));
+
+        let (logits, _) = backend
+            .prefill_request_with_reservation(9, &prompt, 0, None, Some(&capacities))
+            .unwrap();
+        assert_eq!(logits.len(), config.vocab_size);
+
+        let context = backend.request_contexts.get(&9).unwrap();
+        assert_eq!(context.kv_caches.len(), config.num_layers);
+        for (layer_idx, cache) in context.kv_caches.iter().enumerate() {
+            let Some(KvCacheImpl::ReservedPositioned(shard)) = cache else {
+                panic!("layer {layer_idx} did not use reserved positioned KV");
+            };
+            assert_eq!(shard.reserved_capacity(), capacities[layer_idx]);
+            assert_eq!(shard.committed_len(), prompt.len());
+            assert_eq!(shard.positions(), &[0, 1]);
         }
     }
 }

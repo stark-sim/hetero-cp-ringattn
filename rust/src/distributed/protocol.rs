@@ -16,11 +16,14 @@ pub enum WorkerCommand {
     /// `seq_offset` is the global start position of this chunk (domain0=0, domain1=chunk0_len, etc.)
     /// `position_ids` optionally overrides the default [seq_offset, seq_offset+1, ...) ordering
     /// for non-contiguous scheduling strategies such as Striped or ZigZag.
+    /// `layer_kv_capacities` optionally provides this worker's finite-horizon
+    /// reserved KV capacity for every model layer.
     Prefill {
         request_id: u64,
         chunk: Vec<i64>,
         seq_offset: i64,
         position_ids: Option<Vec<i64>>,
+        layer_kv_capacities: Option<Vec<usize>>,
     },
     /// Run single-token decode for a specific request.
     Decode {
@@ -433,9 +436,19 @@ mod tests {
             chunk: vec![1, 2, 3],
             seq_offset: 0,
             position_ids: None,
+            layer_kv_capacities: Some(vec![5, 6]),
         };
         let bytes = bincode::serialize(&cmd).unwrap();
         println!("Prefill cmd: {:?}", bytes);
+        let decoded: WorkerCommand = bincode::deserialize(&bytes).unwrap();
+        let WorkerCommand::Prefill {
+            layer_kv_capacities,
+            ..
+        } = decoded
+        else {
+            panic!("expected Prefill command");
+        };
+        assert_eq!(layer_kv_capacities, Some(vec![5, 6]));
 
         let cmd2 = WorkerCommand::Decode { request_id: 1, token: 42 };
         let bytes2 = bincode::serialize(&cmd2).unwrap();
