@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### Graph Memory 大段 Unicode SQL 不经交互 PTY 写入
+
+type: `lesson` · status: `held` · confidence: 1.0 · importance: 0.8 · source: `incident-2026-08-02-graph-memory-sql-transport`
+
+症状：通过交互式 sqlite3 PTY 写入包含多行中文与长命令的 evidence 时，终端回显出现重复/截断，查询确认第 3、4 条验证记录被串坏。影响：节点状态和边已提交，但证据正文不可信。根因边界：SQL 事务本身正确，损坏发生在大段 Unicode 文本经交互 PTY 传输；此前把含字面反斜杠换行的 SQL 作为 shell 参数也被 SQLite 拒绝且零写入。已验证解决：改用非交互单行 sqlite3 命令，通过 char(10) 在 SQLite 内构造换行；写后用 instr 检查预期哨兵存在、损坏片段不存在，再运行外键与悬空 evidence 检查。预防条件：Graph Memory 的结构化长文本写入避免 PTY；优先非交互 SQL/项目脚本，并把正文读回校验后再导出和提交。证据仅支持项目级操作 lesson，不修改通用 skill。
+
+_updated: 2026-08-01 20:23:44_
 ### [2026-08-02] ReservedPositionedKvShard 提升为 experimental core API
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 0.98 · source: `hetero-cp-ringattn@91df8c4`
