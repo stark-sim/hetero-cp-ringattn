@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-08-02] 本地真实 Qwen BF16 单节点基线可运行
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 0.85 · source: `local-command-2026-08-02`
+
+在 mac-local-shell + libtorch CPU 运行 cargo run --features tch-backend --bin hcp-ringattn-rust -- --infer-model-dir models/Qwen2-0.5B --infer-prompt Hi --infer-max-tokens 1 --infer-temperature 0 --infer-top-p 1 --infer-num-domains 1。实际加载 24 层 Qwen2-0.5B BF16 safetensors，完成 prefill 与 1 token generation，输出逗号，exit 0。该证据只确认本地真实权重/BF16 kernel 基线可用，不证明 reserved cache 或分布式服务。
+
+_updated: 2026-08-01 20:42:55_
 ### [2026-08-02] Reserved positioned KV 支持显式运行 dtype
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 0.98 · source: `hetero-cp-ringattn@b6902ba`

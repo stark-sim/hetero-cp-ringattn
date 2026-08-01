@@ -2,6 +2,20 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 真实 Qwen initial prefill 直接写 reserved positioned cache
+
+type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `analysis-2026-08-02`
+
+把 ReservedPositionedKvShard 接入现有 KvCacheImpl/LlamaModel::forward，使本地真实 Qwen2-0.5B initial prefill 直接原地写入逐层 reserved positioned KV，不经过 legacy contiguous cache 再搬运。该节点先证明单 worker 真实权重与数据格式闭环；多 worker P2P prefill 是后续独立节点。
+
+_updated: 2026-08-01 20:42:55_
+### 通过 KvCacheImpl adapter 接入真实 prefill
+
+type: `decision` · status: `held` · confidence: 0.98 · importance: 1.0 · source: `analysis-2026-08-02`
+
+【动机六问】1.问题：真实 LlamaModel::forward 只能消费 KvCaches，reserved shard 虽已支持 BF16但仍无法进入真实 prefill。2.现状：test-only all-domain helper 能证明数学，却同时看见所有 worker shard；直接提升会违反每 worker 只持本地 KV。另写 model forward 会复制 Norm/Attention/MLP 主流程。3.目标：真实 Qwen initial prefill 通过唯一 LlamaModel::forward 直接写入每层 reserved positioned cache；positions/dtype/committed prefix 正确，logits 与 contiguous reference 一致。4.他者：serving engine 通过统一 cache adapter/block table 让模型 forward 写入不同物理 cache；位置与 cache metadata 由 request state 提供。5.本方案：扩展 KvCache trait 一个默认 no-op 的 position preparation hook；ReservedPositionedKvShard 实现该 trait；KvCacheImpl 增加 reserved variant。LlamaModel 在每层 forward 前把本轮 position_ids 交给 cache。reserved variant 的 legacy update_sharded 明确拒绝，decode 继续走 self-driving core。6.为什么：该 adapter 复用现有真实模型和 ring attention forward，不复制计算主流程，也不把全局 shard 可见性带入 runtime。默认 hook 保持 contiguous/block 行为不变。VERDICT: IMPLEMENT。
+
+_updated: 2026-08-01 20:42:55_
 ### Rust 线优先完成完整推理服务框架
 
 type: `preference` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-02`
@@ -395,6 +409,13 @@ B. vLLM decode ≥2 并发+增长分片保持(修 004,PoC 最小要求);
 C. Rust decode 移植 Q+LSE 累积器环+增长分片(修 007+008)。
 
 _updated: 2026-07-27 15:10:25_
+### 现有多请求 context 未隔离每层 ring phase state
+
+type: `risk` · status: `open` · confidence: 1.0 · importance: 0.98 · source: `code-audit-2026-08-02`
+
+TchWorkerBackend::RequestContext 只保存 KvCaches/global_seq_len/is_prefill_done；每层 HcpRingAttentionBackend 还持有 request-sensitive prefill_kv_len、is_prefill_done 和 seq_offset。单请求不受影响，但分布式多请求交错可能共享错误 phase。按用户路线先继续单请求完整流程；在多请求节点前必须把这些字段纳入 request-local state，否则属于 correctness blocker。
+
+_updated: 2026-08-01 20:42:55_
 ### 真实模型 KV dtype 与 reserved slab 固定 Float 不兼容
 
 type: `risk` · status: `resolved` · confidence: 1.0 · importance: 0.98 · source: `hetero-cp-ringattn@b6902ba`
@@ -546,6 +567,13 @@ type: `belief` · status: `held` · confidence: 0.85 · importance: 0.95 · sour
 基于 white-pearl 限速矩阵：\n- 2.35 Gbps 基线 20.5 s\n- 1 Gbps 29.5 s（1.44x）\n- 500 Mbps 50 s（2.44x）\n- 100 Mbps 445 s（21.7x）\n\n在 Qwen2-0.5B-1M、seq=4096、max_tokens=5 的异构推理任务中，端到端 latency 随跨节点带宽下降呈非线性增长。低于 1 Gbps 时，P2P KV ring 的通信时间显著超过计算时间；100 Mbps 时通信完全主导总时间。\n\n推论：若要在生产环境中部署异构 CP 推理，需要 CXL / RDMA / 高速 NVLink 等级别的互联带宽，否则网络将把多卡聚合的显存优势抵消为极高的延迟惩罚。
 
 _updated: 2026-06-29 14:32:15_
+### All-domain positioned helper 不能成为 worker runtime API
+
+type: `risk` · status: `mitigated` · confidence: 1.0 · importance: 0.9 · source: `code-audit-2026-08-02`
+
+24 层 correctness helper 在单进程同时持有所有 domain shard，适合作为数值与位置 union oracle；若直接提升为 runtime API，会违反每 worker 只有 predecessor/successor 且只持本地 KV 的核心边界。处理：保留为 test oracle，真实服务通过 worker-local cache adapter 接线。该风险不阻断框架推进。
+
+_updated: 2026-08-01 20:42:55_
 ### 主流单请求细粒度分布式推理仍以同构并行组为主要设计点
 
 type: `assumption` · status: `held` · confidence: 0.85 · importance: 0.9 · source: `user-confirmed-research-position-2026-08-02`
