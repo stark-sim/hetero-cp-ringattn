@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### Rust 核心框架恢复审计定位 test-only positioned KV 边界
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `analysis-2026-08-02`
+
+只读检查 git diff、rust/src/model/self_driving.rs、rust/src/model/cache.rs、transport symbols、Tensor::cat callers 和核心 Graph 节点。证据：最小核心 task 已在 checkpoint 13 关闭；24-layer exact slab 与 two-token reserved TCP 已分别验证；ReservedPositionedKvShard 和 process_layer_packet_with_reserved_history 仅定义在 self_driving.rs 的 cfg(test) 模块；公开 process_layer_packet 接收 (Tensor,Tensor) 并在 assignee 通过 Tensor::cat 增长；现有 KvCache trait 不携带 global positions，直接改造会扩大到通用 cache/runtime。工作区的 placement.rs 是用户未提交的 production placement/ledger 草稿，明确只读并排除。结论：不再补重复规模测试；下一最小框架能力是把已验证的 reserved positioned shard 和 adapter 提升为 experimental core API，同时保留 legacy 路径。
+
+_updated: 2026-08-01 20:01:44_
 ### HCP 方法草稿中文版完成并与英文稿结构对齐
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@d2562b3`

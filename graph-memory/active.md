@@ -2,6 +2,20 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 候选：将 reserved positioned KV 提升为实验性核心 API
+
+type: `task` · status: `proposed` · confidence: 0.98 · importance: 1.0 · source: `analysis-2026-08-02`
+
+待用户确认。仅从 self_driving.rs 的 cfg(test) 中抽取 ReservedPositionedKvShard 及 reserved packet processing 到 tch-backend 可编译的 experimental core；复用现有 slab/TCP/24-layer 测试。保留公开 legacy process_layer_packet 的 Tensor::cat，不修改 KvCache trait、placement.rs、allocator、admission、runtime、多请求或硬件路径。
+
+_updated: 2026-08-01 20:01:44_
+### 候选下一节点：只提升已验证的 reserved positioned KV 数据边界
+
+type: `decision` · status: `proposed` · confidence: 0.98 · importance: 1.0 · source: `analysis-2026-08-02`
+
+【动机六问】1.问题：capacity hard bound 目前只存在于 cfg(test) slab，框架编译产物中的公开 self-driving packet 路径仍通过 Tensor::cat 复制完整本地历史，因而无法被后续核心代码复用。2.现状：ReservedPositionedKvShard 已在 24-layer mixed-history 和 two-token TCP 中证明 exact reservation、stable pointer、overflow rejection 与数值正确；但其 struct、append/view API 和 reserved adapter 全在 tests 模块。通用 KvCache trait 既不携带 global positions，也以 update 返回完整 tensor 为合同；直接改造会扩大范围。3.目标：让 reserved positioned shard 和 packet adapter 在 tch-backend 正常编译并由现有实验直接使用；验证行为不变、无新增 Tensor::cat、legacy API 不变。4.他者：成熟 serving engine 使用 reserved arena 或 paged cache，把 committed view 与物理 capacity 分离；完整方案还包含 allocator、block table 和 lifecycle。5.本方案：只做代码抽取和最薄公开 experimental API，不实现成熟 allocator，不替换通用 KvCache。6.为什么：它是把已证明显存性质从测试夹具提升为框架能力的最小改动；比继续扩大集成测试增加更多可复用价值，也避免重新进入 production planner。【边界/牺牲】保留 legacy cat 意味着默认旧路径仍无硬界；新 API 需要调用者预先知道 capacity，不能开放式增长。这个限制符合当前 finite-horizon 实验合同。VERDICT: PROPOSE IMPLEMENTATION, PENDING USER CONFIRMATION。
+
+_updated: 2026-08-01 20:01:44_
 ### 整理 HCP 论文的完整核心推理框架
 
 type: `task` · status: `paused` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-02`
@@ -16,13 +30,6 @@ _updated: 2026-08-01 19:58:15_
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-02`
 
 用户已确认英文草稿可接受，并要求中文版完成后暂时停止论文推进。现阶段不写 Abstract、Implementation Results、性能结果、最终 Conclusion 或新相关工作。下一主线回到 Rust 实验性核心框架；仍遵守核心和必要能力优先，不进入多请求 pipeline、真实 runtime 接入或生产级 allocator，除非用户后续明确恢复这些范围。
-
-_updated: 2026-08-01 19:58:15_
-### 审计 Rust 核心框架并选择下一个最小节点
-
-type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-02`
-
-只读审查当前 Rust self-driving decode、positioned KV、capacity schedule、transport 与已有 Graph Memory 证据，找出一个仍未闭合且不依赖多请求、真实 runtime 或生产 allocator 的必要能力。用户未提交的 Rust 修改只读、不覆盖。输出下一节点的改动、原因、对总体计划的贡献和明确边界。
 
 _updated: 2026-08-01 19:58:15_
 ### 先做只读缺口审计，再选择一个实验性核心节点
