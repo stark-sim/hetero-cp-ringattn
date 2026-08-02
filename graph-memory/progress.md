@@ -2,6 +2,26 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-08-02] 现行远程入口已停止使用旧 GPU LAN 地址
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `hetero-cp-ringattn@b2f2753`
+
+实现提交 b2f2753。验证：
+1. rg -n old-address AGENTS.md scripts docs/PROTOCOL_SMOKE.md docs/DEPLOYMENT_GUIDE.md 无输出，证明现行规则、脚本和操作文档不再引用旧 endpoint；历史 kimi export、memory-bank/legacy 与 harness inventory 副本未改写。
+2. bash -n scripts/run_rust_remote_cp_node.sh scripts/run_rust_remote_cp_3node_smoke.sh scripts/run_rust_remote_p2p_client.sh，exit 0。
+3. 未设置 GPU_HOST/CONNECT_ADDR 启动对应脚本均在网络操作前 exit 1，并提示从 ~/.agents/inventory.yaml 解析。
+4. ssh -o BatchMode=yes -o ConnectTimeout=8 inventory-white-host 执行严格 set -eu 检查，结果 inventory-endpoint-ok；远端 hostname=white，RTX 4090、~/hetero-cp-ringattn 与 ~/models/Qwen2-0.5B 均存在。
+5. git diff --check 通过。
+边界：只验证 endpoint 来源和脚本 fail-fast，不声明推理服务或 self-driving runtime 已跨节点完成。
+
+_updated: 2026-08-02 11:39:46_
+### 远程 endpoint 漂移应在 inventory 边界被阻断
+
+type: `lesson` · status: `held` · confidence: 1.0 · importance: 0.85 · source: `hetero-cp-ringattn@b2f2753`
+
+症状：按项目 AGENTS.md 的固定 GPU 地址连接时 SSH 超时。影响：会把配置漂移误判为节点不可达，并阻断真实异构验证。最小对照：旧规则地址超时，而同一 SSH 用户连接 inventory 中 white.ssh.host 成功，且 CUDA GPU、仓库和模型均存在。根因：项目规则和脚本复制了 infrastructure inventory 中会变化的 endpoint。解决：现行规则只声明 inventory authority；连接脚本要求显式 endpoint 并 fail-fast；文档不再提供旧默认。预防条件：任何远程操作先查 inventory，脚本不得把历史实验地址提升为当前默认。该 lesson 是项目基础设施事实，不创建或修改通用 skill。
+
+_updated: 2026-08-02 11:39:46_
 ### 真实 Qwen 两 worker decode packet 完成 48 次邻接 TCP hop
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@39ba09a`

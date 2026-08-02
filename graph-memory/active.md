@@ -520,13 +520,6 @@ type: `decision` · status: `held` · confidence: 1.0 · importance: 0.98 · sou
 [2026-08-02 实现] b6902ba 验证显式 runtime Kind；VERDICT: IMPLEMENTED。
 
 _updated: 2026-08-01 20:38:25_
-### 移除旧 GPU LAN 地址作为现行连接默认
-
-type: `task` · status: `ongoing` · confidence: 1.0 · importance: 0.95 · source: `user-correction+infrastructure-inventory-2026-08-02`
-
-修订 AGENTS.md、现行 remote smoke 脚本和操作文档，使远程节点连接参数来自 infrastructure inventory。运行脚本不再静默猜测旧 GPU host；需要连接地址时显式要求 GPU_HOST 或 CONNECT_ADDR。保留历史实验结果的事实语义，但不让历史端点继续充当当前操作说明。验收：现行规则和可执行脚本不含旧地址；inventory 中 white 的 SSH endpoint 可达并能看到 CUDA GPU、仓库与模型。
-
-_updated: 2026-08-02 11:12:40_
 ### 现行远程操作只解析 inventory endpoint
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `user-correction+verified-inventory-endpoint-2026-08-02`
