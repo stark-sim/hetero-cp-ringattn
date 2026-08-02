@@ -2,6 +2,26 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### TCP/QUIC positioned KV wire 合同验证通过
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@0382c24`
+
+实现 commit 0382c24 让 KvBlock optional position_ids 通过 TCP/QUIC KvTransport trait 无损传输：JSON metadata 描述 shape/bytes/dtype，payload 保持原始 Int64，顺序为 K、V、positions；旧 frame 缺失字段时继续解析为 None。范围只涉及两个 transport codec 与测试，没有修改 attention、KV 归属、schedule、backend、runtime 或 coordinator。
+
+TDD：
+1. TCP positioned roundtrip 在实现前因接收端 position_ids=None 按预期失败，随后转绿。
+2. QUIC positioned roundtrip 在实现前因接收端 position_ids=None 按预期失败，随后转绿。
+
+验证（所有 cargo 命令均使用 LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib:/opt/homebrew/opt/libomp/lib HCP_ENABLE_TORCH=1 前缀）：
+1. cargo test --manifest-path rust/Cargo.toml --features tch-backend kv_transport -- --nocapture -> 7 passed, 0 failed；覆盖 TCP/QUIC trait object、[0,9,16777217] Int64 精确往返、旧 frame 缺字段兼容和既有 self-driving packet。
+2. cargo test --manifest-path rust/Cargo.toml --features tch-backend test_ring_attention_derivatives_uneven_perf -- --nocapture -> 1 passed；vanilla/striped/zigzag positioned correctness diff 均约 2.6e-8 至 2.8e-8。
+3. cargo test --manifest-path rust/Cargo.toml --features tch-backend -> 107 passed, 0 failed, 3 ignored；doc tests 0 failed, 3 ignored。
+4. cargo clippy --manifest-path rust/Cargo.toml --features tch-backend --all-targets -> exit 0，仅既有 warnings。
+5. rustfmt --edition 2021 --check 两个 transport 文件、git diff --check、SQLite integrity_check/foreign_key_check -> exit 0 / ok / 无 foreign-key violation。
+
+边界：这是本机 CPU codec/correctness 证据，不是跨主机 wire smoke、MPS/CUDA 完整模型或 continuation segment-forward 证据；risk-continuation-prefill-positioned-wire-20260803 仍保持 open，等待 Node 4b。
+
+_updated: 2026-08-02 19:42:44_
 ### [2026-08-03] SelfDrivingPacket 统一 transport 合同通过真实跨主机 QUIC
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@58dccc5`

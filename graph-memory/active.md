@@ -2,6 +2,21 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 先补齐 Positioned KV 的 TCP/QUIC wire 合同
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmation-2026-08-03`
+
+【动机六问】
+1. 问题：continuation prefill 需要重用 decode 后按 layer assignee 分散、位置可能非连续的 KV；网络边界若丢失 position_ids，peer causal mask 会把这些 KV 错当成连续区间。
+2. 现状：KvBlock 已有 optional position_ids，clone、LinkedMockKvTransport 和 HcpRingAttentionBackend 都会保留或消费它；但 TCP/QUIC 的 KV codec 只编码 K/V 与区间 metadata，接收端固定构造 position_ids=None。
+3. 目标：通过 KvTransport trait 发送带非连续 Int64 positions 的 KvBlock 后，TCP 和 QUIC 接收端都获得相同 shape、dtype和值；测试包含 16,777,217 以证明未经过 f32；不带 position metadata 的旧 frame 仍解析为 None。
+4. 他者：vLLM 等 serving runtime 通过 block table、slot mapping 和显式 token position 维护 paged KV 的逻辑位置，通常不把独立 KvBlock 绕 P2P ring 传输，因此其 runtime metadata 机制只能借鉴“位置必须显式”的原则，不能直接复用 codec。
+5. 本方案：在现有 JSON metadata + raw tensor payload 中追加 optional position tensor 描述与原始 Int64 bytes；payload 顺序固定为 K、V、positions（若存在），TCP/QUIC 使用各自已有 tensor codec，接收时按字段存在性选择 Some 或 None。
+6. 为什么：这是让既有 positioned attention 语义跨进程成立的最小改动，不改变 KV 归属、ring hop、调度或 backend API；直接改 runtime 会把 wire 丢失与 continuation 计算混在一起，无法独立定位正确性。
+【兼容边界】保留缺失 position metadata 的旧 KV frame 为 None，不删除连续区间 fallback；本节点不承诺跨版本协议协商或生产级 schema versioning。
+VERDICT: IMPLEMENT。
+
+_updated: 2026-08-02 19:28:05_
 ### 真实 Qwen 两阶段请求接入 WorkerRuntime/coordinator
 
 type: `task` · status: `planning` · confidence: 1.0 · importance: 1.0 · source: `user-selection-2026-08-03`
