@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 RUN_ID="${RUN_ID:-rust-remote-cp-3node-local}"
-GPU_HOST="${GPU_HOST:-192.168.8.172}"
+GPU_HOST="${GPU_HOST:?GPU_HOST is required; resolve it from ~/.agents/inventory.yaml}"
 GPU_USER="${GPU_USER:-stark}"
 GPU_SSH="${GPU_SSH:-${GPU_USER}@${GPU_HOST}}"
 GPU_REPO_DIR="${GPU_REPO_DIR:-hetero-cp-ringattn}"

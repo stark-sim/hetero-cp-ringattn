@@ -7,7 +7,7 @@ RUN_ID="${RUN_ID:-rust-remote-cp-node-local}"
 REPORT_DIR="${REPO_ROOT}/reports/${RUN_ID}"
 NODE_INDEX="${NODE_INDEX:?NODE_INDEX is required: 0=mac-mps, 1=gpu-cuda}"
 BIND_ADDR="${BIND_ADDR:?BIND_ADDR is required, e.g. 0.0.0.0:29174}"
-CONNECT_ADDR="${CONNECT_ADDR:?CONNECT_ADDR is required, e.g. 192.168.8.172:29173}"
+CONNECT_ADDR="${CONNECT_ADDR:?CONNECT_ADDR is required; resolve the peer host from ~/.agents/inventory.yaml}"
 mkdir -p "${REPORT_DIR}"
 
 echo "=== HCP Rust Remote CP Node ==="

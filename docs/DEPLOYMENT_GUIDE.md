@@ -249,9 +249,9 @@ cargo run --features tch-backend --bin hcp-ringattn-rust -- \
 
 ```bash
 # Mac 端（会自动 SSH 到 GPU 节点同步代码并启动）
-GPU_HOST=192.168.8.172 \
-GPU_USER=stark \
-MAC_NODE_ADDR=192.168.8.xxx \
+GPU_HOST=<inventory-gpu-ssh-host> \
+GPU_USER=<inventory-gpu-ssh-user> \
+MAC_NODE_ADDR=<mac-address-reachable-by-gpu> \
 RUN_ID=my-first-hetero-smoke \
 PORT_BASE=29450 \
 bash scripts/run_rust_remote_cp_3node_smoke.sh

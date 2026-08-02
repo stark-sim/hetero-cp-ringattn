@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 RUN_ID="${RUN_ID:-rust-remote-p2p-local}"
 REPORT_DIR="${REPO_ROOT}/reports/${RUN_ID}"
-CONNECT_ADDR="${CONNECT_ADDR:-192.168.8.172:29172}"
+CONNECT_ADDR="${CONNECT_ADDR:?CONNECT_ADDR is required; resolve the GPU host from ~/.agents/inventory.yaml}"
 mkdir -p "${REPORT_DIR}"
 
 echo "=== HCP Rust Remote P2P Client ==="

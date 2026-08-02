@@ -69,13 +69,13 @@ Rust 侧当前定义的最小 schema 包括：
 
 这一步先固定协议语义，不绑定到底层 IP/TCP。后续可以把同一个 `RingAttnMessage` 映射到 TCP、UCX/RDMA、NCCL send/recv、共享内存或自定义 GPU-direct transport。
 
-远端 NVIDIA GPU 当前在 `192.168.8.172`。代码变更只通过 git 同步：本地提交并 push，远端只执行 `git pull` 和 smoke 命令，不在远端直接编辑源码。
+远端节点的当前 SSH host 和 user 必须从 `~/.agents/inventory.yaml` 查询。代码变更只通过 git 同步：本地提交并 push，远端只执行 `git pull` 和 smoke 命令，不在远端直接编辑源码。
 
 ## Remote P2P Pair Smoke
 
 `tcp_remote_pair` 是一个双进程 / 双机器 smoke transport，用于确认同一套 `RingAttnMessage` 可以跨机器点对点发送、接收和校验。它不改变 P2P 的定义：P2P 仍是 point-to-point protocol 语义，TCP 只是本阶段最小可诊断的工程传输。
 
-双机 smoke 不应使用 `127.0.0.1` 作为结论。远端 GPU 节点监听 `0.0.0.0:29172`，本机 client 连接 `192.168.8.172:29172`：
+双机 smoke 不应使用 `127.0.0.1` 作为结论。远端 GPU 节点监听 `0.0.0.0:29172`，本机 client 连接 inventory 中目标 GPU 的当前 SSH host：
 
 ```bash
 # 远端 GPU 节点执行，只通过 git 同步源码
@@ -90,7 +90,7 @@ RUN_ID=rust-remote-p2p-$(date +%Y%m%d-%H%M%S) \
 ```bash
 # 本机执行
 RUN_ID=<same-run-id> \
-  CONNECT_ADDR=192.168.8.172:29172 \
+  CONNECT_ADDR=<inventory-gpu-host>:29172 \
   CARGO_OFFLINE=0 \
   bash scripts/run_rust_remote_p2p_client.sh
 ```
@@ -165,7 +165,7 @@ torch_payload_block_status=pass torch_payload_block_code=3 torch_payload_blocks=
 RUN_ID=rust-remote-cp-node-<timestamp> \
   NODE_INDEX=0 \
   BIND_ADDR=0.0.0.0:29176 \
-  CONNECT_ADDR=192.168.8.172:29175 \
+  CONNECT_ADDR=<inventory-gpu-host>:29175 \
   CARGO_OFFLINE=0 \
   HCP_ENABLE_TORCH=1 \
   HCP_TORCH_DEVICE=mps \
@@ -223,7 +223,7 @@ RUN_ID=rust-remote-cp-3node-<timestamp> \
 该脚本会：
 
 - 自动发现当前 Mac 的 `192.168.8.x` 或 `100.x` 地址，也可用 `MAC_NODE_ADDR` 覆盖；`MAC_192_ADDR` 仅保留为兼容旧命令的别名。
-- 在 GPU host 上执行 `git pull --ff-only`，保持远端源码只通过 git 同步；默认 GPU host 为 `192.168.8.172`，临时 VPN 路由可用 `GPU_HOST=100.118.253.68 MAC_NODE_ADDR=100.121.35.138` 覆盖。
+- 在 GPU host 上执行 `git pull --ff-only`，保持远端源码只通过 git 同步；`GPU_HOST` 必须显式设置为 inventory 中目标节点的 `ssh.host`，`MAC_NODE_ADDR` 使用该节点可反连的当前 Mac 地址。
 - 对本机和远端先做 cargo preflight build，降低节点启动后因编译耗时错过 retry 窗口的风险。
 - 统一启动 node0、node2、node1，并把 launcher stdout/stderr 写入 `reports/<RUN_ID>/launch_node_<N>.log`。
 - 默认本机节点使用 `HCP_TORCH_DEVICE=mps`，GPU 节点使用 `HCP_TORCH_DEVICE=cuda:0`。
@@ -277,7 +277,7 @@ node1: sent=8 received=8 compute_updates=12 torch_query_output_code=3 torch_quer
 node2: sent=8 received=8 compute_updates=12 torch_query_output_code=2 torch_query_output_blocks=12/12 output_seq_offset=64 output_slot_values=288
 ```
 
-2026-04-29 已将 `DomainModelState` 从直接 Q/K/V fixture 生成推进到 projection 数据流：domain-local hidden states 通过 `ModelLayerWeights` 的 Q/K/V projection 生成 Q chunk、K cache、V cache。`RUN_ID=rust-remote-cp-projection-lan-20260429` 在 `GPU_HOST=192.168.8.172 MAC_NODE_ADDR=192.168.8.239` 下通过，远端先从 `ccffedc` fast-forward 到 `46c9e18`：
+2026-04-29 已将 `DomainModelState` 从直接 Q/K/V fixture 生成推进到 projection 数据流：domain-local hidden states 通过 `ModelLayerWeights` 的 Q/K/V projection 生成 Q chunk、K cache、V cache。`RUN_ID=rust-remote-cp-projection-lan-20260429` 曾在现已退役的 LAN endpoint 下通过，远端先从 `ccffedc` fast-forward 到 `46c9e18`；该历史 endpoint 不用于当前连接：
 
 ```text
 node0: sent=8 received=8 compute_updates=12 torch_query_output_code=2 torch_query_output_blocks=12/12 hidden_bytes=2048 q_proj_bytes=4608 k_proj_bytes=4608 v_proj_bytes=4608
