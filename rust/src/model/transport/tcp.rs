@@ -335,6 +335,35 @@ impl KvTransport for TcpKvTransport {
             }
         }
     }
+
+    fn supports_self_driving_packets(&self) -> bool {
+        true
+    }
+
+    fn submit_send_self_driving_packet(
+        &mut self,
+        packet: &SelfDrivingPacket,
+    ) -> Result<(), String> {
+        let frame = serialize_self_driving_packet(packet)?;
+        self.send_buffer.extend_from_slice(&frame);
+        Ok(())
+    }
+
+    fn poll_recv_self_driving_packet(
+        &mut self,
+    ) -> Result<Option<SelfDrivingPacket>, String> {
+        if let Some(packet) = self.pending_self_driving_packets.pop_front() {
+            return Ok(Some(packet));
+        }
+        loop {
+            match self.recv_frame()? {
+                Some(TcpFrame::SelfDrivingPacket(packet)) => return Ok(Some(packet)),
+                Some(TcpFrame::KvBlock(block)) => self.pending_kv.push_back(block),
+                Some(TcpFrame::RingPacket(packet)) => self.pending_packets.push_back(packet),
+                None => return Ok(None),
+            }
+        }
+    }
 }
 
 #[cfg(feature = "tch-backend")]

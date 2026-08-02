@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use super::block::{KvBlock, RingPacket};
+use super::block::{KvBlock, RingPacket, SelfDrivingPacket};
 
 /// 【环上消息】传输层线上复用同一组 stream 承载两类 payload：
 /// KV block（prefill / legacy decode）和 decode Q-ring packet。
@@ -9,6 +9,7 @@ use super::block::{KvBlock, RingPacket};
 pub enum RingMessage {
     KvBlock(KvBlock),
     RingPacket(RingPacket),
+    SelfDrivingPacket(SelfDrivingPacket),
 }
 
 /// 【KV 传输层 Trait】定义分布式 worker 之间交换 KV block 的接口。
@@ -101,6 +102,38 @@ pub trait KvTransport: Send {
     fn recv_packet(&mut self) -> Result<Option<RingPacket>, String> {
         loop {
             match self.poll_recv_packet()? {
+                Some(packet) => return Ok(Some(packet)),
+                None => std::thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        }
+    }
+
+    // ====== Self-driving decode packet API ======
+
+    /// Whether this transport can carry the complete self-driving layer packet.
+    fn supports_self_driving_packets(&self) -> bool {
+        false
+    }
+
+    /// Submit a self-driving packet without waiting for the network write to finish.
+    fn submit_send_self_driving_packet(
+        &mut self,
+        _packet: &SelfDrivingPacket,
+    ) -> Result<(), String> {
+        Err("self-driving packets not supported by this transport".to_string())
+    }
+
+    /// Poll for a self-driving packet without consuming other message types.
+    fn poll_recv_self_driving_packet(
+        &mut self,
+    ) -> Result<Option<SelfDrivingPacket>, String> {
+        Ok(None)
+    }
+
+    /// Block until a self-driving packet arrives.
+    fn recv_self_driving_packet(&mut self) -> Result<Option<SelfDrivingPacket>, String> {
+        loop {
+            match self.poll_recv_self_driving_packet()? {
                 Some(packet) => return Ok(Some(packet)),
                 None => std::thread::sleep(std::time::Duration::from_millis(1)),
             }

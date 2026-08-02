@@ -29,12 +29,16 @@ mod report;
 mod smoke;
 mod tch_backend;
 #[cfg(feature = "tch-backend")]
+mod transport_smoke;
+#[cfg(feature = "tch-backend")]
 mod worker_sdk;
 
 pub use cli::{CliArgs, parse_cli_args, next_cli_value};
 pub use error::{RingError, Tolerance, ToleranceTier};
 pub use report::*;
 pub use smoke::*;
+#[cfg(feature = "tch-backend")]
+pub use transport_smoke::run_self_driving_quic_smoke;
 pub use smoke::reference_algo::*;
 pub use smoke::correctness::*;
 pub use smoke::bridges::*;

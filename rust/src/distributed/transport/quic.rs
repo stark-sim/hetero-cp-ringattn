@@ -15,7 +15,7 @@
 //! 主线程在 `process_kv_block()` 计算的同时，send task 在后台把下一个 block
 //! 写入网络，recv task 在后台等待接收 peer block。
 #[cfg(feature = "tch-backend")]
-use crate::model::transport::{KvBlock, KvTransport, RingMessage, RingPacket};
+use crate::model::transport::{KvBlock, KvTransport, RingMessage, RingPacket, SelfDrivingPacket};
 #[cfg(feature = "tch-backend")]
 use quinn::SendStream;
 use quinn::{ClientConfig, Endpoint, RecvStream, ServerConfig};
@@ -98,7 +98,9 @@ pub fn create_endpoint(listen_addr: SocketAddr) -> Result<Endpoint, String> {
     // With 1.2s RTT cross-VPN, NAT idle timeouts (often 30-60s) can expire during
     // long prefill computation gaps. Keep-alive every 1s ensures NAT table refresh.
     transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(1)));
-    transport_config.max_idle_timeout(Some(std::time::Duration::from_secs(3600).try_into().unwrap()));
+    transport_config.max_idle_timeout(Some(
+        std::time::Duration::from_secs(3600).try_into().unwrap(),
+    ));
     // Disable MTU discovery: Tailscale WireGuard MTU is 1280, and PMTUD may probe
     // larger sizes that get dropped by intermediate devices. Stick to conservative
     // 1200 bytes to avoid fragmentation-related packet loss on high-RTT paths.
@@ -117,8 +119,8 @@ pub fn create_endpoint(listen_addr: SocketAddr) -> Result<Endpoint, String> {
     // 256MB was insufficient and caused deadlock. 1GB provides headroom for 128K.
     transport_config.send_window(1024u64 * 1024 * 1024);
 
-    let mut endpoint = Endpoint::server(server_config, listen_addr)
-        .map_err(|e| format!("bind failed: {e}"))?;
+    let mut endpoint =
+        Endpoint::server(server_config, listen_addr).map_err(|e| format!("bind failed: {e}"))?;
 
     // Client config so this endpoint can also dial outbound
     let crypto = rustls::ClientConfig::builder()
@@ -183,6 +185,7 @@ pub struct QuicKvTransport {
     /// poll_recv_packet 只取 packet，另一类先暂存等对应调用取出。
     pending_kv: std::collections::VecDeque<KvBlock>,
     pending_packets: std::collections::VecDeque<RingPacket>,
+    pending_self_driving_packets: std::collections::VecDeque<SelfDrivingPacket>,
     /// send task 的 JoinHandle（Drop 时需要 abort）
     #[allow(dead_code)]
     send_task: tokio::task::JoinHandle<()>,
@@ -216,6 +219,7 @@ impl QuicKvTransport {
             recv_rx,
             pending_kv: std::collections::VecDeque::new(),
             pending_packets: std::collections::VecDeque::new(),
+            pending_self_driving_packets: std::collections::VecDeque::new(),
             send_task,
             recv_task,
             rt,
@@ -229,6 +233,9 @@ impl QuicKvTransport {
             match msg {
                 RingMessage::KvBlock(block) => self.pending_kv.push_back(block),
                 RingMessage::RingPacket(packet) => self.pending_packets.push_back(packet),
+                RingMessage::SelfDrivingPacket(packet) => {
+                    self.pending_self_driving_packets.push_back(packet)
+                }
             }
         }
     }
@@ -341,12 +348,58 @@ fn serialize_ring_packet(packet: &RingPacket) -> Result<Vec<u8>, String> {
     let meta_bytes = meta.to_string().into_bytes();
     let meta_len = meta_bytes.len() as u32;
 
-    let mut frame = Vec::with_capacity(4 + meta_bytes.len() + q_bytes.len() + o_bytes.len() + lse_bytes.len());
+    let mut frame =
+        Vec::with_capacity(4 + meta_bytes.len() + q_bytes.len() + o_bytes.len() + lse_bytes.len());
     frame.extend_from_slice(&meta_len.to_be_bytes());
     frame.extend_from_slice(&meta_bytes);
     frame.extend_from_slice(&q_bytes);
     frame.extend_from_slice(&o_bytes);
     frame.extend_from_slice(&lse_bytes);
+    Ok(frame)
+}
+
+#[cfg(feature = "tch-backend")]
+fn serialize_self_driving_packet(packet: &SelfDrivingPacket) -> Result<Vec<u8>, String> {
+    let tensors = [
+        ("residual", &packet.residual),
+        ("normalized", &packet.normalized),
+        ("position_ids", &packet.position_ids),
+        ("q", &packet.q),
+        ("attention_output", &packet.attention_output),
+        ("lse", &packet.lse),
+    ];
+    let mut payloads = Vec::with_capacity(tensors.len());
+    let mut tensor_meta = serde_json::Map::new();
+    for (name, tensor) in tensors {
+        let (bytes, dtype) = tensor_to_bytes(tensor)?;
+        tensor_meta.insert(
+            name.to_string(),
+            serde_json::json!({
+                "shape": tensor.size(),
+                "bytes": bytes.len(),
+                "dtype": dtype,
+            }),
+        );
+        payloads.push(bytes);
+    }
+
+    let meta = serde_json::json!({
+        "type": "self_driving_packet",
+        "layer_idx": packet.layer_idx,
+        "assignee": packet.assignee,
+        "current_domain": packet.current_domain,
+        "domains": packet.domains,
+        "visited_domains": packet.visited_domains,
+        "tensors": tensor_meta,
+    });
+    let meta_bytes = meta.to_string().into_bytes();
+    let mut frame =
+        Vec::with_capacity(4 + meta_bytes.len() + payloads.iter().map(Vec::len).sum::<usize>());
+    frame.extend_from_slice(&(meta_bytes.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&meta_bytes);
+    for payload in payloads {
+        frame.extend_from_slice(&payload);
+    }
     Ok(frame)
 }
 
@@ -383,19 +436,51 @@ async fn recv_frame_from_stream(
     let meta_len = u32::from_be_bytes(len_bytes) as usize;
 
     let mut meta_bytes = vec![0u8; meta_len];
-    read_exact(recv, &mut meta_bytes).await
+    read_exact(recv, &mut meta_bytes)
+        .await
         .map_err(|e| format!("quic recv meta failed: {e}"))?;
-    let meta: serde_json::Value = serde_json::from_slice(&meta_bytes)
-        .map_err(|e| format!("quic parse meta failed: {e}"))?;
+    let meta: serde_json::Value =
+        serde_json::from_slice(&meta_bytes).map_err(|e| format!("quic parse meta failed: {e}"))?;
 
     let layer_idx = meta["layer_idx"].as_u64().ok_or("missing layer_idx")? as usize;
+
+    if meta["type"].as_str() == Some("self_driving_packet") {
+        let residual = recv_named_tensor(recv, &meta, "residual", device).await?;
+        let normalized = recv_named_tensor(recv, &meta, "normalized", device).await?;
+        let position_ids = recv_named_tensor(recv, &meta, "position_ids", device).await?;
+        let q = recv_named_tensor(recv, &meta, "q", device).await?;
+        let attention_output = recv_named_tensor(recv, &meta, "attention_output", device).await?;
+        let lse = recv_named_tensor(recv, &meta, "lse", device).await?;
+        let assignee = meta["assignee"].as_u64().ok_or("missing assignee")? as usize;
+        let current_domain = meta["current_domain"]
+            .as_u64()
+            .ok_or("missing current_domain")? as usize;
+        let domains = meta["domains"].as_u64().ok_or("missing domains")? as usize;
+        let visited_domains = meta["visited_domains"]
+            .as_u64()
+            .ok_or("missing visited_domains")? as usize;
+        return Ok(Some(RingMessage::SelfDrivingPacket(SelfDrivingPacket {
+            layer_idx,
+            residual,
+            normalized,
+            position_ids,
+            q,
+            attention_output,
+            lse,
+            assignee,
+            current_domain,
+            domains,
+            visited_domains,
+        })));
+    }
 
     if meta["type"].as_str() == Some("ring_packet") {
         let scale = meta["scale"].as_f64().ok_or("missing scale")?;
         let read_tensor = |prefix: &str| -> Result<(Vec<u8>, Vec<i64>, String), String> {
             let bytes_len = meta[format!("{prefix}_bytes")]
                 .as_u64()
-                .ok_or_else(|| format!("missing {prefix}_bytes"))? as usize;
+                .ok_or_else(|| format!("missing {prefix}_bytes"))?
+                as usize;
             let shape: Vec<i64> = meta[format!("{prefix}_shape")]
                 .as_array()
                 .ok_or_else(|| format!("missing {prefix}_shape"))?
@@ -403,42 +488,68 @@ async fn recv_frame_from_stream(
                 .map(|v| v.as_i64().ok_or("invalid shape"))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e: &str| e.to_string())?;
-            let dtype = meta[format!("{prefix}_dtype")].as_str().unwrap_or("float32").to_string();
+            let dtype = meta[format!("{prefix}_dtype")]
+                .as_str()
+                .unwrap_or("float32")
+                .to_string();
             Ok((vec![0u8; bytes_len], shape, dtype))
         };
         let (mut q_bytes, q_shape, q_dtype) = read_tensor("q")?;
-        read_exact(recv, &mut q_bytes).await
+        read_exact(recv, &mut q_bytes)
+            .await
             .map_err(|e| format!("quic recv q_bytes failed: {e}"))?;
         let (mut o_bytes, o_shape, o_dtype) = read_tensor("o")?;
-        read_exact(recv, &mut o_bytes).await
+        read_exact(recv, &mut o_bytes)
+            .await
             .map_err(|e| format!("quic recv o_bytes failed: {e}"))?;
         let (mut lse_bytes, lse_shape, lse_dtype) = read_tensor("lse")?;
-        read_exact(recv, &mut lse_bytes).await
+        read_exact(recv, &mut lse_bytes)
+            .await
             .map_err(|e| format!("quic recv lse_bytes failed: {e}"))?;
         let q = bytes_to_tensor(&q_bytes, &q_shape, device, &q_dtype)?;
         let o = bytes_to_tensor(&o_bytes, &o_shape, device, &o_dtype)?;
         let lse = bytes_to_tensor(&lse_bytes, &lse_shape, device, &lse_dtype)?;
-        return Ok(Some(RingMessage::RingPacket(RingPacket { layer_idx, q, o, lse, scale })));
+        return Ok(Some(RingMessage::RingPacket(RingPacket {
+            layer_idx,
+            q,
+            o,
+            lse,
+            scale,
+        })));
     }
 
-    let global_seq_start = meta["global_seq_start"].as_u64().ok_or("missing global_seq_start")? as usize;
-    let global_seq_end = meta["global_seq_end"].as_u64().ok_or("missing global_seq_end")? as usize;
+    let global_seq_start = meta["global_seq_start"]
+        .as_u64()
+        .ok_or("missing global_seq_start")? as usize;
+    let global_seq_end = meta["global_seq_end"]
+        .as_u64()
+        .ok_or("missing global_seq_end")? as usize;
     let micro_block_idx = meta["micro_block_idx"].as_u64().unwrap_or(0) as usize;
     let total_micro_blocks = meta["total_micro_blocks"].as_u64().unwrap_or(1) as usize;
     let k_bytes_len = meta["k_bytes"].as_u64().ok_or("missing k_bytes")? as usize;
     let v_bytes_len = meta["v_bytes"].as_u64().ok_or("missing v_bytes")? as usize;
-    let k_shape: Vec<i64> = meta["k_shape"].as_array().ok_or("missing k_shape")?
-        .iter().map(|v| v.as_i64().ok_or("invalid k_shape"))
-        .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
-    let v_shape: Vec<i64> = meta["v_shape"].as_array().ok_or("missing v_shape")?
-        .iter().map(|v| v.as_i64().ok_or("invalid v_shape"))
-        .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+    let k_shape: Vec<i64> = meta["k_shape"]
+        .as_array()
+        .ok_or("missing k_shape")?
+        .iter()
+        .map(|v| v.as_i64().ok_or("invalid k_shape"))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    let v_shape: Vec<i64> = meta["v_shape"]
+        .as_array()
+        .ok_or("missing v_shape")?
+        .iter()
+        .map(|v| v.as_i64().ok_or("invalid v_shape"))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
 
     let mut k_bytes = vec![0u8; k_bytes_len];
-    read_exact(recv, &mut k_bytes).await
+    read_exact(recv, &mut k_bytes)
+        .await
         .map_err(|e| format!("quic recv k_bytes failed: {e}"))?;
     let mut v_bytes = vec![0u8; v_bytes_len];
-    read_exact(recv, &mut v_bytes).await
+    read_exact(recv, &mut v_bytes)
+        .await
         .map_err(|e| format!("quic recv v_bytes failed: {e}"))?;
 
     let k_dtype = meta["k_dtype"].as_str().unwrap_or("float32");
@@ -446,7 +557,47 @@ async fn recv_frame_from_stream(
     let k = bytes_to_tensor(&k_bytes, &k_shape, device, k_dtype)?;
     let v = bytes_to_tensor(&v_bytes, &v_shape, device, v_dtype)?;
 
-    Ok(Some(RingMessage::KvBlock(KvBlock { layer_idx, global_seq_start, global_seq_end, k, v, micro_block_idx, total_micro_blocks, position_ids: None })))
+    Ok(Some(RingMessage::KvBlock(KvBlock {
+        layer_idx,
+        global_seq_start,
+        global_seq_end,
+        k,
+        v,
+        micro_block_idx,
+        total_micro_blocks,
+        position_ids: None,
+    })))
+}
+
+#[cfg(feature = "tch-backend")]
+async fn recv_named_tensor(
+    recv: &mut RecvStream,
+    meta: &serde_json::Value,
+    name: &str,
+    device: Device,
+) -> Result<Tensor, String> {
+    let tensor_meta = &meta["tensors"][name];
+    let bytes_len = tensor_meta["bytes"]
+        .as_u64()
+        .ok_or_else(|| format!("missing {name} bytes"))? as usize;
+    let shape = tensor_meta["shape"]
+        .as_array()
+        .ok_or_else(|| format!("missing {name} shape"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_i64()
+                .ok_or_else(|| format!("invalid {name} shape"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let dtype = tensor_meta["dtype"]
+        .as_str()
+        .ok_or_else(|| format!("missing {name} dtype"))?;
+    let mut bytes = vec![0_u8; bytes_len];
+    read_exact(recv, &mut bytes)
+        .await
+        .map_err(|error| format!("quic recv {name} bytes failed: {error}"))?;
+    bytes_to_tensor(&bytes, &shape, device, dtype)
 }
 
 #[cfg(feature = "tch-backend")]
@@ -460,7 +611,9 @@ impl KvTransport for QuicKvTransport {
     fn submit_send(&mut self, block: &KvBlock) -> Result<(), String> {
         let frame = serialize_kv_block(block)?;
         self.rt.block_on(async {
-            self.send_tx.send(SendCmd::Data(frame)).await
+            self.send_tx
+                .send(SendCmd::Data(frame))
+                .await
                 .map_err(|e| format!("quic send channel closed: {e}"))
         })
     }
@@ -482,7 +635,9 @@ impl KvTransport for QuicKvTransport {
     fn flush_send(&mut self) -> Result<(), String> {
         let (tx, rx) = oneshot::channel();
         self.rt.block_on(async {
-            self.send_tx.send(SendCmd::Flush(tx)).await
+            self.send_tx
+                .send(SendCmd::Flush(tx))
+                .await
                 .map_err(|e| format!("quic send channel closed during flush: {e}"))?;
             rx.await.map_err(|e| format!("quic flush ack dropped: {e}"))
         })
@@ -505,12 +660,17 @@ impl KvTransport for QuicKvTransport {
             loop {
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(timeout_secs),
-                    self.recv_rx.recv()
-                ).await {
+                    self.recv_rx.recv(),
+                )
+                .await
+                {
                     Ok(Some(RingMessage::KvBlock(block))) => return Ok(Some(block)),
                     // 交叉流量：packet 暂存，继续等 KV block
                     Ok(Some(RingMessage::RingPacket(packet))) => {
                         self.pending_packets.push_back(packet);
+                    }
+                    Ok(Some(RingMessage::SelfDrivingPacket(packet))) => {
+                        self.pending_self_driving_packets.push_back(packet);
                     }
                     Ok(None) => return Ok(None), // channel closed（stream 已关闭）
                     Err(_) => return Err(format!("recv_kv_block timeout after {timeout_secs}s")),
@@ -527,7 +687,9 @@ impl KvTransport for QuicKvTransport {
     fn submit_send_packet(&mut self, packet: &RingPacket) -> Result<(), String> {
         let frame = serialize_ring_packet(packet)?;
         self.rt.block_on(async {
-            self.send_tx.send(SendCmd::Data(frame)).await
+            self.send_tx
+                .send(SendCmd::Data(frame))
+                .await
                 .map_err(|e| format!("quic send channel closed: {e}"))
         })
     }
@@ -551,15 +713,74 @@ impl KvTransport for QuicKvTransport {
             loop {
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(timeout_secs),
-                    self.recv_rx.recv()
-                ).await {
+                    self.recv_rx.recv(),
+                )
+                .await
+                {
                     Ok(Some(RingMessage::RingPacket(packet))) => return Ok(Some(packet)),
                     // 交叉流量：KV block 暂存，继续等 packet
                     Ok(Some(RingMessage::KvBlock(block))) => {
                         self.pending_kv.push_back(block);
                     }
+                    Ok(Some(RingMessage::SelfDrivingPacket(packet))) => {
+                        self.pending_self_driving_packets.push_back(packet);
+                    }
                     Ok(None) => return Ok(None),
                     Err(_) => return Err(format!("recv_packet timeout after {timeout_secs}s")),
+                }
+            }
+        })
+    }
+
+    fn supports_self_driving_packets(&self) -> bool {
+        true
+    }
+
+    fn submit_send_self_driving_packet(
+        &mut self,
+        packet: &SelfDrivingPacket,
+    ) -> Result<(), String> {
+        let frame = serialize_self_driving_packet(packet)?;
+        self.rt.block_on(async {
+            self.send_tx
+                .send(SendCmd::Data(frame))
+                .await
+                .map_err(|error| format!("quic send channel closed: {error}"))
+        })
+    }
+
+    fn poll_recv_self_driving_packet(&mut self) -> Result<Option<SelfDrivingPacket>, String> {
+        self.drain_recv_channel();
+        Ok(self.pending_self_driving_packets.pop_front())
+    }
+
+    fn recv_self_driving_packet(&mut self) -> Result<Option<SelfDrivingPacket>, String> {
+        if let Some(packet) = self.pending_self_driving_packets.pop_front() {
+            return Ok(Some(packet));
+        }
+        let timeout_secs = std::env::var("HCP_QUIC_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(600);
+        self.rt.block_on(async {
+            loop {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(timeout_secs),
+                    self.recv_rx.recv(),
+                )
+                .await
+                {
+                    Ok(Some(RingMessage::SelfDrivingPacket(packet))) => return Ok(Some(packet)),
+                    Ok(Some(RingMessage::KvBlock(block))) => self.pending_kv.push_back(block),
+                    Ok(Some(RingMessage::RingPacket(packet))) => {
+                        self.pending_packets.push_back(packet)
+                    }
+                    Ok(None) => return Ok(None),
+                    Err(_) => {
+                        return Err(format!(
+                            "recv_self_driving_packet timeout after {timeout_secs}s"
+                        ))
+                    }
                 }
             }
         })
@@ -569,8 +790,19 @@ impl KvTransport for QuicKvTransport {
 #[cfg(feature = "tch-backend")]
 #[cfg(feature = "tch-backend")]
 fn tensor_to_bytes(t: &Tensor) -> Result<(Vec<u8>, String), String> {
+    if t.kind() == tch::Kind::Int64 {
+        let flat = t.contiguous().view(-1);
+        let values: Vec<i64> =
+            Vec::try_from(&flat).map_err(|e| format!("tensor to vec failed: {e}"))?;
+        let bytes = values
+            .iter()
+            .flat_map(|&value| value.to_le_bytes())
+            .collect();
+        return Ok((bytes, "int64".to_string()));
+    }
     let flat = t.contiguous().view(-1).to_kind(tch::Kind::Float);
-    let values: Vec<f32> = Vec::try_from(&flat).map_err(|e| format!("tensor to vec failed: {e}"))?;
+    let values: Vec<f32> =
+        Vec::try_from(&flat).map_err(|e| format!("tensor to vec failed: {e}"))?;
     let bytes = values.iter().flat_map(|&v| v.to_le_bytes()).collect();
     let dtype = match t.kind() {
         tch::Kind::Float => "float32",
@@ -583,13 +815,44 @@ fn tensor_to_bytes(t: &Tensor) -> Result<(Vec<u8>, String), String> {
 }
 
 #[cfg(feature = "tch-backend")]
-fn bytes_to_tensor(bytes: &[u8], shape: &[i64], device: Device, dtype_str: &str) -> Result<Tensor, String> {
-    let values: Vec<f32> = bytes.chunks_exact(4)
+fn bytes_to_tensor(
+    bytes: &[u8],
+    shape: &[i64],
+    device: Device,
+    dtype_str: &str,
+) -> Result<Tensor, String> {
+    if dtype_str == "int64" {
+        if !bytes.len().is_multiple_of(8) {
+            return Err(format!("int64 byte length is not aligned: {}", bytes.len()));
+        }
+        let values: Vec<i64> = bytes
+            .chunks_exact(8)
+            .map(|chunk| {
+                i64::from_le_bytes([
+                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+                ])
+            })
+            .collect();
+        let expected = shape.iter().product::<i64>() as usize;
+        if values.len() != expected {
+            return Err(format!(
+                "byte length mismatch: expected {expected} int64 values, got {}",
+                values.len()
+            ));
+        }
+        return Ok(Tensor::from_slice(&values).reshape(shape).to_device(device));
+    }
+    let values: Vec<f32> = bytes
+        .chunks_exact(4)
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect();
     let expected = shape.iter().product::<i64>() as usize;
     if values.len() != expected {
-        return Err(format!("byte length mismatch: expected {} floats, got {}", expected, values.len()));
+        return Err(format!(
+            "byte length mismatch: expected {} floats, got {}",
+            expected,
+            values.len()
+        ));
     }
     let t = Tensor::from_slice(&values).reshape(shape).to_device(device);
     let kind = match dtype_str {
@@ -599,4 +862,122 @@ fn bytes_to_tensor(bytes: &[u8], shape: &[i64], device: Device, dtype_str: &str)
         _ => tch::Kind::Float,
     };
     Ok(t.to_kind(kind))
+}
+
+#[cfg(all(test, feature = "tch-backend"))]
+mod tests {
+    use super::*;
+    use crate::model::transport::SelfDrivingPacket;
+    use tch::Kind;
+
+    fn test_self_driving_packet(device: Device) -> SelfDrivingPacket {
+        SelfDrivingPacket {
+            layer_idx: 7,
+            residual: Tensor::arange(8, (Kind::Float, device))
+                .reshape([1, 1, 8])
+                .to_kind(Kind::BFloat16),
+            normalized: (Tensor::arange(8, (Kind::Float, device)) * 0.5)
+                .reshape([1, 1, 8])
+                .to_kind(Kind::BFloat16),
+            position_ids: Tensor::from_slice(&[16_777_217_i64]).reshape([1, 1]),
+            q: Tensor::arange(32, (Kind::Float, device))
+                .reshape([1, 4, 1, 8])
+                .to_kind(Kind::BFloat16),
+            attention_output: (Tensor::arange(32, (Kind::Float, device)) * 0.25)
+                .reshape([1, 4, 1, 8])
+                .to_kind(Kind::BFloat16),
+            lse: Tensor::arange(4, (Kind::Float, device)).reshape([1, 4, 1]),
+            assignee: 1,
+            current_domain: 1,
+            domains: 2,
+            visited_domains: 1,
+        }
+    }
+
+    fn assert_self_driving_packet_eq(actual: &SelfDrivingPacket, expected: &SelfDrivingPacket) {
+        assert_eq!(actual.layer_idx, expected.layer_idx);
+        assert_eq!(actual.assignee, expected.assignee);
+        assert_eq!(actual.current_domain, expected.current_domain);
+        assert_eq!(actual.domains, expected.domains);
+        assert_eq!(actual.visited_domains, expected.visited_domains);
+        for (name, actual, wanted) in [
+            ("residual", &actual.residual, &expected.residual),
+            ("normalized", &actual.normalized, &expected.normalized),
+            ("position_ids", &actual.position_ids, &expected.position_ids),
+            ("q", &actual.q, &expected.q),
+            (
+                "attention_output",
+                &actual.attention_output,
+                &expected.attention_output,
+            ),
+            ("lse", &actual.lse, &expected.lse),
+        ] {
+            assert_eq!(actual.kind(), wanted.kind(), "{name} dtype changed");
+            let diff = (actual - wanted)
+                .abs()
+                .to_kind(Kind::Float)
+                .max()
+                .double_value(&[]);
+            assert_eq!(diff, 0.0, "{name} changed after QUIC roundtrip");
+        }
+    }
+
+    #[test]
+    fn quic_kv_transport_trait_roundtrips_self_driving_packet() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (_client_endpoint, _server_endpoint, client_connection, server_connection) = runtime
+            .block_on(async {
+                let client_endpoint = create_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+                let server_endpoint = create_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+                let server_addr = server_endpoint.local_addr().unwrap();
+                let client_connect = client_endpoint.connect(server_addr, "localhost").unwrap();
+                let server_incoming = server_endpoint.accept().await.unwrap();
+                let (client, server) = tokio::join!(client_connect, server_incoming);
+                (
+                    client_endpoint,
+                    server_endpoint,
+                    client.unwrap(),
+                    server.unwrap(),
+                )
+            });
+
+        let ((client_send, client_recv), (mut server_send, server_recv)) =
+            runtime.block_on(async {
+                let (mut client_send, client_recv) = client_connection.open_bi().await.unwrap();
+                client_send.write_all(b"\x00").await.unwrap();
+                let (server_send, server_recv) = server_connection.accept_bi().await.unwrap();
+                ((client_send, client_recv), (server_send, server_recv))
+            });
+        runtime.block_on(async {
+            server_send.write_all(b"\x00").await.unwrap();
+        });
+
+        let device = Device::Cpu;
+        let mut client: Box<dyn KvTransport> = Box::new(QuicKvTransport::new(
+            client_send,
+            client_recv,
+            runtime.handle().clone(),
+            device,
+        ));
+        let mut server: Box<dyn KvTransport> = Box::new(QuicKvTransport::new(
+            server_send,
+            server_recv,
+            runtime.handle().clone(),
+            device,
+        ));
+        assert!(client.supports_self_driving_packets());
+        assert!(server.supports_self_driving_packets());
+
+        let expected = test_self_driving_packet(device);
+        client.submit_send_self_driving_packet(&expected).unwrap();
+        client.flush_send().unwrap();
+        let received = server.recv_self_driving_packet().unwrap().unwrap();
+        assert_self_driving_packet_eq(&received, &expected);
+
+        server.submit_send_self_driving_packet(&received).unwrap();
+        server.flush_send().unwrap();
+        let echoed = client.recv_self_driving_packet().unwrap().unwrap();
+        assert_self_driving_packet_eq(&echoed, &expected);
+    }
 }

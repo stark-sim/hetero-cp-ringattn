@@ -155,4 +155,80 @@ mod tests {
             assert_eq!(diff, 0.0, "{name} changed after TCP roundtrip");
         }
     }
+
+    #[test]
+    fn tcp_kv_transport_trait_roundtrips_self_driving_packet() {
+        let device = Device::Cpu;
+        let packet = SelfDrivingPacket {
+            layer_idx: 7,
+            residual: Tensor::arange(8, (Kind::Float, device))
+                .reshape([1, 1, 8])
+                .to_kind(Kind::BFloat16),
+            normalized: (Tensor::arange(8, (Kind::Float, device)) * 0.5)
+                .reshape([1, 1, 8])
+                .to_kind(Kind::BFloat16),
+            position_ids: Tensor::from_slice(&[16_777_217_i64]).reshape([1, 1]),
+            q: Tensor::arange(32, (Kind::Float, device))
+                .reshape([1, 4, 1, 8])
+                .to_kind(Kind::BFloat16),
+            attention_output: (Tensor::arange(32, (Kind::Float, device)) * 0.25)
+                .reshape([1, 4, 1, 8])
+                .to_kind(Kind::BFloat16),
+            lse: Tensor::arange(4, (Kind::Float, device)).reshape([1, 4, 1]),
+            assignee: 1,
+            current_domain: 1,
+            domains: 2,
+            visited_domains: 1,
+        };
+        let expected = packet.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut transport: Box<dyn KvTransport> =
+                Box::new(TcpKvTransport::new(stream, device).unwrap());
+            assert!(transport.supports_self_driving_packets());
+            transport.recv_self_driving_packet().unwrap().unwrap()
+        });
+        let client = thread::spawn(move || {
+            let stream = TcpStream::connect(address).unwrap();
+            let mut transport: Box<dyn KvTransport> =
+                Box::new(TcpKvTransport::new(stream, device).unwrap());
+            assert!(transport.supports_self_driving_packets());
+            transport
+                .submit_send_self_driving_packet(&packet)
+                .unwrap();
+            transport.flush_send().unwrap();
+        });
+
+        client.join().unwrap();
+        let received = server.join().unwrap();
+        assert_eq!(received.layer_idx, expected.layer_idx);
+        assert_eq!(received.assignee, expected.assignee);
+        assert_eq!(received.current_domain, expected.current_domain);
+        assert_eq!(received.domains, expected.domains);
+        assert_eq!(received.visited_domains, expected.visited_domains);
+        assert_eq!(received.position_ids.kind(), Kind::Int64);
+        for (name, actual, wanted) in [
+            ("residual", &received.residual, &expected.residual),
+            ("normalized", &received.normalized, &expected.normalized),
+            ("position_ids", &received.position_ids, &expected.position_ids),
+            ("q", &received.q, &expected.q),
+            (
+                "attention_output",
+                &received.attention_output,
+                &expected.attention_output,
+            ),
+            ("lse", &received.lse, &expected.lse),
+        ] {
+            assert_eq!(actual.kind(), wanted.kind(), "{name} dtype changed");
+            let diff = (actual - wanted)
+                .abs()
+                .to_kind(Kind::Float)
+                .max()
+                .double_value(&[]);
+            assert_eq!(diff, 0.0, "{name} changed after trait roundtrip");
+        }
+    }
 }
