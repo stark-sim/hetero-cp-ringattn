@@ -2,6 +2,19 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-08-03] SelfDrivingPacket 统一 transport 合同通过真实跨主机 QUIC
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@58dccc5`
+
+Task 3c 在提交 58dccc5 上完成验证。
+1. 本地 transport 回归：LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib:/opt/homebrew/opt/libomp/lib HCP_ENABLE_TORCH=1 cargo test --manifest-path rust/Cargo.toml --features tch-backend transport -- --nocapture；结果 6 passed, 0 failed。
+2. 本地全量 Rust：同环境 cargo test --manifest-path rust/Cargo.toml --features tch-backend；结果 103 passed, 0 failed, 3 ignored。
+3. Clippy：同环境 cargo clippy --manifest-path rust/Cargo.toml --features tch-backend --lib --bin self_driving_quic_smoke；exit 0，仅有既有 warnings。
+4. 本机双进程：server 0.0.0.0:29641 + client 127.0.0.1:29641；两端均报告 layer=7, position=16777217。
+5. 真实跨主机：white(stark@inventory-white, commit 58dccc5) 独立 server 监听 0.0.0.0:29642；Mac 独立 client 连接 inventory white 100.118.253.68:29642。Mac 输出 self-driving QUIC client roundtrip ok: peer=100.118.253.68:29642, layer=7, position=16777217；white 输出 server roundtrip ok: peer=100.121.35.138:57639, layer=7, position=16777217。
+结论：SelfDrivingPacket 已通过统一 KvTransport trait 在 TCP/QUIC 中保持六个 tensor 的 dtype/值和 route metadata，Int64 position 未经过 f32 丢精度；真实 Mac-white 独立进程 QUIC roundtrip 成立。本证据只证明 transport 合同，不声明真实推理服务完成。
+
+_updated: 2026-08-02 18:34:07_
 ### [2026-08-02] 现行远程入口已停止使用旧 GPU LAN 地址
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `hetero-cp-ringattn@b2f2753`

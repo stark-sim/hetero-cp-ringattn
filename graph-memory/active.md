@@ -2,15 +2,6 @@
 
 当前活跃的任务、决策、风险和假设。
 
-### Task 3c：建立 SelfDrivingPacket 的 worker-process-ready 传输合同
-
-type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-confirmation-2026-08-02`
-
-把 SelfDrivingPacket 提升为 KvTransport 的一等实验性消息，并让 TCP 与 QUIC 两种实现通过同一 trait 合同收发。最小验收：RingMessage 能分派 self-driving variant；trait 提供 submit/poll/阻塞 recv 能力；TCP 复用现有 codec，QUIC 增加对应 frame codec 与交叉暂存；通过 trait object 的 TCP/QUIC loopback 测试保持 BF16 tensor dtype/值、Int64 position 和 layer/assignee/current_domain/domains/visited_domains 路由字段。边界：不新增 coordinator command，不实现 worker request/event loop，不接多请求，不做重试、版本协商、流控优化或其他生产治理。该节点只建立后续独立 worker 进程可依赖的数据面合同。
-
-[2026-08-02 验收修订] 本地 TCP/QUIC loopback 只作为快速 codec 回归，不再构成节点完成证据。Task 3c 必须在 Mac 与 inventory 中 white 两个真实进程之间，通过 QUIC KvTransport trait object 完成 SelfDrivingPacket roundtrip；两端分别运行独立进程，不共享 backend 或地址空间。该跨主机验证只证明 transport 合同，不提前接 coordinator command 或完整推理循环。
-
-_updated: 2026-08-02 12:05:44_
 ### 先建立传输无关的 SelfDrivingPacket 数据面合同
 
 type: `decision` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `user-confirmation+code-audit-2026-08-02`
@@ -700,6 +691,13 @@ type: `belief` · status: `held` · confidence: 0.85 · importance: 0.95 · sour
 基于 white-pearl 限速矩阵：\n- 2.35 Gbps 基线 20.5 s\n- 1 Gbps 29.5 s（1.44x）\n- 500 Mbps 50 s（2.44x）\n- 100 Mbps 445 s（21.7x）\n\n在 Qwen2-0.5B-1M、seq=4096、max_tokens=5 的异构推理任务中，端到端 latency 随跨节点带宽下降呈非线性增长。低于 1 Gbps 时，P2P KV ring 的通信时间显著超过计算时间；100 Mbps 时通信完全主导总时间。\n\n推论：若要在生产环境中部署异构 CP 推理，需要 CXL / RDMA / 高速 NVLink 等级别的互联带宽，否则网络将把多卡聚合的显存优势抵消为极高的延迟惩罚。
 
 _updated: 2026-06-29 14:32:15_
+### Cargo 经 rsproxy 联网运行，不使用 offline
+
+type: `preference` · status: `held` · confidence: 1.0 · importance: 0.9 · source: `user-correction-2026-08-03`
+
+用户确认：Mac、white、pearl 的 Cargo 均使用各机 rsproxy 配置，正常构建和测试不要设置 CARGO_NET_OFFLINE=true，也不要传 --offline。离线模式可能因 replacement registry 的独立索引/cache 缺包而产生假性依赖失败；直接使用 rsproxy。
+
+_updated: 2026-08-02 18:34:07_
 ### Tch reserved Tensor 分配尚不是可恢复的 admission 操作
 
 type: `risk` · status: `open` · confidence: 0.95 · importance: 0.9 · source: `code-audit-2026-08-02`
