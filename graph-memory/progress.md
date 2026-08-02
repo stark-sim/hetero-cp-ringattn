@@ -2,6 +2,17 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### 真实 Qwen 两 worker decode packet 完成 48 次邻接 TCP hop
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@39ba09a`
+
+实现提交 39ba09a 将 Task 3a 的 ignored真实 Qwen2-0.5B、24层、两-token decode oracle 改为持久loopback TCP数据路径。两个 backend各持一个 TcpKvTransport endpoint；每个 LayerStepOutcome::Forward 都执行 LayerPacket->SelfDrivingPacket、send、recv、SelfDrivingPacket->LayerPacket，hop只在实际send成功后计数，并校验反序列化 layer_idx/current_domain。两 token实际完成48=2×24×(2-1)次TCP hop，累计714940 frame bytes，每帧非空。
+核心不变量保持：prefill positions仍为worker0=[0]、worker1=[1,2,3]；schedule counts=[12,36]，最终KV totals=[36,108]=1:3；每层唯一assignee append、position union完整、reserved capacity精确写满。decode 0 max_diff=0.531250、mean_diff=0.083501、tokens=6667/6667；decode 1 max_diff=0.289062、mean_diff=0.051739、tokens=220/220，与Task 3a完全一致。
+TDD：RED把oracle改为尚不存在的TCP helper，以E0425失败；GREEN复用现有TcpKvTransport后通过。中间E0616来自测试读取私有LayerPacket.current_domain；按现有wire API改为转换后读取公开SelfDrivingPacket.current_domain，未扩大核心可见性。该一次性编译期误用无重复模式，不单独提升lesson。
+验证：cargo test --features tch-backend --lib real_qwen_two_worker_reserved_prefill_decodes_two_self_driving_tokens_over_tcp -- --ignored --nocapture 为1 passed、0 failed；cargo test --features tch-backend --quiet 为101 passed、0 failed、3 ignored且doc tests通过；cargo clippy --features tch-backend --all-targets -- -A warnings exit 0；git diff --check exit 0；tch_backend.rs全文件仍有既有rustfmt债，但本节点新增区间未产生rustfmt hunk。
+边界：initial prefill仍使用LinkedMock P2P，只有decode packet经过真实TCP；测试是单进程顺序编排和单请求CPU BF16，不证明独立worker阻塞循环、coordinator、QUIC、跨节点异构硬件、多请求、性能或生产服务。
+
+_updated: 2026-08-02 09:00:54_
 ### 真实 Qwen 两 worker 完成两 token self-driving decode correctness 闭环
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@59618b9`

@@ -2,13 +2,6 @@
 
 当前活跃的任务、决策、风险和假设。
 
-### 真实 Qwen 两 worker self-driving decode packet 经过邻接 TCP
-
-type: `task` · status: `in_progress` · confidence: 1.0 · importance: 1.0 · source: `user-confirmation-2026-08-02`
-
-Task 3b：在 Task 3a 的真实 Qwen2-0.5B、24 层、两 token reserved decode oracle 中，把每层唯一 Forward packet 强制经现有 TcpKvTransport 序列化、loopback TCP 发送、接收和反序列化后再交给下一 worker。验收：48=2 tokens×24 layers×(2-1) 次真实 TCP hop，所有 frame bytes>0；argmax/logits 包络、唯一 assignee append、position union、reservation 与最终 [36,108] KV totals 保持。边界：ignored、单进程、单请求、本地 CPU；不接 coordinator/QUIC、多请求、独立 worker loop 或生产 runtime。
-
-_updated: 2026-08-02 06:51:53_
 ### 以持久 loopback TCP roundtrip 隔离真实 decode packet 的 wire compatibility
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmation-2026-08-02`
