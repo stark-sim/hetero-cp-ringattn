@@ -2,6 +2,21 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 真实 Qwen 两 worker reserved prefill 后执行两 token self-driving decode
+
+type: `task` · status: `in_progress` · confidence: 1.0 · importance: 1.0 · source: `user-confirmation-2026-08-02`
+
+Task 3a：从两个独立 TchWorkerBackend 已完成的真实 Qwen2-0.5B、24 层 reserved prefill request context 出发，执行两个 self-driving decode token。每层只访问当前 worker 的本地 shard，验证唯一 assignee append、N-1 hops、position union、BF16 logits/token 与 contiguous reference 对齐。
+边界：ignored in-process correctness oracle；不接 coordinator、QUIC/TCP、多请求或生产 runtime，不提升 all-domain shard API。
+
+_updated: 2026-08-02 04:00:07_
+### 先以两个独立 backend 闭合真实 Qwen self-driving decode correctness
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `code-audit+user-confirmation-2026-08-02`
+
+【动机六问】1.问题：真实 Qwen worker-local reserved prefill 与 self-driving decode 分别成立，但尚未证明真实 BF16 权重、24 层 prefill cache 和 packet continuation 能组合。2.现状：两个独立 backend 已按 1:3 持有真实 prompt KV；synthetic 模型已证明多层、多 token、reserved append 和 TCP ring；coordinator 仍走 legacy decode，直接接服务会混合多个未知量。3.目标：同一 request 从真实两-worker prefill 状态执行两个 decode token；每 token 每层访问两个 backend、仅 assignee append、每层一跳；24 层位置并集完整唯一，reserved capacity 不越界，logits 包络和 greedy token 对齐 contiguous reference。4.他者：分布式 inference 通常先用每-rank真实模型与本地 cache加集中 reference oracle验证数值，再接网络/runtime；vLLM 的 paged decode可作为生命周期参考，但不能直接复用其同构 collective与 block table来证明 HCP packet。5.本方案：新增 ignored integration oracle，复用 LayerPacket 与 process_layer_packet_with_reserved_history，backend 各自持有本地 model和request cache；只增加必要的 crate 内 final-logits helper可见性，不新增 runtime all-shard API。6.为什么：这是隔离真实模型/缓存兼容性的最小 tracer bullet；若先接 coordinator或transport，失败无法区分权重数值、ownership还是协议问题。VERDICT: IMPLEMENT。
+
+_updated: 2026-08-02 04:00:07_
 ### 以两个独立 backend 验证真实 worker-local reserved prefill
 
 type: `decision` · status: `held` · confidence: 0.99 · importance: 1.0 · source: `hetero-cp-ringattn@c465244`
