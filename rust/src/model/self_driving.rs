@@ -435,7 +435,7 @@ fn ring_backend(layer: &mut DecoderLayer) -> Result<&mut HcpRingAttentionBackend
         })
 }
 
-fn project_final_logits(model: &LlamaModel, hidden_states: &Tensor) -> Tensor {
+pub(crate) fn project_final_logits(model: &LlamaModel, hidden_states: &Tensor) -> Tensor {
     let normalized = model.norm.forward(hidden_states);
     let lm_head = model.lm_head.as_ref().unwrap_or(&model.embedding);
     let logits = normalized.matmul(&lm_head.transpose(0, 1));

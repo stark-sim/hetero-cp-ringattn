@@ -342,9 +342,92 @@ mod tests {
     use super::*;
     use crate::model::cache::KvCacheImpl;
     use crate::model::config::ModelConfig;
-    use crate::model::model::{LlamaModel, create_synthetic_weights};
+    use crate::model::model::{create_synthetic_weights, LlamaModel};
+    use crate::model::self_driving::{
+        process_layer_packet_with_reserved_history, project_final_logits, FrozenKvAssigneeSchedule,
+        LayerPacket, LayerStepOutcome,
+    };
     use crate::worker_sdk::backend::WorkerBackend;
     use tch::{Device, Kind, Tensor};
+
+    fn run_two_backend_reserved_decode(
+        backends: &mut [TchWorkerBackend],
+        request_id: u64,
+        token: i64,
+        position: i64,
+        starter: usize,
+        assignees: &[usize],
+    ) -> (Tensor, usize, usize) {
+        let domains = backends.len();
+        assert_eq!(domains, 2);
+        assert_eq!(assignees.len(), backends[0].model.layers.len());
+
+        let input_ids = Tensor::from_slice(&[token])
+            .unsqueeze(0)
+            .to_device(backends[starter].device);
+        let mut hidden_states = Tensor::embedding(
+            &backends[starter].model.embedding,
+            &input_ids,
+            -1,
+            false,
+            false,
+        );
+        let position_ids = Tensor::from_slice(&[position])
+            .unsqueeze(0)
+            .to_device(backends[starter].device);
+        let mut current_starter = starter;
+        let mut total_hops = 0_usize;
+
+        for (layer_idx, &assignee) in assignees.iter().enumerate() {
+            let mut packet = Some(
+                LayerPacket::start(
+                    &mut backends[current_starter].model.layers[layer_idx],
+                    &hidden_states,
+                    &position_ids,
+                    current_starter,
+                    assignee,
+                    domains,
+                )
+                .unwrap(),
+            );
+            let mut next_hidden = None;
+
+            for visit_index in 0..domains {
+                let domain = (current_starter + visit_index) % domains;
+                let backend = &mut backends[domain];
+                let context = backend.request_contexts.get_mut(&request_id).unwrap();
+                let Some(KvCacheImpl::ReservedPositioned(shard)) =
+                    &mut context.kv_caches[layer_idx]
+                else {
+                    panic!("worker {domain} layer {layer_idx} did not use reserved KV");
+                };
+                let outcome = process_layer_packet_with_reserved_history(
+                    &mut backend.model.layers[layer_idx],
+                    packet.take().unwrap(),
+                    shard,
+                )
+                .unwrap();
+                match outcome {
+                    LayerStepOutcome::Forward(next_packet) => packet = Some(next_packet),
+                    LayerStepOutcome::Finished { hidden_states, .. } => {
+                        assert_eq!(visit_index + 1, domains);
+                        next_hidden = Some(hidden_states);
+                    }
+                }
+            }
+
+            hidden_states = next_hidden.expect("the final worker must finish the layer");
+            current_starter = (current_starter + domains - 1) % domains;
+            total_hops += domains - 1;
+        }
+
+        let logits = project_final_logits(&backends[current_starter].model, &hidden_states);
+        for backend in backends {
+            let context = backend.request_contexts.get_mut(&request_id).unwrap();
+            context.global_seq_len = position as usize + 1;
+        }
+        (logits, current_starter, total_hops)
+    }
 
     /// Verify that `decode_batch` produces identical logits to individual `decode_request`
     /// calls, and that per-request KV caches remain isolated (no cross-contamination).
@@ -641,5 +724,205 @@ mod tests {
             assert_eq!(shard0.active_k().kind(), Kind::BFloat16);
             assert_eq!(shard1.active_k().kind(), Kind::BFloat16);
         }
+    }
+
+    #[test]
+    #[ignore = "requires the local Qwen2-0.5B model weights"]
+    fn real_qwen_two_worker_reserved_prefill_decodes_two_self_driving_tokens() {
+        let device = Device::Cpu;
+        let model_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("models")
+            .join("Qwen2-0.5B");
+        let config = ModelConfig::from_file(model_dir.join("config.json")).unwrap();
+        assert_eq!(config.num_layers, 24);
+        let weights = ModelWeights::from_dir(&model_dir, device).unwrap();
+
+        let mut reference = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+        let model0 = LlamaModel::from_weights(config.clone(), &weights, device, 2).unwrap();
+        let model1 = LlamaModel::from_weights(config.clone(), &weights, device, 2).unwrap();
+        let mut backend0 = TchWorkerBackend::from_model(model0, device, 0);
+        let mut backend1 = TchWorkerBackend::from_model(model1, device, 1);
+
+        let mut transports0: Vec<Box<dyn KvTransport>> = Vec::with_capacity(config.num_layers);
+        let mut transports1: Vec<Box<dyn KvTransport>> = Vec::with_capacity(config.num_layers);
+        for _ in 0..config.num_layers {
+            let (transport0, transport1) =
+                crate::model::transport::LinkedMockKvTransport::create_pair();
+            transports0.push(Box::new(transport0));
+            transports1.push(Box::new(transport1));
+        }
+        backend0.setup_kv_transports(transports0);
+        backend1.setup_kv_transports(transports1);
+
+        let request_id = 74;
+        let prompt = [151644_i64, 9707, 0, 16];
+        let decode_tokens = 2_usize;
+        let schedule =
+            FrozenKvAssigneeSchedule::new(&[1, 3], request_id, decode_tokens * config.num_layers)
+                .unwrap();
+        assert_eq!(schedule.counts(), &[12, 36]);
+        let assignees = (0..decode_tokens)
+            .map(|token_offset| {
+                (0..config.num_layers)
+                    .map(|layer_idx| {
+                        schedule
+                            .assignee_for(token_offset, layer_idx, config.num_layers)
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let capacities = (0..2)
+            .map(|domain| {
+                (0..config.num_layers)
+                    .map(|layer_idx| {
+                        let initial = if domain == 0 { 1 } else { 3 };
+                        initial
+                            + assignees
+                                .iter()
+                                .filter(|token_assignees| token_assignees[layer_idx] == domain)
+                                .count()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        let input_ids = Tensor::from_slice(&prompt).unsqueeze(0);
+        let mut reference_caches = reference.create_kv_caches();
+        let reference_prefill_logits = reference
+            .forward(&input_ids, &mut reference_caches)
+            .unwrap()
+            .narrow(1, prompt.len() as i64 - 1, 1)
+            .squeeze();
+        backend0
+            .prefill_request_with_reservation(
+                request_id,
+                &prompt[..1],
+                0,
+                Some(&[0]),
+                Some(&capacities[0]),
+            )
+            .unwrap();
+        let (distributed_prefill_logits, _) = backend1
+            .prefill_request_with_reservation(
+                request_id,
+                &prompt[1..],
+                1,
+                Some(&[1, 2, 3]),
+                Some(&capacities[1]),
+            )
+            .unwrap();
+        let distributed_prefill_logits = Tensor::from_slice(&distributed_prefill_logits);
+        let mut token = distributed_prefill_logits
+            .argmax(-1, false)
+            .int64_value(&[]);
+        assert_eq!(
+            token,
+            reference_prefill_logits.argmax(-1, false).int64_value(&[])
+        );
+
+        let mut backends = vec![backend0, backend1];
+        let mut starter = 1_usize;
+        for token_offset in 0..decode_tokens {
+            let position = (prompt.len() + token_offset) as i64;
+            let committed_before = (0..config.num_layers)
+                .map(|layer_idx| {
+                    (0..2)
+                        .map(|domain| {
+                            let context =
+                                backends[domain].request_contexts.get(&request_id).unwrap();
+                            let Some(KvCacheImpl::ReservedPositioned(shard)) =
+                                &context.kv_caches[layer_idx]
+                            else {
+                                panic!("worker {domain} layer {layer_idx} did not use reserved KV");
+                            };
+                            shard.committed_len()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+
+            let (distributed_logits, producer, hops) = run_two_backend_reserved_decode(
+                &mut backends,
+                request_id,
+                token,
+                position,
+                starter,
+                &assignees[token_offset],
+            );
+            assert_eq!(hops, config.num_layers);
+            let reference_input = Tensor::from_slice(&[token]).unsqueeze(0);
+            let reference_logits = reference
+                .forward(&reference_input, &mut reference_caches)
+                .unwrap()
+                .squeeze();
+            let distributed_logits = distributed_logits.squeeze();
+            let max_diff = (&distributed_logits - &reference_logits)
+                .abs()
+                .max()
+                .double_value(&[]);
+            let mean_diff = (&distributed_logits - &reference_logits)
+                .abs()
+                .mean(Kind::Float)
+                .double_value(&[]);
+            let distributed_token = distributed_logits.argmax(-1, false).int64_value(&[]);
+            let reference_token = reference_logits.argmax(-1, false).int64_value(&[]);
+            println!(
+                "real two-worker self-driving decode {token_offset}: max_diff={max_diff:.6}, mean_diff={mean_diff:.6}, tokens={distributed_token}/{reference_token}"
+            );
+            assert_eq!(distributed_token, reference_token);
+            assert!(
+                max_diff < 0.75,
+                "decode {token_offset} max logits diff: {max_diff}"
+            );
+            assert!(
+                mean_diff < 0.1,
+                "decode {token_offset} mean logits diff: {mean_diff}"
+            );
+
+            for layer_idx in 0..config.num_layers {
+                let mut positions = Vec::new();
+                for domain in 0..2 {
+                    let context = backends[domain].request_contexts.get(&request_id).unwrap();
+                    let Some(KvCacheImpl::ReservedPositioned(shard)) =
+                        &context.kv_caches[layer_idx]
+                    else {
+                        panic!("worker {domain} layer {layer_idx} did not use reserved KV");
+                    };
+                    let expected_growth = usize::from(assignees[token_offset][layer_idx] == domain);
+                    assert_eq!(
+                        shard.committed_len(),
+                        committed_before[layer_idx][domain] + expected_growth
+                    );
+                    assert!(shard.committed_len() <= shard.reserved_capacity());
+                    assert_eq!(shard.active_k().kind(), Kind::BFloat16);
+                    positions.extend_from_slice(shard.positions());
+                }
+                positions.sort_unstable();
+                assert_eq!(positions, (0..=position).collect::<Vec<_>>());
+            }
+
+            starter = producer;
+            token = distributed_token;
+        }
+
+        let domain_totals = (0..2)
+            .map(|domain| {
+                (0..config.num_layers)
+                    .map(|layer_idx| {
+                        let context = backends[domain].request_contexts.get(&request_id).unwrap();
+                        let Some(KvCacheImpl::ReservedPositioned(shard)) =
+                            &context.kv_caches[layer_idx]
+                        else {
+                            panic!("worker {domain} layer {layer_idx} did not use reserved KV");
+                        };
+                        assert_eq!(shard.committed_len(), shard.reserved_capacity());
+                        shard.committed_len()
+                    })
+                    .sum::<usize>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(domain_totals, vec![36, 108]);
     }
 }
