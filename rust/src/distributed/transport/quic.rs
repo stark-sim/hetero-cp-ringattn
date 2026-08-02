@@ -290,12 +290,27 @@ async fn recv_task_loop(mut recv: RecvStream, msg_tx: mpsc::Sender<RingMessage>,
 }
 
 /// 【序列化 KV block 为 Vec<u8> frame】
+/// Payload 顺序为 K、V、可选 Int64 position_ids；旧 frame 可省略位置 metadata。
 #[cfg(feature = "tch-backend")]
 fn serialize_kv_block(block: &KvBlock) -> Result<Vec<u8>, String> {
     let (k_bytes, k_dtype) = tensor_to_bytes(&block.k)?;
     let (v_bytes, v_dtype) = tensor_to_bytes(&block.v)?;
     let k_shape: Vec<i64> = block.k.size();
     let v_shape: Vec<i64> = block.v.size();
+    let position_payload = block
+        .position_ids
+        .as_ref()
+        .map(|positions| {
+            let (bytes, dtype) = tensor_to_bytes(positions)?;
+            let meta = serde_json::json!({
+                "shape": positions.size(),
+                "bytes": bytes.len(),
+                "dtype": dtype,
+            });
+            Ok::<_, String>((meta, bytes))
+        })
+        .transpose()?;
+    let position_meta = position_payload.as_ref().map(|(meta, _)| meta);
 
     let meta = serde_json::json!({
         "layer_idx": block.layer_idx,
@@ -309,15 +324,24 @@ fn serialize_kv_block(block: &KvBlock) -> Result<Vec<u8>, String> {
         "v_bytes": v_bytes.len(),
         "k_dtype": k_dtype,
         "v_dtype": v_dtype,
+        "position_ids": position_meta,
     });
     let meta_bytes = meta.to_string().into_bytes();
     let meta_len = meta_bytes.len() as u32;
 
-    let mut frame = Vec::with_capacity(4 + meta_bytes.len() + k_bytes.len() + v_bytes.len());
+    let position_bytes_len = position_payload
+        .as_ref()
+        .map_or(0, |(_, bytes)| bytes.len());
+    let mut frame = Vec::with_capacity(
+        4 + meta_bytes.len() + k_bytes.len() + v_bytes.len() + position_bytes_len,
+    );
     frame.extend_from_slice(&meta_len.to_be_bytes());
     frame.extend_from_slice(&meta_bytes);
     frame.extend_from_slice(&k_bytes);
     frame.extend_from_slice(&v_bytes);
+    if let Some((_, bytes)) = position_payload {
+        frame.extend_from_slice(&bytes);
+    }
     Ok(frame)
 }
 
@@ -556,6 +580,28 @@ async fn recv_frame_from_stream(
     let v_dtype = meta["v_dtype"].as_str().unwrap_or("float32");
     let k = bytes_to_tensor(&k_bytes, &k_shape, device, k_dtype)?;
     let v = bytes_to_tensor(&v_bytes, &v_shape, device, v_dtype)?;
+    let position_ids = match meta.get("position_ids").filter(|value| !value.is_null()) {
+        Some(position_meta) => {
+            let bytes_len = position_meta["bytes"]
+                .as_u64()
+                .ok_or("missing position_ids bytes")? as usize;
+            let shape = position_meta["shape"]
+                .as_array()
+                .ok_or("missing position_ids shape")?
+                .iter()
+                .map(|value| value.as_i64().ok_or("invalid position_ids shape"))
+                .collect::<Result<Vec<_>, _>>()?;
+            let dtype = position_meta["dtype"]
+                .as_str()
+                .ok_or("missing position_ids dtype")?;
+            let mut bytes = vec![0_u8; bytes_len];
+            read_exact(recv, &mut bytes)
+                .await
+                .map_err(|e| format!("quic recv position_ids bytes failed: {e}"))?;
+            Some(bytes_to_tensor(&bytes, &shape, device, dtype)?)
+        }
+        None => None,
+    };
 
     Ok(Some(RingMessage::KvBlock(KvBlock {
         layer_idx,
@@ -565,7 +611,7 @@ async fn recv_frame_from_stream(
         v,
         micro_block_idx,
         total_micro_blocks,
-        position_ids: None,
+        position_ids,
     })))
 }
 
@@ -870,6 +916,65 @@ mod tests {
     use crate::model::transport::SelfDrivingPacket;
     use tch::Kind;
 
+    struct TestQuicStreams {
+        _client_endpoint: Endpoint,
+        _server_endpoint: Endpoint,
+        client_send: SendStream,
+        client_recv: RecvStream,
+        server_send: SendStream,
+        server_recv: RecvStream,
+    }
+
+    fn connected_quic_streams(runtime: &tokio::runtime::Runtime) -> TestQuicStreams {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (client_endpoint, server_endpoint, client_connection, server_connection) = runtime
+            .block_on(async {
+                let client_endpoint = create_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+                let server_endpoint = create_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+                let server_addr = server_endpoint.local_addr().unwrap();
+                let client_connect = client_endpoint.connect(server_addr, "localhost").unwrap();
+                let server_incoming = server_endpoint.accept().await.unwrap();
+                let (client, server) = tokio::join!(client_connect, server_incoming);
+                (
+                    client_endpoint,
+                    server_endpoint,
+                    client.unwrap(),
+                    server.unwrap(),
+                )
+            });
+        let ((client_send, client_recv), (mut server_send, server_recv)) =
+            runtime.block_on(async {
+                let (mut client_send, client_recv) = client_connection.open_bi().await.unwrap();
+                client_send.write_all(b"\x00").await.unwrap();
+                let (server_send, server_recv) = server_connection.accept_bi().await.unwrap();
+                ((client_send, client_recv), (server_send, server_recv))
+            });
+        runtime.block_on(async {
+            server_send.write_all(b"\x00").await.unwrap();
+        });
+        TestQuicStreams {
+            _client_endpoint: client_endpoint,
+            _server_endpoint: server_endpoint,
+            client_send,
+            client_recv,
+            server_send,
+            server_recv,
+        }
+    }
+
+    fn without_position_metadata(frame: Vec<u8>) -> Vec<u8> {
+        let old_meta_len = u32::from_be_bytes(frame[..4].try_into().unwrap()) as usize;
+        let mut meta: serde_json::Value =
+            serde_json::from_slice(&frame[4..4 + old_meta_len]).unwrap();
+        meta.as_object_mut().unwrap().remove("position_ids");
+        let meta_bytes = meta.to_string().into_bytes();
+        let mut legacy = Vec::with_capacity(4 + meta_bytes.len() + frame.len() - 4 - old_meta_len);
+        legacy.extend_from_slice(&(meta_bytes.len() as u32).to_be_bytes());
+        legacy.extend_from_slice(&meta_bytes);
+        legacy.extend_from_slice(&frame[4 + old_meta_len..]);
+        legacy
+    }
+
     fn test_self_driving_packet(device: Device) -> SelfDrivingPacket {
         SelfDrivingPacket {
             layer_idx: 7,
@@ -923,35 +1028,106 @@ mod tests {
     }
 
     #[test]
-    fn quic_kv_transport_trait_roundtrips_self_driving_packet() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+    fn quic_kv_transport_trait_roundtrips_positioned_kv_block() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let (_client_endpoint, _server_endpoint, client_connection, server_connection) = runtime
-            .block_on(async {
-                let client_endpoint = create_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
-                let server_endpoint = create_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
-                let server_addr = server_endpoint.local_addr().unwrap();
-                let client_connect = client_endpoint.connect(server_addr, "localhost").unwrap();
-                let server_incoming = server_endpoint.accept().await.unwrap();
-                let (client, server) = tokio::join!(client_connect, server_incoming);
-                (
-                    client_endpoint,
-                    server_endpoint,
-                    client.unwrap(),
-                    server.unwrap(),
-                )
-            });
+        let TestQuicStreams {
+            _client_endpoint,
+            _server_endpoint,
+            client_send,
+            client_recv,
+            server_send,
+            server_recv,
+        } = connected_quic_streams(&runtime);
 
-        let ((client_send, client_recv), (mut server_send, server_recv)) =
-            runtime.block_on(async {
-                let (mut client_send, client_recv) = client_connection.open_bi().await.unwrap();
-                client_send.write_all(b"\x00").await.unwrap();
-                let (server_send, server_recv) = server_connection.accept_bi().await.unwrap();
-                ((client_send, client_recv), (server_send, server_recv))
-            });
+        let device = Device::Cpu;
+        let mut client: Box<dyn KvTransport> = Box::new(QuicKvTransport::new(
+            client_send,
+            client_recv,
+            runtime.handle().clone(),
+            device,
+        ));
+        let mut server: Box<dyn KvTransport> = Box::new(QuicKvTransport::new(
+            server_send,
+            server_recv,
+            runtime.handle().clone(),
+            device,
+        ));
+        let expected_positions = Tensor::from_slice(&[0_i64, 9, 16_777_217]);
+        let block = KvBlock {
+            layer_idx: 5,
+            global_seq_start: 0,
+            global_seq_end: 3,
+            k: Tensor::arange(6, (Kind::Float, device)).reshape([1, 1, 3, 2]),
+            v: (Tensor::arange(6, (Kind::Float, device)) * 0.5).reshape([1, 1, 3, 2]),
+            micro_block_idx: 0,
+            total_micro_blocks: 1,
+            position_ids: Some(expected_positions.shallow_clone()),
+        };
+
+        client.submit_send(&block).unwrap();
+        client.flush_send().unwrap();
+        let received = server.recv_kv_block().unwrap().unwrap();
+
+        let received_positions = received
+            .position_ids
+            .expect("positioned KV block lost position_ids across QUIC");
+        assert_eq!(received_positions.kind(), Kind::Int64);
+        assert_eq!(received_positions.size(), expected_positions.size());
+        assert_eq!(
+            Vec::<i64>::try_from(&received_positions).unwrap(),
+            Vec::<i64>::try_from(&expected_positions).unwrap()
+        );
+    }
+
+    #[test]
+    fn quic_kv_transport_accepts_legacy_kv_frame_without_position_metadata() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let TestQuicStreams {
+            _client_endpoint,
+            _server_endpoint,
+            mut client_send,
+            client_recv: _client_recv,
+            server_send,
+            server_recv,
+        } = connected_quic_streams(&runtime);
+
+        let device = Device::Cpu;
+        let block = KvBlock::single(
+            2,
+            4,
+            6,
+            Tensor::arange(4, (Kind::Float, device)).reshape([1, 1, 2, 2]),
+            Tensor::arange(4, (Kind::Float, device)).reshape([1, 1, 2, 2]),
+        );
+        let legacy_frame = without_position_metadata(serialize_kv_block(&block).unwrap());
         runtime.block_on(async {
-            server_send.write_all(b"\x00").await.unwrap();
+            client_send.write_all(&legacy_frame).await.unwrap();
         });
+
+        let mut server: Box<dyn KvTransport> = Box::new(QuicKvTransport::new(
+            server_send,
+            server_recv,
+            runtime.handle().clone(),
+            device,
+        ));
+        let received = server.recv_kv_block().unwrap().unwrap();
+
+        assert!(received.position_ids.is_none());
+        assert_eq!(received.layer_idx, 2);
+        assert_eq!((received.global_seq_start, received.global_seq_end), (4, 6));
+    }
+
+    #[test]
+    fn quic_kv_transport_trait_roundtrips_self_driving_packet() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let TestQuicStreams {
+            _client_endpoint,
+            _server_endpoint,
+            client_send,
+            client_recv,
+            server_send,
+            server_recv,
+        } = connected_quic_streams(&runtime);
 
         let device = Device::Cpu;
         let mut client: Box<dyn KvTransport> = Box::new(QuicKvTransport::new(

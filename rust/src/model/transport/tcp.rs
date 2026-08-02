@@ -21,11 +21,11 @@ enum TcpFrame {
 ///
 /// 帧格式（length-prefixed）：
 /// ```text
-/// [meta_len: u32 BE] [meta_json] [k_raw_bytes] [v_raw_bytes]
+/// [meta_len: u32 BE] [meta_json] [k_raw_bytes] [v_raw_bytes] [optional position_ids bytes]
 /// ```
 ///
-/// meta_json 包含：layer_idx, global_seq_start/end, k/v shape, k/v bytes 长度, k/v dtype。
-/// raw bytes 是 f32 的小端序二进制表示（支持 Float/Half/BFloat16/Double，传输时统一为 f32）。
+/// meta_json 包含 layer/range、K/V tensor 描述和可选 position_ids tensor 描述。
+/// K/V raw bytes 统一按 f32 传输；position_ids 保持 Int64 小端序，避免位置精度丢失。
 ///
 /// 【decode Q-ring packet 帧】同一 stream 复用，meta 中 "type": "ring_packet"：
 /// ```text
@@ -152,6 +152,20 @@ fn serialize_block_to_buffer(send_buffer: &mut Vec<u8>, block: &KvBlock) -> Resu
     let (v_bytes, v_dtype) = TcpKvTransport::tensor_to_bytes(&block.v)?;
     let k_shape: Vec<i64> = block.k.size();
     let v_shape: Vec<i64> = block.v.size();
+    let position_payload = block
+        .position_ids
+        .as_ref()
+        .map(|positions| {
+            let (bytes, dtype) = TcpKvTransport::tensor_to_bytes(positions)?;
+            let meta = serde_json::json!({
+                "shape": positions.size(),
+                "bytes": bytes.len(),
+                "dtype": dtype,
+            });
+            Ok::<_, String>((meta, bytes))
+        })
+        .transpose()?;
+    let position_meta = position_payload.as_ref().map(|(meta, _)| meta);
 
     let meta = serde_json::json!({
         "layer_idx": block.layer_idx,
@@ -163,6 +177,7 @@ fn serialize_block_to_buffer(send_buffer: &mut Vec<u8>, block: &KvBlock) -> Resu
         "v_bytes": v_bytes.len(),
         "k_dtype": k_dtype,
         "v_dtype": v_dtype,
+        "position_ids": position_meta,
     });
     let meta_bytes = meta.to_string().into_bytes();
     let meta_len = meta_bytes.len() as u32;
@@ -172,6 +187,9 @@ fn serialize_block_to_buffer(send_buffer: &mut Vec<u8>, block: &KvBlock) -> Resu
     send_buffer.extend_from_slice(&meta_bytes);
     send_buffer.extend_from_slice(&k_bytes);
     send_buffer.extend_from_slice(&v_bytes);
+    if let Some((_, bytes)) = position_payload {
+        send_buffer.extend_from_slice(&bytes);
+    }
     Ok(())
 }
 
@@ -349,9 +367,7 @@ impl KvTransport for TcpKvTransport {
         Ok(())
     }
 
-    fn poll_recv_self_driving_packet(
-        &mut self,
-    ) -> Result<Option<SelfDrivingPacket>, String> {
+    fn poll_recv_self_driving_packet(&mut self) -> Result<Option<SelfDrivingPacket>, String> {
         if let Some(packet) = self.pending_self_driving_packets.pop_front() {
             return Ok(Some(packet));
         }
@@ -550,6 +566,28 @@ impl TcpKvTransport {
         let v_dtype = meta["v_dtype"].as_str().unwrap_or("float32");
         let k = Self::bytes_to_tensor(&k_bytes, &k_shape, self.device, k_dtype)?;
         let v = Self::bytes_to_tensor(&v_bytes, &v_shape, self.device, v_dtype)?;
+        let position_ids = match meta.get("position_ids").filter(|value| !value.is_null()) {
+            Some(position_meta) => {
+                let bytes_len = position_meta["bytes"]
+                    .as_u64()
+                    .ok_or("missing position_ids bytes")? as usize;
+                let shape = position_meta["shape"]
+                    .as_array()
+                    .ok_or("missing position_ids shape")?
+                    .iter()
+                    .map(|value| value.as_i64().ok_or("invalid position_ids shape"))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let dtype = position_meta["dtype"]
+                    .as_str()
+                    .ok_or("missing position_ids dtype")?;
+                let mut bytes = vec![0_u8; bytes_len];
+                self.stream
+                    .read_exact(&mut bytes)
+                    .map_err(|e| format!("recv_frame read position_ids bytes failed: {e}"))?;
+                Some(Self::bytes_to_tensor(&bytes, &shape, self.device, dtype)?)
+            }
+            None => None,
+        };
 
         Ok(Some(TcpFrame::KvBlock(KvBlock {
             layer_idx,
@@ -559,7 +597,94 @@ impl TcpKvTransport {
             v,
             micro_block_idx,
             total_micro_blocks,
-            position_ids: None,
+            position_ids,
         })))
+    }
+}
+
+#[cfg(all(test, feature = "tch-backend"))]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use tch::Kind;
+
+    fn without_position_metadata(frame: Vec<u8>) -> Vec<u8> {
+        let old_meta_len = u32::from_be_bytes(frame[..4].try_into().unwrap()) as usize;
+        let mut meta: serde_json::Value =
+            serde_json::from_slice(&frame[4..4 + old_meta_len]).unwrap();
+        meta.as_object_mut().unwrap().remove("position_ids");
+        let meta_bytes = meta.to_string().into_bytes();
+        let mut legacy = Vec::with_capacity(4 + meta_bytes.len() + frame.len() - 4 - old_meta_len);
+        legacy.extend_from_slice(&(meta_bytes.len() as u32).to_be_bytes());
+        legacy.extend_from_slice(&meta_bytes);
+        legacy.extend_from_slice(&frame[4 + old_meta_len..]);
+        legacy
+    }
+
+    #[test]
+    fn tcp_kv_transport_trait_roundtrips_positioned_kv_block() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_stream = TcpStream::connect(addr).unwrap();
+        let (server_stream, _) = listener.accept().unwrap();
+
+        let device = Device::Cpu;
+        let mut client: Box<dyn KvTransport> =
+            Box::new(TcpKvTransport::new(client_stream, device).unwrap());
+        let mut server: Box<dyn KvTransport> =
+            Box::new(TcpKvTransport::new(server_stream, device).unwrap());
+        let expected_positions = Tensor::from_slice(&[0_i64, 9, 16_777_217]);
+        let block = KvBlock {
+            layer_idx: 5,
+            global_seq_start: 0,
+            global_seq_end: 3,
+            k: Tensor::arange(6, (Kind::Float, device)).reshape([1, 1, 3, 2]),
+            v: (Tensor::arange(6, (Kind::Float, device)) * 0.5).reshape([1, 1, 3, 2]),
+            micro_block_idx: 0,
+            total_micro_blocks: 1,
+            position_ids: Some(expected_positions.shallow_clone()),
+        };
+
+        client.submit_send(&block).unwrap();
+        client.flush_send().unwrap();
+        let received = server.recv_kv_block().unwrap().unwrap();
+
+        let received_positions = received
+            .position_ids
+            .expect("positioned KV block lost position_ids across TCP");
+        assert_eq!(received_positions.kind(), Kind::Int64);
+        assert_eq!(received_positions.size(), expected_positions.size());
+        assert_eq!(
+            Vec::<i64>::try_from(&received_positions).unwrap(),
+            Vec::<i64>::try_from(&expected_positions).unwrap()
+        );
+    }
+
+    #[test]
+    fn tcp_kv_transport_accepts_legacy_kv_frame_without_position_metadata() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client_stream = TcpStream::connect(addr).unwrap();
+        let (server_stream, _) = listener.accept().unwrap();
+        let device = Device::Cpu;
+        let block = KvBlock::single(
+            2,
+            4,
+            6,
+            Tensor::arange(4, (Kind::Float, device)).reshape([1, 1, 2, 2]),
+            Tensor::arange(4, (Kind::Float, device)).reshape([1, 1, 2, 2]),
+        );
+        let mut frame = Vec::new();
+        serialize_block_to_buffer(&mut frame, &block).unwrap();
+        let legacy_frame = without_position_metadata(frame);
+        client_stream.write_all(&legacy_frame).unwrap();
+
+        let mut server: Box<dyn KvTransport> =
+            Box::new(TcpKvTransport::new(server_stream, device).unwrap());
+        let received = server.recv_kv_block().unwrap().unwrap();
+
+        assert!(received.position_ids.is_none());
+        assert_eq!(received.layer_idx, 2);
+        assert_eq!((received.global_seq_start, received.global_seq_end), (4, 6));
     }
 }
