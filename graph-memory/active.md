@@ -2,6 +2,42 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 双线程 backend 不是独立 worker 部署闭环
+
+type: `decision` · status: `rejected` · confidence: 1.0 · importance: 1.0 · source: `user-correction+code-audit-2026-08-02`
+
+【动机六问】
+1.问题：Task 3b 之后需要向真实 worker 进程接线，但候选方案把两个 backend 放进同一进程的两个线程，容易把线程隔离误认为部署隔离。
+2.现状：Task 3a 已证明两个独立 backend 的真实 Qwen correctness，Task 3b 已证明每层 SelfDrivingPacket 真实经过 TCP；重复做线程版只新增共享进程内的调度，不补齐 runtime 使用的 KvTransport/QUIC 合同。
+3.目标：下一节点必须直接消除独立 worker 接线的最前置缺口，并且仍然保持小步、可独立验证。
+4.他者：成熟分布式推理系统通常由 coordinator/scheduler 负责请求控制，各 rank/worker 进程持有模型和本地状态；线程可用于本地测试，但不是跨节点数据面合同。
+5.本方案：拒绝把 backend 移入双线程作为独立节点；保留已有线程测试只作为 synthetic 并发证据，不扩大其结论。
+6.为什么：HCP 的部署约束是每个异构节点一个 worker，coordinator 只做请求级控制；下一步应服务这个边界，而不是再证明同进程组合。
+VERDICT: REJECT。
+
+_updated: 2026-08-02 10:39:00_
+### Task 3c：建立 SelfDrivingPacket 的 worker-process-ready 传输合同
+
+type: `task` · status: `pending` · confidence: 1.0 · importance: 1.0 · source: `user-confirmation+code-audit-2026-08-02`
+
+把 SelfDrivingPacket 提升为 KvTransport 的一等实验性消息，并让 TCP 与 QUIC 两种实现通过同一 trait 合同收发。最小验收：RingMessage 能分派 self-driving variant；trait 提供 submit/poll/阻塞 recv 能力；TCP 复用现有 codec，QUIC 增加对应 frame codec 与交叉暂存；通过 trait object 的 TCP/QUIC loopback 测试保持 BF16 tensor dtype/值、Int64 position 和 layer/assignee/current_domain/domains/visited_domains 路由字段。边界：不新增 coordinator command，不实现 worker request/event loop，不接多请求，不做重试、版本协商、流控优化或其他生产治理。该节点只建立后续独立 worker 进程可依赖的数据面合同。
+
+_updated: 2026-08-02 10:39:00_
+### 先建立传输无关的 SelfDrivingPacket 数据面合同
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmation+code-audit-2026-08-02`
+
+【动机六问】
+1.问题：真实模型 self-driving decode 与 TCP wire roundtrip 已成立，但独立 worker runtime 尚无法通过它实际使用的 transport 抽象收发 SelfDrivingPacket。
+2.现状：WorkerRuntime 为每层持有 Box<dyn KvTransport>，部署数据面使用 QuicKvTransport；KvTransport 和 RingMessage 目前只支持 KvBlock/RingPacket。SelfDrivingPacket 的 send/recv 是 TcpKvTransport 的固有方法，QUIC 没有对应 variant、codec 或暂存队列；coordinator 的 Decode/DecodeBatch 仍逐 token 广播并调用 legacy decode_request。
+3.目标：TCP 和 QUIC 都能经同一个 KvTransport trait object 无损传递 SelfDrivingPacket，保持 BF16 tensor dtype/值、Int64 position 和全部 route metadata；现有 KV/RingPacket 行为回归不变。定向 TCP/QUIC loopback 与相关 Rust 回归测试通过即完成。
+4.他者：分布式推理通常先定义 rank/worker 间稳定的数据面消息合同，再让 scheduler 或 coordinator 启动请求；vLLM 的 worker/rank 生命周期可参考，但其同构 collective/内部消息不能直接承载 HCP 的 activation、Q、online-softmax accumulator 与逐层路由状态。
+5.本方案：最小扩展 RingMessage、KvTransport、TcpKvTransport 和 QuicKvTransport，使 SelfDrivingPacket 成为第三类一等消息；复用现有 tensor wire 编码语义，只补齐 QUIC codec、分派、交叉暂存和 trait-level 收发测试。
+6.为什么：这是从 Task 3b 到独立 worker 进程循环之间最小且真实的依赖。它不重做 attention/Norm/MLP/KV ownership 数学，也不提前引入 coordinator 协议、请求状态机、多请求或生产治理；失败时只会暴露 transport 合同问题。
+【部署边界】coordinator 与 worker 正交共存：coordinator 负责 tokenize、capacity/reservation、请求启动/停止和结果收集；每个异构节点一个 worker 进程，worker 持有 backend、完整权重和本地 KV shard；decode 的逐层 hop 只经过相邻 worker，不回 coordinator。
+VERDICT: IMPLEMENT。
+
+_updated: 2026-08-02 10:39:00_
 ### 以持久 loopback TCP roundtrip 隔离真实 decode packet 的 wire compatibility
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmation-2026-08-02`
