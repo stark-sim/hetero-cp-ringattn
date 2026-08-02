@@ -350,16 +350,18 @@ mod tests {
     use crate::worker_sdk::backend::WorkerBackend;
     use tch::{Device, Kind, Tensor};
 
-    fn run_two_backend_reserved_decode(
+    fn run_two_backend_reserved_tcp_decode(
         backends: &mut [TchWorkerBackend],
+        transports: &mut [crate::model::transport::TcpKvTransport],
         request_id: u64,
         token: i64,
         position: i64,
         starter: usize,
         assignees: &[usize],
-    ) -> (Tensor, usize, usize) {
+    ) -> (Tensor, usize, usize, usize) {
         let domains = backends.len();
         assert_eq!(domains, 2);
+        assert_eq!(transports.len(), domains);
         assert_eq!(assignees.len(), backends[0].model.layers.len());
 
         let input_ids = Tensor::from_slice(&[token])
@@ -377,6 +379,7 @@ mod tests {
             .to_device(backends[starter].device);
         let mut current_starter = starter;
         let mut total_hops = 0_usize;
+        let mut total_wire_bytes = 0_usize;
 
         for (layer_idx, &assignee) in assignees.iter().enumerate() {
             let mut packet = Some(
@@ -408,7 +411,20 @@ mod tests {
                 )
                 .unwrap();
                 match outcome {
-                    LayerStepOutcome::Forward(next_packet) => packet = Some(next_packet),
+                    LayerStepOutcome::Forward(next_packet) => {
+                        let wire = next_packet.into_self_driving_packet(layer_idx).unwrap();
+                        let receiver = wire.current_domain;
+                        total_wire_bytes +=
+                            transports[domain].send_self_driving_packet(&wire).unwrap();
+                        total_hops += 1;
+                        let received = transports[receiver]
+                            .recv_self_driving_packet()
+                            .unwrap()
+                            .expect("TCP peer closed before the next self-driving packet");
+                        assert_eq!(received.layer_idx, layer_idx);
+                        assert_eq!(received.current_domain, receiver);
+                        packet = Some(LayerPacket::from_self_driving_packet(received).unwrap());
+                    }
                     LayerStepOutcome::Finished { hidden_states, .. } => {
                         assert_eq!(visit_index + 1, domains);
                         next_hidden = Some(hidden_states);
@@ -418,7 +434,6 @@ mod tests {
 
             hidden_states = next_hidden.expect("the final worker must finish the layer");
             current_starter = (current_starter + domains - 1) % domains;
-            total_hops += domains - 1;
         }
 
         let logits = project_final_logits(&backends[current_starter].model, &hidden_states);
@@ -426,7 +441,7 @@ mod tests {
             let context = backend.request_contexts.get_mut(&request_id).unwrap();
             context.global_seq_len = position as usize + 1;
         }
-        (logits, current_starter, total_hops)
+        (logits, current_starter, total_hops, total_wire_bytes)
     }
 
     /// Verify that `decode_batch` produces identical logits to individual `decode_request`
@@ -728,7 +743,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires the local Qwen2-0.5B model weights"]
-    fn real_qwen_two_worker_reserved_prefill_decodes_two_self_driving_tokens() {
+    fn real_qwen_two_worker_reserved_prefill_decodes_two_self_driving_tokens_over_tcp() {
         let device = Device::Cpu;
         let model_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
@@ -823,7 +838,16 @@ mod tests {
         );
 
         let mut backends = vec![backend0, backend1];
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream0 = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let stream1 = listener.accept().unwrap().0;
+        let mut decode_transports = vec![
+            crate::model::transport::TcpKvTransport::new(stream0, device).unwrap(),
+            crate::model::transport::TcpKvTransport::new(stream1, device).unwrap(),
+        ];
         let mut starter = 1_usize;
+        let mut tcp_hops = 0_usize;
+        let mut tcp_bytes = 0_usize;
         for token_offset in 0..decode_tokens {
             let position = (prompt.len() + token_offset) as i64;
             let committed_before = (0..config.num_layers)
@@ -843,15 +867,20 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
 
-            let (distributed_logits, producer, hops) = run_two_backend_reserved_decode(
-                &mut backends,
-                request_id,
-                token,
-                position,
-                starter,
-                &assignees[token_offset],
-            );
+            let (distributed_logits, producer, hops, wire_bytes) =
+                run_two_backend_reserved_tcp_decode(
+                    &mut backends,
+                    &mut decode_transports,
+                    request_id,
+                    token,
+                    position,
+                    starter,
+                    &assignees[token_offset],
+                );
             assert_eq!(hops, config.num_layers);
+            assert!(wire_bytes > 0);
+            tcp_hops += hops;
+            tcp_bytes += wire_bytes;
             let reference_input = Tensor::from_slice(&[token]).unsqueeze(0);
             let reference_logits = reference
                 .forward(&reference_input, &mut reference_caches)
@@ -906,6 +935,10 @@ mod tests {
             starter = producer;
             token = distributed_token;
         }
+
+        assert_eq!(tcp_hops, decode_tokens * config.num_layers);
+        assert!(tcp_bytes > 0);
+        println!("real two-worker self-driving TCP: hops={tcp_hops}, bytes={tcp_bytes}");
 
         let domain_totals = (0..2)
             .map(|domain| {
