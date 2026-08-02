@@ -2,6 +2,13 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 远程节点连接方式以 infrastructure inventory 为唯一现行来源
+
+type: `preference` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-correction-2026-08-02`
+
+用户明确要求：远程节点的 SSH host、user 和可用平台从 ~/.agents/inventory.yaml 查询，不再把历史 LAN/Wi-Fi 地址写成项目规则或运行脚本默认值。文档可保留带日期的历史实验端点作为证据，但必须明确其为历史信息，不能指导当前连接。
+
+_updated: 2026-08-02 11:12:40_
 ### 双线程 backend 不是独立 worker 部署闭环
 
 type: `decision` · status: `rejected` · confidence: 1.0 · importance: 1.0 · source: `user-correction+code-audit-2026-08-02`
@@ -513,6 +520,28 @@ type: `decision` · status: `held` · confidence: 1.0 · importance: 0.98 · sou
 [2026-08-02 实现] b6902ba 验证显式 runtime Kind；VERDICT: IMPLEMENTED。
 
 _updated: 2026-08-01 20:38:25_
+### 移除旧 GPU LAN 地址作为现行连接默认
+
+type: `task` · status: `ongoing` · confidence: 1.0 · importance: 0.95 · source: `user-correction+infrastructure-inventory-2026-08-02`
+
+修订 AGENTS.md、现行 remote smoke 脚本和操作文档，使远程节点连接参数来自 infrastructure inventory。运行脚本不再静默猜测旧 GPU host；需要连接地址时显式要求 GPU_HOST 或 CONNECT_ADDR。保留历史实验结果的事实语义，但不让历史端点继续充当当前操作说明。验收：现行规则和可执行脚本不含旧地址；inventory 中 white 的 SSH endpoint 可达并能看到 CUDA GPU、仓库与模型。
+
+_updated: 2026-08-02 11:12:40_
+### 现行远程操作只解析 inventory endpoint
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `user-correction+verified-inventory-endpoint-2026-08-02`
+
+【动机六问】
+1.问题：项目规则把一个已过期的 GPU LAN 地址声明为当前 host，导致按规则连接时 SSH 超时，并与 inventory 冲突。
+2.现状：AGENTS.md、三个 remote smoke 脚本和两份现行操作文档仍含旧默认或示例；inventory 记录 white 的当前 Tailscale SSH endpoint，实测可连接并看到 RTX 4090、仓库和 Qwen2-0.5B 模型。
+3.目标：所有新操作先查 inventory；现行规则不固定旧 IP；会发起连接的脚本要求显式 GPU_HOST/CONNECT_ADDR，文档示例指向 inventory 字段。历史实验记录仍保持为带日期证据。
+4.他者：基础设施自动化通常把 endpoint 放在 inventory/service discovery/config 中，运行脚本消费显式配置，而不是复制易漂移的地址常量。
+5.本方案：AGENTS.md 改为 inventory authority；删除 active script 的旧默认，参数缺失时 fail-fast；更新 PROTOCOL_SMOKE 与 DEPLOYMENT_GUIDE 的现行说明。
+6.为什么：这是最小修复，不引入 YAML parser、DNS 或新的配置系统；既利用已有 inventory，也避免脚本再次静默连接错误机器。
+【牺牲四问】默认地址原本用于减少手动参数；移除后牺牲无参数启动便利性；该便利性的本质是为单一稳定环境提供快捷入口；本项目节点和网络路径会变化，显式从 inventory 取值比过期默认造成的误诊成本更低。历史证据不删除，避免改写既有实验事实。
+VERDICT: IMPLEMENT。
+
+_updated: 2026-08-02 11:12:40_
 ### Graph Memory 强制使用非 PTY 长文本写入与正文回读校验
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `sqlite-forensics-2026-08-02`
