@@ -2,6 +2,20 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 真实 Qwen 两 worker self-driving decode packet 经过邻接 TCP
+
+type: `task` · status: `in_progress` · confidence: 1.0 · importance: 1.0 · source: `user-confirmation-2026-08-02`
+
+Task 3b：在 Task 3a 的真实 Qwen2-0.5B、24 层、两 token reserved decode oracle 中，把每层唯一 Forward packet 强制经现有 TcpKvTransport 序列化、loopback TCP 发送、接收和反序列化后再交给下一 worker。验收：48=2 tokens×24 layers×(2-1) 次真实 TCP hop，所有 frame bytes>0；argmax/logits 包络、唯一 assignee append、position union、reservation 与最终 [36,108] KV totals 保持。边界：ignored、单进程、单请求、本地 CPU；不接 coordinator/QUIC、多请求、独立 worker loop 或生产 runtime。
+
+_updated: 2026-08-02 06:51:53_
+### 以持久 loopback TCP roundtrip 隔离真实 decode packet 的 wire compatibility
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmation-2026-08-02`
+
+【动机六问】1.问题：Task 3a 的真实 decode correctness 已成立，但 LayerPacket 仍在同一进程中直接从一个 backend 传给另一个，尚未证明真实 BF16 activation/Q/O/LSE/position 与 route metadata 可经过 wire format。2.现状：现有 TcpKvTransport 已支持 SelfDrivingPacket，synthetic N=3 两-token线程测试也证明邻接 send/recv；真实 Qwen oracle 则覆盖24层、reserved cache和1:3 ownership，但未使用 decode transport。3.目标：保持 Task 3a 所有输入与不变量，每个 Forward packet 必须执行 into_self_driving_packet、send_self_driving_packet、recv_self_driving_packet、from_self_driving_packet；两 token 共48次 hop且每帧非零，数值和KV结果不变。4.他者：分布式推理 rank 通常以阻塞/异步 point-to-point send/recv 在独立进程传 activation 或 attention accumulator；本项目现有 synthetic threaded TCP 是同类最小先例，QUIC和runtime负责更高层生命周期。5.本方案：在 ignored真实 oracle helper 中建立一条持久全双工 loopback TCP连接，为两个 backend 各持一个 TcpKvTransport；仅在 Forward 分支做真实 wire roundtrip并累计hop/bytes，其余计算与断言复用Task 3a。6.为什么：该方案只增加真实模型 wire compatibility 这一项新证据，能把序列化错误与线程调度、coordinator和服务状态错误隔离；改用QUIC或独立worker loop会同时引入协议/并发未知量，新runtime adapter则是未被当前证据要求的抽象。VERDICT: IMPLEMENT。
+
+_updated: 2026-08-02 06:51:53_
 ### 先以两个独立 backend 闭合真实 Qwen self-driving decode correctness
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `code-audit+user-confirmation-2026-08-02`
