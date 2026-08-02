@@ -2,6 +2,40 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 真实 Qwen 两阶段请求接入 WorkerRuntime/coordinator
+
+type: `task` · status: `planning` · confidence: 1.0 · importance: 1.0 · source: `user-selection-2026-08-03`
+
+以小节点把真实 self-driving decode 与 positioned continuation prefill 接入 WorkerRuntime/coordinator。最终验收是同一 request 在 Mac MPS worker 与 white CUDA worker 上完成 initial prompt、两次 decode、continuation prompt、再两次 decode；coordinator 不做模型计算，新主路径不调用 legacy Decode。当前阶段限定单请求、固定两段 prompt，不接多请求 pipeline、HTTP 或生产治理。
+
+_updated: 2026-08-02 19:01:54_
+### 拆分推进完整 runtime 两阶段 self-driving 请求
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `code-audit+user-selection-2026-08-03`
+
+【动机六问】
+1.问题：Task 3c 只证明 SelfDrivingPacket 可跨主机 QUIC；真实 WorkerRuntime 仍走 legacy Decode，且同一请求第二段 prompt 会重置 KV，尚不能形成真实对话式请求。
+2.现状：WorkerRuntime::Decode 调用 decode_request/LlamaModel::forward；prefill_request_with_reservation 每次创建新 cache；self-driving real-Qwen 只存在 test helper。更关键的是 decode 后 positioned KV 在各 worker 上非连续，现有 prefill ring 仍按 seq_offset 连续区间解释 peer KV，QUIC KvBlock 不传 position_ids。
+3.目标：Mac coordinator + Mac MPS worker0 + white CUDA worker1 对同一 request 完成 prompt A initial prefill -> 两个 self-driving decode step -> prompt B continuation prefill -> 两个 self-driving decode step。两平台都执行真实 Qwen forward；KV history 不重建、不丢失、不重复；position union 完整；最终 token 与独立 contiguous reference 对齐。
+4.他者：vLLM/主流 serving runtime 用显式 request state、prefill/decode phase、block table/slot mapping 和 scheduler command 驱动 worker；这些机制说明 phase 与物理 KV 位置必须显式，但其同构 collective 和 paged-attention worker loop不能直接承载 HCP 的异构 P2P ring 与 SelfDrivingPacket。
+5.本方案：选择完整 runtime/coordinator 路径，但拆成小节点。先让 positioned KV position IDs 成为 prefill ring wire 合同并建立 continuation backend；再把 self-driving 单步执行提升为 WorkerBackend 能力；随后增加明确的 ContinuationPrefill/SelfDrivingDecode 控制协议与 worker phase loop；最后让 coordinator 生成容量/assignee plan 并做真实 Mac-white 两阶段请求验证。
+6.为什么：专用 tracer 会再次把已证明算法留在服务边界之外；直接一次性改完则混合 KV 语义、peer event loop、控制协议和设备部署。分层推进既不让 legacy forward 决定新主路径，也能让每个 correctness 缺口单独 RED/GREEN。
+【legacy 边界】本阶段不以删除旧命令为目标，避免把兼容性清理混入核心闭环；新两阶段请求不得调用 legacy Decode。旧路径保留为非主路径，待新路径稳定后另做带牺牲分析的删除决策。
+VERDICT: IMPLEMENT。
+
+_updated: 2026-08-02 19:01:54_
+### Continuation prefill 必须先获得 positioned KV wire 语义
+
+type: `risk` · status: `open` · confidence: 1.0 · importance: 1.0 · source: `code-audit-2026-08-03`
+
+代码审计确认 continuation prefill 不能直接复用现有 forward：
+1. TchWorkerBackend::do_prefill 会重建所有 KV cache，并把 model/global layer prefill state 清零。
+2. LlamaModel::forward 在 is_prefill_done=true 时，无论输入 seq_len，都只构造一个 global_seq_len position，不能表达多-token continuation segment。
+3. self-driving decode 按 layer assignee append 后，每个 worker 的 ReservedPositionedKvShard positions 不再是单一连续区间。
+4. HcpRingAttentionBackend prefill 仍以 seq_offset/global_seq_start 解释整个 local K/V；KvBlock 虽有 position_ids 字段，但当前 QUIC/TCP KV codec 没有传递它。
+因此直接把第二段 prompt 送进现有 Prefill/Decode 会重置或错误掩码。先建立 positioned KV wire + continuation segment forward 才能继续 runtime 接线。
+
+_updated: 2026-08-02 19:01:54_
 ### 先建立传输无关的 SelfDrivingPacket 数据面合同
 
 type: `decision` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `user-confirmation+code-audit-2026-08-02`
