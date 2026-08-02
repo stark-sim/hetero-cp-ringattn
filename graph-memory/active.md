@@ -2,14 +2,6 @@
 
 当前活跃的任务、决策、风险和假设。
 
-### 真实 Qwen 两 worker reserved prefill 后执行两 token self-driving decode
-
-type: `task` · status: `in_progress` · confidence: 1.0 · importance: 1.0 · source: `user-confirmation-2026-08-02`
-
-Task 3a：从两个独立 TchWorkerBackend 已完成的真实 Qwen2-0.5B、24 层 reserved prefill request context 出发，执行两个 self-driving decode token。每层只访问当前 worker 的本地 shard，验证唯一 assignee append、N-1 hops、position union、BF16 logits/token 与 contiguous reference 对齐。
-边界：ignored in-process correctness oracle；不接 coordinator、QUIC/TCP、多请求或生产 runtime，不提升 all-domain shard API。
-
-_updated: 2026-08-02 04:00:07_
 ### 先以两个独立 backend 闭合真实 Qwen self-driving decode correctness
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `code-audit+user-confirmation-2026-08-02`

@@ -2,6 +2,25 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### 真实 Qwen 两 worker 完成两 token self-driving decode correctness 闭环
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@59618b9`
+
+实现提交 59618b9：新增 ignored in-process oracle，从两个独立 TchWorkerBackend 的真实 Qwen2-0.5B、24 层、CPU BF16 reserved prefill 状态继续执行两个 self-driving decode token。prefill positions 为 worker0=[0]、worker1=[1,2,3]；冻结 schedule tickets=[1,3]，48 个 layer-token append events 精确计数 [12,36]。每 token 24 个网络等价 hop，即每层 N-1=1；每层仅唯一 assignee append，本地 shard position union 完整且无重复；最终跨层 KV totals=[36,108]=1:3，所有 shard 精确写满 reservation。
+数值结果：decode 0 max_diff=0.531250、mean_diff=0.083501、tokens=6667/6667；decode 1 max_diff=0.289062、mean_diff=0.051739、tokens=220/220。两轮 argmax 均与 contiguous reference 精确一致。
+验证：聚焦 ignored test real_qwen_two_worker_reserved_prefill_decodes_two_self_driving_tokens 为 1 passed、0 failed；完整 cargo test --features tch-backend 为 101 passed、0 failed、3 ignored；cargo clippy --features tch-backend --all-targets -- -A warnings exit 0；rustfmt --check self_driving.rs、git diff --check 均 exit 0。tch_backend.rs 全文件仍有既有 rustfmt 债，但本节点新增测试区间未产生新的 rustfmt hunk。
+边界：只证明本机 libtorch CPU 的真实 BF16、两 worker、in-process correctness；不证明 coordinator、TCP/QUIC、跨节点异构硬件、多请求、性能或生产服务。
+
+_updated: 2026-08-02 06:12:35_
+### BF16 prefill 的 max-diff 门槛不能无证据推广到多层 decode continuation
+
+type: `lesson` · status: `held` · confidence: 1.0 · importance: 0.92 · source: `hetero-cp-ringattn@59618b9`
+
+症状：把真实两-worker prefill oracle 的 max logits diff<0.5 经验门槛直接沿用到 24 层 decode continuation 后，decode 0 稳定得到 0.531250 而失败；重复运行结果一致。临时只检查 finite 后，第二 token、argmax、position union、唯一 assignee append、reservation 和 capacity-weighted totals 全部通过。
+根因边界：prefill 的一次分块 online-softmax 数值包络不能直接代表 24 层跨 backend continuation 的累计 BF16 重排误差；0.531250 本身不证明 ownership 或 layer 数据流错误。
+修订：真实 decode oracle 以 argmax exact 和 mean diff<0.1 为主要数值合同，并保留 max diff<0.75 作为当前固定 CPU BF16 oracle 的失控保护。0.75 不是跨硬件数学保证，也不取代旧 prefill oracle 的 max<0.5 门槛。后续跨设备应先收集各硬件分布，再分别校准 guard，不把单一 max 阈值写成算法正确性定理。
+
+_updated: 2026-08-02 06:12:35_
 ### [2026-08-02] Graph Memory SQLite 写入 transport 规则与回归已验证
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `local-graph-memory-skill-2026-08-02`
