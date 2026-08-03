@@ -45,9 +45,9 @@ enum TcpFrame {
 pub struct TcpKvTransport {
     stream: TcpStream,
     device: Device,
-    /// 【内部发送缓冲区】用于 submit_send 的异步化。
+    /// 【内部发送缓冲区】用于组装一次同步 submit 的完整 frame。
     /// TCP 本身是同步流，submit_send 会把完整 frame 先序列化到 buffer，
-    /// 在 flush_send 时才一次性写入 stream。
+    /// 然后立即写入 stream；真正异步的 transport 由 QUIC 后台 task 提供。
     send_buffer: Vec<u8>,
     /// TCP is a byte stream, so nonblocking reads may stop at any byte.
     /// Keep incomplete frame data until a later poll supplies the remainder.
@@ -284,7 +284,8 @@ fn serialize_self_driving_packet(packet: &SelfDrivingPacket) -> Result<Vec<u8>, 
 #[cfg(feature = "tch-backend")]
 impl KvTransport for TcpKvTransport {
     fn submit_send(&mut self, block: &KvBlock) -> Result<(), String> {
-        serialize_block_to_buffer(&mut self.send_buffer, block)
+        serialize_block_to_buffer(&mut self.send_buffer, block)?;
+        self.flush_send()
     }
 
     fn poll_recv(&mut self) -> Result<Option<KvBlock>, String> {
@@ -336,7 +337,8 @@ impl KvTransport for TcpKvTransport {
     }
 
     fn submit_send_packet(&mut self, packet: &RingPacket) -> Result<(), String> {
-        serialize_packet_to_buffer(&mut self.send_buffer, packet)
+        serialize_packet_to_buffer(&mut self.send_buffer, packet)?;
+        self.flush_send()
     }
 
     fn poll_recv_packet(&mut self) -> Result<Option<RingPacket>, String> {
@@ -382,7 +384,7 @@ impl KvTransport for TcpKvTransport {
     ) -> Result<(), String> {
         let frame = serialize_self_driving_packet(packet)?;
         self.send_buffer.extend_from_slice(&frame);
-        Ok(())
+        self.flush_send()
     }
 
     fn poll_recv_self_driving_packet(&mut self) -> Result<Option<SelfDrivingPacket>, String> {
@@ -845,6 +847,37 @@ mod tests {
         assert_eq!(
             Vec::<i64>::try_from(&received.position_ids.unwrap()).unwrap(),
             expected_positions
+        );
+    }
+
+    #[test]
+    fn tcp_submit_send_starts_network_write_before_outer_flush() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_stream = TcpStream::connect(addr).unwrap();
+        let (server_stream, _) = listener.accept().unwrap();
+        let device = Device::Cpu;
+        let mut client = TcpKvTransport::new(client_stream, device).unwrap();
+        let mut server = TcpKvTransport::new(server_stream, device).unwrap();
+        server
+            .stream
+            .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+            .unwrap();
+        let block = KvBlock::single(
+            3,
+            4,
+            6,
+            Tensor::arange(4, (Kind::Float, device)).reshape([1, 1, 2, 2]),
+            Tensor::arange(4, (Kind::Float, device)).reshape([1, 1, 2, 2]),
+        );
+
+        client.submit_send(&block).unwrap();
+        let received = server.recv_kv_block().unwrap().unwrap();
+
+        assert_eq!(received.layer_idx, block.layer_idx);
+        assert_eq!(
+            (received.global_seq_start, received.global_seq_end),
+            (block.global_seq_start, block.global_seq_end)
         );
     }
 
