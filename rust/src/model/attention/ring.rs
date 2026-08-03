@@ -1,16 +1,16 @@
-use crate::model::ModelError;
 use super::backend::AttentionBackend;
 use super::strategy::RingSchedulingStrategy;
+use crate::model::ModelError;
 
-#[cfg(feature = "tch-backend")]
-use tch::{Device, Kind, Tensor};
 #[cfg(feature = "tch-backend")]
 use crate::model::transport::{KvBlock, KvTransport, RingPacket};
+#[cfg(feature = "tch-backend")]
+use tch::{Device, Kind, Tensor};
 
 #[cfg(feature = "tch-backend")]
-use std::time::Instant;
-#[cfg(feature = "tch-backend")]
 use std::io::Write;
+#[cfg(feature = "tch-backend")]
+use std::time::Instant;
 
 /// Ring-attention backend that splits sequence into chunks and computes
 /// attention via online softmax over K/V blocks.
@@ -117,14 +117,31 @@ impl HcpRingAttentionBackend {
         rope: &crate::model::layers::RotaryEmbedding,
         num_domains: usize,
     ) -> Result<Self, ModelError> {
-        let q_bias = weights.get(&crate::model::WeightNames::q_proj_bias(layer)).ok().map(|t| t.shallow_clone());
-        let k_bias = weights.get(&crate::model::WeightNames::k_proj_bias(layer)).ok().map(|t| t.shallow_clone());
-        let v_bias = weights.get(&crate::model::WeightNames::v_proj_bias(layer)).ok().map(|t| t.shallow_clone());
+        let q_bias = weights
+            .get(&crate::model::WeightNames::q_proj_bias(layer))
+            .ok()
+            .map(|t| t.shallow_clone());
+        let k_bias = weights
+            .get(&crate::model::WeightNames::k_proj_bias(layer))
+            .ok()
+            .map(|t| t.shallow_clone());
+        let v_bias = weights
+            .get(&crate::model::WeightNames::v_proj_bias(layer))
+            .ok()
+            .map(|t| t.shallow_clone());
         Ok(Self {
-            q_proj: weights.get(&crate::model::WeightNames::q_proj_weight(layer))?.shallow_clone(),
-            k_proj: weights.get(&crate::model::WeightNames::k_proj_weight(layer))?.shallow_clone(),
-            v_proj: weights.get(&crate::model::WeightNames::v_proj_weight(layer))?.shallow_clone(),
-            o_proj: weights.get(&crate::model::WeightNames::o_proj_weight(layer))?.shallow_clone(),
+            q_proj: weights
+                .get(&crate::model::WeightNames::q_proj_weight(layer))?
+                .shallow_clone(),
+            k_proj: weights
+                .get(&crate::model::WeightNames::k_proj_weight(layer))?
+                .shallow_clone(),
+            v_proj: weights
+                .get(&crate::model::WeightNames::v_proj_weight(layer))?
+                .shallow_clone(),
+            o_proj: weights
+                .get(&crate::model::WeightNames::o_proj_weight(layer))?
+                .shallow_clone(),
             q_bias,
             k_bias,
             v_bias,
@@ -171,21 +188,21 @@ impl HcpRingAttentionBackend {
     }
 
     /// 【处理单个 KV block】用一组 Q 去和一组 K/V 做 attention，然后更新 online softmax 状态。
-    /// 
+    ///
     /// 所有位置参数都必须是【全局位置】，不能是本地索引。
     /// 例如 domain1 的本地索引 0 对应全局位置 8。
     #[allow(clippy::too_many_arguments)]
     fn process_kv_block(
         &self,
-        q_chunk: &Tensor,            // 当前 Q chunk，shape: [batch, num_heads, q_chunk_len, head_dim]
-        q_pos: &Tensor,              // 当前 Q chunk 的原始全局位置，shape: [q_chunk_len] (Int64)
-        k_chunk: &Tensor,            // 当前 K block，shape: [batch, num_heads, kv_chunk_len, head_dim]
-        v_chunk: &Tensor,            // 当前 V block，shape: [batch, num_heads, kv_chunk_len, head_dim]
-        k_pos: &Tensor,              // 当前 K/V block 的原始全局位置，shape: [kv_chunk_len] (Int64)
-        rm: &mut Tensor,             // 【running max】当前见过的最大 score（可变的引用）
-        rs: &mut Tensor,             // 【running sum】当前 softmax 分母的累加和
-        obh: &mut Tensor,            // 【output buffer】当前加权累加的输出
-        apply_causal_mask: bool,     // 【是否应用因果掩码】true=因果路径, false=非因果路径
+        q_chunk: &Tensor, // 当前 Q chunk，shape: [batch, num_heads, q_chunk_len, head_dim]
+        q_pos: &Tensor,   // 当前 Q chunk 的原始全局位置，shape: [q_chunk_len] (Int64)
+        k_chunk: &Tensor, // 当前 K block，shape: [batch, num_heads, kv_chunk_len, head_dim]
+        v_chunk: &Tensor, // 当前 V block，shape: [batch, num_heads, kv_chunk_len, head_dim]
+        k_pos: &Tensor,   // 当前 K/V block 的原始全局位置，shape: [kv_chunk_len] (Int64)
+        rm: &mut Tensor,  // 【running max】当前见过的最大 score（可变的引用）
+        rs: &mut Tensor,  // 【running sum】当前 softmax 分母的累加和
+        obh: &mut Tensor, // 【output buffer】当前加权累加的输出
+        apply_causal_mask: bool, // 【是否应用因果掩码】true=因果路径, false=非因果路径
     ) {
         let kv_chunk_len = k_pos.size()[0];
 
@@ -206,7 +223,7 @@ impl HcpRingAttentionBackend {
 
         // ====== 第一步：计算 Attention Scores ======
         // Attention 的核心公式：score = Q @ K^T / sqrt(head_dim)
-        // 
+        //
         // q_chunk shape: [batch, num_heads, q_chunk_len, head_dim]
         // k_chunk shape: [batch, num_heads, kv_chunk_len, head_dim]
         // k_chunk.transpose(2, 3) → [batch, num_heads, head_dim, kv_chunk_len]
@@ -215,9 +232,9 @@ impl HcpRingAttentionBackend {
         let mut scores = q_chunk.matmul(&k_chunk.transpose(2, 3)) * self.scale;
 
         // 用全局位置构造因果掩码，确保当前 token 看不到未来的 token。
-        // 
+        //
         // 原理：对于每个 query 位置 i 和 key 位置 j，如果 i >= j 则允许 attention，否则 mask 为 -inf。
-        // 
+        //
         // q_pos: 当前 Q chunk 的全局位置，shape [1, 1, q_chunk_len, 1]
         // k_pos: 当前 K/V block 的全局位置，shape [1, 1, 1, kv_chunk_len]
         // causal = q_pos.ge_tensor(&k_pos): element-wise 比较，返回 bool tensor。
@@ -366,12 +383,7 @@ impl HcpRingAttentionBackend {
             q += bias;
         }
         let q = q
-            .view([
-                batch,
-                seq_len,
-                self.num_heads as i64,
-                self.head_dim as i64,
-            ])
+            .view([batch, seq_len, self.num_heads as i64, self.head_dim as i64])
             .transpose(1, 2);
         let (q, _) = self.rope.apply(&q, &q, Some(position_ids));
         Ok(q)
@@ -483,21 +495,10 @@ impl HcpRingAttentionBackend {
             tensor
                 .unsqueeze(2)
                 .expand(
-                    [
-                        shape[0],
-                        shape[1],
-                        num_rep as i64,
-                        shape[2],
-                        shape[3],
-                    ],
+                    [shape[0], shape[1], num_rep as i64, shape[2], shape[3]],
                     false,
                 )
-                .reshape([
-                    shape[0],
-                    shape[1] * num_rep as i64,
-                    shape[2],
-                    shape[3],
-                ])
+                .reshape([shape[0], shape[1] * num_rep as i64, shape[2], shape[3]])
         };
         (repeat(k), repeat(v))
     }
@@ -544,10 +545,7 @@ impl HcpRingAttentionBackend {
         let device = q.device();
         let mut rm = Tensor::full([batch, num_heads, query_len], -1e4_f64, (q_kind, device));
         let mut rs = Tensor::zeros([batch, num_heads, query_len], (q_kind, device));
-        let mut obh = Tensor::zeros(
-            [batch, num_heads, query_len, head_dim],
-            (q_kind, device),
-        );
+        let mut obh = Tensor::zeros([batch, num_heads, query_len, head_dim], (q_kind, device));
         let q_positions = q_positions.view([-1]).to_device(Device::Cpu);
         let k_positions = k_positions.view([-1]).to_device(Device::Cpu);
         self.process_kv_block(
@@ -603,10 +601,11 @@ impl HcpRingAttentionBackend {
         let batch = attention_output.size()[0];
         let seq_len = attention_output.size()[2];
         let hidden_size = (self.num_heads * self.head_dim) as i64;
-        let attention_output = attention_output
-            .transpose(1, 2)
-            .contiguous()
-            .view([batch, seq_len, hidden_size]);
+        let attention_output =
+            attention_output
+                .transpose(1, 2)
+                .contiguous()
+                .view([batch, seq_len, hidden_size]);
         attention_output.matmul(&self.o_proj.transpose(0, 1))
     }
 
@@ -639,7 +638,14 @@ impl HcpRingAttentionBackend {
     ///（此时 Σexp(s - lse) = 1，obh 即归一化输出），复用 process_kv_block 的 merge 数学：
     ///   m = max(lse_acc, lse_loc), lse' = m + log(exp(lse_acc - m) + exp(lse_loc - m))
     /// 空 segment 时 packet 原样通过（lse + log(1) = lse）。
-    fn decode_merge_packet(&self, q: &Tensor, o: &Tensor, lse: &Tensor, k: &Tensor, v: &Tensor) -> (Tensor, Tensor) {
+    fn decode_merge_packet(
+        &self,
+        q: &Tensor,
+        o: &Tensor,
+        lse: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+    ) -> (Tensor, Tensor) {
         let mut rm = lse.to_kind(q.kind());
         let mut rs = Tensor::ones_like(&rm);
         let mut obh = o.shallow_clone();
@@ -667,7 +673,12 @@ impl HcpRingAttentionBackend {
     ///   因此最后一轮收到的全合并 packet 就是本层全局 attention 输出。
     ///
     /// `k` / `v`：本地 segment [durable KV; 当前 token]（forward 保证末位是当前 token）。
-    fn ring_decode_attention(&mut self, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor, ModelError> {
+    fn ring_decode_attention(
+        &mut self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+    ) -> Result<Tensor, ModelError> {
         let ring_start = Instant::now();
         let local_len = k.size()[2];
         let peer_len = local_len.saturating_sub(1);
@@ -681,7 +692,8 @@ impl HcpRingAttentionBackend {
             Kind::Double => 8,
             _ => 4,
         };
-        let packet_bytes = (q.numel() * 2) * elem_bytes + q.size()[0] as usize * q.size()[1] as usize * 4;
+        let packet_bytes =
+            (q.numel() * 2) * elem_bytes + q.size()[0] as usize * q.size()[1] as usize * 4;
         let mut perf_sent_bytes = 0usize;
         let mut perf_recv_bytes = 0usize;
 
@@ -716,7 +728,9 @@ impl HcpRingAttentionBackend {
                         .recv_packet()
                         .map_err(|e| ModelError::Backend(format!("recv_packet: {e}")))?,
                 };
-                pkt.ok_or_else(|| ModelError::Backend("ring decode: packet stream closed".to_string()))?
+                pkt.ok_or_else(|| {
+                    ModelError::Backend("ring decode: packet stream closed".to_string())
+                })?
             }; // transport borrow 结束
             perf_recv_bytes += packet_bytes;
 
@@ -779,7 +793,11 @@ impl HcpRingAttentionBackend {
                 line.push_str(&format!(",\"{}\":{}", k, v));
             }
             line.push_str("}\n");
-            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
                 let _ = file.write_all(line.as_bytes());
             }
         }
@@ -824,9 +842,7 @@ impl HcpRingAttentionBackend {
         let mut perf_micro_block_count: usize = 0;
 
         // ====== 确定 chunk 大小 ======
-        let q_chunk_size = (seq_len as usize)
-            .div_ceil(self.num_domains)
-            .clamp(1, 2048);
+        let q_chunk_size = (seq_len as usize).div_ceil(self.num_domains).clamp(1, 2048);
         let kv_chunk_size = if seq_len == 1 { 2048 } else { q_chunk_size };
 
         // micro KV block 大小：默认使用 kv_chunk_size，可通过 HCP_MICRO_KV_BLOCK_SIZE 覆盖
@@ -876,9 +892,16 @@ impl HcpRingAttentionBackend {
                 // 原因：Striped / 非连续分片下，某个 query 可能在第一个 block 就全被因果掩码屏蔽；
                 // 若 rm = -inf，online softmax 的 exp(-inf - (-inf)) 会产生 NaN。
                 // -1e4 对 Half/BFloat16/Float/Double 都可表示，且 exp(-1e4) 在所有浮点格式下都为 0。
-                rm: Tensor::full([batch, num_heads, q_chunk_len], -1e4_f64, (q_kind, q.device())),
+                rm: Tensor::full(
+                    [batch, num_heads, q_chunk_len],
+                    -1e4_f64,
+                    (q_kind, q.device()),
+                ),
                 rs: Tensor::zeros([batch, num_heads, q_chunk_len], (q_kind, q.device())),
-                obh: Tensor::zeros([batch, num_heads, q_chunk_len, head_dim], (q_kind, q.device())),
+                obh: Tensor::zeros(
+                    [batch, num_heads, q_chunk_len, head_dim],
+                    (q_kind, q.device()),
+                ),
             });
         }
 
@@ -893,7 +916,11 @@ impl HcpRingAttentionBackend {
                     global_seq_start + self.prefill_kv_len,
                 )
             } else {
-                (k.shallow_clone(), v.shallow_clone(), global_seq_start + k.size()[2] as usize)
+                (
+                    k.shallow_clone(),
+                    v.shallow_clone(),
+                    global_seq_start + k.size()[2] as usize,
+                )
             };
             let send_kv_len = k_to_send.size()[2] as usize;
             let num_micro = send_kv_len.div_ceil(micro_kv_block_size);
@@ -902,7 +929,10 @@ impl HcpRingAttentionBackend {
                     let start = i * micro_kv_block_size;
                     let end = ((i + 1) * micro_kv_block_size).min(send_kv_len);
                     let len_i64 = (end - start) as i64;
-                    let pos_ids = self.position_ids.as_ref().map(|pos| pos.narrow(0, start as i64, len_i64));
+                    let pos_ids = self
+                        .position_ids
+                        .as_ref()
+                        .map(|pos| pos.narrow(0, start as i64, len_i64));
                     KvBlock {
                         layer_idx: self.layer_idx,
                         global_seq_start: global_seq_start + start,
@@ -944,17 +974,18 @@ impl HcpRingAttentionBackend {
         };
 
         // ====== 接收一个 micro block（poll_recv + recv_kv_block fallback）======
-        let recv_micro_block = |transport: &mut dyn KvTransport| -> Result<Option<KvBlock>, String> {
-            match transport.poll_recv() {
-                Ok(Some(block)) => Ok(Some(block)),
-                Ok(None) => match transport.recv_kv_block() {
+        let recv_micro_block =
+            |transport: &mut dyn KvTransport| -> Result<Option<KvBlock>, String> {
+                match transport.poll_recv() {
                     Ok(Some(block)) => Ok(Some(block)),
-                    Ok(None) => Ok(None),
+                    Ok(None) => match transport.recv_kv_block() {
+                        Ok(Some(block)) => Ok(Some(block)),
+                        Ok(None) => Ok(None),
+                        Err(e) => Err(e),
+                    },
                     Err(e) => Err(e),
-                },
-                Err(e) => Err(e),
-            }
-        };
+                }
+            };
 
         if has_transport {
             let num_rounds = self.num_domains.saturating_sub(1);
@@ -967,7 +998,8 @@ impl HcpRingAttentionBackend {
                 Kind::Double => 8,
                 _ => 4,
             };
-            perf_kv_sent_bytes = local_micro_blocks.iter()
+            perf_kv_sent_bytes = local_micro_blocks
+                .iter()
                 .map(|b| b.k.numel() * local_elem_bytes + b.v.numel() * local_elem_bytes)
                 .sum();
 
@@ -979,9 +1011,13 @@ impl HcpRingAttentionBackend {
                     // 1. 发送所有本地 micro blocks
                     let send_start = Instant::now();
                     for micro_block in &local_micro_blocks {
-                        transport.submit_send(micro_block).map_err(|e| ModelError::Backend(format!("submit_send: {e}")))?;
+                        transport
+                            .submit_send(micro_block)
+                            .map_err(|e| ModelError::Backend(format!("submit_send: {e}")))?;
                     }
-                    transport.flush_send().map_err(|e| ModelError::Backend(format!("flush_send: {e}")))?;
+                    transport
+                        .flush_send()
+                        .map_err(|e| ModelError::Backend(format!("flush_send: {e}")))?;
                     perf_send_ms = send_start.elapsed().as_secs_f64() * 1000.0;
 
                     // 2. 收集所有 peer micro blocks（所有 rounds）
@@ -989,7 +1025,9 @@ impl HcpRingAttentionBackend {
                     let mut all_blocks: Vec<Vec<KvBlock>> = Vec::new();
                     for round in 0..num_rounds {
                         let mut round_blocks = Vec::new();
-                        while let Some(block) = recv_micro_block(transport.as_mut()).map_err(|e| ModelError::Backend(format!("recv_micro_block: {e}")))? {
+                        while let Some(block) = recv_micro_block(transport.as_mut())
+                            .map_err(|e| ModelError::Backend(format!("recv_micro_block: {e}")))?
+                        {
                             let elem_bytes = match block.k.kind() {
                                 Kind::Float => 4,
                                 Kind::Half => 2,
@@ -997,10 +1035,13 @@ impl HcpRingAttentionBackend {
                                 Kind::Double => 8,
                                 _ => 4,
                             };
-                            perf_kv_recv_bytes += block.k.numel() * elem_bytes + block.v.numel() * elem_bytes;
+                            perf_kv_recv_bytes +=
+                                block.k.numel() * elem_bytes + block.v.numel() * elem_bytes;
                             let is_last = block.micro_block_idx + 1 == block.total_micro_blocks;
                             round_blocks.push(block);
-                            if is_last { break; }
+                            if is_last {
+                                break;
+                            }
                         }
                         all_blocks.push(round_blocks);
 
@@ -1015,10 +1056,15 @@ impl HcpRingAttentionBackend {
                                     Kind::Double => 8,
                                     _ => 4,
                                 };
-                                perf_kv_sent_bytes += block.k.numel() * elem_bytes + block.v.numel() * elem_bytes;
-                                transport.submit_send(block).map_err(|e| ModelError::Backend(format!("forward submit_send: {e}")))?;
+                                perf_kv_sent_bytes +=
+                                    block.k.numel() * elem_bytes + block.v.numel() * elem_bytes;
+                                transport.submit_send(block).map_err(|e| {
+                                    ModelError::Backend(format!("forward submit_send: {e}"))
+                                })?;
                             }
-                            transport.flush_send().map_err(|e| ModelError::Backend(format!("flush_send: {e}")))?;
+                            transport
+                                .flush_send()
+                                .map_err(|e| ModelError::Backend(format!("flush_send: {e}")))?;
                             perf_forward_ms += fwd_start.elapsed().as_secs_f64() * 1000.0;
                         }
                     }
@@ -1036,9 +1082,14 @@ impl HcpRingAttentionBackend {
                         let v_chunk = v.narrow(2, *kv_start as i64, kv_chunk_len);
                         let k_pos = build_k_pos(*kv_start, *kv_end);
                         self.process_kv_block(
-                            &state.q_chunk, &state.q_pos,
-                            &k_chunk, &v_chunk, &k_pos,
-                            &mut state.rm, &mut state.rs, &mut state.obh,
+                            &state.q_chunk,
+                            &state.q_pos,
+                            &k_chunk,
+                            &v_chunk,
+                            &k_pos,
+                            &mut state.rm,
+                            &mut state.rs,
+                            &mut state.obh,
                             apply_causal,
                         );
                     }
@@ -1054,9 +1105,14 @@ impl HcpRingAttentionBackend {
                         let k_pos = peer_k_pos(micro_block);
                         for state in q_states.iter_mut() {
                             self.process_kv_block(
-                                &state.q_chunk, &state.q_pos,
-                                &micro_block.k, &micro_block.v, &k_pos,
-                                &mut state.rm, &mut state.rs, &mut state.obh,
+                                &state.q_chunk,
+                                &state.q_pos,
+                                &micro_block.k,
+                                &micro_block.v,
+                                &k_pos,
+                                &mut state.rm,
+                                &mut state.rs,
+                                &mut state.obh,
                                 apply_causal,
                             );
                         }
@@ -1070,7 +1126,9 @@ impl HcpRingAttentionBackend {
                     // Phase 0: 逐个 submit_send 本地 micro blocks（send task 后台传输）
                     let phase0_start = Instant::now();
                     for micro_block in &local_micro_blocks {
-                        transport.submit_send(micro_block).map_err(|e| ModelError::Backend(format!("submit_send: {e}")))?;
+                        transport
+                            .submit_send(micro_block)
+                            .map_err(|e| ModelError::Backend(format!("submit_send: {e}")))?;
                     }
                     perf_send_ms = phase0_start.elapsed().as_secs_f64() * 1000.0;
                 } // transport borrow 结束
@@ -1084,9 +1142,14 @@ impl HcpRingAttentionBackend {
                         let v_chunk = v.narrow(2, *kv_start as i64, kv_chunk_len);
                         let k_pos = build_k_pos(*kv_start, *kv_end);
                         self.process_kv_block(
-                            &state.q_chunk, &state.q_pos,
-                            &k_chunk, &v_chunk, &k_pos,
-                            &mut state.rm, &mut state.rs, &mut state.obh,
+                            &state.q_chunk,
+                            &state.q_pos,
+                            &k_chunk,
+                            &v_chunk,
+                            &k_pos,
+                            &mut state.rm,
+                            &mut state.rs,
+                            &mut state.obh,
                             apply_causal,
                         );
                     }
@@ -1108,7 +1171,9 @@ impl HcpRingAttentionBackend {
                         let recv_start = std::time::Instant::now();
                         let block = {
                             let transport = self.kv_transport.as_mut().unwrap();
-                            match recv_micro_block(transport.as_mut()).map_err(|e| ModelError::Backend(format!("recv_micro_block: {e}")))? {
+                            match recv_micro_block(transport.as_mut()).map_err(|e| {
+                                ModelError::Backend(format!("recv_micro_block: {e}"))
+                            })? {
                                 Some(block) => block,
                                 None => break,
                             }
@@ -1124,7 +1189,8 @@ impl HcpRingAttentionBackend {
                             Kind::Double => 8,
                             _ => 4,
                         };
-                        let recv_bytes = block.k.numel() * elem_bytes + block.v.numel() * elem_bytes;
+                        let recv_bytes =
+                            block.k.numel() * elem_bytes + block.v.numel() * elem_bytes;
                         perf_kv_recv_bytes += recv_bytes;
                         let is_last = block.micro_block_idx + 1 == block.total_micro_blocks;
                         // 防御性断言：micro blocks 必须按顺序到达（QUIC stream 保证有序）
@@ -1140,9 +1206,14 @@ impl HcpRingAttentionBackend {
                         let k_pos = peer_k_pos(&block);
                         for state in q_states.iter_mut() {
                             self.process_kv_block(
-                                &state.q_chunk, &state.q_pos,
-                                &block.k, &block.v, &k_pos,
-                                &mut state.rm, &mut state.rs, &mut state.obh,
+                                &state.q_chunk,
+                                &state.q_pos,
+                                &block.k,
+                                &block.v,
+                                &k_pos,
+                                &mut state.rm,
+                                &mut state.rs,
+                                &mut state.obh,
                                 apply_causal,
                             );
                         }
@@ -1154,21 +1225,29 @@ impl HcpRingAttentionBackend {
                         if round < num_rounds.saturating_sub(1) {
                             let fwd_start = std::time::Instant::now();
                             let transport = self.kv_transport.as_mut().unwrap();
-                            transport.submit_send(&block).map_err(|e| ModelError::Backend(format!("forward submit_send: {e}")))?;
+                            transport.submit_send(&block).map_err(|e| {
+                                ModelError::Backend(format!("forward submit_send: {e}"))
+                            })?;
                             perf_forward_ms += fwd_start.elapsed().as_secs_f64() * 1000.0;
                             perf_kv_sent_bytes += recv_bytes;
                         }
 
-                        if is_last { break; }
+                        if is_last {
+                            break;
+                        }
                     }
                 }
                 if micro_block_count > 0 {
-                    let avg_recv_ms = total_recv_time.as_secs_f64() * 1000.0 / micro_block_count as f64;
-                    let avg_compute_ms = total_compute_time.as_secs_f64() * 1000.0 / micro_block_count as f64;
+                    let avg_recv_ms =
+                        total_recv_time.as_secs_f64() * 1000.0 / micro_block_count as f64;
+                    let avg_compute_ms =
+                        total_compute_time.as_secs_f64() * 1000.0 / micro_block_count as f64;
                     // overlap hint: 如果 compute > recv 说明网络没拖后腿；反之说明网络是瓶颈
                     let overlap_ratio = if total_compute_time.as_secs_f64() > 0.0 {
                         total_recv_time.as_secs_f64() / total_compute_time.as_secs_f64()
-                    } else { 0.0 };
+                    } else {
+                        0.0
+                    };
                     println!("[ring_attention] layer {} Phase 2 summary: {micro_block_count} micro blocks, avg recv={avg_recv_ms:.2}ms, avg compute={avg_compute_ms:.2}ms, recv/compute={overlap_ratio:.2}x",
                         self.layer_idx);
                 }
@@ -1180,7 +1259,9 @@ impl HcpRingAttentionBackend {
                 {
                     let flush_start = Instant::now();
                     let transport = self.kv_transport.as_mut().unwrap();
-                    transport.flush_send().map_err(|e| ModelError::Backend(format!("flush_send: {e}")))?;
+                    transport
+                        .flush_send()
+                        .map_err(|e| ModelError::Backend(format!("flush_send: {e}")))?;
                     perf_flush_ms = flush_start.elapsed().as_secs_f64() * 1000.0;
                 }
             }
@@ -1193,9 +1274,14 @@ impl HcpRingAttentionBackend {
                     let v_chunk = v.narrow(2, *kv_start as i64, kv_chunk_len);
                     let k_pos = build_k_pos(*kv_start, *kv_end);
                     self.process_kv_block(
-                        &state.q_chunk, &state.q_pos,
-                        &k_chunk, &v_chunk, &k_pos,
-                        &mut state.rm, &mut state.rs, &mut state.obh,
+                        &state.q_chunk,
+                        &state.q_pos,
+                        &k_chunk,
+                        &v_chunk,
+                        &k_pos,
+                        &mut state.rm,
+                        &mut state.rs,
+                        &mut state.obh,
                         apply_causal,
                     );
                 }
@@ -1281,34 +1367,68 @@ impl HcpRingAttentionBackend {
 
         // Step 1: Linear projection
         let mut q = hidden_states.matmul(&self.q_proj.transpose(0, 1));
-        if let Some(ref bias) = self.q_bias { q += bias; }
+        if let Some(ref bias) = self.q_bias {
+            q += bias;
+        }
         let mut k = hidden_states.matmul(&self.k_proj.transpose(0, 1));
-        if let Some(ref bias) = self.k_bias { k += bias; }
+        if let Some(ref bias) = self.k_bias {
+            k += bias;
+        }
         let mut v = hidden_states.matmul(&self.v_proj.transpose(0, 1));
-        if let Some(ref bias) = self.v_bias { v += bias; }
+        if let Some(ref bias) = self.v_bias {
+            v += bias;
+        }
 
-        crate::model::model::LlamaModel::write_tensor_as_binary(&q, &export_dir.join(format!("q_proj_layer_{}.bin", self.layer_idx)))
-            .map_err(|e| ModelError::Generation(format!("debug export q_proj: {}", e)))?;
-        crate::model::model::LlamaModel::write_tensor_as_binary(&k, &export_dir.join(format!("k_proj_layer_{}.bin", self.layer_idx)))
-            .map_err(|e| ModelError::Generation(format!("debug export k_proj: {}", e)))?;
-        crate::model::model::LlamaModel::write_tensor_as_binary(&v, &export_dir.join(format!("v_proj_layer_{}.bin", self.layer_idx)))
-            .map_err(|e| ModelError::Generation(format!("debug export v_proj: {}", e)))?;
+        crate::model::model::LlamaModel::write_tensor_as_binary(
+            &q,
+            &export_dir.join(format!("q_proj_layer_{}.bin", self.layer_idx)),
+        )
+        .map_err(|e| ModelError::Generation(format!("debug export q_proj: {}", e)))?;
+        crate::model::model::LlamaModel::write_tensor_as_binary(
+            &k,
+            &export_dir.join(format!("k_proj_layer_{}.bin", self.layer_idx)),
+        )
+        .map_err(|e| ModelError::Generation(format!("debug export k_proj: {}", e)))?;
+        crate::model::model::LlamaModel::write_tensor_as_binary(
+            &v,
+            &export_dir.join(format!("v_proj_layer_{}.bin", self.layer_idx)),
+        )
+        .map_err(|e| ModelError::Generation(format!("debug export v_proj: {}", e)))?;
 
         // Step 2: Reshape
-        let q = q.view([batch, seq_len, self.num_heads as i64, self.head_dim as i64])
+        let q = q
+            .view([batch, seq_len, self.num_heads as i64, self.head_dim as i64])
             .transpose(1, 2);
-        let k = k.view([batch, seq_len, self.num_kv_heads as i64, self.head_dim as i64])
+        let k = k
+            .view([
+                batch,
+                seq_len,
+                self.num_kv_heads as i64,
+                self.head_dim as i64,
+            ])
             .transpose(1, 2);
-        let v = v.view([batch, seq_len, self.num_kv_heads as i64, self.head_dim as i64])
+        let v = v
+            .view([
+                batch,
+                seq_len,
+                self.num_kv_heads as i64,
+                self.head_dim as i64,
+            ])
             .transpose(1, 2);
 
         // Step 3: RoPE
         let (q, k) = self.rope.apply(&q, &k, Some(position_ids));
 
-        crate::model::model::LlamaModel::write_tensor_as_binary(&q, &export_dir.join(format!("q_rope_layer_{}.bin", self.layer_idx)))
-            .map_err(|e| ModelError::Generation(format!("debug export q_rope: {}", e)))?;
-        crate::model::model::LlamaModel::write_tensor_as_binary(&k, &export_dir.join(format!("k_rope_layer_{}.bin", self.layer_idx)))
-            .map_err(|e| ModelError::Generation(format!("debug export k_rope: {}", e)))?;
+        crate::model::model::LlamaModel::write_tensor_as_binary(
+            &q,
+            &export_dir.join(format!("q_rope_layer_{}.bin", self.layer_idx)),
+        )
+        .map_err(|e| ModelError::Generation(format!("debug export q_rope: {}", e)))?;
+        crate::model::model::LlamaModel::write_tensor_as_binary(
+            &k,
+            &export_dir.join(format!("k_rope_layer_{}.bin", self.layer_idx)),
+        )
+        .map_err(|e| ModelError::Generation(format!("debug export k_rope: {}", e)))?;
 
         // Step 4: KV Cache update
         let (k_cached, v_cached) = if let Some(cache) = kv_cache {
@@ -1322,25 +1442,39 @@ impl HcpRingAttentionBackend {
             self.is_prefill_done = true;
         }
 
-        crate::model::model::LlamaModel::write_tensor_as_binary(&k_cached, &export_dir.join(format!("k_cache_layer_{}.bin", self.layer_idx)))
-            .map_err(|e| ModelError::Generation(format!("debug export k_cache: {}", e)))?;
-        crate::model::model::LlamaModel::write_tensor_as_binary(&v_cached, &export_dir.join(format!("v_cache_layer_{}.bin", self.layer_idx)))
-            .map_err(|e| ModelError::Generation(format!("debug export v_cache: {}", e)))?;
+        crate::model::model::LlamaModel::write_tensor_as_binary(
+            &k_cached,
+            &export_dir.join(format!("k_cache_layer_{}.bin", self.layer_idx)),
+        )
+        .map_err(|e| ModelError::Generation(format!("debug export k_cache: {}", e)))?;
+        crate::model::model::LlamaModel::write_tensor_as_binary(
+            &v_cached,
+            &export_dir.join(format!("v_cache_layer_{}.bin", self.layer_idx)),
+        )
+        .map_err(|e| ModelError::Generation(format!("debug export v_cache: {}", e)))?;
 
         // Step 5: GQA head repeat
         let num_rep = self.num_heads / self.num_kv_heads;
         let k_cached = if num_rep > 1 {
             let shape = k_cached.size();
-            k_cached.unsqueeze(2)
-                .expand([shape[0], shape[1], num_rep as i64, shape[2], shape[3]], false)
+            k_cached
+                .unsqueeze(2)
+                .expand(
+                    [shape[0], shape[1], num_rep as i64, shape[2], shape[3]],
+                    false,
+                )
                 .reshape([shape[0], shape[1] * num_rep as i64, shape[2], shape[3]])
         } else {
             k_cached
         };
         let v_cached = if num_rep > 1 {
             let shape = v_cached.size();
-            v_cached.unsqueeze(2)
-                .expand([shape[0], shape[1], num_rep as i64, shape[2], shape[3]], false)
+            v_cached
+                .unsqueeze(2)
+                .expand(
+                    [shape[0], shape[1], num_rep as i64, shape[2], shape[3]],
+                    false,
+                )
                 .reshape([shape[0], shape[1] * num_rep as i64, shape[2], shape[3]])
         } else {
             v_cached
@@ -1348,17 +1482,28 @@ impl HcpRingAttentionBackend {
 
         // Step 6: Ring Attention
         let global_seq_start = self.seq_offset;
-        let attn_output = self.ring_attention(&q, &k_cached, &v_cached, attention_mask, global_seq_start)?;
+        let attn_output =
+            self.ring_attention(&q, &k_cached, &v_cached, attention_mask, global_seq_start)?;
 
-        crate::model::model::LlamaModel::write_tensor_as_binary(&attn_output, &export_dir.join(format!("attn_out_layer_{}.bin", self.layer_idx)))
-            .map_err(|e| ModelError::Generation(format!("debug export attn_out: {}", e)))?;
+        crate::model::model::LlamaModel::write_tensor_as_binary(
+            &attn_output,
+            &export_dir.join(format!("attn_out_layer_{}.bin", self.layer_idx)),
+        )
+        .map_err(|e| ModelError::Generation(format!("debug export attn_out: {}", e)))?;
 
         // Step 7: O-projection
-        let attn_output = attn_output.transpose(1, 2).contiguous().view([batch, seq_len, hidden_size]);
+        let attn_output =
+            attn_output
+                .transpose(1, 2)
+                .contiguous()
+                .view([batch, seq_len, hidden_size]);
         let result = attn_output.matmul(&self.o_proj.transpose(0, 1));
 
-        crate::model::model::LlamaModel::write_tensor_as_binary(&result, &export_dir.join(format!("attn_final_layer_{}.bin", self.layer_idx)))
-            .map_err(|e| ModelError::Generation(format!("debug export attn_final: {}", e)))?;
+        crate::model::model::LlamaModel::write_tensor_as_binary(
+            &result,
+            &export_dir.join(format!("attn_final_layer_{}.bin", self.layer_idx)),
+        )
+        .map_err(|e| ModelError::Generation(format!("debug export attn_final: {}", e)))?;
 
         Ok(result)
     }
@@ -1390,27 +1535,40 @@ impl HcpRingAttentionBackend {
         let q_path = qk_dir.join(format!("q_proj_layer_{}.bin", self.layer_idx));
         let k_path = qk_dir.join(format!("k_proj_layer_{}.bin", self.layer_idx));
 
-        let q = Self::read_tensor_as_binary(&q_path, hidden_states.device())
-            .map_err(|e| ModelError::Generation(format!("failed to read injected q_proj: {}", e)))?;
-        let k = Self::read_tensor_as_binary(&k_path, hidden_states.device())
-            .map_err(|e| ModelError::Generation(format!("failed to read injected k_proj: {}", e)))?;
+        let q = Self::read_tensor_as_binary(&q_path, hidden_states.device()).map_err(|e| {
+            ModelError::Generation(format!("failed to read injected q_proj: {}", e))
+        })?;
+        let k = Self::read_tensor_as_binary(&k_path, hidden_states.device()).map_err(|e| {
+            ModelError::Generation(format!("failed to read injected k_proj: {}", e))
+        })?;
 
         // Compute V normally
         let mut v = hidden_states.matmul(&self.v_proj.transpose(0, 1));
-        if let Some(ref bias) = self.v_bias { v += bias; }
+        if let Some(ref bias) = self.v_bias {
+            v += bias;
+        }
 
-        crate::model::model::LlamaModel::write_tensor_as_binary(&q, &export_dir.join(format!("q_proj_layer_{}.bin", self.layer_idx)))
-            .map_err(|e| ModelError::Generation(format!("debug export q_proj: {}", e)))?;
-        crate::model::model::LlamaModel::write_tensor_as_binary(&k, &export_dir.join(format!("k_proj_layer_{}.bin", self.layer_idx)))
-            .map_err(|e| ModelError::Generation(format!("debug export k_proj: {}", e)))?;
-        crate::model::model::LlamaModel::write_tensor_as_binary(&v, &export_dir.join(format!("v_proj_layer_{}.bin", self.layer_idx)))
-            .map_err(|e| ModelError::Generation(format!("debug export v_proj: {}", e)))?;
+        crate::model::model::LlamaModel::write_tensor_as_binary(
+            &q,
+            &export_dir.join(format!("q_proj_layer_{}.bin", self.layer_idx)),
+        )
+        .map_err(|e| ModelError::Generation(format!("debug export q_proj: {}", e)))?;
+        crate::model::model::LlamaModel::write_tensor_as_binary(
+            &k,
+            &export_dir.join(format!("k_proj_layer_{}.bin", self.layer_idx)),
+        )
+        .map_err(|e| ModelError::Generation(format!("debug export k_proj: {}", e)))?;
+        crate::model::model::LlamaModel::write_tensor_as_binary(
+            &v,
+            &export_dir.join(format!("v_proj_layer_{}.bin", self.layer_idx)),
+        )
+        .map_err(|e| ModelError::Generation(format!("debug export v_proj: {}", e)))?;
 
         // Step 2: Reshape (if needed)
         // Python exports q/k as [batch, num_heads, seq_len, head_dim] (already transposed)
         // Rust computes them as [batch, seq_len, num_heads * head_dim] then reshapes
         let q = if q.size().len() == 4 {
-            q  // Already [batch, num_heads, seq_len, head_dim]
+            q // Already [batch, num_heads, seq_len, head_dim]
         } else {
             q.view([batch, seq_len, self.num_heads as i64, self.head_dim as i64])
                 .transpose(1, 2)
@@ -1418,19 +1576,36 @@ impl HcpRingAttentionBackend {
         let k = if k.size().len() == 4 {
             k
         } else {
-            k.view([batch, seq_len, self.num_kv_heads as i64, self.head_dim as i64])
-                .transpose(1, 2)
+            k.view([
+                batch,
+                seq_len,
+                self.num_kv_heads as i64,
+                self.head_dim as i64,
+            ])
+            .transpose(1, 2)
         };
-        let v = v.view([batch, seq_len, self.num_kv_heads as i64, self.head_dim as i64])
+        let v = v
+            .view([
+                batch,
+                seq_len,
+                self.num_kv_heads as i64,
+                self.head_dim as i64,
+            ])
             .transpose(1, 2);
 
         // Step 3: RoPE
         let (q, k) = self.rope.apply(&q, &k, Some(position_ids));
 
-        crate::model::model::LlamaModel::write_tensor_as_binary(&q, &export_dir.join(format!("q_rope_layer_{}.bin", self.layer_idx)))
-            .map_err(|e| ModelError::Generation(format!("debug export q_rope: {}", e)))?;
-        crate::model::model::LlamaModel::write_tensor_as_binary(&k, &export_dir.join(format!("k_rope_layer_{}.bin", self.layer_idx)))
-            .map_err(|e| ModelError::Generation(format!("debug export k_rope: {}", e)))?;
+        crate::model::model::LlamaModel::write_tensor_as_binary(
+            &q,
+            &export_dir.join(format!("q_rope_layer_{}.bin", self.layer_idx)),
+        )
+        .map_err(|e| ModelError::Generation(format!("debug export q_rope: {}", e)))?;
+        crate::model::model::LlamaModel::write_tensor_as_binary(
+            &k,
+            &export_dir.join(format!("k_rope_layer_{}.bin", self.layer_idx)),
+        )
+        .map_err(|e| ModelError::Generation(format!("debug export k_rope: {}", e)))?;
 
         // Step 4: KV Cache update
         let (k_cached, v_cached) = if let Some(cache) = kv_cache {
@@ -1444,25 +1619,39 @@ impl HcpRingAttentionBackend {
             self.is_prefill_done = true;
         }
 
-        crate::model::model::LlamaModel::write_tensor_as_binary(&k_cached, &export_dir.join(format!("k_cache_layer_{}.bin", self.layer_idx)))
-            .map_err(|e| ModelError::Generation(format!("debug export k_cache: {}", e)))?;
-        crate::model::model::LlamaModel::write_tensor_as_binary(&v_cached, &export_dir.join(format!("v_cache_layer_{}.bin", self.layer_idx)))
-            .map_err(|e| ModelError::Generation(format!("debug export v_cache: {}", e)))?;
+        crate::model::model::LlamaModel::write_tensor_as_binary(
+            &k_cached,
+            &export_dir.join(format!("k_cache_layer_{}.bin", self.layer_idx)),
+        )
+        .map_err(|e| ModelError::Generation(format!("debug export k_cache: {}", e)))?;
+        crate::model::model::LlamaModel::write_tensor_as_binary(
+            &v_cached,
+            &export_dir.join(format!("v_cache_layer_{}.bin", self.layer_idx)),
+        )
+        .map_err(|e| ModelError::Generation(format!("debug export v_cache: {}", e)))?;
 
         // Step 5: GQA head repeat
         let num_rep = self.num_heads / self.num_kv_heads;
         let k_cached = if num_rep > 1 {
             let shape = k_cached.size();
-            k_cached.unsqueeze(2)
-                .expand([shape[0], shape[1], num_rep as i64, shape[2], shape[3]], false)
+            k_cached
+                .unsqueeze(2)
+                .expand(
+                    [shape[0], shape[1], num_rep as i64, shape[2], shape[3]],
+                    false,
+                )
                 .reshape([shape[0], shape[1] * num_rep as i64, shape[2], shape[3]])
         } else {
             k_cached
         };
         let v_cached = if num_rep > 1 {
             let shape = v_cached.size();
-            v_cached.unsqueeze(2)
-                .expand([shape[0], shape[1], num_rep as i64, shape[2], shape[3]], false)
+            v_cached
+                .unsqueeze(2)
+                .expand(
+                    [shape[0], shape[1], num_rep as i64, shape[2], shape[3]],
+                    false,
+                )
                 .reshape([shape[0], shape[1] * num_rep as i64, shape[2], shape[3]])
         } else {
             v_cached
@@ -1470,17 +1659,28 @@ impl HcpRingAttentionBackend {
 
         // Step 6: Ring Attention
         let global_seq_start = self.seq_offset;
-        let attn_output = self.ring_attention(&q, &k_cached, &v_cached, attention_mask, global_seq_start)?;
+        let attn_output =
+            self.ring_attention(&q, &k_cached, &v_cached, attention_mask, global_seq_start)?;
 
-        crate::model::model::LlamaModel::write_tensor_as_binary(&attn_output, &export_dir.join(format!("attn_out_layer_{}.bin", self.layer_idx)))
-            .map_err(|e| ModelError::Generation(format!("debug export attn_out: {}", e)))?;
+        crate::model::model::LlamaModel::write_tensor_as_binary(
+            &attn_output,
+            &export_dir.join(format!("attn_out_layer_{}.bin", self.layer_idx)),
+        )
+        .map_err(|e| ModelError::Generation(format!("debug export attn_out: {}", e)))?;
 
         // Step 7: O-projection
-        let attn_output = attn_output.transpose(1, 2).contiguous().view([batch, seq_len, hidden_size]);
+        let attn_output =
+            attn_output
+                .transpose(1, 2)
+                .contiguous()
+                .view([batch, seq_len, hidden_size]);
         let result = attn_output.matmul(&self.o_proj.transpose(0, 1));
 
-        crate::model::model::LlamaModel::write_tensor_as_binary(&result, &export_dir.join(format!("attn_final_layer_{}.bin", self.layer_idx)))
-            .map_err(|e| ModelError::Generation(format!("debug export attn_final: {}", e)))?;
+        crate::model::model::LlamaModel::write_tensor_as_binary(
+            &result,
+            &export_dir.join(format!("attn_final_layer_{}.bin", self.layer_idx)),
+        )
+        .map_err(|e| ModelError::Generation(format!("debug export attn_final: {}", e)))?;
 
         Ok(result)
     }
@@ -1488,8 +1688,7 @@ impl HcpRingAttentionBackend {
     /// Read a tensor from a binary file: [ndims: u64 LE][dim0: u64 LE]...[dimN: u64 LE][f32 data...]
     fn read_tensor_as_binary(path: &std::path::Path, device: Device) -> Result<Tensor, String> {
         use std::io::Read;
-        let mut file = std::fs::File::open(path)
-            .map_err(|e| format!("open file: {}", e))?;
+        let mut file = std::fs::File::open(path).map_err(|e| format!("open file: {}", e))?;
         let mut ndims_buf = [0u8; 8];
         file.read_exact(&mut ndims_buf).map_err(|e| e.to_string())?;
         let ndims = u64::from_le_bytes(ndims_buf) as i64;
@@ -1502,7 +1701,8 @@ impl HcpRingAttentionBackend {
         let numel: i64 = shape.iter().product();
         let mut data_buf = vec![0u8; (numel * 4) as usize];
         file.read_exact(&mut data_buf).map_err(|e| e.to_string())?;
-        let data: Vec<f32> = data_buf.chunks_exact(4)
+        let data: Vec<f32> = data_buf
+            .chunks_exact(4)
             .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect();
         Ok(Tensor::from_slice(&data).to_device(device).reshape(&shape))
@@ -1511,7 +1711,12 @@ impl HcpRingAttentionBackend {
 
 #[cfg(feature = "tch-backend")]
 impl AttentionBackend for HcpRingAttentionBackend {
-    fn set_distributed(&mut self, domain_id: usize, seq_offset: usize, transport: Option<Box<dyn KvTransport>>) {
+    fn set_distributed(
+        &mut self,
+        domain_id: usize,
+        seq_offset: usize,
+        transport: Option<Box<dyn KvTransport>>,
+    ) {
         self.local_domain_id = domain_id;
         self.seq_offset = seq_offset;
         self.kv_base_global_start = seq_offset;
@@ -1531,8 +1736,8 @@ impl AttentionBackend for HcpRingAttentionBackend {
     }
     fn forward(
         &mut self,
-        hidden_states: &Tensor,      // 【输入】上一层的输出，shape: [batch, seq_len, hidden_size]
-        position_ids: &Tensor,       // 【位置编码】每个 token 在完整序列中的绝对位置，shape: [batch, seq_len]
+        hidden_states: &Tensor, // 【输入】上一层的输出，shape: [batch, seq_len, hidden_size]
+        position_ids: &Tensor, // 【位置编码】每个 token 在完整序列中的绝对位置，shape: [batch, seq_len]
         kv_cache: Option<&mut dyn crate::model::cache::KvCache>, // 【KV 缓存】用于自回归生成时复用之前的 K/V
         attention_mask: Option<&Tensor>, // 【注意力掩码】因果掩码，防止当前 token 看到未来的 token
     ) -> Result<Tensor, ModelError> {
@@ -1546,7 +1751,7 @@ impl AttentionBackend for HcpRingAttentionBackend {
 
         // ====== 第一步：线性投影（Linear Projection）======
         // Attention 的核心思想：用三个不同的权重矩阵把输入 hidden_states 映射成 Q、K、V。
-        // 
+        //
         // Q（Query）：当前 token 的"查询向量"，用来问"我和哪些过去的 token 相关？"
         // K（Key）：每个 token 的"关键词向量"，用来回答查询
         // V（Value）：每个 token 的"价值向量"，最终加权平均的就是 V
@@ -1554,23 +1759,42 @@ impl AttentionBackend for HcpRingAttentionBackend {
         // 数学上：q = hidden_states @ W_q^T
         // matmul 是矩阵乘法，transpose(0, 1) 把权重矩阵转置（因为 PyTorch/HF 格式是 [out, in]）
         let mut q = hidden_states.matmul(&self.q_proj.transpose(0, 1));
-        if let Some(ref bias) = self.q_bias { q += bias; }  // 如果有偏置，加上去
+        if let Some(ref bias) = self.q_bias {
+            q += bias;
+        } // 如果有偏置，加上去
         let mut k = hidden_states.matmul(&self.k_proj.transpose(0, 1));
-        if let Some(ref bias) = self.k_bias { k += bias; }
+        if let Some(ref bias) = self.k_bias {
+            k += bias;
+        }
         let mut v = hidden_states.matmul(&self.v_proj.transpose(0, 1));
-        if let Some(ref bias) = self.v_bias { v += bias; }
+        if let Some(ref bias) = self.v_bias {
+            v += bias;
+        }
 
         // ====== 第二步：reshape 成多头格式 ======
         // 原始 shape: [batch, seq_len, num_heads * head_dim]
         // 先 view 成: [batch, seq_len, num_heads, head_dim]
         // 再 transpose(1, 2) 交换第 1、2 维，变成: [batch, num_heads, seq_len, head_dim]
-        // 
+        //
         // 这样每个 head 独立处理一部分维度，可以并行计算。
-        let q = q.view([batch, seq_len, self.num_heads as i64, self.head_dim as i64])
+        let q = q
+            .view([batch, seq_len, self.num_heads as i64, self.head_dim as i64])
             .transpose(1, 2);
-        let k = k.view([batch, seq_len, self.num_kv_heads as i64, self.head_dim as i64])
+        let k = k
+            .view([
+                batch,
+                seq_len,
+                self.num_kv_heads as i64,
+                self.head_dim as i64,
+            ])
             .transpose(1, 2);
-        let v = v.view([batch, seq_len, self.num_kv_heads as i64, self.head_dim as i64])
+        let v = v
+            .view([
+                batch,
+                seq_len,
+                self.num_kv_heads as i64,
+                self.head_dim as i64,
+            ])
             .transpose(1, 2);
 
         // ====== 第三步：RoPE（旋转位置编码）======
@@ -1629,7 +1853,10 @@ impl AttentionBackend for HcpRingAttentionBackend {
         let k = if num_rep > 1 {
             let shape = k.size();
             k.unsqueeze(2)
-                .expand([shape[0], shape[1], num_rep as i64, shape[2], shape[3]], false)
+                .expand(
+                    [shape[0], shape[1], num_rep as i64, shape[2], shape[3]],
+                    false,
+                )
                 .reshape([shape[0], shape[1] * num_rep as i64, shape[2], shape[3]])
         } else {
             k
@@ -1637,7 +1864,10 @@ impl AttentionBackend for HcpRingAttentionBackend {
         let v = if num_rep > 1 {
             let shape = v.size();
             v.unsqueeze(2)
-                .expand([shape[0], shape[1], num_rep as i64, shape[2], shape[3]], false)
+                .expand(
+                    [shape[0], shape[1], num_rep as i64, shape[2], shape[3]],
+                    false,
+                )
                 .reshape([shape[0], shape[1] * num_rep as i64, shape[2], shape[3]])
         } else {
             v
@@ -1646,7 +1876,7 @@ impl AttentionBackend for HcpRingAttentionBackend {
         // ====== 第六步：计算全局序列起始位置 ======
         // 在分布式场景下，domain1 处理的是完整序列的后半段（比如 [8, 16)）。
         // 但 causal mask 必须使用"全局位置"才能正确判断哪些 K 对当前 Q 可见。
-        // 
+        //
         // 例如 domain1 的 position_ids = [8, 9, ..., 15]，min = 8。
         // global_seq_start = 8 意味着本地索引 0 对应全局位置 8。
         // 如果没有传输层（单进程本地模式），global_seq_start = 0。
@@ -1671,7 +1901,11 @@ impl AttentionBackend for HcpRingAttentionBackend {
         // transpose(1, 2) → [batch, seq_len, num_heads, head_dim]
         // view → [batch, seq_len, hidden_size]（把多头的结果拼接起来）
         // 最后再乘一个 o_proj 权重矩阵，映射回 hidden_size 维度
-        let attn_output = attn_output.transpose(1, 2).contiguous().view([batch, seq_len, hidden_size]);
+        let attn_output =
+            attn_output
+                .transpose(1, 2)
+                .contiguous()
+                .view([batch, seq_len, hidden_size]);
         Ok(attn_output.matmul(&self.o_proj.transpose(0, 1)))
     }
 
@@ -1696,10 +1930,22 @@ mod tests {
         let head_dim = 8usize;
 
         crate::model::layers::GqaAttention {
-            q_proj: Tensor::randn([(num_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),
-            k_proj: Tensor::randn([(num_kv_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),
-            v_proj: Tensor::randn([(num_kv_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),
-            o_proj: Tensor::randn([hidden_size, (num_heads * head_dim) as i64], (Kind::Float, device)),
+            q_proj: Tensor::randn(
+                [(num_heads * head_dim) as i64, hidden_size],
+                (Kind::Float, device),
+            ),
+            k_proj: Tensor::randn(
+                [(num_kv_heads * head_dim) as i64, hidden_size],
+                (Kind::Float, device),
+            ),
+            v_proj: Tensor::randn(
+                [(num_kv_heads * head_dim) as i64, hidden_size],
+                (Kind::Float, device),
+            ),
+            o_proj: Tensor::randn(
+                [hidden_size, (num_heads * head_dim) as i64],
+                (Kind::Float, device),
+            ),
             q_bias: None,
             k_bias: None,
             v_bias: None,
@@ -1748,13 +1994,16 @@ mod tests {
         let expected = attn.matmul(&v);
 
         // 用 process_kv_block（非因果模式）计算
-        let rope = crate::model::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
+        let rope =
+            crate::model::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
         let backend = HcpRingAttentionBackend {
             q_proj: Tensor::randn([1, 1], (Kind::Float, device)),
             k_proj: Tensor::randn([1, 1], (Kind::Float, device)),
             v_proj: Tensor::randn([1, 1], (Kind::Float, device)),
             o_proj: Tensor::randn([1, 1], (Kind::Float, device)),
-            q_bias: None, k_bias: None, v_bias: None,
+            q_bias: None,
+            k_bias: None,
+            v_bias: None,
             rope,
             num_heads: num_heads as usize,
             num_kv_heads: num_heads as usize,
@@ -1788,10 +2037,7 @@ mod tests {
         let q_pos = Tensor::arange_start(0, query_len, (Kind::Int64, Device::Cpu));
         let k_pos = Tensor::arange_start(0, block_len, (Kind::Int64, Device::Cpu));
         backend.process_kv_block(
-            &q, &q_pos,
-            &k, &v, &k_pos,
-            &mut rm, &mut rs, &mut obh,
-            false,
+            &q, &q_pos, &k, &v, &k_pos, &mut rm, &mut rs, &mut obh, false,
         );
 
         // obh 形状: [1, num_heads, query_len, head_dim]
@@ -1800,7 +2046,11 @@ mod tests {
         let diff = (&expected - &actual).abs().mean(Kind::Float);
         let diff_val: f64 = diff.double_value(&[]);
         println!("Single block diff = {}", diff_val);
-        assert!(diff_val < 1e-4, "Single block chunk step differs from softmax: {}", diff_val);
+        assert!(
+            diff_val < 1e-4,
+            "Single block chunk step differs from softmax: {}",
+            diff_val
+        );
     }
 
     #[test]
@@ -1842,13 +2092,16 @@ mod tests {
         let expected = attn.matmul(&v);
 
         // Create a minimal backend (only needs q/k/v/o_proj for local_attention_scores)
-        let rope = crate::model::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
+        let rope =
+            crate::model::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
         let mut backend = HcpRingAttentionBackend {
             q_proj: Tensor::randn([1, 1], (Kind::Float, device)),
             k_proj: Tensor::randn([1, 1], (Kind::Float, device)),
             v_proj: Tensor::randn([1, 1], (Kind::Float, device)),
             o_proj: Tensor::randn([1, 1], (Kind::Float, device)),
-            q_bias: None, k_bias: None, v_bias: None,
+            q_bias: None,
+            k_bias: None,
+            v_bias: None,
             rope,
             num_heads: num_heads as usize,
             num_kv_heads: num_heads as usize,
@@ -1864,7 +2117,7 @@ mod tests {
             disable_overlap: false,
             position_ids: None,
             micro_kv_block_size: 0,
-                    ..Default::default()
+            ..Default::default()
         };
 
         let actual = backend.ring_attention(&q, &k, &v, None, 0).unwrap();
@@ -1872,7 +2125,11 @@ mod tests {
         let diff = (&expected - &actual).abs().mean(Kind::Float);
         let diff_val: f64 = diff.double_value(&[]);
         println!("Ring vs local full diff = {}", diff_val);
-        assert!(diff_val < 1e-5, "Ring attention differs from local full: {}", diff_val);
+        assert!(
+            diff_val < 1e-5,
+            "Ring attention differs from local full: {}",
+            diff_val
+        );
     }
 
     /// Verify ring attention with causal mask matches local causal attention.
@@ -1898,13 +2155,16 @@ mod tests {
         let attn = scores_masked.softmax(-1, Kind::Float);
         let expected = attn.matmul(&v);
 
-        let rope = crate::model::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
+        let rope =
+            crate::model::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
         let mut backend = HcpRingAttentionBackend {
             q_proj: Tensor::randn([1, 1], (Kind::Float, device)),
             k_proj: Tensor::randn([1, 1], (Kind::Float, device)),
             v_proj: Tensor::randn([1, 1], (Kind::Float, device)),
             o_proj: Tensor::randn([1, 1], (Kind::Float, device)),
-            q_bias: None, k_bias: None, v_bias: None,
+            q_bias: None,
+            k_bias: None,
+            v_bias: None,
             rope,
             num_heads: num_heads as usize,
             num_kv_heads: num_heads as usize,
@@ -1920,7 +2180,7 @@ mod tests {
             disable_overlap: false,
             position_ids: None,
             micro_kv_block_size: 0,
-                    ..Default::default()
+            ..Default::default()
         };
 
         let actual = backend.ring_attention(&q, &k, &v, Some(&mask), 0).unwrap();
@@ -1928,7 +2188,11 @@ mod tests {
         let diff = (&expected - &actual).abs().mean(Kind::Float);
         let diff_val: f64 = diff.double_value(&[]);
         println!("Ring vs local causal diff = {}", diff_val);
-        assert!(diff_val < 1e-4, "Ring attention differs from local causal: {}", diff_val);
+        assert!(
+            diff_val < 1e-4,
+            "Ring attention differs from local causal: {}",
+            diff_val
+        );
     }
 
     /// Verify ring attention with seq_len=1 (decode) and long KV cache matches local attention.
@@ -1952,13 +2216,16 @@ mod tests {
         let attn = scores.softmax(-1, Kind::Float);
         let expected = attn.matmul(&v);
 
-        let rope = crate::model::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
+        let rope =
+            crate::model::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
         let mut backend = HcpRingAttentionBackend {
             q_proj: Tensor::randn([1, 1], (Kind::Float, device)),
             k_proj: Tensor::randn([1, 1], (Kind::Float, device)),
             v_proj: Tensor::randn([1, 1], (Kind::Float, device)),
             o_proj: Tensor::randn([1, 1], (Kind::Float, device)),
-            q_bias: None, k_bias: None, v_bias: None,
+            q_bias: None,
+            k_bias: None,
+            v_bias: None,
             rope,
             num_heads: num_heads as usize,
             num_kv_heads: num_heads as usize,
@@ -1974,7 +2241,7 @@ mod tests {
             disable_overlap: false,
             position_ids: None,
             micro_kv_block_size: 0,
-                    ..Default::default()
+            ..Default::default()
         };
 
         // Without transport, ring_attention processes only local KV.
@@ -1984,7 +2251,11 @@ mod tests {
         let diff = (&expected - &actual).abs().mean(Kind::Float);
         let diff_val: f64 = diff.double_value(&[]);
         println!("Decode ring vs local diff = {}", diff_val);
-        assert!(diff_val < 1e-5, "Decode ring attention differs from local: {}", diff_val);
+        assert!(
+            diff_val < 1e-5,
+            "Decode ring attention differs from local: {}",
+            diff_val
+        );
     }
 
     /// Verify distributed decode (seq_len=1) with peer KV matches local attention.
@@ -2017,11 +2288,23 @@ mod tests {
         let half = (kv_len - 1) / 2; // 8
 
         // domain0 local KV = [0..7] + [16]
-        let k0_local = Tensor::cat(&[k_all.narrow(2, 0, half), k_all.narrow(2, kv_len - 1, 1)], 2);
-        let v0_local = Tensor::cat(&[v_all.narrow(2, 0, half), v_all.narrow(2, kv_len - 1, 1)], 2);
+        let k0_local = Tensor::cat(
+            &[k_all.narrow(2, 0, half), k_all.narrow(2, kv_len - 1, 1)],
+            2,
+        );
+        let v0_local = Tensor::cat(
+            &[v_all.narrow(2, 0, half), v_all.narrow(2, kv_len - 1, 1)],
+            2,
+        );
         // domain1 local KV = [8..15] + [16]
-        let k1_local = Tensor::cat(&[k_all.narrow(2, half, half), k_all.narrow(2, kv_len - 1, 1)], 2);
-        let v1_local = Tensor::cat(&[v_all.narrow(2, half, half), v_all.narrow(2, kv_len - 1, 1)], 2);
+        let k1_local = Tensor::cat(
+            &[k_all.narrow(2, half, half), k_all.narrow(2, kv_len - 1, 1)],
+            2,
+        );
+        let v1_local = Tensor::cat(
+            &[v_all.narrow(2, half, half), v_all.narrow(2, kv_len - 1, 1)],
+            2,
+        );
 
         // History for sending (exclude new token)
         let k0_hist = k_all.narrow(2, 0, half);
@@ -2029,7 +2312,8 @@ mod tests {
         let k1_hist = k_all.narrow(2, half, half);
         let v1_hist = v_all.narrow(2, half, half);
 
-        let rope = crate::model::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
+        let rope =
+            crate::model::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
 
         // Worker 0: receives peer KV [8..15] from worker 1
         let mut transport0 = MockKvTransport::new();
@@ -2049,7 +2333,9 @@ mod tests {
             k_proj: Tensor::randn([1, 1], (Kind::Float, device)),
             v_proj: Tensor::randn([1, 1], (Kind::Float, device)),
             o_proj: Tensor::randn([1, 1], (Kind::Float, device)),
-            q_bias: None, k_bias: None, v_bias: None,
+            q_bias: None,
+            k_bias: None,
+            v_bias: None,
             rope: rope.clone(),
             num_heads: num_heads as usize,
             num_kv_heads: num_heads as usize,
@@ -2065,9 +2351,11 @@ mod tests {
             disable_overlap: false,
             position_ids: None,
             micro_kv_block_size: 0,
-                    ..Default::default()
+            ..Default::default()
         };
-        let out0 = backend0.ring_attention(&q_all, &k0_local, &v0_local, None, 0).unwrap();
+        let out0 = backend0
+            .ring_attention(&q_all, &k0_local, &v0_local, None, 0)
+            .unwrap();
 
         // Worker 1: receives peer KV [0..7] from worker 0
         let mut transport1 = MockKvTransport::new();
@@ -2087,7 +2375,9 @@ mod tests {
             k_proj: Tensor::randn([1, 1], (Kind::Float, device)),
             v_proj: Tensor::randn([1, 1], (Kind::Float, device)),
             o_proj: Tensor::randn([1, 1], (Kind::Float, device)),
-            q_bias: None, k_bias: None, v_bias: None,
+            q_bias: None,
+            k_bias: None,
+            v_bias: None,
             rope,
             num_heads: num_heads as usize,
             num_kv_heads: num_heads as usize,
@@ -2103,20 +2393,40 @@ mod tests {
             disable_overlap: false,
             position_ids: None,
             micro_kv_block_size: 0,
-                    ..Default::default()
+            ..Default::default()
         };
-        let out1 = backend1.ring_attention(&q_all, &k1_local, &v1_local, None, half as usize).unwrap();
+        let out1 = backend1
+            .ring_attention(&q_all, &k1_local, &v1_local, None, half as usize)
+            .unwrap();
 
-        let diff0 = (&expected - &out0).abs().mean(Kind::Float).double_value(&[]);
-        let diff1 = (&expected - &out1).abs().mean(Kind::Float).double_value(&[]);
+        let diff0 = (&expected - &out0)
+            .abs()
+            .mean(Kind::Float)
+            .double_value(&[]);
+        let diff1 = (&expected - &out1)
+            .abs()
+            .mean(Kind::Float)
+            .double_value(&[]);
         let diff01 = (&out0 - &out1).abs().mean(Kind::Float).double_value(&[]);
         println!("Decode with peer KV diff ref-vs-domain0 = {}", diff0);
         println!("Decode with peer KV diff ref-vs-domain1 = {}", diff1);
         println!("Decode with peer KV diff domain0-vs-domain1 = {}", diff01);
 
-        assert!(diff0 < 1e-4, "Decode distributed (domain0) differs from reference: {}", diff0);
-        assert!(diff1 < 1e-4, "Decode distributed (domain1) differs from reference: {}", diff1);
-        assert!(diff01 < 1e-4, "Decode distributed domain0 differs from domain1: {}", diff01);
+        assert!(
+            diff0 < 1e-4,
+            "Decode distributed (domain0) differs from reference: {}",
+            diff0
+        );
+        assert!(
+            diff1 < 1e-4,
+            "Decode distributed (domain1) differs from reference: {}",
+            diff1
+        );
+        assert!(
+            diff01 < 1e-4,
+            "Decode distributed domain0 differs from domain1: {}",
+            diff01
+        );
     }
 
     /// Verify HcpRingAttentionBackend::forward matches GqaAttention::forward
@@ -2136,10 +2446,22 @@ mod tests {
 
         // Create GqaAttention
         let gqa = crate::model::layers::GqaAttention {
-            q_proj: Tensor::randn([(num_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),
-            k_proj: Tensor::randn([(num_kv_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),
-            v_proj: Tensor::randn([(num_kv_heads * head_dim) as i64, hidden_size], (Kind::Float, device)),
-            o_proj: Tensor::randn([hidden_size, (num_heads * head_dim) as i64], (Kind::Float, device)),
+            q_proj: Tensor::randn(
+                [(num_heads * head_dim) as i64, hidden_size],
+                (Kind::Float, device),
+            ),
+            k_proj: Tensor::randn(
+                [(num_kv_heads * head_dim) as i64, hidden_size],
+                (Kind::Float, device),
+            ),
+            v_proj: Tensor::randn(
+                [(num_kv_heads * head_dim) as i64, hidden_size],
+                (Kind::Float, device),
+            ),
+            o_proj: Tensor::randn(
+                [hidden_size, (num_heads * head_dim) as i64],
+                (Kind::Float, device),
+            ),
             q_bias: None,
             k_bias: None,
             v_bias: None,
@@ -2157,7 +2479,9 @@ mod tests {
             k_proj: gqa.k_proj.shallow_clone(),
             v_proj: gqa.v_proj.shallow_clone(),
             o_proj: gqa.o_proj.shallow_clone(),
-            q_bias: None, k_bias: None, v_bias: None,
+            q_bias: None,
+            k_bias: None,
+            v_bias: None,
             rope,
             num_heads,
             num_kv_heads,
@@ -2173,7 +2497,7 @@ mod tests {
             disable_overlap: false,
             position_ids: None,
             micro_kv_block_size: 0,
-                    ..Default::default()
+            ..Default::default()
         };
 
         // hidden states for decode step
@@ -2181,8 +2505,14 @@ mod tests {
         let position_ids = Tensor::from_slice(&[16i64]).unsqueeze(0); // position 16
 
         // Pre-populate KV caches with synthetic history (16 tokens)
-        let history_k = Tensor::randn([1, num_kv_heads as i64, cache_len - 1, head_dim as i64], (Kind::Float, device));
-        let history_v = Tensor::randn([1, num_kv_heads as i64, cache_len - 1, head_dim as i64], (Kind::Float, device));
+        let history_k = Tensor::randn(
+            [1, num_kv_heads as i64, cache_len - 1, head_dim as i64],
+            (Kind::Float, device),
+        );
+        let history_v = Tensor::randn(
+            [1, num_kv_heads as i64, cache_len - 1, head_dim as i64],
+            (Kind::Float, device),
+        );
 
         let mut gqa_cache = crate::model::cache::ContiguousKvCache::new();
         let _ = gqa_cache.update(&history_k, &history_v).unwrap();
@@ -2191,12 +2521,23 @@ mod tests {
         let _ = ring_cache.update(&history_k, &history_v).unwrap();
 
         // Run both forwards
-        let gqa_out = gqa.forward(&hidden_states, &position_ids, Some(&mut gqa_cache), None).unwrap();
-        let ring_out = ring_backend.forward(&hidden_states, &position_ids, Some(&mut ring_cache), None).unwrap();
+        let gqa_out = gqa
+            .forward(&hidden_states, &position_ids, Some(&mut gqa_cache), None)
+            .unwrap();
+        let ring_out = ring_backend
+            .forward(&hidden_states, &position_ids, Some(&mut ring_cache), None)
+            .unwrap();
 
-        let diff = (&gqa_out - &ring_out).abs().mean(Kind::Float).double_value(&[]);
+        let diff = (&gqa_out - &ring_out)
+            .abs()
+            .mean(Kind::Float)
+            .double_value(&[]);
         println!("Ring backend vs GqaAttention decode diff = {}", diff);
-        assert!(diff < 1e-4, "Ring backend differs from GqaAttention on decode: {}", diff);
+        assert!(
+            diff < 1e-4,
+            "Ring backend differs from GqaAttention on decode: {}",
+            diff
+        );
     }
 
     /// Verify distributed ring attention with MockKvTransport matches single-process causal attention.
@@ -2232,7 +2573,8 @@ mod tests {
         let k1 = k.narrow(2, half, half);
         let v1 = v.narrow(2, half, half);
 
-        let rope = crate::model::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
+        let rope =
+            crate::model::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device);
 
         // Worker 0: receives peer KV from worker 1
         let mut transport0 = MockKvTransport::new();
@@ -2252,7 +2594,9 @@ mod tests {
             k_proj: Tensor::randn([1, 1], (Kind::Float, device)),
             v_proj: Tensor::randn([1, 1], (Kind::Float, device)),
             o_proj: Tensor::randn([1, 1], (Kind::Float, device)),
-            q_bias: None, k_bias: None, v_bias: None,
+            q_bias: None,
+            k_bias: None,
+            v_bias: None,
             rope: rope.clone(),
             num_heads: num_heads as usize,
             num_kv_heads: num_heads as usize,
@@ -2268,9 +2612,11 @@ mod tests {
             disable_overlap: false,
             position_ids: None,
             micro_kv_block_size: 0,
-                    ..Default::default()
+            ..Default::default()
         };
-        let out0 = backend0.ring_attention(&q0, &k0, &v0, Some(&mask), 0).unwrap();
+        let out0 = backend0
+            .ring_attention(&q0, &k0, &v0, Some(&mask), 0)
+            .unwrap();
 
         // Worker 1: receives peer KV from worker 0
         let mut transport1 = MockKvTransport::new();
@@ -2290,7 +2636,9 @@ mod tests {
             k_proj: Tensor::randn([1, 1], (Kind::Float, device)),
             v_proj: Tensor::randn([1, 1], (Kind::Float, device)),
             o_proj: Tensor::randn([1, 1], (Kind::Float, device)),
-            q_bias: None, k_bias: None, v_bias: None,
+            q_bias: None,
+            k_bias: None,
+            v_bias: None,
             rope,
             num_heads: num_heads as usize,
             num_kv_heads: num_heads as usize,
@@ -2306,15 +2654,23 @@ mod tests {
             disable_overlap: false,
             position_ids: None,
             micro_kv_block_size: 0,
-                    ..Default::default()
+            ..Default::default()
         };
-        let out1 = backend1.ring_attention(&q1, &k1, &v1, Some(&mask), half as usize).unwrap();
+        let out1 = backend1
+            .ring_attention(&q1, &k1, &v1, Some(&mask), half as usize)
+            .unwrap();
 
         // Compare each worker against expected slice before concatenation
         let expected0 = expected.narrow(2, 0, half);
         let expected1 = expected.narrow(2, half, half);
-        let diff0 = (&expected0 - &out0).abs().mean(Kind::Float).double_value(&[]);
-        let diff1 = (&expected1 - &out1).abs().mean(Kind::Float).double_value(&[]);
+        let diff0 = (&expected0 - &out0)
+            .abs()
+            .mean(Kind::Float)
+            .double_value(&[]);
+        let diff1 = (&expected1 - &out1)
+            .abs()
+            .mean(Kind::Float)
+            .double_value(&[]);
         println!("worker0 diff={}, worker1 diff={}", diff0, diff1);
 
         // Concatenate outputs: out0 [1, num_heads, half, head_dim], out1 [1, num_heads, half, head_dim]
@@ -2323,7 +2679,11 @@ mod tests {
         let diff = (&expected - &actual).abs().mean(Kind::Float);
         let diff_val: f64 = diff.double_value(&[]);
         println!("Distributed ring attention diff = {}", diff_val);
-        assert!(diff_val < 1e-4, "Distributed ring attention differs from local causal: {}", diff_val);
+        assert!(
+            diff_val < 1e-4,
+            "Distributed ring attention differs from local causal: {}",
+            diff_val
+        );
     }
 
     /// 2-domain uneven (3:1) ring attention perf comparison test.
@@ -2361,9 +2721,22 @@ mod tests {
             );
             let has_nan = actual.isnan().any().double_value(&[]) != 0.0;
             assert!(!has_nan, "{} output contains NaN", name);
-            let diff = (&expected - &actual).abs().mean(Kind::Float).double_value(&[]);
-            assert!(diff < 1e-4, "{} uneven ring attention correctness failed: {}", name, diff);
-            assert!(per_worker_diff < 1e-4, "{} per-worker diff too large: {}", name, per_worker_diff);
+            let diff = (&expected - &actual)
+                .abs()
+                .mean(Kind::Float)
+                .double_value(&[]);
+            assert!(
+                diff < 1e-4,
+                "{} uneven ring attention correctness failed: {}",
+                name,
+                diff
+            );
+            assert!(
+                per_worker_diff < 1e-4,
+                "{} per-worker diff too large: {}",
+                name,
+                per_worker_diff
+            );
 
             println!("{} correctness diff = {}", name, diff);
             let rows = parse_perf_log(&log_path);
@@ -2388,8 +2761,10 @@ mod tests {
         head_dim: i64,
         device: tch::Device,
     ) -> (Tensor, f64) {
+        use crate::model::attention::strategy::{
+            build_assignment, build_domain_positions, build_inverse_perm, position_ids_tensor,
+        };
         use crate::model::transport::MockKvTransport;
-        use crate::model::attention::strategy::{build_assignment, build_domain_positions, build_inverse_perm, position_ids_tensor};
 
         let seq_len = q.size()[2] as usize;
         let num_domains = chunks.len();
@@ -2411,7 +2786,8 @@ mod tests {
             pos_d.push(pos_t);
         }
 
-        let rope = crate::model::layers::RotaryEmbedding::new(head_dim as usize, 16384, 10000.0, device);
+        let rope =
+            crate::model::layers::RotaryEmbedding::new(head_dim as usize, 16384, 10000.0, device);
 
         // Create transports and backends.
         let mut backends: Vec<HcpRingAttentionBackend> = Vec::new();
@@ -2436,7 +2812,9 @@ mod tests {
                 k_proj: Tensor::randn([1, 1], (Kind::Float, device)),
                 v_proj: Tensor::randn([1, 1], (Kind::Float, device)),
                 o_proj: Tensor::randn([1, 1], (Kind::Float, device)),
-                q_bias: None, k_bias: None, v_bias: None,
+                q_bias: None,
+                k_bias: None,
+                v_bias: None,
                 rope: rope.clone(),
                 num_heads: num_heads as usize,
                 num_kv_heads: num_heads as usize,
@@ -2464,13 +2842,21 @@ mod tests {
         for domain in 0..num_domains {
             let global_start = positions[domain].first().copied().unwrap_or(0);
             let out = backends[domain]
-                .ring_attention(&q_d[domain], &k_d[domain], &v_d[domain], Some(&mask), global_start)
+                .ring_attention(
+                    &q_d[domain],
+                    &k_d[domain],
+                    &v_d[domain],
+                    Some(&mask),
+                    global_start,
+                )
                 .unwrap();
             outputs.push(out);
         }
 
         // Reconstruct original order.
-        let inverse_t = Tensor::f_from_slice::<i64>(&inverse_perm).unwrap().to_device(device);
+        let inverse_t = Tensor::f_from_slice::<i64>(&inverse_perm)
+            .unwrap()
+            .to_device(device);
         let concatenated = Tensor::cat(&outputs, 2);
         let actual = concatenated.index_select(2, &inverse_t);
 
@@ -2486,7 +2872,10 @@ mod tests {
             for &orig_pos in &positions[domain] {
                 let expected_slice = expected_full.narrow(2, orig_pos as i64, 1);
                 let actual_slice = actual.narrow(2, orig_pos as i64, 1);
-                let d = (&expected_slice - &actual_slice).abs().mean(Kind::Float).double_value(&[]);
+                let d = (&expected_slice - &actual_slice)
+                    .abs()
+                    .mean(Kind::Float)
+                    .double_value(&[]);
                 max_diff = max_diff.max(d);
             }
         }
@@ -2498,10 +2887,14 @@ mod tests {
     #[cfg(feature = "tch-backend")]
     fn parse_perf_log(path: &str) -> Vec<std::collections::HashMap<String, String>> {
         let content = std::fs::read_to_string(path).unwrap_or_default();
-        content.lines().filter_map(|line| {
-            serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(line).ok()
-                .map(|m| m.into_iter().map(|(k, v)| (k, v.to_string())).collect())
-        }).collect()
+        content
+            .lines()
+            .filter_map(|line| {
+                serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(line)
+                    .ok()
+                    .map(|m| m.into_iter().map(|(k, v)| (k, v.to_string())).collect())
+            })
+            .collect()
     }
 
     #[cfg(feature = "tch-backend")]
@@ -2512,7 +2905,10 @@ mod tests {
             let local = row.get("local_compute_ms").cloned().unwrap_or_default();
             let peer = row.get("peer_compute_ms").cloned().unwrap_or_default();
             let recv = row.get("recv_ms").cloned().unwrap_or_default();
-            println!("domain {}: total={}ms local_compute={}ms peer_compute={}ms recv={}ms", domain, total, local, peer, recv);
+            println!(
+                "domain {}: total={}ms local_compute={}ms peer_compute={}ms recv={}ms",
+                domain, total, local, peer, recv
+            );
         }
     }
 
@@ -2537,8 +2933,14 @@ mod tests {
         let scale = 1.0 / (head_dim as f64).sqrt();
 
         tch::manual_seed(20260727);
-        let k_all = Tensor::randn([1, num_heads, total_len as i64, head_dim], (Kind::Float, device));
-        let v_all = Tensor::randn([1, num_heads, total_len as i64, head_dim], (Kind::Float, device));
+        let k_all = Tensor::randn(
+            [1, num_heads, total_len as i64, head_dim],
+            (Kind::Float, device),
+        );
+        let v_all = Tensor::randn(
+            [1, num_heads, total_len as i64, head_dim],
+            (Kind::Float, device),
+        );
         let q_steps: Vec<Tensor> = (0..decode_steps)
             .map(|_| Tensor::randn([1, num_heads, 1, head_dim], (Kind::Float, device)))
             .collect();
@@ -2552,8 +2954,15 @@ mod tests {
                 k_proj: Tensor::randn([1, 1], (Kind::Float, device)),
                 v_proj: Tensor::randn([1, 1], (Kind::Float, device)),
                 o_proj: Tensor::randn([1, 1], (Kind::Float, device)),
-                q_bias: None, k_bias: None, v_bias: None,
-                rope: crate::model::layers::RotaryEmbedding::new(head_dim as usize, 128, 10000.0, device),
+                q_bias: None,
+                k_bias: None,
+                v_bias: None,
+                rope: crate::model::layers::RotaryEmbedding::new(
+                    head_dim as usize,
+                    128,
+                    10000.0,
+                    device,
+                ),
                 num_heads: num_heads as usize,
                 num_kv_heads: num_heads as usize,
                 head_dim: head_dim as usize,
@@ -2616,7 +3025,11 @@ mod tests {
                     scale,
                 });
                 let (o1, lse1) = scratch.decode_merge_packet(
-                    q, &seeds[pred2].0, &seeds[pred2].1, &dur_k[pred], &dur_v[pred],
+                    q,
+                    &seeds[pred2].0,
+                    &seeds[pred2].1,
+                    &dur_k[pred],
+                    &dur_v[pred],
                 );
                 transport.push_packet(RingPacket {
                     layer_idx: 0,
@@ -2630,7 +3043,9 @@ mod tests {
 
             for (i, backend) in backends.iter_mut().enumerate() {
                 let pred = (i + num_domains - 1) % num_domains;
-                let out = backend.ring_decode_attention(q, &seg_k[i], &seg_v[i]).unwrap();
+                let out = backend
+                    .ring_decode_attention(q, &seg_k[i], &seg_v[i])
+                    .unwrap();
                 let diff = (&expected - &out).abs().mean(Kind::Float).double_value(&[]);
                 assert!(diff < 1e-4, "step {t} node {i} decode Q-ring diff: {diff}");
 
@@ -2647,15 +3062,31 @@ mod tests {
                 assert_eq!(sent.len(), 2, "step {t} node {i} sent packet count");
                 let diff_seed_o = (&seeds[i].0 - &sent[0].o).abs().max().double_value(&[]);
                 let diff_seed_lse = (&seeds[i].1 - &sent[0].lse).abs().max().double_value(&[]);
-                assert!(diff_seed_o < 1e-6, "step {t} node {i} seed o mismatch: {diff_seed_o}");
-                assert!(diff_seed_lse < 1e-6, "step {t} node {i} seed lse mismatch: {diff_seed_lse}");
+                assert!(
+                    diff_seed_o < 1e-6,
+                    "step {t} node {i} seed o mismatch: {diff_seed_o}"
+                );
+                assert!(
+                    diff_seed_lse < 1e-6,
+                    "step {t} node {i} seed lse mismatch: {diff_seed_lse}"
+                );
                 let (exp_o, exp_lse) = scratch.decode_merge_packet(
-                    q, &seeds[pred].0, &seeds[pred].1, &dur_k[i], &dur_v[i],
+                    q,
+                    &seeds[pred].0,
+                    &seeds[pred].1,
+                    &dur_k[i],
+                    &dur_v[i],
                 );
                 let diff_fwd_o = (&exp_o - &sent[1].o).abs().max().double_value(&[]);
                 let diff_fwd_lse = (&exp_lse - &sent[1].lse).abs().max().double_value(&[]);
-                assert!(diff_fwd_o < 1e-6, "step {t} node {i} forwarded o mismatch: {diff_fwd_o}");
-                assert!(diff_fwd_lse < 1e-6, "step {t} node {i} forwarded lse mismatch: {diff_fwd_lse}");
+                assert!(
+                    diff_fwd_o < 1e-6,
+                    "step {t} node {i} forwarded o mismatch: {diff_fwd_o}"
+                );
+                assert!(
+                    diff_fwd_lse < 1e-6,
+                    "step {t} node {i} forwarded lse mismatch: {diff_fwd_lse}"
+                );
             }
 
             // growth 分片：当前 token 归属 pos % N，只有归属节点累积
@@ -2671,10 +3102,17 @@ mod tests {
                 .filter(|t| (prefill_len + t) % num_domains == i)
                 .count();
             let expect_len = (chunks[i].1 - chunks[i].0) + share;
-            assert_eq!(dur_k[i].size()[2] as usize, expect_len, "node {i} durable len");
+            assert_eq!(
+                dur_k[i].size()[2] as usize,
+                expect_len,
+                "node {i} durable len"
+            );
             total += expect_len;
         }
-        assert_eq!(total, total_len, "durable segments must partition all tokens");
+        assert_eq!(
+            total, total_len,
+            "durable segments must partition all tokens"
+        );
     }
 
     /// 【forward 级 decode Q-ring 集成：2 domain × 4 decode step】
@@ -2735,15 +3173,33 @@ mod tests {
 
         tch::manual_seed(31337);
         // 共享权重（num_kv_heads == num_heads，避开 GQA repeat 的干扰）
-        let q_proj = Tensor::randn([(num_heads * head_dim) as i64, hidden_size], (Kind::Float, device));
-        let k_proj = Tensor::randn([(num_heads * head_dim) as i64, hidden_size], (Kind::Float, device));
-        let v_proj = Tensor::randn([(num_heads * head_dim) as i64, hidden_size], (Kind::Float, device));
-        let o_proj = Tensor::randn([hidden_size, (num_heads * head_dim) as i64], (Kind::Float, device));
+        let q_proj = Tensor::randn(
+            [(num_heads * head_dim) as i64, hidden_size],
+            (Kind::Float, device),
+        );
+        let k_proj = Tensor::randn(
+            [(num_heads * head_dim) as i64, hidden_size],
+            (Kind::Float, device),
+        );
+        let v_proj = Tensor::randn(
+            [(num_heads * head_dim) as i64, hidden_size],
+            (Kind::Float, device),
+        );
+        let o_proj = Tensor::randn(
+            [hidden_size, (num_heads * head_dim) as i64],
+            (Kind::Float, device),
+        );
         let rope = crate::model::layers::RotaryEmbedding::new(head_dim, 128, 10000.0, device);
 
         // 共享 "prefill" KV（直接写入 cache，绕过 prefill forward；node0 [0,4), node1 [4,7)）
-        let k_pre = Tensor::randn([1, num_heads as i64, prefill_len, head_dim as i64], (Kind::Float, device));
-        let v_pre = Tensor::randn([1, num_heads as i64, prefill_len, head_dim as i64], (Kind::Float, device));
+        let k_pre = Tensor::randn(
+            [1, num_heads as i64, prefill_len, head_dim as i64],
+            (Kind::Float, device),
+        );
+        let v_pre = Tensor::randn(
+            [1, num_heads as i64, prefill_len, head_dim as i64],
+            (Kind::Float, device),
+        );
 
         // 共享 decode 输入（所有节点对同一 token 计算完全相同的 Q/K/V）
         let hiddens: Vec<Tensor> = (0..decode_steps)
@@ -2760,7 +3216,9 @@ mod tests {
                 k_proj: k_proj.shallow_clone(),
                 v_proj: v_proj.shallow_clone(),
                 o_proj: o_proj.shallow_clone(),
-                q_bias: None, k_bias: None, v_bias: None,
+                q_bias: None,
+                k_bias: None,
+                v_bias: None,
                 rope: rope.clone(),
                 num_heads,
                 num_kv_heads: num_heads,
@@ -2794,9 +3252,13 @@ mod tests {
         );
 
         let mut cache0 = crate::model::cache::ContiguousKvCache::new();
-        let _ = cache0.update(&k_pre.narrow(2, 0, 4), &v_pre.narrow(2, 0, 4)).unwrap();
+        let _ = cache0
+            .update(&k_pre.narrow(2, 0, 4), &v_pre.narrow(2, 0, 4))
+            .unwrap();
         let mut cache1 = crate::model::cache::ContiguousKvCache::new();
-        let _ = cache1.update(&k_pre.narrow(2, 4, 3), &v_pre.narrow(2, 4, 3)).unwrap();
+        let _ = cache1
+            .update(&k_pre.narrow(2, 4, 3), &v_pre.narrow(2, 4, 3))
+            .unwrap();
 
         let hiddens0: Vec<Tensor> = hiddens.iter().map(|t| t.shallow_clone()).collect();
         let hiddens1: Vec<Tensor> = hiddens.iter().map(|t| t.shallow_clone()).collect();
@@ -2840,24 +3302,48 @@ mod tests {
         let mut ref_outs = Vec::new();
         for (t, h) in hiddens.iter().enumerate() {
             let pos = Tensor::from_slice(&[prefill_len + t as i64]).unsqueeze(0);
-            ref_outs.push(ref_backend.forward(h, &pos, Some(&mut ref_cache), None).unwrap());
+            ref_outs.push(
+                ref_backend
+                    .forward(h, &pos, Some(&mut ref_cache), None)
+                    .unwrap(),
+            );
         }
 
         let (outs0, len0) = handle0.join().unwrap();
         let (outs1, len1) = handle1.join().unwrap();
 
         for t in 0..decode_steps as usize {
-            let diff0 = (&ref_outs[t] - &outs0[t]).abs().mean(Kind::Float).double_value(&[]);
-            let diff1 = (&ref_outs[t] - &outs1[t]).abs().mean(Kind::Float).double_value(&[]);
+            let diff0 = (&ref_outs[t] - &outs0[t])
+                .abs()
+                .mean(Kind::Float)
+                .double_value(&[]);
+            let diff1 = (&ref_outs[t] - &outs1[t])
+                .abs()
+                .mean(Kind::Float)
+                .double_value(&[]);
             println!("step {t} decode Q-ring forward diff0={diff0} diff1={diff1}");
-            assert!(diff0 < 1e-4, "step {t} node0 differs from reference: {diff0}");
-            assert!(diff1 < 1e-4, "step {t} node1 differs from reference: {diff1}");
+            assert!(
+                diff0 < 1e-4,
+                "step {t} node0 differs from reference: {diff0}"
+            );
+            assert!(
+                diff1 < 1e-4,
+                "step {t} node1 differs from reference: {diff1}"
+            );
         }
 
         // (b) cache 只含 prefill chunk + p%N 份额：
         // 位置 7,8,9,10 → node0 得 8,10（2 个）；node1 得 7,9（2 个）
-        assert_eq!(len0, 4 + 2, "node0 cache must be prefill chunk + its growth share");
-        assert_eq!(len1, 3 + 2, "node1 cache must be prefill chunk + its growth share");
+        assert_eq!(
+            len0,
+            4 + 2,
+            "node0 cache must be prefill chunk + its growth share"
+        );
+        assert_eq!(
+            len1,
+            3 + 2,
+            "node1 cache must be prefill chunk + its growth share"
+        );
     }
 
     /// 【legacy decode 回退】decode_ring = false 时保持旧的 KV-resend decode 行为，
@@ -2883,14 +3369,32 @@ mod tests {
         let scale = 1.0 / (head_dim as f64).sqrt();
 
         tch::manual_seed(777);
-        let q_proj = Tensor::randn([(num_heads * head_dim) as i64, hidden_size], (Kind::Float, device));
-        let k_proj = Tensor::randn([(num_heads * head_dim) as i64, hidden_size], (Kind::Float, device));
-        let v_proj = Tensor::randn([(num_heads * head_dim) as i64, hidden_size], (Kind::Float, device));
-        let o_proj = Tensor::randn([hidden_size, (num_heads * head_dim) as i64], (Kind::Float, device));
+        let q_proj = Tensor::randn(
+            [(num_heads * head_dim) as i64, hidden_size],
+            (Kind::Float, device),
+        );
+        let k_proj = Tensor::randn(
+            [(num_heads * head_dim) as i64, hidden_size],
+            (Kind::Float, device),
+        );
+        let v_proj = Tensor::randn(
+            [(num_heads * head_dim) as i64, hidden_size],
+            (Kind::Float, device),
+        );
+        let o_proj = Tensor::randn(
+            [hidden_size, (num_heads * head_dim) as i64],
+            (Kind::Float, device),
+        );
         let rope = crate::model::layers::RotaryEmbedding::new(head_dim, 128, 10000.0, device);
 
-        let k_pre = Tensor::randn([1, num_heads as i64, prefill_len, head_dim as i64], (Kind::Float, device));
-        let v_pre = Tensor::randn([1, num_heads as i64, prefill_len, head_dim as i64], (Kind::Float, device));
+        let k_pre = Tensor::randn(
+            [1, num_heads as i64, prefill_len, head_dim as i64],
+            (Kind::Float, device),
+        );
+        let v_pre = Tensor::randn(
+            [1, num_heads as i64, prefill_len, head_dim as i64],
+            (Kind::Float, device),
+        );
         let hidden = Tensor::randn([1, 1, hidden_size], (Kind::Float, device));
 
         let make_backend = |transport: Option<Box<dyn KvTransport>>,
@@ -2903,7 +3407,9 @@ mod tests {
                 k_proj: k_proj.shallow_clone(),
                 v_proj: v_proj.shallow_clone(),
                 o_proj: o_proj.shallow_clone(),
-                q_bias: None, k_bias: None, v_bias: None,
+                q_bias: None,
+                k_bias: None,
+                v_bias: None,
                 rope: rope.clone(),
                 num_heads,
                 num_kv_heads: num_heads,
@@ -2936,7 +3442,9 @@ mod tests {
         });
         let mut backend0 = make_backend(Some(Box::new(transport0)), 2, 4, false);
         let mut cache0 = crate::model::cache::ContiguousKvCache::new();
-        let _ = cache0.update(&k_pre.narrow(2, 0, 4), &v_pre.narrow(2, 0, 4)).unwrap();
+        let _ = cache0
+            .update(&k_pre.narrow(2, 0, 4), &v_pre.narrow(2, 0, 4))
+            .unwrap();
 
         // 参考：单节点 full KV
         let mut ref_backend = make_backend(None, 1, prefill_len as usize, true);
@@ -2944,13 +3452,21 @@ mod tests {
         let _ = ref_cache.update(&k_pre, &v_pre).unwrap();
 
         let pos = Tensor::from_slice(&[prefill_len]).unsqueeze(0);
-        let out0 = backend0.forward(&hidden, &pos, Some(&mut cache0), None).unwrap();
-        let out_ref = ref_backend.forward(&hidden, &pos, Some(&mut ref_cache), None).unwrap();
+        let out0 = backend0
+            .forward(&hidden, &pos, Some(&mut cache0), None)
+            .unwrap();
+        let out_ref = ref_backend
+            .forward(&hidden, &pos, Some(&mut ref_cache), None)
+            .unwrap();
 
         let diff = (&out_ref - &out0).abs().mean(Kind::Float).double_value(&[]);
         println!("legacy decode diff = {diff}");
         assert!(diff < 1e-4, "legacy decode differs from reference: {diff}");
         // legacy 行为：growth KV 复制到每个节点
-        assert_eq!(cache0.seq_len(), 5, "legacy decode replicates growth KV on every node");
+        assert_eq!(
+            cache0.seq_len(),
+            5,
+            "legacy decode replicates growth KV on every node"
+        );
     }
 }
