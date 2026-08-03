@@ -2,6 +2,35 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### Rust 代码先 rustfmt，再 diff；多节点源码只经 Git remote 同步
+
+type: `preference` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-03`
+
+用户确认：我们新增或修改 Rust 代码后先运行 rustfmt，再检查 git diff、验证和提交。业务等价但文本格式不同不应跨节点传播；多节点源码同步以格式化后的 Git commit/remote 为唯一通道，不额外复制源码。历史大范围格式债若会污染业务提交，先做独立纯格式基线提交。
+
+_updated: 2026-08-03 05:09:31_
+### 修复单 token 本地 prefill shard 的 causal phase
+
+type: `task` · status: `in_progress` · confidence: 1.0 · importance: 1.0 · source: `systematic-debugging-2026-08-03`
+
+作为 Node 4b 的模型语义前置小节点：当全局 initial prefill 按 1:3 切成 local lengths 1/3 时，长度为 1 的 worker 仍必须使用 causal ring mask，不能看到 peer future KV。用独立 2 层 TCP regression 与 24 层 Node 4b initial assertion 验证。
+
+_updated: 2026-08-03 04:30:48_
+### Prefill causality 必须由 phase 而非本地 seq_len 决定
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `layer-count-diagnosis-2026-08-03`
+
+【动机六问】
+1. 问题：24 层 1:3 initial prefill 在第 2 层开始大幅偏离 reference；worker0 的单 token shard 在第 1 层已经错误地看到 peer future KV。
+2. 现状：LlamaModel::forward 用 local seq_len > 1 决定是否传 attention_mask；worker0 local seq_len=1 因此 attention_mask=None。HcpRingAttentionBackend 仍交换 worker1 positions [1,2,3] 的 KV；没有 causal flag 时 position 0 会参与所有 future KV。诊断证据：1 层 worker1 last max diff=1.2e-7，但 worker0 position0 max diff=0.0966；2 层 worker1 last diff 跳到 0.0175。
+3. 目标：任何 is_prefill=true 的 forward 都启用 causal semantics，即使本地 shard 只有 1 token；独立 2 层、两 worker、1:3 TCP prefill 的两个 shard logits 与 contiguous reference 在 float 阈值内对齐；24 层 Node 4b initial assertion越过。
+4. 他者：vLLM/PagedAttention 等 runtime 通过 attention metadata、query lengths 和 explicit prefill/decode phase 选择 causal kernel，不从某个 rank 的 local token count 推断全局 phase。其完整 metadata 系统不适合当前小节点，但“phase 显式支配 mask”原则可直接复用。
+5. 本方案：复用 LlamaModel::forward 已有的 is_prefill 局部变量，把 attention_mask 条件从 seq_len > 1 改为 is_prefill；distributed 或超长 shard 仍使用 1x1 dummy，仅作为 ring causal flag；普通单 token prefill 的 1x1 dense mask数学等价于无 mask。
+6. 为什么：这是修复已确认 root cause 的一行语义变化，不需要提前引入 ForwardMode enum；仅在 ring 层猜 seq_offset/local length 无法可靠识别全局 phase。continuation 的 is_prefill 扩展仍由 Node 4b 后续处理。
+【边界】本节点只修 initial prefill local length=1，不实现 continuation cache 复用、Q/KV position 分离或零 token shard。
+VERDICT: IMPLEMENT。
+
+_updated: 2026-08-03 04:30:48_
 ### 同步 TCP submit 必须同步写 socket
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `controlled-comparison-2026-08-03`
@@ -619,6 +648,20 @@ B. vLLM decode ≥2 并发+增长分片保持(修 004,PoC 最小要求);
 C. Rust decode 移植 Q+LSE 累积器环+增长分片(修 007+008)。
 
 _updated: 2026-07-27 15:10:25_
+### Node 4b 先建立两个文件的纯 rustfmt 基线
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 0.98 · source: `user-confirmed-2026-08-03`
+
+【动机六问】
+1. 问题：历史 Rust 格式不一致使一次标准 rustfmt 产生数百行非业务 diff，掩盖真正的因果修复，也会让多节点源码文本产生无意义差异。
+2. 现状：model.rs 与 tch_backend.rs 尚未形成 rustfmt 基线；若把格式化和 causal 语义改动混在同一提交，难以审查和回溯。
+3. 目标：两个文件先形成可验证的纯格式 commit；此后我们的 Rust 改动均先 rustfmt 再 diff，远端节点只需从 Git remote 同步。
+4. 既有做法：Rust 生态以 rustfmt/cargo fmt 作为规范化文本工具，通常配合 fmt check；历史项目常用独立 formatting-only commit 建立基线。
+5. 本项目方案：仅格式化当前正在编辑的两个文件，独立测试、提交和推送；不触碰其他用户修改。随后在格式化基线上重新加入 causal gate 与 focused regression。
+6. 为什么这样做：直接 cargo fmt 全仓会卷入 dirty worktree 中其他用户文件；限定两个文件既落实用户的新规则，又保持节点与提交可审查。
+VERDICT: IMPLEMENT
+
+_updated: 2026-08-03 05:09:31_
 ### 现有多请求 context 未隔离每层 ring phase state
 
 type: `risk` · status: `open` · confidence: 1.0 · importance: 0.98 · source: `code-audit-2026-08-02`

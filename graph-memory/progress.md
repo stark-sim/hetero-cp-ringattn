@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### model/backend rustfmt 基线已验证并推送
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `hetero-cp-ringattn@c637298`
+
+实现提交 c637298 仅对 rust/src/model/model.rs 与 rust/src/worker_sdk/tch_backend.rs 建立 rustfmt 基线，未包含 Graph Memory 或其他用户修改。验证：LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib:/opt/homebrew/opt/libomp/lib HCP_ENABLE_TORCH=1 cargo test --manifest-path rust/Cargo.toml --features tch-backend => 109 passed、0 failed、3 ignored，doc tests 0 failed；同环境 cargo clippy --manifest-path rust/Cargo.toml --features tch-backend --all-targets -- -A warnings => exit 0；rustfmt --edition 2021 --check 两个文件与 git diff --check => exit 0。提交已推送 origin/main。该 checkpoint 只规范文本，不声称业务行为变化。
+
+_updated: 2026-08-03 05:20:46_
 ### 同步 TCP submit progress 验证通过
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@15ce539`
