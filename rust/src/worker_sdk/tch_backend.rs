@@ -18,9 +18,9 @@
 //! 所以 `TchWorkerBackend` 本身不需要关心网络细节。
 
 use crate::model::cache::{KvCacheImpl, KvCaches};
+use crate::model::model::LlamaModel;
 use crate::model::self_driving::ReservedPositionedKvShard;
 use crate::model::transport::KvTransport;
-use crate::model::model::LlamaModel;
 use crate::model::{ModelConfig, ModelWeights};
 use crate::worker_sdk::backend::WorkerBackend;
 use std::collections::HashMap;
@@ -79,14 +79,13 @@ impl TchWorkerBackend {
         num_domains: usize,
     ) -> Result<Self, String> {
         let config_path = Path::new(model_dir).join("config.json");
-        let config = ModelConfig::from_file(&config_path)
-            .map_err(|e| format!("load config failed: {e}"))?;
+        let config =
+            ModelConfig::from_file(&config_path).map_err(|e| format!("load config failed: {e}"))?;
         let weights = ModelWeights::from_dir(model_dir, device)
             .map_err(|e| format!("load weights failed: {e}"))?;
 
-        let model =
-            LlamaModel::from_weights(config, &weights, device, num_domains)
-                .map_err(|e| format!("build model failed: {e}"))?;
+        let model = LlamaModel::from_weights(config, &weights, device, num_domains)
+            .map_err(|e| format!("build model failed: {e}"))?;
 
         let kv_caches = model.create_kv_caches();
 
@@ -172,8 +171,7 @@ impl TchWorkerBackend {
         }
 
         if let Some(pos) = position_ids {
-            self.model
-                .set_prefill_position_ids(pos, self.device);
+            self.model.set_prefill_position_ids(pos, self.device);
         }
 
         let input = Tensor::from_slice(chunk)
@@ -203,7 +201,9 @@ impl WorkerBackend for TchWorkerBackend {
         let domain_id = self.domain_id;
         for (layer_idx, transport) in transports.into_iter().enumerate() {
             if let Some(layer) = self.model.layers.get_mut(layer_idx) {
-                layer.attention.set_distributed(domain_id, 0, Some(transport));
+                layer
+                    .attention
+                    .set_distributed(domain_id, 0, Some(transport));
             }
         }
     }
@@ -226,8 +226,8 @@ impl WorkerBackend for TchWorkerBackend {
             .forward(&input, &mut self.kv_caches)
             .map_err(|e| format!("decode forward failed: {e}"))?;
 
-        let logits_vec: Vec<f32> = Vec::try_from(&logits.squeeze())
-            .map_err(|e| format!("logits to vec failed: {e}"))?;
+        let logits_vec: Vec<f32> =
+            Vec::try_from(&logits.squeeze()).map_err(|e| format!("logits to vec failed: {e}"))?;
 
         Ok(logits_vec)
     }
@@ -244,11 +244,14 @@ impl WorkerBackend for TchWorkerBackend {
             self.do_prefill(chunk, seq_offset, position_ids, None)?;
 
         // Save the freshly computed KV cache and model state into per-request context.
-        self.request_contexts.insert(request_id, RequestContext {
-            kv_caches: std::mem::replace(&mut self.kv_caches, self.model.create_kv_caches()),
-            global_seq_len: self.model.global_seq_len,
-            is_prefill_done: self.model.is_prefill_done,
-        });
+        self.request_contexts.insert(
+            request_id,
+            RequestContext {
+                kv_caches: std::mem::replace(&mut self.kv_caches, self.model.create_kv_caches()),
+                global_seq_len: self.model.global_seq_len,
+                is_prefill_done: self.model.is_prefill_done,
+            },
+        );
 
         Ok((logits_vec, global_seq_len))
     }
@@ -261,25 +264,26 @@ impl WorkerBackend for TchWorkerBackend {
         position_ids: Option<&[i64]>,
         layer_kv_capacities: Option<&[usize]>,
     ) -> Result<(Vec<f32>, usize), String> {
-        let (logits_vec, global_seq_len) = self.do_prefill(
-            chunk,
-            seq_offset,
-            position_ids,
-            layer_kv_capacities,
-        )?;
+        let (logits_vec, global_seq_len) =
+            self.do_prefill(chunk, seq_offset, position_ids, layer_kv_capacities)?;
 
-        self.request_contexts.insert(request_id, RequestContext {
-            kv_caches: std::mem::replace(&mut self.kv_caches, self.model.create_kv_caches()),
-            global_seq_len: self.model.global_seq_len,
-            is_prefill_done: self.model.is_prefill_done,
-        });
+        self.request_contexts.insert(
+            request_id,
+            RequestContext {
+                kv_caches: std::mem::replace(&mut self.kv_caches, self.model.create_kv_caches()),
+                global_seq_len: self.model.global_seq_len,
+                is_prefill_done: self.model.is_prefill_done,
+            },
+        );
 
         Ok((logits_vec, global_seq_len))
     }
 
     /// Request-aware decode: uses the request's isolated KV cache.
     fn decode_request(&mut self, request_id: u64, token: i64) -> Result<Vec<f32>, String> {
-        let ctx = self.request_contexts.get_mut(&request_id)
+        let ctx = self
+            .request_contexts
+            .get_mut(&request_id)
             .ok_or_else(|| format!("request {request_id} not found"))?;
 
         // Restore model state from the request's context before forward.
@@ -298,8 +302,8 @@ impl WorkerBackend for TchWorkerBackend {
         ctx.global_seq_len = self.model.global_seq_len;
         ctx.is_prefill_done = self.model.is_prefill_done;
 
-        let logits_vec: Vec<f32> = Vec::try_from(&logits.squeeze())
-            .map_err(|e| format!("logits to vec failed: {e}"))?;
+        let logits_vec: Vec<f32> =
+            Vec::try_from(&logits.squeeze()).map_err(|e| format!("logits to vec failed: {e}"))?;
 
         Ok(logits_vec)
     }
@@ -334,7 +338,6 @@ impl WorkerBackend for TchWorkerBackend {
         self.device
     }
 }
-
 
 #[cfg(test)]
 #[cfg(feature = "tch-backend")]
@@ -488,25 +491,47 @@ mod tests {
         let prompt_b: Vec<i64> = (10..10 + seq_len).collect();
 
         // Prefill both requests on both backends
-        let (logits_a_batch, _) = backend_batch.prefill_request(1, &prompt_a, 0, None).unwrap();
-        let (logits_b_batch, _) = backend_batch.prefill_request(2, &prompt_b, 0, None).unwrap();
+        let (logits_a_batch, _) = backend_batch
+            .prefill_request(1, &prompt_a, 0, None)
+            .unwrap();
+        let (logits_b_batch, _) = backend_batch
+            .prefill_request(2, &prompt_b, 0, None)
+            .unwrap();
 
         let (logits_a_ref, _) = backend_ref.prefill_request(1, &prompt_a, 0, None).unwrap();
         let (logits_b_ref, _) = backend_ref.prefill_request(2, &prompt_b, 0, None).unwrap();
 
         // Verify prefill logits match (sanity check)
         let prefill_diff_a = Tensor::from_slice(&logits_a_batch)
-            .f_sub(&Tensor::from_slice(&logits_a_ref)).unwrap()
-            .abs().mean(Kind::Float).double_value(&[]);
+            .f_sub(&Tensor::from_slice(&logits_a_ref))
+            .unwrap()
+            .abs()
+            .mean(Kind::Float)
+            .double_value(&[]);
         let prefill_diff_b = Tensor::from_slice(&logits_b_batch)
-            .f_sub(&Tensor::from_slice(&logits_b_ref)).unwrap()
-            .abs().mean(Kind::Float).double_value(&[]);
-        assert!(prefill_diff_a < 1e-6, "prefill logits mismatch for request A: {}", prefill_diff_a);
-        assert!(prefill_diff_b < 1e-6, "prefill logits mismatch for request B: {}", prefill_diff_b);
+            .f_sub(&Tensor::from_slice(&logits_b_ref))
+            .unwrap()
+            .abs()
+            .mean(Kind::Float)
+            .double_value(&[]);
+        assert!(
+            prefill_diff_a < 1e-6,
+            "prefill logits mismatch for request A: {}",
+            prefill_diff_a
+        );
+        assert!(
+            prefill_diff_b < 1e-6,
+            "prefill logits mismatch for request B: {}",
+            prefill_diff_b
+        );
 
         // Sample deterministic tokens (argmax, temperature=0)
-        let token_a = Tensor::from_slice(&logits_a_batch).argmax(-1, false).int64_value(&[]) as i64;
-        let token_b = Tensor::from_slice(&logits_b_batch).argmax(-1, false).int64_value(&[]) as i64;
+        let token_a = Tensor::from_slice(&logits_a_batch)
+            .argmax(-1, false)
+            .int64_value(&[]) as i64;
+        let token_b = Tensor::from_slice(&logits_b_batch)
+            .argmax(-1, false)
+            .int64_value(&[]) as i64;
 
         // ====== Single-step decode: batch vs individual ======
         let ref_logits_a = backend_ref.decode_request(1, token_a).unwrap();
@@ -516,21 +541,48 @@ mod tests {
             .decode_batch(&[(1, token_a), (2, token_b)])
             .unwrap();
 
-        let batch_logits_a = batch_results.iter().find(|(id, _)| *id == 1).unwrap().1.clone();
-        let batch_logits_b = batch_results.iter().find(|(id, _)| *id == 2).unwrap().1.clone();
+        let batch_logits_a = batch_results
+            .iter()
+            .find(|(id, _)| *id == 1)
+            .unwrap()
+            .1
+            .clone();
+        let batch_logits_b = batch_results
+            .iter()
+            .find(|(id, _)| *id == 2)
+            .unwrap()
+            .1
+            .clone();
 
         let diff_a = Tensor::from_slice(&batch_logits_a)
-            .f_sub(&Tensor::from_slice(&ref_logits_a)).unwrap()
-            .abs().mean(Kind::Float).double_value(&[]);
+            .f_sub(&Tensor::from_slice(&ref_logits_a))
+            .unwrap()
+            .abs()
+            .mean(Kind::Float)
+            .double_value(&[]);
         let diff_b = Tensor::from_slice(&batch_logits_b)
-            .f_sub(&Tensor::from_slice(&ref_logits_b)).unwrap()
-            .abs().mean(Kind::Float).double_value(&[]);
+            .f_sub(&Tensor::from_slice(&ref_logits_b))
+            .unwrap()
+            .abs()
+            .mean(Kind::Float)
+            .double_value(&[]);
 
-        println!("decode_batch isolation: diff_a={:.2e}, diff_b={:.2e}", diff_a, diff_b);
+        println!(
+            "decode_batch isolation: diff_a={:.2e}, diff_b={:.2e}",
+            diff_a, diff_b
+        );
 
         const TOL: f64 = 1e-5;
-        assert!(diff_a < TOL, "decode_batch logits differ for request A: {}", diff_a);
-        assert!(diff_b < TOL, "decode_batch logits differ for request B: {}", diff_b);
+        assert!(
+            diff_a < TOL,
+            "decode_batch logits differ for request A: {}",
+            diff_a
+        );
+        assert!(
+            diff_b < TOL,
+            "decode_batch logits differ for request B: {}",
+            diff_b
+        );
 
         // ====== Multi-step decode: ensure no cross-contamination over 4 steps ======
         const NUM_DECODE_STEPS: usize = 4;
@@ -552,26 +604,58 @@ mod tests {
             let batch_lb = batch_res.iter().find(|(id, _)| *id == 2).unwrap().1.clone();
 
             let step_diff_a = Tensor::from_slice(&batch_la)
-                .f_sub(&Tensor::from_slice(&ref_la)).unwrap()
-                .abs().mean(Kind::Float).double_value(&[]);
+                .f_sub(&Tensor::from_slice(&ref_la))
+                .unwrap()
+                .abs()
+                .mean(Kind::Float)
+                .double_value(&[]);
             let step_diff_b = Tensor::from_slice(&batch_lb)
-                .f_sub(&Tensor::from_slice(&ref_lb)).unwrap()
-                .abs().mean(Kind::Float).double_value(&[]);
+                .f_sub(&Tensor::from_slice(&ref_lb))
+                .unwrap()
+                .abs()
+                .mean(Kind::Float)
+                .double_value(&[]);
 
-            let token_batch_a = Tensor::from_slice(&batch_la).argmax(-1, false).int64_value(&[]);
-            let token_batch_b = Tensor::from_slice(&batch_lb).argmax(-1, false).int64_value(&[]);
-            let token_ref_a = Tensor::from_slice(&ref_la).argmax(-1, false).int64_value(&[]);
-            let token_ref_b = Tensor::from_slice(&ref_lb).argmax(-1, false).int64_value(&[]);
+            let token_batch_a = Tensor::from_slice(&batch_la)
+                .argmax(-1, false)
+                .int64_value(&[]);
+            let token_batch_b = Tensor::from_slice(&batch_lb)
+                .argmax(-1, false)
+                .int64_value(&[]);
+            let token_ref_a = Tensor::from_slice(&ref_la)
+                .argmax(-1, false)
+                .int64_value(&[]);
+            let token_ref_b = Tensor::from_slice(&ref_lb)
+                .argmax(-1, false)
+                .int64_value(&[]);
 
             println!(
                 "Multi-step decode step {}: diff_a={:.2e}, diff_b={:.2e}, tokens=[{},{}] vs ref=[{},{}]",
                 step, step_diff_a, step_diff_b, token_batch_a, token_batch_b, token_ref_a, token_ref_b
             );
 
-            assert!(step_diff_a < LOGITS_TOL, "step {} request A logits diff too large: {}", step, step_diff_a);
-            assert!(step_diff_b < LOGITS_TOL, "step {} request B logits diff too large: {}", step, step_diff_b);
-            assert_eq!(token_batch_a, token_ref_a, "step {} request A token mismatch", step);
-            assert_eq!(token_batch_b, token_ref_b, "step {} request B token mismatch", step);
+            assert!(
+                step_diff_a < LOGITS_TOL,
+                "step {} request A logits diff too large: {}",
+                step,
+                step_diff_a
+            );
+            assert!(
+                step_diff_b < LOGITS_TOL,
+                "step {} request B logits diff too large: {}",
+                step,
+                step_diff_b
+            );
+            assert_eq!(
+                token_batch_a, token_ref_a,
+                "step {} request A token mismatch",
+                step
+            );
+            assert_eq!(
+                token_batch_b, token_ref_b,
+                "step {} request B token mismatch",
+                step
+            );
 
             next_token_a = token_ref_a as i64;
             next_token_b = token_ref_b as i64;
@@ -735,7 +819,10 @@ mod tests {
             assert_eq!(shard1.reserved_capacity(), capacities1[layer_idx]);
             assert_eq!(shard0.positions(), &[0]);
             assert_eq!(shard1.positions(), &[1, 2, 3]);
-            assert_eq!(shard0.committed_len() + shard1.committed_len(), prompt.len());
+            assert_eq!(
+                shard0.committed_len() + shard1.committed_len(),
+                prompt.len()
+            );
             assert_eq!(shard0.active_k().kind(), Kind::BFloat16);
             assert_eq!(shard1.active_k().kind(), Kind::BFloat16);
         }

@@ -56,7 +56,12 @@ impl LlamaModel {
     /// - Attention 后端（HcpRingAttentionBackend）
     /// - MLP（SwiGLU）
     /// - 输出 RMSNorm（attention 之后、MLP 之前）
-    pub fn from_weights(config: ModelConfig, weights: &ModelWeights, device: Device, num_domains: usize) -> Result<Self, ModelError> {
+    pub fn from_weights(
+        config: ModelConfig,
+        weights: &ModelWeights,
+        device: Device,
+        num_domains: usize,
+    ) -> Result<Self, ModelError> {
         let embedding = weights.get(WeightNames::embedding())?.shallow_clone();
 
         let norm = RmsNorm::from_weights(weights, WeightNames::layer_norm(), config.rms_norm_eps)?;
@@ -93,10 +98,15 @@ impl LlamaModel {
             // Always use HcpRingAttentionBackend (even for single-node).
             // It implements online softmax with fixed chunk-size上限,
             // avoiding the O(seq²) scores materialization in GqaAttention::forward.
-            let backend: Box<dyn crate::model::attention::AttentionBackend> =
-                Box::new(crate::model::attention::HcpRingAttentionBackend::from_weights(
-                    weights, layer_idx, &config, &rope, num_domains,
-                )?);
+            let backend: Box<dyn crate::model::attention::AttentionBackend> = Box::new(
+                crate::model::attention::HcpRingAttentionBackend::from_weights(
+                    weights,
+                    layer_idx,
+                    &config,
+                    &rope,
+                    num_domains,
+                )?,
+            );
 
             layers.push(DecoderLayer {
                 input_layernorm: input_ln,
@@ -113,7 +123,19 @@ impl LlamaModel {
             _ => Kind::Float,
         };
 
-        Ok(Self { config, embedding, layers, norm, lm_head, seq_offset: 0, num_domains, global_seq_len: 0, is_prefill_done: false, dtype, prefill_position_ids: None })
+        Ok(Self {
+            config,
+            embedding,
+            layers,
+            norm,
+            lm_head,
+            seq_offset: 0,
+            num_domains,
+            global_seq_len: 0,
+            is_prefill_done: false,
+            dtype,
+            prefill_position_ids: None,
+        })
     }
 
     /// 【为模型中所有 attention 后端配置分布式传输】
@@ -125,14 +147,20 @@ impl LlamaModel {
     /// Only affects layers using `HcpRingAttentionBackend`.
     #[cfg(feature = "tch-backend")]
     #[allow(dead_code)]
-    pub fn setup_distributed_domain<F>(&mut self, domain_id: usize, seq_offset: i64, mut transport_factory: F)
-    where
+    pub fn setup_distributed_domain<F>(
+        &mut self,
+        domain_id: usize,
+        seq_offset: i64,
+        mut transport_factory: F,
+    ) where
         F: FnMut(usize) -> Option<Box<dyn crate::model::KvTransport>>,
     {
         self.seq_offset = seq_offset;
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             let transport = transport_factory(layer_idx);
-            layer.attention.set_distributed(domain_id, seq_offset as usize, transport);
+            layer
+                .attention
+                .set_distributed(domain_id, seq_offset as usize, transport);
         }
     }
 
@@ -164,7 +192,11 @@ impl LlamaModel {
         );
     }
 
-    pub fn forward(&mut self, input_ids: &Tensor, kv_caches: &mut KvCaches) -> Result<Tensor, ModelError> {
+    pub fn forward(
+        &mut self,
+        input_ids: &Tensor,
+        kv_caches: &mut KvCaches,
+    ) -> Result<Tensor, ModelError> {
         // Disable gradient computation for inference. Without this, PyTorch
         // retains the entire computation graph across all 24 layers, which
         // balloons memory usage by several GB (especially for long sequences).
@@ -251,9 +283,7 @@ impl LlamaModel {
 
         // Layer stack
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-            let kv_cache_impl = kv_caches
-                .get_mut(layer_idx)
-                .and_then(Option::as_mut);
+            let kv_cache_impl = kv_caches.get_mut(layer_idx).and_then(Option::as_mut);
             let kv_cache: Option<&mut dyn crate::model::cache::KvCache> = match kv_cache_impl {
                 Some(cache) => {
                     cache.prepare_positions(&position_ids)?;
@@ -261,7 +291,12 @@ impl LlamaModel {
                 }
                 None => None,
             };
-            hidden_states = layer.forward(&hidden_states, &position_ids, kv_cache, attention_mask.as_ref())?;
+            hidden_states = layer.forward(
+                &hidden_states,
+                &position_ids,
+                kv_cache,
+                attention_mask.as_ref(),
+            )?;
         }
 
         // Increment global_seq_len after decode step only
@@ -387,15 +422,27 @@ impl LlamaModel {
             .map_err(|e| ModelError::Generation(format!("failed to create export dir: {}", e)))?;
 
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-            let kv_cache: Option<&mut dyn crate::model::cache::KvCache> = kv_caches
-                .get_mut(layer_idx)
-                .and_then(|c| c.as_mut().map(|c| c as &mut dyn crate::model::cache::KvCache));
-            hidden_states = layer.forward(&hidden_states, &position_ids, kv_cache, attention_mask.as_ref())?;
+            let kv_cache: Option<&mut dyn crate::model::cache::KvCache> =
+                kv_caches.get_mut(layer_idx).and_then(|c| {
+                    c.as_mut()
+                        .map(|c| c as &mut dyn crate::model::cache::KvCache)
+                });
+            hidden_states = layer.forward(
+                &hidden_states,
+                &position_ids,
+                kv_cache,
+                attention_mask.as_ref(),
+            )?;
 
             // Export hidden state after this layer
-            let file_path = std::path::Path::new(export_dir).join(format!("layer_{}.bin", layer_idx));
-            Self::write_tensor_as_binary(&hidden_states, &file_path)
-                .map_err(|e| ModelError::Generation(format!("failed to write layer {} hidden state: {}", layer_idx, e)))?;
+            let file_path =
+                std::path::Path::new(export_dir).join(format!("layer_{}.bin", layer_idx));
+            Self::write_tensor_as_binary(&hidden_states, &file_path).map_err(|e| {
+                ModelError::Generation(format!(
+                    "failed to write layer {} hidden state: {}",
+                    layer_idx, e
+                ))
+            })?;
         }
 
         if !is_prefill {
@@ -406,8 +453,9 @@ impl LlamaModel {
 
         // Export final norm output
         let file_path = std::path::Path::new(export_dir).join("final_norm.bin");
-        Self::write_tensor_as_binary(&hidden_states, &file_path)
-            .map_err(|e| ModelError::Generation(format!("failed to write final norm hidden state: {}", e)))?;
+        Self::write_tensor_as_binary(&hidden_states, &file_path).map_err(|e| {
+            ModelError::Generation(format!("failed to write final norm hidden state: {}", e))
+        })?;
 
         let seq_len = hidden_states.size()[1];
         const LM_HEAD_CHUNK_SIZE: i64 = 8192;
@@ -497,40 +545,81 @@ impl LlamaModel {
             .map_err(|e| ModelError::Generation(format!("failed to write embedding: {}", e)))?;
 
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-            let kv_cache: Option<&mut dyn crate::model::cache::KvCache> = kv_caches
-                .get_mut(layer_idx)
-                .and_then(|c| c.as_mut().map(|c| c as &mut dyn crate::model::cache::KvCache));
+            let kv_cache: Option<&mut dyn crate::model::cache::KvCache> =
+                kv_caches.get_mut(layer_idx).and_then(|c| {
+                    c.as_mut()
+                        .map(|c| c as &mut dyn crate::model::cache::KvCache)
+                });
 
             if layer_idx == 0 {
                 // Layer 0: use debug forward to export all attention intermediates
                 let residual = hidden_states.shallow_clone();
                 let normed = layer.input_layernorm.forward(&hidden_states);
                 Self::write_tensor_as_binary(&normed, &export_path.join("layer_0_input_norm.bin"))
-                    .map_err(|e| ModelError::Generation(format!("failed to write layer 0 input norm: {}", e)))?;
+                    .map_err(|e| {
+                        ModelError::Generation(format!("failed to write layer 0 input norm: {}", e))
+                    })?;
 
                 // Cast to HcpRingAttentionBackend to call forward_debug or forward_debug_with_injected_qk
-                let attn_out = if let Some(ring) = layer.attention.as_any_mut().downcast_mut::<crate::model::attention::HcpRingAttentionBackend>() {
+                let attn_out = if let Some(ring) = layer
+                    .attention
+                    .as_any_mut()
+                    .downcast_mut::<crate::model::attention::HcpRingAttentionBackend>(
+                ) {
                     if let Some(qk_dir) = qk_inject_dir {
                         let qk_path = std::path::Path::new(qk_dir);
-                        ring.forward_debug_with_injected_qk(&normed, &position_ids, kv_cache, attention_mask.as_ref(), export_path, qk_path)?
+                        ring.forward_debug_with_injected_qk(
+                            &normed,
+                            &position_ids,
+                            kv_cache,
+                            attention_mask.as_ref(),
+                            export_path,
+                            qk_path,
+                        )?
                     } else {
-                        ring.forward_debug(&normed, &position_ids, kv_cache, attention_mask.as_ref(), export_path)?
+                        ring.forward_debug(
+                            &normed,
+                            &position_ids,
+                            kv_cache,
+                            attention_mask.as_ref(),
+                            export_path,
+                        )?
                     }
                 } else {
-                    layer.attention.forward(&normed, &position_ids, kv_cache, attention_mask.as_ref())?
+                    layer.attention.forward(
+                        &normed,
+                        &position_ids,
+                        kv_cache,
+                        attention_mask.as_ref(),
+                    )?
                 };
                 hidden_states = &attn_out + &residual;
-                Self::write_tensor_as_binary(&hidden_states, &export_path.join("layer_0_post_attn.bin"))
-                    .map_err(|e| ModelError::Generation(format!("failed to write layer 0 post attn: {}", e)))?;
+                Self::write_tensor_as_binary(
+                    &hidden_states,
+                    &export_path.join("layer_0_post_attn.bin"),
+                )
+                .map_err(|e| {
+                    ModelError::Generation(format!("failed to write layer 0 post attn: {}", e))
+                })?;
 
                 let residual = hidden_states.shallow_clone();
                 let normed = layer.post_attention_layernorm.forward(&hidden_states);
                 let mlp_out = layer.mlp.forward(&normed);
                 hidden_states = &mlp_out + &residual;
-                Self::write_tensor_as_binary(&hidden_states, &export_path.join("layer_0_post_mlp.bin"))
-                    .map_err(|e| ModelError::Generation(format!("failed to write layer 0 post mlp: {}", e)))?;
+                Self::write_tensor_as_binary(
+                    &hidden_states,
+                    &export_path.join("layer_0_post_mlp.bin"),
+                )
+                .map_err(|e| {
+                    ModelError::Generation(format!("failed to write layer 0 post mlp: {}", e))
+                })?;
             } else {
-                hidden_states = layer.forward(&hidden_states, &position_ids, kv_cache, attention_mask.as_ref())?;
+                hidden_states = layer.forward(
+                    &hidden_states,
+                    &position_ids,
+                    kv_cache,
+                    attention_mask.as_ref(),
+                )?;
             }
         }
 
@@ -564,15 +653,17 @@ impl LlamaModel {
         let flat = tensor.contiguous().view(-1);
         let data: Vec<f32> = Vec::try_from(&flat).map_err(|e| format!("tensor to vec: {}", e))?;
         let shape = tensor.size();
-        let mut file = std::fs::File::create(path)
-            .map_err(|e| format!("create file: {}", e))?;
+        let mut file = std::fs::File::create(path).map_err(|e| format!("create file: {}", e))?;
         let ndims = shape.len() as u64;
-        file.write_all(&ndims.to_le_bytes()).map_err(|e| e.to_string())?;
+        file.write_all(&ndims.to_le_bytes())
+            .map_err(|e| e.to_string())?;
         for &dim in &shape {
-            file.write_all(&(dim as u64).to_le_bytes()).map_err(|e| e.to_string())?;
+            file.write_all(&(dim as u64).to_le_bytes())
+                .map_err(|e| e.to_string())?;
         }
         for &val in &data {
-            file.write_all(&val.to_le_bytes()).map_err(|e| e.to_string())?;
+            file.write_all(&val.to_le_bytes())
+                .map_err(|e| e.to_string())?;
         }
         Ok(())
     }
@@ -581,34 +672,70 @@ impl LlamaModel {
 #[cfg(test)]
 #[cfg(feature = "tch-backend")]
 pub(crate) fn create_synthetic_weights(config: &ModelConfig, device: Device) -> ModelWeights {
-        let mut tensors = std::collections::HashMap::new();
-        let hidden = config.hidden_size as i64;
-        let vocab = config.vocab_size as i64;
-        let intermediate = config.intermediate_size as i64;
-        let head_dim = (config.hidden_size / config.num_heads) as i64;
-        let num_heads = config.num_heads as i64;
-        let num_kv_heads = config.num_kv_heads.unwrap_or(config.num_heads) as i64;
+    let mut tensors = std::collections::HashMap::new();
+    let hidden = config.hidden_size as i64;
+    let vocab = config.vocab_size as i64;
+    let intermediate = config.intermediate_size as i64;
+    let head_dim = (config.hidden_size / config.num_heads) as i64;
+    let num_heads = config.num_heads as i64;
+    let num_kv_heads = config.num_kv_heads.unwrap_or(config.num_heads) as i64;
 
-        tensors.insert(WeightNames::embedding().to_string(), Tensor::randn([vocab, hidden], (Kind::Float, device)));
-        tensors.insert(WeightNames::layer_norm().to_string(), Tensor::ones([hidden], (Kind::Float, device)));
-        tensors.insert(WeightNames::lm_head().to_string(), Tensor::randn([vocab, hidden], (Kind::Float, device)));
+    tensors.insert(
+        WeightNames::embedding().to_string(),
+        Tensor::randn([vocab, hidden], (Kind::Float, device)),
+    );
+    tensors.insert(
+        WeightNames::layer_norm().to_string(),
+        Tensor::ones([hidden], (Kind::Float, device)),
+    );
+    tensors.insert(
+        WeightNames::lm_head().to_string(),
+        Tensor::randn([vocab, hidden], (Kind::Float, device)),
+    );
 
-        for layer in 0..config.num_layers {
-            tensors.insert(WeightNames::rms_norm_weight(layer), Tensor::ones([hidden], (Kind::Float, device)));
-            tensors.insert(WeightNames::post_attn_norm_weight(layer), Tensor::ones([hidden], (Kind::Float, device)));
-            // HF format: q/k/v/o proj weights are [out_features, in_features]
-            tensors.insert(WeightNames::q_proj_weight(layer), Tensor::randn([num_heads * head_dim, hidden], (Kind::Float, device)));
-            tensors.insert(WeightNames::k_proj_weight(layer), Tensor::randn([num_kv_heads * head_dim, hidden], (Kind::Float, device)));
-            tensors.insert(WeightNames::v_proj_weight(layer), Tensor::randn([num_kv_heads * head_dim, hidden], (Kind::Float, device)));
-            tensors.insert(WeightNames::o_proj_weight(layer), Tensor::randn([hidden, num_heads * head_dim], (Kind::Float, device)));
-            // HF format: gate/up/down proj weights follow nn.Linear(out_features, in_features)
-            tensors.insert(WeightNames::gate_proj_weight(layer), Tensor::randn([intermediate, hidden], (Kind::Float, device)));
-            tensors.insert(WeightNames::up_proj_weight(layer), Tensor::randn([intermediate, hidden], (Kind::Float, device)));
-            tensors.insert(WeightNames::down_proj_weight(layer), Tensor::randn([hidden, intermediate], (Kind::Float, device)));
-        }
-
-        ModelWeights { tensors }
+    for layer in 0..config.num_layers {
+        tensors.insert(
+            WeightNames::rms_norm_weight(layer),
+            Tensor::ones([hidden], (Kind::Float, device)),
+        );
+        tensors.insert(
+            WeightNames::post_attn_norm_weight(layer),
+            Tensor::ones([hidden], (Kind::Float, device)),
+        );
+        // HF format: q/k/v/o proj weights are [out_features, in_features]
+        tensors.insert(
+            WeightNames::q_proj_weight(layer),
+            Tensor::randn([num_heads * head_dim, hidden], (Kind::Float, device)),
+        );
+        tensors.insert(
+            WeightNames::k_proj_weight(layer),
+            Tensor::randn([num_kv_heads * head_dim, hidden], (Kind::Float, device)),
+        );
+        tensors.insert(
+            WeightNames::v_proj_weight(layer),
+            Tensor::randn([num_kv_heads * head_dim, hidden], (Kind::Float, device)),
+        );
+        tensors.insert(
+            WeightNames::o_proj_weight(layer),
+            Tensor::randn([hidden, num_heads * head_dim], (Kind::Float, device)),
+        );
+        // HF format: gate/up/down proj weights follow nn.Linear(out_features, in_features)
+        tensors.insert(
+            WeightNames::gate_proj_weight(layer),
+            Tensor::randn([intermediate, hidden], (Kind::Float, device)),
+        );
+        tensors.insert(
+            WeightNames::up_proj_weight(layer),
+            Tensor::randn([intermediate, hidden], (Kind::Float, device)),
+        );
+        tensors.insert(
+            WeightNames::down_proj_weight(layer),
+            Tensor::randn([hidden, intermediate], (Kind::Float, device)),
+        );
     }
+
+    ModelWeights { tensors }
+}
 
 #[cfg(test)]
 #[cfg(feature = "tch-backend")]
@@ -618,18 +745,18 @@ mod tests {
     use tch::{Device, Kind, Tensor};
 
     /// 【分布式 LlamaModel prefill 端到端测试】
-    /// 
+    ///
     /// 测试目标：验证把 16 个 token 的序列拆成两个 domain（各 8 个 token）做分布式 prefill，
     /// 最终拼接的 logits 与单进程参考模型的 logits 一致。
-    /// 
+    ///
     /// 场景设计：
     /// - 参考模型（ref_model）：num_domains=1，处理完整序列 [0,1,...,15]，使用标准 GQA。
     /// - domain0：num_domains=2，domain_id=0，处理前半段 [0,1,...,7]，seq_offset=0。
     /// - domain1：num_domains=2，domain_id=1，处理后半段 [8,9,...,15]，seq_offset=8。
-    /// 
+    ///
     /// domain0 的 attention 只能看到 K/V [0..8)（自己的），看不到 domain1 的 K/V。
     /// 这没问题，因为对于 token 0..7 来说，token 8..15 都是"未来"，因果 mask 本来就看不到。
-    /// 
+    ///
     /// domain1 的 attention 需要看到 K/V [0..16)。
     /// - 本地 K/V [8..16) 由 domain1 自己计算。
     /// - peer K/V [0..8) 需要 domain0 通过网络发送过来。
@@ -673,7 +800,7 @@ mod tests {
 
         // ====== 创建三个模型实例 ======
         // 三个模型共享同一组权重，所以它们的参数完全相同。
-        // 
+        //
         // ref_model: num_domains=1，使用 HcpRingAttentionBackend（分块 online softmax）。
         // domain0/domain1: num_domains=2，使用 HcpRingAttentionBackend（ring attention）。
         let mut ref_model = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
@@ -697,8 +824,12 @@ mod tests {
             transports0.push(t0);
             transports1.push(t1);
         }
-        domain0.setup_distributed_domain(0, 0, |layer_idx| Some(Box::new(transports0[layer_idx].clone())));
-        domain1.setup_distributed_domain(1, 8, |layer_idx| Some(Box::new(transports1[layer_idx].clone())));
+        domain0.setup_distributed_domain(0, 0, |layer_idx| {
+            Some(Box::new(transports0[layer_idx].clone()))
+        });
+        domain1.setup_distributed_domain(1, 8, |layer_idx| {
+            Some(Box::new(transports1[layer_idx].clone()))
+        });
 
         // ====== 构造输入数据 ======
         // input_ids = [0, 1, 2, ..., 15]，shape [1, 16]。
@@ -707,8 +838,7 @@ mod tests {
         // - input_ids1 = [8, 9, ..., 15]（domain1）
         let seq_len = 16i64;
         let half = seq_len / 2;
-        let input_ids = Tensor::arange(seq_len, (Kind::Int64, device))
-            .unsqueeze(0); // [1, 16]
+        let input_ids = Tensor::arange(seq_len, (Kind::Int64, device)).unsqueeze(0); // [1, 16]
 
         // ====== 参考模型前向传播 ======
         // 单进程处理完整序列，输出 logits shape: [1, 16, vocab_size]
@@ -735,17 +865,23 @@ mod tests {
         let dist_logits = Tensor::cat(&[logits0, logits1], 1);
 
         // 计算整体平均误差。
-        let diff = (&ref_logits - &dist_logits).abs().mean(Kind::Float).double_value(&[]);
+        let diff = (&ref_logits - &dist_logits)
+            .abs()
+            .mean(Kind::Float)
+            .double_value(&[]);
         println!("Distributed LlamaModel prefill diff = {}", diff);
-        
+
         // 逐 token 比较误差，方便定位问题。
         for i in 0..seq_len {
             let ref_token = ref_logits.narrow(1, i, 1);
             let dist_token = dist_logits.narrow(1, i, 1);
-            let token_diff = (&ref_token - &dist_token).abs().mean(Kind::Float).double_value(&[]);
+            let token_diff = (&ref_token - &dist_token)
+                .abs()
+                .mean(Kind::Float)
+                .double_value(&[]);
             println!("token {} diff = {}", i, token_diff);
         }
-        
+
         // End-to-end tolerance tier: mean absolute error threshold for multi-layer model output.
         const END_TO_END_MEAN_ABS_ERR_TOL: f64 = 1e-3;
         assert!(
@@ -812,14 +948,19 @@ mod tests {
             transports1.push(t1);
         }
         // ring_ref: num_domains=2 but no transport → uses HcpRingAttentionBackend with local KV only
-        ring_ref.setup_distributed_domain(0, 0, |_layer_idx| None::<Box<dyn crate::model::KvTransport>>);
-        domain0.setup_distributed_domain(0, 0, |layer_idx| Some(Box::new(transports0[layer_idx].clone())));
-        domain1.setup_distributed_domain(1, 8, |layer_idx| Some(Box::new(transports1[layer_idx].clone())));
+        ring_ref.setup_distributed_domain(0, 0, |_layer_idx| {
+            None::<Box<dyn crate::model::KvTransport>>
+        });
+        domain0.setup_distributed_domain(0, 0, |layer_idx| {
+            Some(Box::new(transports0[layer_idx].clone()))
+        });
+        domain1.setup_distributed_domain(1, 8, |layer_idx| {
+            Some(Box::new(transports1[layer_idx].clone()))
+        });
 
         let seq_len = 16i64;
         let half = seq_len / 2;
-        let input_ids = Tensor::arange(seq_len, (Kind::Int64, device))
-            .unsqueeze(0); // [1, 16]
+        let input_ids = Tensor::arange(seq_len, (Kind::Int64, device)).unsqueeze(0); // [1, 16]
 
         // ====== Prefill ======
         let mut ref_caches = ref_model.create_kv_caches();
@@ -852,7 +993,9 @@ mod tests {
 
         // ====== Reference model decode ======
         let ref_decode_logits = ref_model.forward(&decode_input, &mut ref_caches).unwrap();
-        let ring_ref_decode_logits = ring_ref.forward(&decode_input, &mut ring_ref_caches).unwrap();
+        let ring_ref_decode_logits = ring_ref
+            .forward(&decode_input, &mut ring_ref_caches)
+            .unwrap();
         println!("ref_decode_logits shape = {:?}", ref_decode_logits.size());
 
         // ====== Distributed model decode ======
@@ -860,10 +1003,22 @@ mod tests {
         let decode_logits1 = domain1.forward(&decode_input, &mut caches1).unwrap();
 
         // ====== Compare ======
-        let diff_ring = (&ref_decode_logits - &ring_ref_decode_logits).abs().mean(Kind::Float).double_value(&[]);
-        let diff0 = (&ref_decode_logits - &decode_logits0).abs().mean(Kind::Float).double_value(&[]);
-        let diff1 = (&ref_decode_logits - &decode_logits1).abs().mean(Kind::Float).double_value(&[]);
-        let diff01 = (&decode_logits0 - &decode_logits1).abs().mean(Kind::Float).double_value(&[]);
+        let diff_ring = (&ref_decode_logits - &ring_ref_decode_logits)
+            .abs()
+            .mean(Kind::Float)
+            .double_value(&[]);
+        let diff0 = (&ref_decode_logits - &decode_logits0)
+            .abs()
+            .mean(Kind::Float)
+            .double_value(&[]);
+        let diff1 = (&ref_decode_logits - &decode_logits1)
+            .abs()
+            .mean(Kind::Float)
+            .double_value(&[]);
+        let diff01 = (&decode_logits0 - &decode_logits1)
+            .abs()
+            .mean(Kind::Float)
+            .double_value(&[]);
 
         println!("Decode diff ref-vs-ring_ref (no transport) = {}", diff_ring);
         println!("Decode diff ref-vs-domain0 = {}", diff0);
@@ -940,9 +1095,15 @@ mod tests {
             transports0.push(t0);
             transports1.push(t1);
         }
-        ring_ref.setup_distributed_domain(0, 0, |_layer_idx| None::<Box<dyn crate::model::KvTransport>>);
-        domain0.setup_distributed_domain(0, 0, |layer_idx| Some(Box::new(transports0[layer_idx].clone())));
-        domain1.setup_distributed_domain(1, 8, |layer_idx| Some(Box::new(transports1[layer_idx].clone())));
+        ring_ref.setup_distributed_domain(0, 0, |_layer_idx| {
+            None::<Box<dyn crate::model::KvTransport>>
+        });
+        domain0.setup_distributed_domain(0, 0, |layer_idx| {
+            Some(Box::new(transports0[layer_idx].clone()))
+        });
+        domain1.setup_distributed_domain(1, 8, |layer_idx| {
+            Some(Box::new(transports1[layer_idx].clone()))
+        });
 
         let seq_len = 16i64;
         let half = seq_len / 2;
@@ -968,8 +1129,11 @@ mod tests {
         domain0.global_seq_len = global_prompt_len;
 
         // Sample first token from ref prefill output
-        let mut next_token = ref_logits.narrow(1, seq_len - 1, 1).squeeze()
-            .argmax(-1, false).int64_value(&[]) as i64;
+        let mut next_token = ref_logits
+            .narrow(1, seq_len - 1, 1)
+            .squeeze()
+            .argmax(-1, false)
+            .int64_value(&[]) as i64;
         println!("multi-step decode first_token = {}", next_token);
 
         const DECODE_TOL: f64 = 1e-3;
@@ -981,27 +1145,64 @@ mod tests {
                 .to_device(device);
 
             let ref_decode_logits = ref_model.forward(&decode_input, &mut ref_caches).unwrap();
-            let ring_ref_decode_logits = ring_ref.forward(&decode_input, &mut ring_ref_caches).unwrap();
+            let ring_ref_decode_logits = ring_ref
+                .forward(&decode_input, &mut ring_ref_caches)
+                .unwrap();
             let decode_logits0 = domain0.forward(&decode_input, &mut caches0).unwrap();
             let decode_logits1 = domain1.forward(&decode_input, &mut caches1).unwrap();
 
-            let diff_ring = (&ref_decode_logits - &ring_ref_decode_logits).abs().mean(Kind::Float).double_value(&[]);
-            let diff0 = (&ref_decode_logits - &decode_logits0).abs().mean(Kind::Float).double_value(&[]);
-            let diff1 = (&ref_decode_logits - &decode_logits1).abs().mean(Kind::Float).double_value(&[]);
-            let diff01 = (&decode_logits0 - &decode_logits1).abs().mean(Kind::Float).double_value(&[]);
+            let diff_ring = (&ref_decode_logits - &ring_ref_decode_logits)
+                .abs()
+                .mean(Kind::Float)
+                .double_value(&[]);
+            let diff0 = (&ref_decode_logits - &decode_logits0)
+                .abs()
+                .mean(Kind::Float)
+                .double_value(&[]);
+            let diff1 = (&ref_decode_logits - &decode_logits1)
+                .abs()
+                .mean(Kind::Float)
+                .double_value(&[]);
+            let diff01 = (&decode_logits0 - &decode_logits1)
+                .abs()
+                .mean(Kind::Float)
+                .double_value(&[]);
 
             println!(
                 "step {} diff ring={:.2e} ref0={:.2e} ref1={:.2e} d01={:.2e}",
                 step, diff_ring, diff0, diff1, diff01
             );
 
-            assert!(diff_ring < DECODE_TOL, "step {} ring_ref diff too large: {}", step, diff_ring);
-            assert!(diff0 < DECODE_TOL, "step {} domain0 diff too large: {}", step, diff0);
-            assert!(diff1 < DECODE_TOL, "step {} domain1 diff too large: {}", step, diff1);
-            assert!(diff01 < DECODE_TOL, "step {} domain0-vs-domain1 diff too large: {}", step, diff01);
+            assert!(
+                diff_ring < DECODE_TOL,
+                "step {} ring_ref diff too large: {}",
+                step,
+                diff_ring
+            );
+            assert!(
+                diff0 < DECODE_TOL,
+                "step {} domain0 diff too large: {}",
+                step,
+                diff0
+            );
+            assert!(
+                diff1 < DECODE_TOL,
+                "step {} domain1 diff too large: {}",
+                step,
+                diff1
+            );
+            assert!(
+                diff01 < DECODE_TOL,
+                "step {} domain0-vs-domain1 diff too large: {}",
+                step,
+                diff01
+            );
 
             // Sample next token from ref for the following step
-            next_token = ref_decode_logits.squeeze().argmax(-1, false).int64_value(&[]) as i64;
+            next_token = ref_decode_logits
+                .squeeze()
+                .argmax(-1, false)
+                .int64_value(&[]) as i64;
         }
     }
 
@@ -1048,7 +1249,8 @@ mod tests {
         let weights = create_synthetic_weights(&config, device);
 
         // 创建三个独立的模型实例，各自有独立的 KV cache
-        let mut model_batch = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+        let mut model_batch =
+            LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
         let mut model_a = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
         let mut model_b = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
 
@@ -1068,23 +1270,42 @@ mod tests {
 
         let logits_a = model_a.forward(&input_a, &mut caches_a).unwrap();
         let logits_b = model_b.forward(&input_b, &mut caches_b).unwrap();
-        let logits_batch = model_batch.forward(&input_batch, &mut caches_batch).unwrap();
+        let logits_batch = model_batch
+            .forward(&input_batch, &mut caches_batch)
+            .unwrap();
 
         // logits_batch shape: [2, 12, vocab_size]
         let batch_a = logits_batch.narrow(0, 0, 1); // [1, 12, vocab]
         let batch_b = logits_batch.narrow(0, 1, 1); // [1, 12, vocab]
 
-        let diff_a = (&logits_a - &batch_a).abs().mean(Kind::Float).double_value(&[]);
-        let diff_b = (&logits_b - &batch_b).abs().mean(Kind::Float).double_value(&[]);
+        let diff_a = (&logits_a - &batch_a)
+            .abs()
+            .mean(Kind::Float)
+            .double_value(&[]);
+        let diff_b = (&logits_b - &batch_b)
+            .abs()
+            .mean(Kind::Float)
+            .double_value(&[]);
 
-        println!("Prefill batch correctness: diff_a={:.2e}, diff_b={:.2e}", diff_a, diff_b);
+        println!(
+            "Prefill batch correctness: diff_a={:.2e}, diff_b={:.2e}",
+            diff_a, diff_b
+        );
 
         // CPU BLAS non-determinism can cause ~1.5e-5 diff between batched and
         // single-path. Use relaxed tolerance + token agreement as the true
         // correctness signal.
         const BATCH_TOL: f64 = 1e-4;
-        assert!(diff_a < BATCH_TOL, "Prefill batch sample 0 differs: {}", diff_a);
-        assert!(diff_b < BATCH_TOL, "Prefill batch sample 1 differs: {}", diff_b);
+        assert!(
+            diff_a < BATCH_TOL,
+            "Prefill batch sample 0 differs: {}",
+            diff_a
+        );
+        assert!(
+            diff_b < BATCH_TOL,
+            "Prefill batch sample 1 differs: {}",
+            diff_b
+        );
 
         // ====== Single-step decode correctness ======
         // 从 batch 模型的 prefill 输出采样两个 token
@@ -1093,32 +1314,61 @@ mod tests {
         let token_a = last_logits_a.argmax(-1, false).int64_value(&[]) as i64;
         let token_b = last_logits_b.argmax(-1, false).int64_value(&[]) as i64;
 
-        let decode_a = Tensor::from_slice(&[token_a]).unsqueeze(0).to_device(device);
-        let decode_b = Tensor::from_slice(&[token_b]).unsqueeze(0).to_device(device);
+        let decode_a = Tensor::from_slice(&[token_a])
+            .unsqueeze(0)
+            .to_device(device);
+        let decode_b = Tensor::from_slice(&[token_b])
+            .unsqueeze(0)
+            .to_device(device);
         let decode_batch = Tensor::cat(&[decode_a.shallow_clone(), decode_b.shallow_clone()], 0);
 
         let d_logits_a = model_a.forward(&decode_a, &mut caches_a).unwrap();
         let d_logits_b = model_b.forward(&decode_b, &mut caches_b).unwrap();
-        let d_logits_batch = model_batch.forward(&decode_batch, &mut caches_batch).unwrap();
+        let d_logits_batch = model_batch
+            .forward(&decode_batch, &mut caches_batch)
+            .unwrap();
 
         let d_batch_a = d_logits_batch.narrow(0, 0, 1);
         let d_batch_b = d_logits_batch.narrow(0, 1, 1);
 
-        let d_diff_a = (&d_logits_a - &d_batch_a).abs().mean(Kind::Float).double_value(&[]);
-        let d_diff_b = (&d_logits_b - &d_batch_b).abs().mean(Kind::Float).double_value(&[]);
+        let d_diff_a = (&d_logits_a - &d_batch_a)
+            .abs()
+            .mean(Kind::Float)
+            .double_value(&[]);
+        let d_diff_b = (&d_logits_b - &d_batch_b)
+            .abs()
+            .mean(Kind::Float)
+            .double_value(&[]);
 
-        println!("Decode batch correctness: diff_a={:.2e}, diff_b={:.2e}", d_diff_a, d_diff_b);
+        println!(
+            "Decode batch correctness: diff_a={:.2e}, diff_b={:.2e}",
+            d_diff_a, d_diff_b
+        );
 
-        assert!(d_diff_a < BATCH_TOL, "Decode batch sample 0 differs: {}", d_diff_a);
-        assert!(d_diff_b < BATCH_TOL, "Decode batch sample 1 differs: {}", d_diff_b);
+        assert!(
+            d_diff_a < BATCH_TOL,
+            "Decode batch sample 0 differs: {}",
+            d_diff_a
+        );
+        assert!(
+            d_diff_b < BATCH_TOL,
+            "Decode batch sample 1 differs: {}",
+            d_diff_b
+        );
 
         // Token agreement is the true correctness signal.
         let d_token_batch_a = d_batch_a.squeeze().argmax(-1, false).int64_value(&[]);
         let d_token_batch_b = d_batch_b.squeeze().argmax(-1, false).int64_value(&[]);
         let d_token_a = d_logits_a.squeeze().argmax(-1, false).int64_value(&[]);
         let d_token_b = d_logits_b.squeeze().argmax(-1, false).int64_value(&[]);
-        assert_eq!(d_token_a, d_token_batch_a, "single-decode token mismatch for sample 0");
-        assert_eq!(d_token_b, d_token_batch_b, "single-decode token mismatch for sample 1");
+        assert_eq!(
+            d_token_a, d_token_batch_a,
+            "single-decode token mismatch for sample 0"
+        );
+        assert_eq!(
+            d_token_b, d_token_batch_b,
+            "single-decode token mismatch for sample 1"
+        );
 
         // ====== Multi-step decode correctness ======
         // Logits may diverge slightly due to floating-point non-determinism
@@ -1132,8 +1382,12 @@ mod tests {
         let mut next_token_b = token_b;
 
         for step in 0..NUM_DECODE_STEPS {
-            let da = Tensor::from_slice(&[next_token_a]).unsqueeze(0).to_device(device);
-            let db = Tensor::from_slice(&[next_token_b]).unsqueeze(0).to_device(device);
+            let da = Tensor::from_slice(&[next_token_a])
+                .unsqueeze(0)
+                .to_device(device);
+            let db = Tensor::from_slice(&[next_token_b])
+                .unsqueeze(0)
+                .to_device(device);
             let dbatch = Tensor::cat(&[da.shallow_clone(), db.shallow_clone()], 0);
 
             let la = model_a.forward(&da, &mut caches_a).unwrap();
@@ -1156,10 +1410,28 @@ mod tests {
                 step, step_diff_a, step_diff_b, token_batch_a, token_batch_b, token_ref_a, token_ref_b
             );
 
-            assert!(step_diff_a < LOGITS_TOL, "step {} batch sample 0 logits diff too large: {}", step, step_diff_a);
-            assert!(step_diff_b < LOGITS_TOL, "step {} batch sample 1 logits diff too large: {}", step, step_diff_b);
-            assert_eq!(token_batch_a, token_ref_a, "step {} batch sample 0 token mismatch", step);
-            assert_eq!(token_batch_b, token_ref_b, "step {} batch sample 1 token mismatch", step);
+            assert!(
+                step_diff_a < LOGITS_TOL,
+                "step {} batch sample 0 logits diff too large: {}",
+                step,
+                step_diff_a
+            );
+            assert!(
+                step_diff_b < LOGITS_TOL,
+                "step {} batch sample 1 logits diff too large: {}",
+                step,
+                step_diff_b
+            );
+            assert_eq!(
+                token_batch_a, token_ref_a,
+                "step {} batch sample 0 token mismatch",
+                step
+            );
+            assert_eq!(
+                token_batch_b, token_ref_b,
+                "step {} batch sample 1 token mismatch",
+                step
+            );
 
             next_token_a = token_ref_a as i64;
             next_token_b = token_ref_b as i64;
@@ -1199,7 +1471,8 @@ mod tests {
         };
 
         let weights = create_synthetic_weights(&config, device);
-        let mut model_contiguous = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+        let mut model_contiguous =
+            LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
         let mut model_block = LlamaModel::from_weights(config, &weights, device, 1).unwrap();
 
         // Prefill with 8 tokens (crosses block boundary when block_size=4)
@@ -1211,12 +1484,24 @@ mod tests {
             .map(|_| Some(KvCacheImpl::BlockTable(BlockTableKvCache::new(4))))
             .collect();
 
-        let logits_contiguous = model_contiguous.forward(&input_ids, &mut caches_contiguous).unwrap();
+        let logits_contiguous = model_contiguous
+            .forward(&input_ids, &mut caches_contiguous)
+            .unwrap();
         let logits_block = model_block.forward(&input_ids, &mut caches_block).unwrap();
 
-        let prefill_diff = (&logits_contiguous - &logits_block).abs().mean(Kind::Float).double_value(&[]);
-        println!("Prefill diff (Contiguous vs BlockTable): {:.2e}", prefill_diff);
-        assert!(prefill_diff < 1e-6, "Prefill logits differ: {}", prefill_diff);
+        let prefill_diff = (&logits_contiguous - &logits_block)
+            .abs()
+            .mean(Kind::Float)
+            .double_value(&[]);
+        println!(
+            "Prefill diff (Contiguous vs BlockTable): {:.2e}",
+            prefill_diff
+        );
+        assert!(
+            prefill_diff < 1e-6,
+            "Prefill logits differ: {}",
+            prefill_diff
+        );
 
         // Decode 3 steps
         let mut next_token_contiguous = logits_contiguous
@@ -1234,20 +1519,37 @@ mod tests {
         assert_eq!(next_token_contiguous, next_token_block);
 
         for step in 0..3 {
-            let input_c = Tensor::from_slice(&[next_token_contiguous]).unsqueeze(0).to_device(device);
-            let input_b = Tensor::from_slice(&[next_token_block]).unsqueeze(0).to_device(device);
+            let input_c = Tensor::from_slice(&[next_token_contiguous])
+                .unsqueeze(0)
+                .to_device(device);
+            let input_b = Tensor::from_slice(&[next_token_block])
+                .unsqueeze(0)
+                .to_device(device);
 
-            let logit_c = model_contiguous.forward(&input_c, &mut caches_contiguous).unwrap();
+            let logit_c = model_contiguous
+                .forward(&input_c, &mut caches_contiguous)
+                .unwrap();
             let logit_b = model_block.forward(&input_b, &mut caches_block).unwrap();
 
-            let step_diff = (&logit_c - &logit_b).abs().mean(Kind::Float).double_value(&[]);
+            let step_diff = (&logit_c - &logit_b)
+                .abs()
+                .mean(Kind::Float)
+                .double_value(&[]);
             println!("Decode step {} diff: {:.2e}", step, step_diff);
-            assert!(step_diff < 1e-6, "Decode step {} logits differ: {}", step, step_diff);
+            assert!(
+                step_diff < 1e-6,
+                "Decode step {} logits differ: {}",
+                step,
+                step_diff
+            );
 
             next_token_contiguous = logit_c.squeeze().argmax(-1, false).int64_value(&[]) as i64;
             next_token_block = logit_b.squeeze().argmax(-1, false).int64_value(&[]) as i64;
-            assert_eq!(next_token_contiguous, next_token_block,
-                "Decode step {} sampled token mismatch", step);
+            assert_eq!(
+                next_token_contiguous, next_token_block,
+                "Decode step {} sampled token mismatch",
+                step
+            );
         }
 
         println!("✅ BlockTableKvCache integration test passed");
