@@ -49,6 +49,10 @@ pub struct TcpKvTransport {
     /// TCP 本身是同步流，submit_send 会把完整 frame 先序列化到 buffer，
     /// 在 flush_send 时才一次性写入 stream。
     send_buffer: Vec<u8>,
+    /// TCP is a byte stream, so nonblocking reads may stop at any byte.
+    /// Keep incomplete frame data until a later poll supplies the remainder.
+    recv_buffer: Vec<u8>,
+    peer_closed: bool,
     /// 【交叉暂存】同一 stream 复用 KV block 和 Q-ring packet 两类 frame，
     /// recv_kv_block 收到 packet（或 recv_packet 收到 KV）时先暂存，
     /// 等对应的 recv 调用再取出。
@@ -70,6 +74,8 @@ impl TcpKvTransport {
             stream,
             device,
             send_buffer: Vec::new(),
+            recv_buffer: Vec::new(),
+            peer_closed: false,
             pending_kv: std::collections::VecDeque::new(),
             pending_packets: std::collections::VecDeque::new(),
             pending_self_driving_packets: std::collections::VecDeque::new(),
@@ -282,22 +288,18 @@ impl KvTransport for TcpKvTransport {
     }
 
     fn poll_recv(&mut self) -> Result<Option<KvBlock>, String> {
-        // TCP 是同步流，poll_recv 需要非阻塞读取一个完整 frame。
-        // 为了简化实现，这里切换到非阻塞模式尝试读取，如果读不到就切回阻塞模式返回 None。
-        // 实际测试中使用 Mock 或 QUIC，TCP transport 使用较少。
-        self.stream
-            .set_nonblocking(true)
-            .map_err(|e| format!("set_nonblocking failed: {e}"))?;
-
-        let result = self.recv_kv_block();
-
-        // 恢复阻塞模式（不影响 send）
-        let _ = self.stream.set_nonblocking(false);
-
-        match result {
-            Ok(opt) => Ok(opt),
-            Err(e) if e.contains("WouldBlock") => Ok(None),
-            Err(e) => Err(e),
+        if let Some(block) = self.pending_kv.pop_front() {
+            return Ok(Some(block));
+        }
+        loop {
+            match self.poll_frame()? {
+                Some(TcpFrame::KvBlock(block)) => return Ok(Some(block)),
+                Some(TcpFrame::RingPacket(packet)) => self.pending_packets.push_back(packet),
+                Some(TcpFrame::SelfDrivingPacket(packet)) => {
+                    self.pending_self_driving_packets.push_back(packet)
+                }
+                None => return Ok(None),
+            }
         }
     }
 
@@ -337,6 +339,22 @@ impl KvTransport for TcpKvTransport {
         serialize_packet_to_buffer(&mut self.send_buffer, packet)
     }
 
+    fn poll_recv_packet(&mut self) -> Result<Option<RingPacket>, String> {
+        if let Some(packet) = self.pending_packets.pop_front() {
+            return Ok(Some(packet));
+        }
+        loop {
+            match self.poll_frame()? {
+                Some(TcpFrame::RingPacket(packet)) => return Ok(Some(packet)),
+                Some(TcpFrame::KvBlock(block)) => self.pending_kv.push_back(block),
+                Some(TcpFrame::SelfDrivingPacket(packet)) => {
+                    self.pending_self_driving_packets.push_back(packet)
+                }
+                None => return Ok(None),
+            }
+        }
+    }
+
     fn recv_packet(&mut self) -> Result<Option<RingPacket>, String> {
         if let Some(packet) = self.pending_packets.pop_front() {
             return Ok(Some(packet));
@@ -372,7 +390,7 @@ impl KvTransport for TcpKvTransport {
             return Ok(Some(packet));
         }
         loop {
-            match self.recv_frame()? {
+            match self.poll_frame()? {
                 Some(TcpFrame::SelfDrivingPacket(packet)) => return Ok(Some(packet)),
                 Some(TcpFrame::KvBlock(block)) => self.pending_kv.push_back(block),
                 Some(TcpFrame::RingPacket(packet)) => self.pending_packets.push_back(packet),
@@ -384,6 +402,142 @@ impl KvTransport for TcpKvTransport {
 
 #[cfg(feature = "tch-backend")]
 impl TcpKvTransport {
+    fn frame_payload_len(meta: &serde_json::Value) -> Result<usize, String> {
+        let byte_len = |value: &serde_json::Value, name: &str| -> Result<usize, String> {
+            value[name]
+                .as_u64()
+                .map(|length| length as usize)
+                .ok_or_else(|| format!("missing {name}"))
+        };
+        let add = |total: usize, length: usize| {
+            total
+                .checked_add(length)
+                .ok_or_else(|| "TCP frame payload length overflow".to_string())
+        };
+
+        match meta["type"].as_str() {
+            Some("self_driving_packet") => {
+                let tensors = meta["tensors"]
+                    .as_object()
+                    .ok_or("missing self-driving tensor metadata")?;
+                let mut total = 0;
+                for name in [
+                    "residual",
+                    "normalized",
+                    "position_ids",
+                    "q",
+                    "attention_output",
+                    "lse",
+                ] {
+                    let entry = tensors
+                        .get(name)
+                        .ok_or_else(|| format!("missing {name} metadata"))?;
+                    let length = entry["bytes"]
+                        .as_u64()
+                        .map(|length| length as usize)
+                        .ok_or_else(|| format!("missing {name} bytes"))?;
+                    total = add(total, length)?;
+                }
+                Ok(total)
+            }
+            Some("ring_packet") => {
+                let mut total = 0;
+                for name in ["q_bytes", "o_bytes", "lse_bytes"] {
+                    total = add(total, byte_len(meta, name)?)?;
+                }
+                Ok(total)
+            }
+            _ => {
+                let mut total = add(byte_len(meta, "k_bytes")?, byte_len(meta, "v_bytes")?)?;
+                if let Some(position_meta) =
+                    meta.get("position_ids").filter(|value| !value.is_null())
+                {
+                    let length = position_meta["bytes"]
+                        .as_u64()
+                        .map(|length| length as usize)
+                        .ok_or("missing position_ids bytes")?;
+                    total = add(total, length)?;
+                }
+                Ok(total)
+            }
+        }
+    }
+
+    fn buffered_frame_len(&self) -> Result<Option<usize>, String> {
+        if self.recv_buffer.len() < 4 {
+            return Ok(None);
+        }
+        let meta_len = u32::from_be_bytes(self.recv_buffer[..4].try_into().unwrap()) as usize;
+        let meta_end = 4_usize
+            .checked_add(meta_len)
+            .ok_or_else(|| "TCP frame metadata length overflow".to_string())?;
+        if self.recv_buffer.len() < meta_end {
+            return Ok(None);
+        }
+        let meta: serde_json::Value = serde_json::from_slice(&self.recv_buffer[4..meta_end])
+            .map_err(|error| format!("recv_frame parse meta failed: {error}"))?;
+        let payload_len = Self::frame_payload_len(&meta)?;
+        meta_end
+            .checked_add(payload_len)
+            .map(Some)
+            .ok_or_else(|| "TCP frame length overflow".to_string())
+    }
+
+    fn try_decode_buffered_frame(&mut self) -> Result<Option<TcpFrame>, String> {
+        let Some(frame_len) = self.buffered_frame_len()? else {
+            if self.peer_closed && !self.recv_buffer.is_empty() {
+                return Err("peer closed with an incomplete TCP frame".to_string());
+            }
+            return Ok(None);
+        };
+        if self.recv_buffer.len() < frame_len {
+            if self.peer_closed {
+                return Err("peer closed with an incomplete TCP frame".to_string());
+            }
+            return Ok(None);
+        }
+
+        let frame = Self::decode_frame_from_reader(
+            &mut std::io::Cursor::new(&self.recv_buffer[..frame_len]),
+            self.device,
+        )?
+        .ok_or_else(|| "complete TCP frame decoded as EOF".to_string())?;
+        self.recv_buffer.drain(..frame_len);
+        Ok(Some(frame))
+    }
+
+    fn fill_recv_buffer_nonblocking(&mut self) -> Result<(), String> {
+        self.stream
+            .set_nonblocking(true)
+            .map_err(|error| format!("set_nonblocking failed: {error}"))?;
+
+        let read_result = (|| {
+            let mut chunk = [0_u8; 64 * 1024];
+            loop {
+                match self.stream.read(&mut chunk) {
+                    Ok(0) => {
+                        self.peer_closed = true;
+                        return Ok(());
+                    }
+                    Ok(count) => self.recv_buffer.extend_from_slice(&chunk[..count]),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(format!("poll_recv read failed: {error}")),
+                }
+            }
+        })();
+        let restore_result = self
+            .stream
+            .set_nonblocking(false)
+            .map_err(|error| format!("restore blocking mode failed: {error}"));
+        read_result.and(restore_result)
+    }
+
+    fn poll_frame(&mut self) -> Result<Option<TcpFrame>, String> {
+        self.fill_recv_buffer_nonblocking()?;
+        self.try_decode_buffered_frame()
+    }
+
     pub fn send_self_driving_packet(
         &mut self,
         packet: &SelfDrivingPacket,
@@ -412,9 +566,31 @@ impl TcpKvTransport {
     /// 【读取一个 frame】按 meta["type"] 分发 KV block / Q-ring packet。
     /// 无 "type" 字段的 frame 一律按 KV block 解析（向后兼容）。
     fn recv_frame(&mut self) -> Result<Option<TcpFrame>, String> {
+        loop {
+            if let Some(frame) = self.try_decode_buffered_frame()? {
+                return Ok(Some(frame));
+            }
+            if self.peer_closed {
+                return Ok(None);
+            }
+
+            let mut chunk = [0_u8; 64 * 1024];
+            match self.stream.read(&mut chunk) {
+                Ok(0) => self.peer_closed = true,
+                Ok(count) => self.recv_buffer.extend_from_slice(&chunk[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(format!("recv_frame read failed: {error}")),
+            }
+        }
+    }
+
+    fn decode_frame_from_reader<R: Read>(
+        reader: &mut R,
+        device: Device,
+    ) -> Result<Option<TcpFrame>, String> {
         // Read meta_len
         let mut len_bytes = [0u8; 4];
-        match self.stream.read_exact(&mut len_bytes) {
+        match reader.read_exact(&mut len_bytes) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(format!("recv_frame read meta_len failed: {e}")),
@@ -423,7 +599,7 @@ impl TcpKvTransport {
 
         // Read meta
         let mut meta_bytes = vec![0u8; meta_len];
-        self.stream
+        reader
             .read_exact(&mut meta_bytes)
             .map_err(|e| format!("recv_frame read meta failed: {e}"))?;
         let meta: serde_json::Value = serde_json::from_slice(&meta_bytes)
@@ -435,8 +611,7 @@ impl TcpKvTransport {
             let tensor_meta = meta["tensors"]
                 .as_object()
                 .ok_or("missing self-driving tensor metadata")?;
-            let device = self.device;
-            let read_tensor = |stream: &mut TcpStream, name: &str| -> Result<Tensor, String> {
+            let read_tensor = |reader: &mut R, name: &str| -> Result<Tensor, String> {
                 let entry = tensor_meta
                     .get(name)
                     .ok_or_else(|| format!("missing {name} metadata"))?;
@@ -455,18 +630,18 @@ impl TcpKvTransport {
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let mut bytes = vec![0u8; bytes_len];
-                stream
+                reader
                     .read_exact(&mut bytes)
                     .map_err(|e| format!("recv_frame read {name} bytes failed: {e}"))?;
                 let dtype = entry["dtype"].as_str().unwrap_or("float32");
                 Self::bytes_to_tensor(&bytes, &shape, device, dtype)
             };
-            let residual = read_tensor(&mut self.stream, "residual")?;
-            let normalized = read_tensor(&mut self.stream, "normalized")?;
-            let position_ids = read_tensor(&mut self.stream, "position_ids")?;
-            let q = read_tensor(&mut self.stream, "q")?;
-            let attention_output = read_tensor(&mut self.stream, "attention_output")?;
-            let lse = read_tensor(&mut self.stream, "lse")?;
+            let residual = read_tensor(reader, "residual")?;
+            let normalized = read_tensor(reader, "normalized")?;
+            let position_ids = read_tensor(reader, "position_ids")?;
+            let q = read_tensor(reader, "q")?;
+            let attention_output = read_tensor(reader, "attention_output")?;
+            let lse = read_tensor(reader, "lse")?;
             let read_usize = |name: &str| -> Result<usize, String> {
                 meta[name]
                     .as_u64()
@@ -490,8 +665,7 @@ impl TcpKvTransport {
 
         if meta["type"].as_str() == Some("ring_packet") {
             let scale = meta["scale"].as_f64().ok_or("missing scale")?;
-            let device = self.device;
-            let read_tensor = |stream: &mut TcpStream, prefix: &str| -> Result<Tensor, String> {
+            let read_tensor = |reader: &mut R, prefix: &str| -> Result<Tensor, String> {
                 let bytes_len = meta[format!("{prefix}_bytes")]
                     .as_u64()
                     .ok_or_else(|| format!("missing {prefix}_bytes"))?
@@ -504,7 +678,7 @@ impl TcpKvTransport {
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e: &str| e.to_string())?;
                 let mut bytes = vec![0u8; bytes_len];
-                stream
+                reader
                     .read_exact(&mut bytes)
                     .map_err(|e| format!("recv_frame read {prefix}_bytes failed: {e}"))?;
                 let dtype = meta[format!("{prefix}_dtype")]
@@ -513,9 +687,9 @@ impl TcpKvTransport {
                 Self::bytes_to_tensor(&bytes, &shape, device, dtype)
             };
             // 拆分 stream 借用：依次读 q / o / lse
-            let q = read_tensor(&mut self.stream, "q")?;
-            let o = read_tensor(&mut self.stream, "o")?;
-            let lse = read_tensor(&mut self.stream, "lse")?;
+            let q = read_tensor(reader, "q")?;
+            let o = read_tensor(reader, "o")?;
+            let lse = read_tensor(reader, "lse")?;
             return Ok(Some(TcpFrame::RingPacket(RingPacket {
                 layer_idx,
                 q,
@@ -552,20 +726,20 @@ impl TcpKvTransport {
 
         // Read k_bytes
         let mut k_bytes = vec![0u8; k_bytes_len];
-        self.stream
+        reader
             .read_exact(&mut k_bytes)
             .map_err(|e| format!("recv_frame read k_bytes failed: {e}"))?;
 
         // Read v_bytes
         let mut v_bytes = vec![0u8; v_bytes_len];
-        self.stream
+        reader
             .read_exact(&mut v_bytes)
             .map_err(|e| format!("recv_frame read v_bytes failed: {e}"))?;
 
         let k_dtype = meta["k_dtype"].as_str().unwrap_or("float32");
         let v_dtype = meta["v_dtype"].as_str().unwrap_or("float32");
-        let k = Self::bytes_to_tensor(&k_bytes, &k_shape, self.device, k_dtype)?;
-        let v = Self::bytes_to_tensor(&v_bytes, &v_shape, self.device, v_dtype)?;
+        let k = Self::bytes_to_tensor(&k_bytes, &k_shape, device, k_dtype)?;
+        let v = Self::bytes_to_tensor(&v_bytes, &v_shape, device, v_dtype)?;
         let position_ids = match meta.get("position_ids").filter(|value| !value.is_null()) {
             Some(position_meta) => {
                 let bytes_len = position_meta["bytes"]
@@ -581,10 +755,10 @@ impl TcpKvTransport {
                     .as_str()
                     .ok_or("missing position_ids dtype")?;
                 let mut bytes = vec![0_u8; bytes_len];
-                self.stream
+                reader
                     .read_exact(&mut bytes)
                     .map_err(|e| format!("recv_frame read position_ids bytes failed: {e}"))?;
-                Some(Self::bytes_to_tensor(&bytes, &shape, self.device, dtype)?)
+                Some(Self::bytes_to_tensor(&bytes, &shape, device, dtype)?)
             }
             None => None,
         };
@@ -619,6 +793,59 @@ mod tests {
         legacy.extend_from_slice(&meta_bytes);
         legacy.extend_from_slice(&frame[4 + old_meta_len..]);
         legacy
+    }
+
+    #[test]
+    fn tcp_poll_recv_preserves_partial_frame_until_complete() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client_stream = TcpStream::connect(addr).unwrap();
+        let (server_stream, _) = listener.accept().unwrap();
+        let observer = server_stream.try_clone().unwrap();
+        let device = Device::Cpu;
+        let expected_positions = [2_i64, 9];
+        let block = KvBlock {
+            layer_idx: 7,
+            global_seq_start: 2,
+            global_seq_end: 10,
+            k: Tensor::arange(4, (Kind::Float, device)).reshape([1, 1, 2, 2]),
+            v: (Tensor::arange(4, (Kind::Float, device)) * 0.25).reshape([1, 1, 2, 2]),
+            micro_block_idx: 0,
+            total_micro_blocks: 1,
+            position_ids: Some(Tensor::from_slice(&expected_positions)),
+        };
+        let mut frame = Vec::new();
+        serialize_block_to_buffer(&mut frame, &block).unwrap();
+
+        client_stream.write_all(&frame[..2]).unwrap();
+        let mut observed_prefix = [0_u8; 2];
+        assert_eq!(observer.peek(&mut observed_prefix).unwrap(), 2);
+
+        let mut server = TcpKvTransport::new(server_stream, device).unwrap();
+        assert!(server.poll_recv().unwrap().is_none());
+
+        client_stream.write_all(&frame[2..]).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let received = loop {
+            if let Some(block) = server.poll_recv().unwrap() {
+                break block;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "poll_recv did not recover after the partial frame was completed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+
+        assert_eq!(received.layer_idx, block.layer_idx);
+        assert_eq!(
+            (received.global_seq_start, received.global_seq_end),
+            (block.global_seq_start, block.global_seq_end)
+        );
+        assert_eq!(
+            Vec::<i64>::try_from(&received.position_ids.unwrap()).unwrap(),
+            expected_positions
+        );
     }
 
     #[test]
