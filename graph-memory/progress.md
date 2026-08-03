@@ -2,6 +2,19 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### Continuation/extend 主流 cache 元数据一手资料审计
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `primary-source-audit-2026-08-03`
+
+[2026-08-03 primary-source audit]
+1. Hugging Face Transformers：masking_utils.py 在有 past_key_values 时分别取得 q_offset=get_query_offset(layer_idx) 与 (kv_length, kv_offset)=get_mask_sizes(q_length, layer_idx)。这证明通用 cache attention 不能用 query length/position 推导完整 KV 范围。来源：https://github.com/huggingface/transformers/blob/main/src/transformers/masking_utils.py
+2. vLLM：PagedAttention.write_to_paged_cache 用 slot_mapping 只写本轮新 K/V；scheduler 以 request.num_computed_tokens 和 num_tokens_with_spec 计算 num_new_tokens，并显式说明统一覆盖 chunked prefill/prefix caching/decode。物理 cache 地址与本轮 query 工作量是两套元数据。来源：https://raw.githubusercontent.com/vllm-project/vllm/main/vllm/v1/attention/ops/paged_attn.py 与 https://raw.githubusercontent.com/vllm-project/vllm/main/vllm/v1/core/sched/scheduler.py
+3. TensorRT-LLM：KVCacheManager.create_kv_cache 创建 request-owned cache，并通过 radix-tree reuse match 复用历史。来源：https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/runtime/kv_cache_manager_v2/_core/_kv_cache_manager.py
+4. SGLang：当前 KNOWN_FAILURES 明确记录 non_monotonic_extend 会破坏假设 out_cache_loc/contiguous K slots 单调的 FA3/FA4、FlashInfer MLA 与 dual-chunk backend。这直接说明 HCP 不能把 layer-assigned decode 后的物理 append 顺序误当成连续逻辑 token 区间。来源：https://github.com/sgl-project/sglang/blob/main/test/registered/attention/unittests/KNOWN_FAILURES.md
+5. FlashInfer：prefill/append kernel API 分别接收 qo_indptr 与 kv_indptr/paged_kv_indptr，并用 paged_kv_indices 描述 KV 地址，query/output cardinality 与完整 KV cardinality 是独立输入。来源：https://raw.githubusercontent.com/flashinfer-ai/flashinfer/main/flashinfer/prefill.py
+审计边界：这些框架主要证明接口原则；它们的 paged allocator、CUDA kernel、radix cache、collective/同构执行环境不能直接替代 HCP 的 capacity-weighted ReservedPositionedKvShard 与 neighbor-only P2P ring。Context7 的 TLS 通过 SSL_CERT_FILE 指向 certifi 后恢复；其 md 选项与当前 API 漂移，改用 txt。三个 Context7 聚合路径返回 404 后，最终证据改用 GitHub tree/raw 当前可访问路径，未把失效链接写成依据。
+
+_updated: 2026-08-03 09:14:32_
 ### 单 token 本地 prefill shard 的因果回归已验证
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@830a406`

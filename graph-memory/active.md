@@ -2,6 +2,35 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### Continuation 必须独立表达 query 与完整 KV 逻辑位置
+
+type: `belief` · status: `held` · confidence: 0.99 · importance: 1.0 · source: `evidence-continuation-mainstream-cache-audit-20260803`
+
+Continuation/extend attention 必须把本轮 query 的逻辑位置集合 P_Q 与 attention 所读完整 KV 的逻辑位置集合 P_KV 分开。初始 prefill 中二者常因 Q/K/V 同批投影且本地 shard 连续而表面相同；经历 capacity-weighted initial shard 与 layer-assigned decode 后，每层每节点的 P_KV 是非连续 owned-position 集合，而 continuation 的 P_Q 只含本轮新增 segment。正确 causal 条件是逐元素 p_k <= p_q，不是 local index、seq_offset 或 cache length 比较。该结论同时受主流 cache API 与项目已有 24 层 test-only positioned continuation 数据流支持。
+
+_updated: 2026-08-03 09:14:32_
+### HCP continuation 采用 P_Q/P_KV 双位置合同并复用 request cache
+
+type: `decision` · status: `pending_review` · confidence: 0.98 · importance: 1.0 · source: `analysis-2026-08-03`
+
+【修订后的动机六问】
+1. 问题：initial prefill -> layer-assigned decode 后，同一 request 追加 prompt segment 时，当前 backend 会重建 cache；即使改成复用，ring attention 仍用同一连续位置假设描述本轮 Q 和完整本地 KV，因而 causal mask 与 wire metadata 错误。
+2. 现状：ReservedPositionedKvShard 已原地保存 K/V 与显式绝对 positions，KvBlock wire 已携带 position_ids；但 KvCache::update 只返回 (K,V)，attention 无法取得与完整 active K/V 对齐的 committed positions。LlamaModel 仅用 !is_prefill_done 识别 prefill，TchWorkerBackend::do_prefill 总是分配新 cache 并覆盖 RequestContext。24 层 evidence 已证明 initial/decode 正确，首个真实 RED 是 continuation max diff=0.0804928839。
+3. 目标：同一 request 的 explicit positioned segment 只投影新增 token；复用每层原 ReservedPositionedKvShard 和 reservation；attention 显式接收 P_Q 与完整本地 P_KV，KvBlock 发送 P_KV；每层两节点 position union 精确覆盖 0..8，无重复，storage capacity 不变，24 层 last logits 与 contiguous reference <1e-3。
+4. 他者：HF 让 cache 提供 q_offset 与 kv_length/offset；vLLM 以 slot_mapping 写新增 KV、block table/num_computed_tokens 管历史；TensorRT-LLM 维持 request-owned cache 生命周期；SGLang 有 explicit extend 且其 non-monotonic layout failures 反证连续 slot 假设；FlashInfer 以独立 qo_indptr 与 paged_kv_indptr 描述 Q/KV。共同原则可复用，CUDA paged kernels/allocator 不可直接复用。
+5. 本方案：分两个小节点。4b.1 给 KvCache 增加默认 None 的只读 committed_position_ids，ReservedPositioned 返回完整 positions；ring_attention 每次 forward 直接使用当前 position_ids 作为 P_Q、cache committed positions 作为本地 P_KV，并把后者切片进 KvBlock。4b.2 同一 request_id + explicit positions 进入 segment branch：恢复 RequestContext，不重建 cache/不重设 reservation；one-shot explicit positions 使 LlamaModel 走 causal segment forward，完成后更新 request state。
+6. 为什么：它复用当前 cache、wire、online-softmax、request API 和已验证 test-only 数学路径；只新增 continuation 必需的逻辑位置合同。引入 paged allocator、ForwardMode enum、动态 planner 或复制一套逐层 helper 都不是当前 correctness 所必需。默认 None 让 Contiguous/BlockTable cache 继续按连续 fallback 工作。
+【牺牲与边界】同一 request_id 不再能隐式表示“覆盖重开”；重开必须 release 后再 prefill。当前不做零-token worker、失败原子回滚、runtime/coordinator、多请求或真实模型。当前 continuation 继续走 prefill KV ring，会按完整历史长度传输 distributed KV；它保持 neighbor-only P2P、N-1 ring 与线性流量，但不是 m<<T 时的最小字节方案。
+VERDICT: IMPLEMENT AFTER USER CONFIRMATION。
+
+_updated: 2026-08-03 09:14:32_
+### Node 4b.1：建立 query/KV 双位置合同
+
+type: `task` · status: `planning` · confidence: 1.0 · importance: 1.0 · source: `analysis-2026-08-03`
+
+Node 4b.1：只建立 attention 的 P_Q/P_KV 双位置合同。KvCache 暴露 optional committed positions，ReservedPositioned 返回与 active K/V 等长的逻辑绝对位置；ring 的本地 causal、KvBlock metadata 与 peer merge 使用正确集合。先用一层非连续 history focused oracle 验证，不改 backend request 生命周期。
+
+_updated: 2026-08-03 09:14:32_
 ### Rust 代码先 rustfmt，再 diff；多节点源码只经 Git remote 同步
 
 type: `preference` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-03`
@@ -641,6 +670,13 @@ B. vLLM decode ≥2 并发+增长分片保持(修 004,PoC 最小要求);
 C. Rust decode 移植 Q+LSE 累积器环+增长分片(修 007+008)。
 
 _updated: 2026-07-27 15:10:25_
+### Node 4b.2：复用 request cache 执行 positioned segment
+
+type: `task` · status: `planning` · confidence: 1.0 · importance: 0.99 · source: `analysis-2026-08-03`
+
+Node 4b.2：在 4b.1 通过后，让同一 request_id 的 explicit positioned prefill 复用 RequestContext/ReservedPositioned reservation，并让 one-shot explicit positions 触发 causal segment forward。用 24 层、两 worker、1:3 initial -> layer-assigned decode -> continuation acceptance 收口；不接 runtime。
+
+_updated: 2026-08-03 09:14:32_
 ### Node 4b 先建立两个文件的纯 rustfmt 基线
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 0.98 · source: `user-confirmed-2026-08-03`
@@ -680,6 +716,25 @@ type: `decision` · status: `held` · confidence: 1.0 · importance: 0.98 · sou
 [2026-08-02 实现] b6902ba 验证显式 runtime Kind；VERDICT: IMPLEMENTED。
 
 _updated: 2026-08-01 20:38:25_
+### Multi-query accumulator continuation ring 延后为独立路线
+
+type: `decision` · status: `held` · confidence: 0.95 · importance: 0.96 · source: `analysis-2026-08-03`
+
+【路线比较】
+默认 KV ring 的存在理由：Ring Attention 的 prefill 把本地 Q 固定、旋转 KV，天然支持多 token causal segment，且现有 online-softmax/transport 已验证。
+可能牺牲：短 continuation 会再次搬运完整历史 KV，常数带宽可能过大。
+被牺牲能力的意义：multi-query accumulator ring 可把历史 KV 原地保留，只传 Q/O/LSE，理论上在 m<<T 更省字节。
+对 HCP 的意义：这是重要优化方向，但不能直接把单-token self-driving packet 扩成多 token。必须先定义多 query packet、同层所有新 KV 就绪顺序、hidden/MLP 在 finisher 的归属、并比较 N-1 hops 携带 activation 与 N hops 返回 origin 两种路线；否则会改变核心 ownership 与层间数据流。
+结论：Node 4b DEFER multi-query continuation ring，只实现有证据的 KV-ring correctness；把 Q-ring 作为独立路线选择记忆，待 baseline 可运行后按 payload bytes 与实测带宽决定。VERDICT: DEFER。
+
+_updated: 2026-08-03 09:14:32_
+### KV-ring continuation 正确但会重传完整历史 shard
+
+type: `risk` · status: `open` · confidence: 1.0 · importance: 0.95 · source: `analysis-2026-08-03`
+
+当前最小 continuation 实现复用 prefill KV ring：每层固定本地新 segment Q，同时每个节点的完整本地历史 KV shard 沿 ring 传播。它只需 predecessor/successor、无 collective，aggregate traffic 对历史长度保持线性，且 peer KV 可 micro-block 化，不要求任何节点持久化其他节点 cache；但当 continuation 新增长度 m 远小于历史 T 时，发送 O(T·KV-width) 可能显著高于循环 O(m·(Q+O+LSE)-width) 的 multi-query accumulator。当前 milestone 选择 correctness 与复用，不能把该路径宣称为 continuation 最优带宽。
+
+_updated: 2026-08-03 09:14:32_
 ### 现行远程操作只解析 inventory endpoint
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `user-correction+verified-inventory-endpoint-2026-08-02`
