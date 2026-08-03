@@ -2,16 +2,9 @@
 
 当前活跃的任务、决策、风险和假设。
 
-### Continuation 必须独立表达 query 与完整 KV 逻辑位置
-
-type: `belief` · status: `held` · confidence: 0.99 · importance: 1.0 · source: `evidence-continuation-mainstream-cache-audit-20260803`
-
-Continuation/extend attention 必须把本轮 query 的逻辑位置集合 P_Q 与 attention 所读完整 KV 的逻辑位置集合 P_KV 分开。初始 prefill 中二者常因 Q/K/V 同批投影且本地 shard 连续而表面相同；经历 capacity-weighted initial shard 与 layer-assigned decode 后，每层每节点的 P_KV 是非连续 owned-position 集合，而 continuation 的 P_Q 只含本轮新增 segment。正确 causal 条件是逐元素 p_k <= p_q，不是 local index、seq_offset 或 cache length 比较。该结论同时受主流 cache API 与项目已有 24 层 test-only positioned continuation 数据流支持。
-
-_updated: 2026-08-03 09:14:32_
 ### HCP continuation 采用 P_Q/P_KV 双位置合同并复用 request cache
 
-type: `decision` · status: `pending_review` · confidence: 0.98 · importance: 1.0 · source: `analysis-2026-08-03`
+type: `decision` · status: `held` · confidence: 0.98 · importance: 1.0 · source: `user-confirmed-2026-08-03`
 
 【修订后的动机六问】
 1. 问题：initial prefill -> layer-assigned decode 后，同一 request 追加 prompt segment 时，当前 backend 会重建 cache；即使改成复用，ring attention 仍用同一连续位置假设描述本轮 Q 和完整本地 KV，因而 causal mask 与 wire metadata 错误。
@@ -21,14 +14,50 @@ type: `decision` · status: `pending_review` · confidence: 0.98 · importance: 
 5. 本方案：分两个小节点。4b.1 给 KvCache 增加默认 None 的只读 committed_position_ids，ReservedPositioned 返回完整 positions；ring_attention 每次 forward 直接使用当前 position_ids 作为 P_Q、cache committed positions 作为本地 P_KV，并把后者切片进 KvBlock。4b.2 同一 request_id + explicit positions 进入 segment branch：恢复 RequestContext，不重建 cache/不重设 reservation；one-shot explicit positions 使 LlamaModel 走 causal segment forward，完成后更新 request state。
 6. 为什么：它复用当前 cache、wire、online-softmax、request API 和已验证 test-only 数学路径；只新增 continuation 必需的逻辑位置合同。引入 paged allocator、ForwardMode enum、动态 planner 或复制一套逐层 helper 都不是当前 correctness 所必需。默认 None 让 Contiguous/BlockTable cache 继续按连续 fallback 工作。
 【牺牲与边界】同一 request_id 不再能隐式表示“覆盖重开”；重开必须 release 后再 prefill。当前不做零-token worker、失败原子回滚、runtime/coordinator、多请求或真实模型。当前 continuation 继续走 prefill KV ring，会按完整历史长度传输 distributed KV；它保持 neighbor-only P2P、N-1 ring 与线性流量，但不是 m<<T 时的最小字节方案。
-VERDICT: IMPLEMENT AFTER USER CONFIRMATION。
+VERDICT: IMPLEMENT。用户于 2026-08-03 确认先完成 baseline，同时保留并继续实验 decode accumulator 路线。
 
-_updated: 2026-08-03 09:14:32_
+_updated: 2026-08-03 15:01:43_
 ### Node 4b.1：建立 query/KV 双位置合同
 
-type: `task` · status: `planning` · confidence: 1.0 · importance: 1.0 · source: `analysis-2026-08-03`
+type: `task` · status: `in_progress` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-03`
 
 Node 4b.1：只建立 attention 的 P_Q/P_KV 双位置合同。KvCache 暴露 optional committed positions，ReservedPositioned 返回与 active K/V 等长的逻辑绝对位置；ring 的本地 causal、KvBlock metadata 与 peer merge 使用正确集合。先用一层非连续 history focused oracle 验证，不改 backend request 生命周期。
+
+_updated: 2026-08-03 15:01:43_
+### Continuation baseline 不得覆盖 decode 自驱动环优势
+
+type: `preference` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-03`
+
+用户确认：先走通 prefill KV ring 的 continuation correctness baseline，但它只是基线，不代表用同一种数据流统一所有阶段。已经成立的单-token decode Q/O/LSE accumulator 自驱动环必须保留为一等路线；baseline 后要实际比较 KV ring、批量 accumulator ring 和按 segment/history 比例选择的混合路线，不能因工程接线方便而静默丢弃 decode 的低历史流量优势。
+
+_updated: 2026-08-03 15:01:43_
+### Multi-query accumulator 的 defer 只限于 baseline 节点
+
+type: `revision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-03`
+
+对 decision-continuation-multi-query-ring-deferred-20260803 的范围澄清：DEFER 只表示 Node 4b.1/4b.2 不同时引入多-token packet、层内新 KV 就绪顺序和 token-boundary 回程选择；不表示放弃 accumulator continuation，更不表示 KV ring 已被选为最终统一方案。baseline 验证完成后，批量 accumulator 与混合路线进入独立实验节点。
+
+_updated: 2026-08-03 15:01:43_
+### Continuation 保留分阶段数据流并依证据比较三条路线
+
+type: `decision` · status: `held` · confidence: 0.98 · importance: 1.0 · source: `user-confirmed-2026-08-03`
+
+【动机六问】
+1. 问题：HCP 既要支持 mixed-history continuation，又不能因复用 prefill KV ring 而丢掉 decode 已验证的 Q/O/LSE accumulator 低历史流量优势。
+2. 现状：initial/segment prefill 的 KV ring 能自然处理多 query causal attention；单-token decode 的 self-driving accumulator ring 让历史 KV 原地、只传 activation/Q/O/LSE。前者有 correctness 复用优势但会重传 O(T) 历史，后者在 m=1 时省流量，但尚未定义 m>1 packet、同层新 KV 就绪和 token-boundary activation 归属。当前没有证据支持强行统一为任一路线。
+3. 目标：先完成同一 request 的 KV-ring continuation baseline；随后在相同 P_Q/P_KV 语义与 oracle 下实现批量 accumulator 实验；记录每层 payload bytes、hop 数、峰值临时显存、计算归属与 correctness，最后比较 (a) KV ring、(b) batched Q/O/LSE accumulator ring、(c) 依据 segment 长度 m、历史 T、Q/KV width 与链路特征选择路径的混合方案。
+4. 他者：主流推理系统按 prefill/extend/decode phase 使用不同 attention metadata 与 kernel；它们不会要求多-token prefill 和单-token decode 共享完全相同的数据流。可复用的是分阶段选择原则，不能直接复用依赖同构 CUDA collective、paged allocator 或中心化调度的实现。
+5. 本方案：保持一个共同的 P_Q/P_KV correctness 合同，允许阶段使用不同 P2P ring 消息。4b.1/4b.2 只建 baseline；之后单独实现 batched accumulator；再用模型参数和实测链路数据比较阈值。证据出现前不新增动态 planner，KV ring 保持可回退的 correctness 路线。
+6. 为什么：HCP 的约束是异构容量、neighbor-only P2P、每节点只持自身 KV shard。共同语义合同加可替换数据流能同时保存两个阶段的优势；现在直接统一或直接做运行时 selector 都会把未验证的顺序和成本假设写死。
+【牺牲与边界】分阶段路线会保留两种 packet/执行路径，增加后续维护面；其价值必须由相同 oracle 与成本测量证明。当前只承诺实验比较，不承诺生产级自动选择、多请求调度或真实 runtime 接入。
+VERDICT: IMPLEMENT SEQUENCED EXPERIMENTS。
+
+_updated: 2026-08-03 15:01:43_
+### Continuation 必须独立表达 query 与完整 KV 逻辑位置
+
+type: `belief` · status: `held` · confidence: 0.99 · importance: 1.0 · source: `evidence-continuation-mainstream-cache-audit-20260803`
+
+Continuation/extend attention 必须把本轮 query 的逻辑位置集合 P_Q 与 attention 所读完整 KV 的逻辑位置集合 P_KV 分开。初始 prefill 中二者常因 Q/K/V 同批投影且本地 shard 连续而表面相同；经历 capacity-weighted initial shard 与 layer-assigned decode 后，每层每节点的 P_KV 是非连续 owned-position 集合，而 continuation 的 P_Q 只含本轮新增 segment。正确 causal 条件是逐元素 p_k <= p_q，不是 local index、seq_offset 或 cache length 比较。该结论同时受主流 cache API 与项目已有 24 层 test-only positioned continuation 数据流支持。
 
 _updated: 2026-08-03 09:14:32_
 ### Rust 代码先 rustfmt，再 diff；多节点源码只经 Git remote 同步
@@ -677,6 +706,13 @@ type: `task` · status: `planning` · confidence: 1.0 · importance: 0.99 · sou
 Node 4b.2：在 4b.1 通过后，让同一 request_id 的 explicit positioned prefill 复用 RequestContext/ReservedPositioned reservation，并让 one-shot explicit positions 触发 causal segment forward。用 24 层、两 worker、1:3 initial -> layer-assigned decode -> continuation acceptance 收口；不接 runtime。
 
 _updated: 2026-08-03 09:14:32_
+### Baseline 后实验 batched Q/O/LSE continuation ring
+
+type: `task` · status: `planning` · confidence: 0.95 · importance: 0.98 · source: `user-confirmed-2026-08-03`
+
+在 4b.2 correctness baseline 通过后，以相同 P_Q/P_KV 与 24 层 mixed-history oracle 实验多-token self-driving accumulator ring。先解决 packet shape、同层新 KV 全部就绪顺序、MLP/norm/hidden 的单点执行与 token-boundary N-1/N hop 选择；只做实验性 correctness 和流量计数，不接动态 planner 或服务 runtime。
+
+_updated: 2026-08-03 15:01:43_
 ### Node 4b 先建立两个文件的纯 rustfmt 基线
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 0.98 · source: `user-confirmed-2026-08-03`
@@ -716,6 +752,13 @@ type: `decision` · status: `held` · confidence: 1.0 · importance: 0.98 · sou
 [2026-08-02 实现] b6902ba 验证显式 runtime Kind；VERDICT: IMPLEMENTED。
 
 _updated: 2026-08-01 20:38:25_
+### 比较 KV ring、batched accumulator 与混合 continuation 路线
+
+type: `task` · status: `planning` · confidence: 0.92 · importance: 0.97 · source: `user-confirmed-2026-08-03`
+
+使用同一模型、history T、segment m、capacity-weighted KV placement 与 neighbor-only P2P 约束，对三条路线做 correctness 与成本对照。至少记录总 payload bytes、每 link bytes、hop 数、峰值 peer 暂存、每 worker attention/MLP/norm 计算量；混合路线先形成可检验的选择条件，不在证据前实现生产级 planner。
+
+_updated: 2026-08-03 15:01:43_
 ### Multi-query accumulator continuation ring 延后为独立路线
 
 type: `decision` · status: `held` · confidence: 0.95 · importance: 0.96 · source: `analysis-2026-08-03`
