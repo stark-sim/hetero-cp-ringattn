@@ -721,6 +721,104 @@ mod tests {
     }
 
     #[test]
+    fn single_local_token_prefill_remains_causal_with_future_peer_kv() {
+        let device = Device::Cpu;
+        let config = ModelConfig {
+            architectures: Some(vec!["LlamaForCausalLM".to_string()]),
+            hidden_size: 32,
+            num_layers: 2,
+            num_heads: 4,
+            num_kv_heads: Some(1),
+            intermediate_size: 64,
+            vocab_size: 100,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-6,
+            tie_word_embeddings: false,
+            torch_dtype: Some("float32".to_string()),
+            hidden_act: "silu".to_string(),
+            max_position_embeddings: Some(128),
+            attention_dropout: 0.0,
+            bos_token_id: None,
+            eos_token_id: None,
+            use_cache: true,
+            sliding_window: None,
+            use_sliding_window: None,
+            partial_rotary_factor: 1.0,
+        };
+        let weights = create_synthetic_weights(&config, device);
+        let mut reference = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+        let mut backend0 = TchWorkerBackend::from_model(
+            LlamaModel::from_weights(config.clone(), &weights, device, 2).unwrap(),
+            device,
+            0,
+        );
+        let mut backend1 = TchWorkerBackend::from_model(
+            LlamaModel::from_weights(config.clone(), &weights, device, 2).unwrap(),
+            device,
+            1,
+        );
+        let mut transports0: Vec<Box<dyn KvTransport>> = Vec::with_capacity(config.num_layers);
+        let mut transports1: Vec<Box<dyn KvTransport>> = Vec::with_capacity(config.num_layers);
+        for _ in 0..config.num_layers {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let stream0 = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let stream1 = listener.accept().unwrap().0;
+            transports0.push(Box::new(
+                crate::model::transport::TcpKvTransport::new(stream0, device).unwrap(),
+            ));
+            transports1.push(Box::new(
+                crate::model::transport::TcpKvTransport::new(stream1, device).unwrap(),
+            ));
+        }
+        backend0.setup_kv_transports(transports0);
+        backend1.setup_kv_transports(transports1);
+
+        let prompt = [3_i64, 5, 7, 9];
+        let mut reference_caches = reference.create_kv_caches();
+        let reference_logits = reference
+            .forward(
+                &Tensor::from_slice(&prompt).unsqueeze(0),
+                &mut reference_caches,
+            )
+            .unwrap();
+        let ((logits0, _), (logits1, _)) = std::thread::scope(|scope| {
+            let worker0 = scope.spawn(|| {
+                backend0.prefill_request_with_reservation(
+                    80,
+                    &prompt[..1],
+                    0,
+                    Some(&[0]),
+                    Some(&[1, 1]),
+                )
+            });
+            let worker1 = scope.spawn(|| {
+                backend1.prefill_request_with_reservation(
+                    80,
+                    &prompt[1..],
+                    1,
+                    Some(&[1, 2, 3]),
+                    Some(&[3, 3]),
+                )
+            });
+            (
+                worker0.join().unwrap().unwrap(),
+                worker1.join().unwrap().unwrap(),
+            )
+        });
+
+        let first_diff = (Tensor::from_slice(&logits0) - reference_logits.select(1, 0).squeeze())
+            .abs()
+            .max()
+            .double_value(&[]);
+        let last_diff = (Tensor::from_slice(&logits1) - reference_logits.select(1, 3).squeeze())
+            .abs()
+            .max()
+            .double_value(&[]);
+        assert!(first_diff < 1e-3, "first-position max diff: {first_diff}");
+        assert!(last_diff < 1e-3, "last-position max diff: {last_diff}");
+    }
+
+    #[test]
     #[ignore = "requires the local Qwen2-0.5B model weights"]
     fn real_qwen_two_worker_reserved_prefill_matches_reference() {
         let device = Device::Cpu;

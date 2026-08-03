@@ -268,7 +268,7 @@ impl LlamaModel {
         // For distributed inference, ring_attention only checks is_some() and
         // implements causality via global position comparison; it never reads
         // the dense mask tensor. Use a tiny dummy to avoid O(seq_len²) allocation.
-        let attention_mask = if seq_len > 1 {
+        let attention_mask = if is_prefill {
             // For long sequences or distributed mode, skip O(seq_len²) dense mask.
             // HcpRingAttentionBackend implements causality via position comparison
             // and never reads the mask tensor data; it only checks is_some().
