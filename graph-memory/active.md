@@ -2,6 +2,22 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 同步 TCP submit 必须同步写 socket
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `controlled-comparison-2026-08-03`
+
+【动机六问】
+1. 问题：buffered framing 修复后，默认 ring pipeline 在 initial prefill 阶段 30 秒超时；双方都无法收到 peer KV。
+2. 现状：TcpKvTransport::submit_send 只序列化到本地 send_buffer；ring pipeline 的顺序是双方 submit -> local compute -> blocking recv -> 最后 flush。TCP 没有后台 writer，因此任何 bytes 都未进入 socket。设置 HCP_DISABLE_OVERLAP=1 后 receive 前显式 flush，测试立即越过网络阶段，确认根因。
+3. 目标：TCP submit_send/submit_send_packet/submit_send_self_driving_packet 返回前已把 frame 写入 socket；peer 不调用发送方额外 flush 也能 receive；默认 24 层测试不再发生网络超时。QUIC 与 wire schema 不变。
+4. 他者：同步 transport 通常让 submit 直接执行 write；需要真正 overlap 的实现使用后台 writer task、async socket 或显式 send state machine。QUIC 当前就是 channel + async send task。
+5. 本方案：复用现有 serialize buffer 与 flush_send，在每个 TCP submit 方法内部立即 flush；外层 Phase 3 flush 继续保留为幂等 no-op，不改 KvTransport trait 或 ring pipeline。
+6. 为什么：给 TCP 增加 writer thread 会引入线程生命周期、错误回传和背压，超出实验性小节点；在 ring 层强制 submit 后 flush 会把同步 transport 细节泄漏进算法。同步 submit 是最小且符合 trait 允许同步实现的修复。
+【牺牲分析】默认 split-phase submit 的目的是真实启动发送后与 compute overlap；本方案牺牲同步 TCP 上的这种潜在 overlap。该能力本质上用于隐藏网络时延，但当前 TCP 实现从未启动后台 I/O，所以没有可用 overlap，只有确定性死锁。HCP 当前跨主机路径由 QUIC 提供真实异步发送，TCP 是简单测试 transport；未来若 TCP 性能进入范围，应在 transport 内加入真实 writer task，而不是恢复 delayed local buffer。
+【边界】不引入生产级背压、writer task 或 TCP 性能声明。
+VERDICT: IMPLEMENT。
+
+_updated: 2026-08-03 03:33:44_
 ### TCP poll 必须保留半帧接收状态
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `code-audit-2026-08-03`

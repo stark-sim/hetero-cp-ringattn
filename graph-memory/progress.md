@@ -2,6 +2,22 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### 同步 TCP submit progress 验证通过
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@15ce539`
+
+实现提交 15ce539。受控对照：Node 4b 默认 overlap 路径在 buffered framing 修复后仍于 recv_frame 30 秒超时；设置 HCP_DISABLE_OVERLAP=1 让 receive 前 flush 后，测试在 0.07 秒内越过 initial 24-layer ring 并到达数值断言，确认根因是 TCP submit 只进入本地 buffer。RED regression：仅调用 client.submit_send、不调用外层 flush，server 在 100ms 读超时；GREEN：TCP 的 KV/RingPacket/SelfDrivingPacket submit 均在返回前调用既有 flush_send，peer 成功 receive。
+Node 4b 默认路径复测：24 层每层双向 KV exchange 在 0.03 秒内完成，稳定到达 initial logits 数值断言，不再网络超时。完整验证：LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib:/opt/homebrew/opt/libomp/lib HCP_ENABLE_TORCH=1 cargo test --manifest-path rust/Cargo.toml --features tch-backend -- --skip reserved_prefill_continues_after_layer_assigned_decode_without_rebuilding_history => 109 passed, 0 failed, 3 ignored, 1 filtered out；同环境 cargo clippy --all-targets -A warnings、rustfmt --check、git diff --check 均 exit 0。
+边界：同步 TCP 不再承诺 compute/send overlap；QUIC 后台 send task 与协议不变。本证据不证明 TCP 性能、continuation 数值正确性或真实模型。
+
+_updated: 2026-08-03 03:50:51_
+### Split-phase submit 必须真正启动 I/O 才能声称 overlap
+
+type: `lesson` · status: `held` · confidence: 1.0 · importance: 0.9 · source: `incident-2026-08-03@15ce539`
+
+症状：双方 submit 后都进入 receive，最后才 flush，形成确定性循环等待。根因：接口命名为 submit 并不等于实现已经启动发送；TCP 只把 bytes 留在调用线程的本地 Vec，没有 writer task。已验证解决：同步 transport 在 submit 内完成 write；异步 transport 由后台 task 取得 buffer ownership。最早预防条件：设计 submit/compute/recv/flush pipeline 时，逐 transport 证明 submit 返回前已经发生可独立前进的 I/O；仅缓存 serialization bytes 不构成 overlap。该条件由 TCP regression 与 Graph Memory lesson 保存，不创建新 skill。
+
+_updated: 2026-08-03 03:50:51_
 ### TCP poll 半帧恢复与完整回归通过
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@23e4d0a`
