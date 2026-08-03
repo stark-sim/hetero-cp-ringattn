@@ -2,6 +2,29 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### TCP poll 半帧恢复与完整回归通过
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@23e4d0a`
+
+实现提交 23e4d0a。RED：仅发送 length-prefixed KV frame 的前 2 个 header bytes，旧 poll_recv 在 macOS 稳定返回 recv_frame read meta_len failed: Resource temporarily unavailable (os error 35)。GREEN：TcpKvTransport 使用持久 recv_buffer 保存任意半帧，nonblocking poll 只在完整 meta+payload 到齐后解码；补齐余下 bytes 后 layer/range/Int64 position_ids 精确恢复。同步补齐 ring packet poll，并让 self-driving packet poll 共用同一 framing 状态。
+验证：LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib:/opt/homebrew/opt/libomp/lib HCP_ENABLE_TORCH=1 cargo test --manifest-path rust/Cargo.toml --features tch-backend tcp_poll_recv_preserves_partial_frame_until_complete -- --nocapture => 1 passed, 0 failed；完整回归以 --skip reserved_prefill_continues_after_layer_assigned_decode_without_rebuilding_history 跳过 Node 4b 故意 RED，结果 108 passed, 0 failed, 3 ignored, 1 filtered out；同环境 cargo clippy --manifest-path rust/Cargo.toml --features tch-backend --all-targets -- -A warnings、rustfmt --check、git diff --check 均 exit 0。
+边界：未增加最大 frame 配额、生产级背压或协议版本；这是同步 TCP test transport 的 framing correctness，不是性能证据。
+
+_updated: 2026-08-03 03:23:01_
+### 非阻塞 TCP frame parser 必须保存部分读取状态
+
+type: `lesson` · status: `held` · confidence: 1.0 · importance: 0.9 · source: `incident-2026-08-03@23e4d0a`
+
+症状：poll 无数据或只到达半个 header 时返回平台相关 WouldBlock 错误，且下一次读取可能失去 frame 边界。影响：上层 ring prefill 在 attention 语义执行前失败，错误地掩盖 continuation RED。最小复现：先写 length prefix 的 2/4 bytes，调用一次 poll，再补齐 frame。根因：TCP 是字节流，nonblocking read_exact 可以先消费任意前缀再返回 WouldBlock；字符串匹配只能隐藏错误，不能恢复已消费 bytes。已验证解决：持久 receive buffer + 完整 frame 后解码。最早预防条件：任何对 length-prefixed TCP stream 的非阻塞 poll 都必须有跨调用 decoder state；如果上层需要消息级 try_recv，应先由 reader task/codec 完成 framing。该教训由机械回归测试长期防止，不创建重复 skill。
+
+_updated: 2026-08-03 03:23:01_
+### Positioned wire 完成后收敛 continuation 剩余风险
+
+type: `revision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@0382c24`
+
+旧风险同时包含 wire 丢失与 segment-forward 两个 blocker。commit 0382c24 已消除 wire 部分，因此保留旧节点历史并以 risk-continuation-segment-forward-20260803 替代为当前风险；新风险只描述 request cache 复用以及 Q/KV 位置向量必须分离的问题。
+
+_updated: 2026-08-03 02:47:51_
 ### TCP/QUIC positioned KV wire 合同验证通过
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@0382c24`

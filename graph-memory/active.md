@@ -2,6 +2,62 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### TCP poll 必须保留半帧接收状态
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `code-audit-2026-08-03`
+
+【动机六问】
+1. 问题：Node 4b 的 initial prefill 在 TcpKvTransport::poll_recv 中出现 Resource temporarily unavailable；当前 poll 可能把半个 frame 消费后丢失，导致后续永久错位。
+2. 现状：poll_recv 临时把 TcpStream 切成 nonblocking，然后调用基于 read_exact 的阻塞 recv_kv_block/recv_frame，并按字符串 WouldBlock 判空。错误文本不跨平台，且 read_exact 可能已消费 header/meta/payload 的任意前缀，transport 没有状态可以恢复。
+3. 目标：无数据或任意半帧时 poll_recv 返回 None 且不丢 bytes；补齐余下 bytes 后同一 frame 可完整解码；阻塞 recv API、交叉 frame 暂存及既有 TCP codec 回归不退化。
+4. 他者：tokio_util::codec::Framed、QUIC receive task 和常规 TCP 协议解析器都把 TCP 当字节流，使用持久 receive buffer/state machine，只在完整 length-prefixed frame 到齐后解码；try_recv 只适用于已经切成消息的 channel。
+5. 本方案：为 TcpKvTransport 增加持久 receive buffer；nonblocking poll 只把当前可用 bytes 追加进 buffer，并仅解析完整 frame；blocking recv 继续填充同一 buffer直到完整 frame。帧长度仍由现有 meta length 与 payload byte metadata 推导，wire schema 不变。
+6. 为什么：只匹配 WouldBlock 文本不能恢复半帧；让 poll 直接阻塞违反 KvTransport 合同；后台 reader thread 会引入额外线程与生命周期管理。持久 buffer 是当前同步 TCP 实现中最小且协议正确的方案。
+【边界】这是测试型 TCP transport 的正确性修复，不引入生产级背压、最大 frame 配额、协议版本或性能优化。
+VERDICT: IMPLEMENT。
+
+_updated: 2026-08-03 03:00:55_
+### Continuation prefill 必须先获得 positioned KV wire 语义
+
+type: `risk` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `code-audit-2026-08-03`
+
+代码审计确认 continuation prefill 不能直接复用现有 forward：
+1. TchWorkerBackend::do_prefill 会重建所有 KV cache，并把 model/global layer prefill state 清零。
+2. LlamaModel::forward 在 is_prefill_done=true 时，无论输入 seq_len，都只构造一个 global_seq_len position，不能表达多-token continuation segment。
+3. self-driving decode 按 layer assignee append 后，每个 worker 的 ReservedPositionedKvShard positions 不再是单一连续区间。
+4. HcpRingAttentionBackend prefill 仍以 seq_offset/global_seq_start 解释整个 local K/V；KvBlock 虽有 position_ids 字段，但当前 QUIC/TCP KV codec 没有传递它。
+因此直接把第二段 prompt 送进现有 Prefill/Decode 会重置或错误掩码。先建立 positioned KV wire + continuation segment forward 才能继续 runtime 接线。
+
+_updated: 2026-08-03 02:47:51_
+### Continuation segment 必须分离 Q positions 与完整 KV positions
+
+type: `risk` · status: `open` · confidence: 1.0 · importance: 1.0 · source: `code-audit-2026-08-03`
+
+Node 4a 已证明 TCP/QUIC 可以传递 KvBlock.position_ids，剩余 blocker 是计算语义：TchWorkerBackend::do_prefill 对同一 request 仍重建 cache；LlamaModel::forward 在 is_prefill_done=true 时把任意输入当单-token decode；HcpRingAttentionBackend 只有一个 position_ids 状态，而 continuation 的本次 Q positions 长度只等于新增 segment，KV positions 必须覆盖 ReservedPositionedKvShard 中 initial prefill + layer-assigned decode + continuation 的完整本地历史。若继续使用连续区间或同一个向量，causal mask 与 peer KV metadata 会错误。
+
+_updated: 2026-08-03 02:47:51_
+### Node 4b：Reserved positioned continuation prefill backend
+
+type: `task` · status: `in_progress` · confidence: 1.0 · importance: 1.0 · source: `user-confirmation-2026-08-03`
+
+让同一 request_id 的第二次 reserved prefill 复用既有 RequestContext 和 ReservedPositionedKvShard，只投影新增 prompt segment，并让 ring attention 使用本次 Q positions 与完整本地 KV positions。用 24 层、两 worker、1:3 context split 的 synthetic Qwen/Llama 结构验证 initial prefill -> 一次 layer-assigned self-driving decode -> continuation prefill 与 contiguous reference 对齐。范围不包含 WorkerCommand、WorkerRuntime、coordinator、跨主机、真实权重或 continuation 后再次 decode。
+
+_updated: 2026-08-03 02:47:51_
+### 复用 request-aware reserved prefill API 执行显式 positioned segment
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmation-2026-08-03`
+
+【动机六问】
+1. 问题：真实对话请求在 decode 后追加 prompt B 时，必须保留各 worker 已有的 capacity-weighted、按 layer 分散的 KV；当前再次 prefill 会重建 cache，且 attention 无法同时表达短 Q segment 与完整混合历史。
+2. 现状：ReservedPositionedKvShard 已能原地 append 并保存显式 positions；KvBlock wire 已无损携带 positions；但 do_prefill 总是创建新 cache，LlamaModel 只把第一次 forward 当多-token prefill，ring backend 的单一 position_ids 只适合 Q/KV 等长的初始 prefill。
+3. 目标：同一 request 的第二次 reserved prefill 不替换 cache、不改变 reservation，新增 K/V 原地 append；每层两个 worker 的 position union 精确覆盖 initial + decode + continuation；24 层 continuation last logits 与独立 contiguous reference 在既有 float correctness 阈值内对齐。
+4. 他者：vLLM 等 runtime 用 request block table/slot mapping 保存历史，并以 extend/append slots 对新增 prompt 做 chunked prefill；其核心原则是逻辑 request state 与新增 token positions 显式化。但 paged-attention block table、统一 CUDA worker 与 collective 不能直接替代 HCP 的 ReservedPositionedKvShard 和 neighbor P2P KV ring。
+5. 本方案：当 prefill_request_with_reservation 收到已存在 request_id 时进入 continuation 分支，拒绝重分配并复用 RequestContext；一次性 explicit prefill positions 触发多-token segment forward；KvCache 提供 optional committed position tensor，ring backend 分别保存 query positions 和完整 local KV positions，并随 KvBlock 发送后者。
+6. 为什么：这复用了当前 request API、model forward、Reserved slab 与 Node 4a wire，只增加 continuation 必需语义。备选 A 是引入显式 ForwardMode enum 并重构整个 forward，边界更清晰但当前步子过大，DEFER；备选 B 是提升 test-only 手工逐层 prefill helper，会复制 model/backend 数据流并绕开真实服务路径，REJECT。
+【边界】同一 request_id 表示 continuation；要重新开始必须先 release_request。当前只支持每 worker 非空 segment，不处理零-token worker、协议命令、并发请求、失败回滚或 production schema/versioning。
+VERDICT: IMPLEMENT。
+
+_updated: 2026-08-03 02:47:51_
 ### 先补齐 Positioned KV 的 TCP/QUIC wire 合同
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmation-2026-08-03`
@@ -37,18 +93,6 @@ type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · sour
 6.为什么：专用 tracer 会再次把已证明算法留在服务边界之外；直接一次性改完则混合 KV 语义、peer event loop、控制协议和设备部署。分层推进既不让 legacy forward 决定新主路径，也能让每个 correctness 缺口单独 RED/GREEN。
 【legacy 边界】本阶段不以删除旧命令为目标，避免把兼容性清理混入核心闭环；新两阶段请求不得调用 legacy Decode。旧路径保留为非主路径，待新路径稳定后另做带牺牲分析的删除决策。
 VERDICT: IMPLEMENT。
-
-_updated: 2026-08-02 19:01:54_
-### Continuation prefill 必须先获得 positioned KV wire 语义
-
-type: `risk` · status: `open` · confidence: 1.0 · importance: 1.0 · source: `code-audit-2026-08-03`
-
-代码审计确认 continuation prefill 不能直接复用现有 forward：
-1. TchWorkerBackend::do_prefill 会重建所有 KV cache，并把 model/global layer prefill state 清零。
-2. LlamaModel::forward 在 is_prefill_done=true 时，无论输入 seq_len，都只构造一个 global_seq_len position，不能表达多-token continuation segment。
-3. self-driving decode 按 layer assignee append 后，每个 worker 的 ReservedPositionedKvShard positions 不再是单一连续区间。
-4. HcpRingAttentionBackend prefill 仍以 seq_offset/global_seq_start 解释整个 local K/V；KvBlock 虽有 position_ids 字段，但当前 QUIC/TCP KV codec 没有传递它。
-因此直接把第二段 prompt 送进现有 Prefill/Decode 会重置或错误掩码。先建立 positioned KV wire + continuation segment forward 才能继续 runtime 接线。
 
 _updated: 2026-08-02 19:01:54_
 ### 先建立传输无关的 SelfDrivingPacket 数据面合同
