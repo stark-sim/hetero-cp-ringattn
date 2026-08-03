@@ -9,13 +9,6 @@ type: `preference` · status: `held` · confidence: 1.0 · importance: 1.0 · so
 用户确认：我们新增或修改 Rust 代码后先运行 rustfmt，再检查 git diff、验证和提交。业务等价但文本格式不同不应跨节点传播；多节点源码同步以格式化后的 Git commit/remote 为唯一通道，不额外复制源码。历史大范围格式债若会污染业务提交，先做独立纯格式基线提交。
 
 _updated: 2026-08-03 05:09:31_
-### 修复单 token 本地 prefill shard 的 causal phase
-
-type: `task` · status: `in_progress` · confidence: 1.0 · importance: 1.0 · source: `systematic-debugging-2026-08-03`
-
-作为 Node 4b 的模型语义前置小节点：当全局 initial prefill 按 1:3 切成 local lengths 1/3 时，长度为 1 的 worker 仍必须使用 causal ring mask，不能看到 peer future KV。用独立 2 层 TCP regression 与 24 层 Node 4b initial assertion 验证。
-
-_updated: 2026-08-03 04:30:48_
 ### Prefill causality 必须由 phase 而非本地 seq_len 决定
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `layer-count-diagnosis-2026-08-03`

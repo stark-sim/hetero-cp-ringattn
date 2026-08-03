@@ -2,6 +2,27 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### 单 token 本地 prefill shard 的因果回归已验证
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@830a406`
+
+实现提交 830a406 将 LlamaModel attention_mask gate 从 local seq_len > 1 改为 is_prefill，并新增两 worker、两层、1:3 local positions [0]/[1,2,3] 的独立 TCP regression。TDD RED：恢复旧 gate 后 focused test 稳定失败，worker0 first-position max diff=27.771865844726563；GREEN：同 focused test 1 passed、0 failed。完整验证：cargo test --features tch-backend => 110 passed、0 failed、3 ignored，doc tests 0 failed；cargo clippy --features tch-backend --all-targets -- -A warnings、rustfmt --check 两文件、git diff --check 均 exit 0。实现已推送 origin/main。
+
+_updated: 2026-08-03 05:56:23_
+### 24 层 Node 4b 越过 initial 后定位 continuation RED
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@830a406`
+
+在同一 causal 语义修复下运行 24 层、两 worker、1:3 的 Node 4b acceptance 草稿：initial prefill first max diff=8.940696716308594e-8，last max diff=1.1920928955078125e-7，last mean diff=4.038214740376134e-8，tokens=65/65；随后 decode 通过，测试首次失败点移动到 continuation logits max diff=0.08049288392066956。结论：local single-token causal 泄漏已与 continuation 问题解耦；0.08049 是 Node 4b 下一轮诊断对象，不属于本 causal checkpoint。
+
+_updated: 2026-08-03 05:56:23_
+### Prefill causality 是全局 phase，不是本地长度属性
+
+type: `lesson` · status: `held` · confidence: 1.0 · importance: 0.98 · source: `hetero-cp-ringattn@830a406`
+
+分布式 prefill 的因果语义属于全局 forward phase，不能由单 worker 的 local seq_len 推断。capacity-weighted sharding 可以合法产生 local seq_len=1；该 worker 的 Q position 仍必须屏蔽 peer 上更大的 future KV positions。decode 恰好也是 seq_len=1，因此 local length 无法区分 prefill 与 decode；模型已有 is_prefill 状态才是正确 gate。
+
+_updated: 2026-08-03 05:56:23_
 ### model/backend rustfmt 基线已验证并推送
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `hetero-cp-ringattn@c637298`
