@@ -817,11 +817,14 @@ impl HcpRingAttentionBackend {
     /// 【两种运行模式】
     /// - Pipeline 模式（默认）：Phase 0 submit_send → Phase 1 本地 compute → Phase 2 循环 recv→process→转发
     /// - 串行模式（HCP_DISABLE_OVERLAP=1）：先全部 exchange 完，再统一 compute，用于 baseline 对比测试
+    #[allow(clippy::too_many_arguments)]
     fn ring_attention(
         &mut self,
         q: &Tensor,
         k: &Tensor,
         v: &Tensor,
+        query_position_ids: &Tensor,
+        local_kv_position_ids: Option<&Tensor>,
         attention_mask: Option<&Tensor>,
         global_seq_start: usize,
     ) -> Result<Tensor, ModelError> {
@@ -829,6 +832,33 @@ impl HcpRingAttentionBackend {
         let num_heads = q.size()[1];
         let seq_len = q.size()[2];
         let head_dim = q.size()[3];
+        let local_kv_len = k.size()[2] as usize;
+
+        let position_row = |positions: &Tensor,
+                            expected_len: i64,
+                            label: &str|
+         -> Result<Tensor, ModelError> {
+            let shape = positions.size();
+            let row = match shape.as_slice() {
+                    [len] if *len == expected_len => positions.shallow_clone(),
+                    [batch, len] if *batch >= 1 && *len == expected_len => positions.get(0),
+                    _ => {
+                        return Err(ModelError::Backend(format!(
+                            "ring attention {label} positions must align with length {expected_len}, got {shape:?}"
+                        )))
+                    }
+                };
+            Ok(row.to_kind(Kind::Int64).to_device(Device::Cpu))
+        };
+        let query_positions = position_row(query_position_ids, seq_len, "query")?;
+        let local_kv_positions = match local_kv_position_ids {
+            Some(positions) => Some(position_row(positions, local_kv_len as i64, "local KV")?),
+            None => self
+                .position_ids
+                .as_ref()
+                .map(|positions| position_row(positions, local_kv_len as i64, "legacy local KV"))
+                .transpose()?,
+        };
 
         let ring_start = Instant::now();
         let mut perf_local_compute_ms = 0.0_f64;
@@ -854,7 +884,6 @@ impl HcpRingAttentionBackend {
             kv_chunk_size.max(1024)
         };
 
-        let local_kv_len = k.size()[2] as usize;
         let kv_chunks: Vec<(usize, usize)> = (0..local_kv_len)
             .step_by(kv_chunk_size)
             .map(|start| (start, (start + kv_chunk_size).min(local_kv_len)))
@@ -876,14 +905,7 @@ impl HcpRingAttentionBackend {
             let q_end = (q_start + q_chunk_size).min(seq_len as usize);
             let q_chunk_len = (q_end - q_start) as i64;
             let q_chunk = q.narrow(2, q_start as i64, q_chunk_len);
-            let q_pos = match self.position_ids.as_ref() {
-                Some(pos) => pos.narrow(0, q_start as i64, q_chunk_len),
-                None => Tensor::arange_start(
-                    (global_seq_start + q_start) as i64,
-                    (global_seq_start + q_end) as i64,
-                    (Kind::Int64, Device::Cpu),
-                ),
-            };
+            let q_pos = query_positions.narrow(0, q_start as i64, q_chunk_len);
             let q_kind = q.kind();
             q_states.push(QChunkState {
                 q_chunk,
@@ -929,8 +951,7 @@ impl HcpRingAttentionBackend {
                     let start = i * micro_kv_block_size;
                     let end = ((i + 1) * micro_kv_block_size).min(send_kv_len);
                     let len_i64 = (end - start) as i64;
-                    let pos_ids = self
-                        .position_ids
+                    let pos_ids = local_kv_positions
                         .as_ref()
                         .map(|pos| pos.narrow(0, start as i64, len_i64));
                     KvBlock {
@@ -951,7 +972,7 @@ impl HcpRingAttentionBackend {
 
         // 构造本地 KV chunk 的原始位置 id（连续或非连续分片）
         let build_k_pos = |start: usize, end: usize| -> Tensor {
-            match self.position_ids.as_ref() {
+            match local_kv_positions.as_ref() {
                 Some(pos) => pos.narrow(0, start as i64, (end - start) as i64),
                 None => Tensor::arange_start(
                     (global_seq_start + start) as i64,
@@ -1431,11 +1452,14 @@ impl HcpRingAttentionBackend {
         .map_err(|e| ModelError::Generation(format!("debug export k_rope: {}", e)))?;
 
         // Step 4: KV Cache update
-        let (k_cached, v_cached) = if let Some(cache) = kv_cache {
-            cache.update(&k, &v)?
+        let (k_cached, v_cached, committed_kv_positions) = if let Some(cache) = kv_cache {
+            let (k_cached, v_cached) = cache.update(&k, &v)?;
+            (k_cached, v_cached, cache.committed_position_ids())
         } else {
-            (k.shallow_clone(), v.shallow_clone())
+            (k.shallow_clone(), v.shallow_clone(), None)
         };
+        let local_kv_positions = committed_kv_positions
+            .or_else(|| (k_cached.size()[2] == seq_len).then(|| position_ids.shallow_clone()));
 
         if !self.is_prefill_done {
             self.prefill_kv_len = k_cached.size()[2] as usize;
@@ -1482,8 +1506,15 @@ impl HcpRingAttentionBackend {
 
         // Step 6: Ring Attention
         let global_seq_start = self.seq_offset;
-        let attn_output =
-            self.ring_attention(&q, &k_cached, &v_cached, attention_mask, global_seq_start)?;
+        let attn_output = self.ring_attention(
+            &q,
+            &k_cached,
+            &v_cached,
+            position_ids,
+            local_kv_positions.as_ref(),
+            attention_mask,
+            global_seq_start,
+        )?;
 
         crate::model::model::LlamaModel::write_tensor_as_binary(
             &attn_output,
@@ -1608,11 +1639,14 @@ impl HcpRingAttentionBackend {
         .map_err(|e| ModelError::Generation(format!("debug export k_rope: {}", e)))?;
 
         // Step 4: KV Cache update
-        let (k_cached, v_cached) = if let Some(cache) = kv_cache {
-            cache.update(&k, &v)?
+        let (k_cached, v_cached, committed_kv_positions) = if let Some(cache) = kv_cache {
+            let (k_cached, v_cached) = cache.update(&k, &v)?;
+            (k_cached, v_cached, cache.committed_position_ids())
         } else {
-            (k.shallow_clone(), v.shallow_clone())
+            (k.shallow_clone(), v.shallow_clone(), None)
         };
+        let local_kv_positions = committed_kv_positions
+            .or_else(|| (k_cached.size()[2] == seq_len).then(|| position_ids.shallow_clone()));
 
         if !self.is_prefill_done {
             self.prefill_kv_len = k_cached.size()[2] as usize;
@@ -1659,8 +1693,15 @@ impl HcpRingAttentionBackend {
 
         // Step 6: Ring Attention
         let global_seq_start = self.seq_offset;
-        let attn_output =
-            self.ring_attention(&q, &k_cached, &v_cached, attention_mask, global_seq_start)?;
+        let attn_output = self.ring_attention(
+            &q,
+            &k_cached,
+            &v_cached,
+            position_ids,
+            local_kv_positions.as_ref(),
+            attention_mask,
+            global_seq_start,
+        )?;
 
         crate::model::model::LlamaModel::write_tensor_as_binary(
             &attn_output,
@@ -1821,17 +1862,20 @@ impl AttentionBackend for HcpRingAttentionBackend {
                 .as_ref()
                 .map(|t| t.supports_ring_packets())
                 .unwrap_or(false);
-        let (k, v) = if let Some(cache) = kv_cache {
-            if use_decode_ring {
+        let (k, v, committed_kv_positions) = if let Some(cache) = kv_cache {
+            let (k, v) = if use_decode_ring {
                 let global_pos = position_ids.max().int64_value(&[]) as usize;
                 let keep = global_pos % self.num_domains == self.local_domain_id;
                 cache.update_sharded(&k, &v, keep)?
             } else {
                 cache.update(&k, &v)?
-            }
+            };
+            (k, v, cache.committed_position_ids())
         } else {
-            (k.shallow_clone(), v.shallow_clone())
+            (k.shallow_clone(), v.shallow_clone(), None)
         };
+        let local_kv_positions = committed_kv_positions
+            .or_else(|| (k.size()[2] == seq_len).then(|| position_ids.shallow_clone()));
 
         // 记录 prefill 阶段的 KV 长度。decode 阶段发送 peer KV 时，
         // 只发送 prefill 分区，不包含 decode 阶段 append 的新 token。
@@ -1893,7 +1937,15 @@ impl AttentionBackend for HcpRingAttentionBackend {
         let attn_output = if use_decode_ring {
             self.ring_decode_attention(&q, &k, &v)?
         } else {
-            self.ring_attention(&q, &k, &v, attention_mask, global_seq_start)?
+            self.ring_attention(
+                &q,
+                &k,
+                &v,
+                position_ids,
+                local_kv_positions.as_ref(),
+                attention_mask,
+                global_seq_start,
+            )?
         };
 
         // ====== 第八步：输出投影（O-projection）======
@@ -2070,6 +2122,140 @@ mod tests {
         assert_eq!(out.size(), vec![batch, seq_len, hidden_size]);
     }
 
+    #[test]
+    #[cfg(feature = "tch-backend")]
+    fn ring_forward_uses_independent_query_and_committed_kv_positions() {
+        use crate::model::self_driving::ReservedPositionedKvShard;
+        use crate::model::transport::{KvBlock, KvTransport, LinkedMockKvTransport};
+        use crate::model::ModelConfig;
+
+        let device = Device::Cpu;
+        let hidden_size = 4i64;
+        let config = ModelConfig {
+            architectures: Some(vec!["LlamaForCausalLM".to_string()]),
+            hidden_size: hidden_size as usize,
+            num_layers: 1,
+            num_heads: 1,
+            num_kv_heads: Some(1),
+            intermediate_size: 8,
+            vocab_size: 16,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-6,
+            tie_word_embeddings: false,
+            torch_dtype: Some("float32".to_string()),
+            hidden_act: "silu".to_string(),
+            max_position_embeddings: Some(32),
+            attention_dropout: 0.0,
+            bos_token_id: None,
+            eos_token_id: None,
+            use_cache: true,
+            sliding_window: None,
+            use_sliding_window: None,
+            partial_rotary_factor: 1.0,
+        };
+        let identity = Tensor::eye(hidden_size, (Kind::Float, device));
+        let mut backend = HcpRingAttentionBackend {
+            q_proj: identity.shallow_clone(),
+            k_proj: identity.shallow_clone(),
+            v_proj: identity.shallow_clone(),
+            o_proj: identity,
+            q_bias: None,
+            k_bias: None,
+            v_bias: None,
+            rope: crate::model::layers::RotaryEmbedding::new(
+                hidden_size as usize,
+                32,
+                config.rope_theta,
+                device,
+            ),
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: hidden_size as usize,
+            scale: 1.0 / (hidden_size as f64).sqrt(),
+            num_domains: 2,
+            layer_idx: 0,
+            kv_transport: None,
+            local_domain_id: 0,
+            seq_offset: 0,
+            prefill_kv_len: 0,
+            is_prefill_done: false,
+            disable_overlap: false,
+            position_ids: None,
+            micro_kv_block_size: 0,
+            ..Default::default()
+        };
+
+        let (local_transport, mut peer_transport) = LinkedMockKvTransport::create_pair();
+        peer_transport
+            .submit_send(&KvBlock {
+                layer_idx: 0,
+                global_seq_start: 31,
+                global_seq_end: 32,
+                k: Tensor::zeros([1, 1, 1, hidden_size], (Kind::Float, device)),
+                v: Tensor::zeros([1, 1, 1, hidden_size], (Kind::Float, device)),
+                micro_block_idx: 0,
+                total_micro_blocks: 1,
+                position_ids: Some(Tensor::from_slice(&[31i64])),
+            })
+            .unwrap();
+        backend.kv_transport = Some(Box::new(local_transport));
+
+        let history_k = Tensor::from_slice(&[0.2f32, -0.1, 0.4, 0.3, -0.5, 0.6, 0.1, -0.2])
+            .reshape([1, 1, 2, hidden_size]);
+        let history_v = Tensor::from_slice(&[0.7f32, 0.2, -0.3, 0.5, -0.4, 0.8, 0.6, -0.1])
+            .reshape([1, 1, 2, hidden_size]);
+        let mut cache = ReservedPositionedKvShard::new(&config, 4, device);
+        cache.append(&history_k, &history_v, &[0, 4]).unwrap();
+
+        let hidden = Tensor::from_slice(&[0.3f32, -0.2, 0.7, 0.1, -0.6, 0.4, 0.2, 0.9]).reshape([
+            1,
+            2,
+            hidden_size,
+        ]);
+        let query_positions = Tensor::from_slice(&[3i64, 5]).reshape([1, 2]);
+        cache.prepare_positions(&query_positions).unwrap();
+
+        let (q, new_k, new_v) = backend
+            .project_positioned_qkv(&hidden, &query_positions)
+            .unwrap();
+        let all_k = Tensor::cat(&[history_k, new_k], 2);
+        let all_v = Tensor::cat(&[history_v, new_v], 2);
+        let all_k_positions = Tensor::from_slice(&[0i64, 4, 3, 5]);
+        let (expected_attention, _) = backend.positioned_local_compact_partial(
+            &q,
+            &query_positions,
+            &all_k,
+            &all_v,
+            &all_k_positions,
+        );
+        let expected = backend.project_decode_output(&expected_attention);
+        let causal_flag = Tensor::zeros([1, 1, 1, 1], (Kind::Float, device));
+
+        let actual = backend
+            .forward(
+                &hidden,
+                &query_positions,
+                Some(&mut cache),
+                Some(&causal_flag),
+            )
+            .unwrap();
+
+        let sent_block = peer_transport.recv_kv_block().unwrap().unwrap();
+        let sent_positions = sent_block
+            .position_ids
+            .expect("committed KV positions missing");
+        let sent_positions = (0..sent_positions.size()[0])
+            .map(|index| sent_positions.int64_value(&[index]))
+            .collect::<Vec<_>>();
+        assert_eq!(sent_positions, vec![0, 4, 3, 5]);
+
+        let max_diff = (&actual - &expected).abs().max().double_value(&[]);
+        assert!(
+            max_diff < 1e-5,
+            "ring forward confused query positions with committed KV positions: max diff={max_diff}"
+        );
+    }
+
     /// Build a ring-attention backend and verify it matches local full attention
     /// (non-causal, all positions attend to all positions).
     #[test]
@@ -2120,7 +2306,10 @@ mod tests {
             ..Default::default()
         };
 
-        let actual = backend.ring_attention(&q, &k, &v, None, 0).unwrap();
+        let positions = Tensor::arange(seq_len, (Kind::Int64, device)).unsqueeze(0);
+        let actual = backend
+            .ring_attention(&q, &k, &v, &positions, None, None, 0)
+            .unwrap();
 
         let diff = (&expected - &actual).abs().mean(Kind::Float);
         let diff_val: f64 = diff.double_value(&[]);
@@ -2183,7 +2372,10 @@ mod tests {
             ..Default::default()
         };
 
-        let actual = backend.ring_attention(&q, &k, &v, Some(&mask), 0).unwrap();
+        let positions = Tensor::arange(seq_len, (Kind::Int64, device)).unsqueeze(0);
+        let actual = backend
+            .ring_attention(&q, &k, &v, &positions, None, Some(&mask), 0)
+            .unwrap();
 
         let diff = (&expected - &actual).abs().mean(Kind::Float);
         let diff_val: f64 = diff.double_value(&[]);
@@ -2246,7 +2438,10 @@ mod tests {
 
         // Without transport, ring_attention processes only local KV.
         // Since local KV = full KV (17 tokens), output should match local_attention_scores.
-        let actual = backend.ring_attention(&q, &k, &v, None, 0).unwrap();
+        let query_position = Tensor::from_slice(&[kv_len - 1]).unsqueeze(0);
+        let actual = backend
+            .ring_attention(&q, &k, &v, &query_position, None, None, 0)
+            .unwrap();
 
         let diff = (&expected - &actual).abs().mean(Kind::Float);
         let diff_val: f64 = diff.double_value(&[]);
@@ -2353,8 +2548,9 @@ mod tests {
             micro_kv_block_size: 0,
             ..Default::default()
         };
+        let query_position = Tensor::from_slice(&[kv_len - 1]).unsqueeze(0);
         let out0 = backend0
-            .ring_attention(&q_all, &k0_local, &v0_local, None, 0)
+            .ring_attention(&q_all, &k0_local, &v0_local, &query_position, None, None, 0)
             .unwrap();
 
         // Worker 1: receives peer KV [0..7] from worker 0
@@ -2396,7 +2592,15 @@ mod tests {
             ..Default::default()
         };
         let out1 = backend1
-            .ring_attention(&q_all, &k1_local, &v1_local, None, half as usize)
+            .ring_attention(
+                &q_all,
+                &k1_local,
+                &v1_local,
+                &query_position,
+                None,
+                None,
+                half as usize,
+            )
             .unwrap();
 
         let diff0 = (&expected - &out0)
@@ -2614,8 +2818,9 @@ mod tests {
             micro_kv_block_size: 0,
             ..Default::default()
         };
+        let q0_positions = Tensor::arange(half, (Kind::Int64, device)).unsqueeze(0);
         let out0 = backend0
-            .ring_attention(&q0, &k0, &v0, Some(&mask), 0)
+            .ring_attention(&q0, &k0, &v0, &q0_positions, None, Some(&mask), 0)
             .unwrap();
 
         // Worker 1: receives peer KV from worker 0
@@ -2656,8 +2861,17 @@ mod tests {
             micro_kv_block_size: 0,
             ..Default::default()
         };
+        let q1_positions = Tensor::arange_start(half, seq_len, (Kind::Int64, device)).unsqueeze(0);
         let out1 = backend1
-            .ring_attention(&q1, &k1, &v1, Some(&mask), half as usize)
+            .ring_attention(
+                &q1,
+                &k1,
+                &v1,
+                &q1_positions,
+                None,
+                Some(&mask),
+                half as usize,
+            )
             .unwrap();
 
         // Compare each worker against expected slice before concatenation
@@ -2846,6 +3060,8 @@ mod tests {
                     &q_d[domain],
                     &k_d[domain],
                     &v_d[domain],
+                    &pos_d[domain],
+                    Some(&pos_d[domain]),
                     Some(&mask),
                     global_start,
                 )

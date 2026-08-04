@@ -259,6 +259,10 @@ impl KvCache for ReservedPositionedKvShard {
         Ok((self.active_k(), self.active_v()))
     }
 
+    fn committed_position_ids(&self) -> Option<Tensor> {
+        Some(self.position_tensor())
+    }
+
     fn update_sharded(
         &mut self,
         new_k: &Tensor,

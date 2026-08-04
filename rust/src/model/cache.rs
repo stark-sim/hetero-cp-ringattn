@@ -15,6 +15,12 @@ pub trait KvCache: Send {
         Ok(())
     }
 
+    /// Return the absolute positions aligned with the full K/V tensors from `update`.
+    /// Caches with an implicit contiguous layout keep the default `None` fallback.
+    fn committed_position_ids(&self) -> Option<Tensor> {
+        None
+    }
+
     /// Append new K/V tokens and return the full K/V tensors for attention compute.
     ///
     /// `new_k` / `new_v`: [batch, num_kv_heads, new_seq_len, head_dim]
@@ -31,7 +37,12 @@ pub trait KvCache: Send {
     /// 但返回值仍然是 [缓存内容; 新 token]，供当前 step 的 attention 使用。
     ///
     /// 默认实现忽略 `keep`（退化为全量复制的旧行为），保证未适配的缓存实现行为不变。
-    fn update_sharded(&mut self, new_k: &Tensor, new_v: &Tensor, keep: bool) -> Result<(Tensor, Tensor), ModelError> {
+    fn update_sharded(
+        &mut self,
+        new_k: &Tensor,
+        new_v: &Tensor,
+        keep: bool,
+    ) -> Result<(Tensor, Tensor), ModelError> {
         let _ = keep;
         self.update(new_k, new_v)
     }
@@ -90,7 +101,12 @@ impl KvCache for ContiguousKvCache {
     }
 
     /// 【分片更新】keep=false 时不持久化新 token，仅返回 [缓存内容; 新 token]。
-    fn update_sharded(&mut self, new_k: &Tensor, new_v: &Tensor, keep: bool) -> Result<(Tensor, Tensor), ModelError> {
+    fn update_sharded(
+        &mut self,
+        new_k: &Tensor,
+        new_v: &Tensor,
+        keep: bool,
+    ) -> Result<(Tensor, Tensor), ModelError> {
         if keep {
             return self.update(new_k, new_v);
         }
@@ -178,7 +194,10 @@ impl KvCache for BlockTableKvCache {
         let mut offset = 0i64;
 
         // Fill the last block if it has remaining space.
-        if self.last_block_used > 0 && self.last_block_used < self.block_size && !self.k_blocks.is_empty() {
+        if self.last_block_used > 0
+            && self.last_block_used < self.block_size
+            && !self.k_blocks.is_empty()
+        {
             let space = self.block_size - self.last_block_used;
             let take = remaining.min(space);
             if take > 0 {
@@ -212,11 +231,19 @@ impl KvCache for BlockTableKvCache {
 
         // Return full K/V by concatenating all blocks along seq_len dimension.
         let k_full = Tensor::cat(
-            &self.k_blocks.iter().map(|t| t.shallow_clone()).collect::<Vec<_>>(),
+            &self
+                .k_blocks
+                .iter()
+                .map(|t| t.shallow_clone())
+                .collect::<Vec<_>>(),
             2,
         );
         let v_full = Tensor::cat(
-            &self.v_blocks.iter().map(|t| t.shallow_clone()).collect::<Vec<_>>(),
+            &self
+                .v_blocks
+                .iter()
+                .map(|t| t.shallow_clone())
+                .collect::<Vec<_>>(),
             2,
         );
 
@@ -228,7 +255,12 @@ impl KvCache for BlockTableKvCache {
     }
 
     /// 【分片更新】keep=false 时不持久化新 token，仅返回 [所有 block; 新 token]。
-    fn update_sharded(&mut self, new_k: &Tensor, new_v: &Tensor, keep: bool) -> Result<(Tensor, Tensor), ModelError> {
+    fn update_sharded(
+        &mut self,
+        new_k: &Tensor,
+        new_v: &Tensor,
+        keep: bool,
+    ) -> Result<(Tensor, Tensor), ModelError> {
         if keep {
             return self.update(new_k, new_v);
         }
@@ -283,11 +315,17 @@ impl KvCacheImpl {
                     return None;
                 }
                 let k = Tensor::cat(
-                    &c.k_blocks.iter().map(|t| t.shallow_clone()).collect::<Vec<_>>(),
+                    &c.k_blocks
+                        .iter()
+                        .map(|t| t.shallow_clone())
+                        .collect::<Vec<_>>(),
                     2,
                 );
                 let v = Tensor::cat(
-                    &c.v_blocks.iter().map(|t| t.shallow_clone()).collect::<Vec<_>>(),
+                    &c.v_blocks
+                        .iter()
+                        .map(|t| t.shallow_clone())
+                        .collect::<Vec<_>>(),
                     2,
                 );
                 Some((k, v))
@@ -321,7 +359,20 @@ impl KvCache for KvCacheImpl {
         }
     }
 
-    fn update_sharded(&mut self, new_k: &Tensor, new_v: &Tensor, keep: bool) -> Result<(Tensor, Tensor), ModelError> {
+    fn committed_position_ids(&self) -> Option<Tensor> {
+        match self {
+            KvCacheImpl::Contiguous(c) => c.committed_position_ids(),
+            KvCacheImpl::BlockTable(c) => c.committed_position_ids(),
+            KvCacheImpl::ReservedPositioned(c) => c.committed_position_ids(),
+        }
+    }
+
+    fn update_sharded(
+        &mut self,
+        new_k: &Tensor,
+        new_v: &Tensor,
+        keep: bool,
+    ) -> Result<(Tensor, Tensor), ModelError> {
         match self {
             KvCacheImpl::Contiguous(c) => c.update_sharded(new_k, new_v, keep),
             KvCacheImpl::BlockTable(c) => c.update_sharded(new_k, new_v, keep),
@@ -539,7 +590,12 @@ mod tests {
             let share = (0..decode_steps)
                 .filter(|s| (global_prefill_len + s) % num_nodes == node)
                 .count();
-            assert_eq!(cache.seq_len(), prefill_chunk_len + share, "node {} durable len", node);
+            assert_eq!(
+                cache.seq_len(),
+                prefill_chunk_len + share,
+                "node {} durable len",
+                node
+            );
             total += cache.seq_len();
         }
         // 无缺口、无重复：所有节点 durable 之和 = 全局 token 数
