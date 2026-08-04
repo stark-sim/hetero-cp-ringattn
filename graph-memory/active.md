@@ -17,13 +17,6 @@ type: `decision` · status: `held` · confidence: 0.98 · importance: 1.0 · sou
 VERDICT: IMPLEMENT。用户于 2026-08-03 确认先完成 baseline，同时保留并继续实验 decode accumulator 路线。
 
 _updated: 2026-08-03 15:01:43_
-### Node 4b.1：建立 query/KV 双位置合同
-
-type: `task` · status: `in_progress` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-03`
-
-Node 4b.1：只建立 attention 的 P_Q/P_KV 双位置合同。KvCache 暴露 optional committed positions，ReservedPositioned 返回与 active K/V 等长的逻辑绝对位置；ring 的本地 causal、KvBlock metadata 与 peer merge 使用正确集合。先用一层非连续 history focused oracle 验证，不改 backend request 生命周期。
-
-_updated: 2026-08-03 15:01:43_
 ### Continuation baseline 不得覆盖 decode 自驱动环优势
 
 type: `preference` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-03`

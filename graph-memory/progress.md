@@ -2,6 +2,21 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### Node 4b.1 独立 query/KV 位置合同通过 RED/GREEN 与完整回归
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@82aca48`
+
+Node 4b.1 已建立 P_Q/P_KV 双位置合同并验证本地计算与 wire metadata：
+1. 数值 RED：旧实现运行 `DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib cargo test --features tch-backend ring_forward_uses_independent_query_and_committed_kv_positions -- --nocapture`，以 history positions [0,4]、query positions [3,5] 失败，max diff=0.6131259202957153。
+2. Wire RED：测试加入 successor 收包断言后，受控回退发送端到旧 self.position_ids，失败为 `committed KV positions missing`；证明测试能捕获 P_KV 未进入 KvBlock 的回归。
+3. Focused GREEN：恢复 committed P_KV 后同一 focused test 通过；successor 收到 position_ids=[0,4,3,5]，不是本轮 P_Q=[3,5]。
+4. 完整回归：`DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib cargo test --features tch-backend --lib` -> 111 passed, 0 failed, 3 ignored。
+5. 静态验证：`DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib cargo clippy --all-targets --features tch-backend --message-format short` exit 0；仅保留既有 warnings，新引入的 ring 参数数 lint 已显式限定允许。
+6. 格式与 diff：`rustfmt --edition 2021 --check rust/src/model/cache.rs rust/src/model/self_driving.rs rust/src/model/attention/ring.rs` exit 0；`git diff --check` exit 0。
+实现：KvCache 增加默认 None 的 committed_position_ids；ReservedPositionedKvShard 返回与 active K/V 对齐的绝对位置；KvCacheImpl 转发；ring_attention 分别切 P_Q 与 P_KV，本地 causal 和发送 KvBlock 均消费 P_KV。Contiguous/BlockTable 保持连续 fallback。未改变 request cache 生命周期。
+提交：31a2559 为 ring.rs 独立 rustfmt 基线；82aca48 为本节点实现。
+
+_updated: 2026-08-04 13:02:27_
 ### Continuation/extend 主流 cache 元数据一手资料审计
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `primary-source-audit-2026-08-03`
