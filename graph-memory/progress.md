@@ -2,6 +2,21 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-08-05] 24 层两 worker positioned continuation 复用 request cache
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@3aa7282`
+
+Node 4b.2 在提交 3aa7282 上完成实验性 Rust tch backend continuation baseline。
+1. 原始 RED：24 层、两 worker、1:3 initial prefill -> 一个按 1:3 layer-assignee 分布的 decode token -> 1:3 positioned continuation；旧实现失败为 `worker 0 layer 0 rebuilt its request cache`，证明同 request_id 再 prefill 会覆盖旧 RequestContext。
+2. phase RED：复用 context 后，小份 worker 的 continuation local seq_len=1 被误判为 decode accumulator，失败为 `reserved positioned KV decode must use the self-driving ring`。
+3. wire RED：只修 accumulator gate 后，continuation max diff=22.804737091064453；日志显示 peer 只收到 256 bytes。根因是 KV-ring 发送端仍以 local seq_len==1 只发送 initial prefill KV，漏掉 decode growth 和当前 continuation KV。
+4. GREEN：phase 改由 causal segment mask 区分；单 token 且无 mask 才是 decode，positioned continuation 即使 local len=1 也走 causal KV ring并发送完整 committed local KV。
+5. focused oracle：`DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib:/opt/homebrew/opt/libomp/lib cargo test --manifest-path rust/Cargo.toml --features tch-backend positioned_continuation_reuses_two_worker_reserved_request_cache -- --nocapture` -> 1 passed。24 层每层 reservation capacity 与 K/V storage pointer 不变；两 worker position union 精确为 0..=8；initial/decode/continuation logits 均与 contiguous reference max diff <1e-3。
+6. 完整验证：同环境 `cargo test --manifest-path rust/Cargo.toml --features tch-backend` -> library 112 passed, 0 failed, 3 ignored；所有 binaries 0 failed；doc tests 0 failed, 3 ignored。
+7. 静态验证：同环境 `cargo clippy --manifest-path rust/Cargo.toml --features tch-backend --all-targets --message-format short` exit 0，仅既有 warnings；`rustfmt --edition 2021 --check rust/src/model/model.rs rust/src/model/attention/ring.rs rust/src/worker_sdk/tch_backend.rs` 与 `git diff --check` exit 0。
+实现边界：同 request_id + explicit positions 复用 ReservedPositionedKvShard；无 explicit positions 的同 ID 重开被拒绝。未实现 runtime/coordinator 接线、多请求并发、失败原子回滚、真实模型/跨硬件验证、batched accumulator 或动态路线 planner。
+
+_updated: 2026-08-05 08:26:40_
 ### Node 4b.1 独立 query/KV 位置合同通过 RED/GREEN 与完整回归
 
 type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@82aca48`

@@ -2,6 +2,23 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### Prefill causality 必须由 phase 而非本地 seq_len 决定
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `layer-count-diagnosis-2026-08-03`
+
+【动机六问】
+1. 问题：24 层 1:3 initial prefill 在第 2 层开始大幅偏离 reference；worker0 的单 token shard 在第 1 层已经错误地看到 peer future KV。
+2. 现状：LlamaModel::forward 用 local seq_len > 1 决定是否传 attention_mask；worker0 local seq_len=1 因此 attention_mask=None。HcpRingAttentionBackend 仍交换 worker1 positions [1,2,3] 的 KV；没有 causal flag 时 position 0 会参与所有 future KV。诊断证据：1 层 worker1 last max diff=1.2e-7，但 worker0 position0 max diff=0.0966；2 层 worker1 last diff 跳到 0.0175。
+3. 目标：任何 is_prefill=true 的 forward 都启用 causal semantics，即使本地 shard 只有 1 token；独立 2 层、两 worker、1:3 TCP prefill 的两个 shard logits 与 contiguous reference 在 float 阈值内对齐；24 层 Node 4b initial assertion越过。
+4. 他者：vLLM/PagedAttention 等 runtime 通过 attention metadata、query lengths 和 explicit prefill/decode phase 选择 causal kernel，不从某个 rank 的 local token count 推断全局 phase。其完整 metadata 系统不适合当前小节点，但“phase 显式支配 mask”原则可直接复用。
+5. 本方案：复用 LlamaModel::forward 已有的 is_prefill 局部变量，把 attention_mask 条件从 seq_len > 1 改为 is_prefill；distributed 或超长 shard 仍使用 1x1 dummy，仅作为 ring causal flag；普通单 token prefill 的 1x1 dense mask数学等价于无 mask。
+6. 为什么：这是修复已确认 root cause 的一行语义变化，不需要提前引入 ForwardMode enum；仅在 ring 层猜 seq_offset/local length 无法可靠识别全局 phase。continuation 的 is_prefill 扩展仍由 Node 4b 后续处理。
+【边界】本节点只修 initial prefill local length=1，不实现 continuation cache 复用、Q/KV position 分离或零 token shard。
+VERDICT: IMPLEMENT。
+
+[2026-08-05 follow-up] 3aa7282 将同一原则扩展到 positioned continuation：capacity-weighted worker 的 continuation local len 也可能为 1；causal segment mask 现在同时约束 accumulator gate 与 KV 发送范围，不能再由 local seq_len 推断 phase。
+
+_updated: 2026-08-05 08:31:10_
 ### HCP continuation 采用 P_Q/P_KV 双位置合同并复用 request cache
 
 type: `decision` · status: `held` · confidence: 0.98 · importance: 1.0 · source: `user-confirmed-2026-08-03`
@@ -60,21 +77,6 @@ type: `preference` · status: `held` · confidence: 1.0 · importance: 1.0 · so
 用户确认：我们新增或修改 Rust 代码后先运行 rustfmt，再检查 git diff、验证和提交。业务等价但文本格式不同不应跨节点传播；多节点源码同步以格式化后的 Git commit/remote 为唯一通道，不额外复制源码。历史大范围格式债若会污染业务提交，先做独立纯格式基线提交。
 
 _updated: 2026-08-03 05:09:31_
-### Prefill causality 必须由 phase 而非本地 seq_len 决定
-
-type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `layer-count-diagnosis-2026-08-03`
-
-【动机六问】
-1. 问题：24 层 1:3 initial prefill 在第 2 层开始大幅偏离 reference；worker0 的单 token shard 在第 1 层已经错误地看到 peer future KV。
-2. 现状：LlamaModel::forward 用 local seq_len > 1 决定是否传 attention_mask；worker0 local seq_len=1 因此 attention_mask=None。HcpRingAttentionBackend 仍交换 worker1 positions [1,2,3] 的 KV；没有 causal flag 时 position 0 会参与所有 future KV。诊断证据：1 层 worker1 last max diff=1.2e-7，但 worker0 position0 max diff=0.0966；2 层 worker1 last diff 跳到 0.0175。
-3. 目标：任何 is_prefill=true 的 forward 都启用 causal semantics，即使本地 shard 只有 1 token；独立 2 层、两 worker、1:3 TCP prefill 的两个 shard logits 与 contiguous reference 在 float 阈值内对齐；24 层 Node 4b initial assertion越过。
-4. 他者：vLLM/PagedAttention 等 runtime 通过 attention metadata、query lengths 和 explicit prefill/decode phase 选择 causal kernel，不从某个 rank 的 local token count 推断全局 phase。其完整 metadata 系统不适合当前小节点，但“phase 显式支配 mask”原则可直接复用。
-5. 本方案：复用 LlamaModel::forward 已有的 is_prefill 局部变量，把 attention_mask 条件从 seq_len > 1 改为 is_prefill；distributed 或超长 shard 仍使用 1x1 dummy，仅作为 ring causal flag；普通单 token prefill 的 1x1 dense mask数学等价于无 mask。
-6. 为什么：这是修复已确认 root cause 的一行语义变化，不需要提前引入 ForwardMode enum；仅在 ring 层猜 seq_offset/local length 无法可靠识别全局 phase。continuation 的 is_prefill 扩展仍由 Node 4b 后续处理。
-【边界】本节点只修 initial prefill local length=1，不实现 continuation cache 复用、Q/KV position 分离或零 token shard。
-VERDICT: IMPLEMENT。
-
-_updated: 2026-08-03 04:30:48_
 ### 同步 TCP submit 必须同步写 socket
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `controlled-comparison-2026-08-03`
@@ -116,20 +118,6 @@ type: `risk` · status: `superseded` · confidence: 1.0 · importance: 1.0 · so
 3. self-driving decode 按 layer assignee append 后，每个 worker 的 ReservedPositionedKvShard positions 不再是单一连续区间。
 4. HcpRingAttentionBackend prefill 仍以 seq_offset/global_seq_start 解释整个 local K/V；KvBlock 虽有 position_ids 字段，但当前 QUIC/TCP KV codec 没有传递它。
 因此直接把第二段 prompt 送进现有 Prefill/Decode 会重置或错误掩码。先建立 positioned KV wire + continuation segment forward 才能继续 runtime 接线。
-
-_updated: 2026-08-03 02:47:51_
-### Continuation segment 必须分离 Q positions 与完整 KV positions
-
-type: `risk` · status: `open` · confidence: 1.0 · importance: 1.0 · source: `code-audit-2026-08-03`
-
-Node 4a 已证明 TCP/QUIC 可以传递 KvBlock.position_ids，剩余 blocker 是计算语义：TchWorkerBackend::do_prefill 对同一 request 仍重建 cache；LlamaModel::forward 在 is_prefill_done=true 时把任意输入当单-token decode；HcpRingAttentionBackend 只有一个 position_ids 状态，而 continuation 的本次 Q positions 长度只等于新增 segment，KV positions 必须覆盖 ReservedPositionedKvShard 中 initial prefill + layer-assigned decode + continuation 的完整本地历史。若继续使用连续区间或同一个向量，causal mask 与 peer KV metadata 会错误。
-
-_updated: 2026-08-03 02:47:51_
-### Node 4b：Reserved positioned continuation prefill backend
-
-type: `task` · status: `in_progress` · confidence: 1.0 · importance: 1.0 · source: `user-confirmation-2026-08-03`
-
-让同一 request_id 的第二次 reserved prefill 复用既有 RequestContext 和 ReservedPositionedKvShard，只投影新增 prompt segment，并让 ring attention 使用本次 Q positions 与完整本地 KV positions。用 24 层、两 worker、1:3 context split 的 synthetic Qwen/Llama 结构验证 initial prefill -> 一次 layer-assigned self-driving decode -> continuation prefill 与 contiguous reference 对齐。范围不包含 WorkerCommand、WorkerRuntime、coordinator、跨主机、真实权重或 continuation 后再次 decode。
 
 _updated: 2026-08-03 02:47:51_
 ### 复用 request-aware reserved prefill API 执行显式 positioned segment
@@ -692,13 +680,6 @@ B. vLLM decode ≥2 并发+增长分片保持(修 004,PoC 最小要求);
 C. Rust decode 移植 Q+LSE 累积器环+增长分片(修 007+008)。
 
 _updated: 2026-07-27 15:10:25_
-### Node 4b.2：复用 request cache 执行 positioned segment
-
-type: `task` · status: `planning` · confidence: 1.0 · importance: 0.99 · source: `analysis-2026-08-03`
-
-Node 4b.2：在 4b.1 通过后，让同一 request_id 的 explicit positioned prefill 复用 RequestContext/ReservedPositioned reservation，并让 one-shot explicit positions 触发 causal segment forward。用 24 层、两 worker、1:3 initial -> layer-assigned decode -> continuation acceptance 收口；不接 runtime。
-
-_updated: 2026-08-03 09:14:32_
 ### Baseline 后实验 batched Q/O/LSE continuation ring
 
 type: `task` · status: `planning` · confidence: 0.95 · importance: 0.98 · source: `user-confirmed-2026-08-03`
