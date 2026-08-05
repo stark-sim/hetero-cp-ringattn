@@ -2025,6 +2025,60 @@ mod tests {
             .unsqueeze(0)
     }
 
+    /// Attention-level contract for a batched positioned accumulator packet.
+    /// Routing metadata such as layer index is deliberately outside this
+    /// test-only contract; the tensors are the history-independent payload.
+    #[cfg(feature = "tch-backend")]
+    struct BatchedPositionedAccumulatorPacket {
+        q: Tensor,
+        q_positions: Tensor,
+        o: Tensor,
+        lse: Tensor,
+    }
+
+    #[cfg(feature = "tch-backend")]
+    impl BatchedPositionedAccumulatorPacket {
+        fn seed(
+            backend: &HcpRingAttentionBackend,
+            q: &Tensor,
+            q_positions: &Tensor,
+            k: &Tensor,
+            v: &Tensor,
+            k_positions: &Tensor,
+        ) -> Self {
+            let (o, lse) =
+                backend.positioned_local_compact_partial(q, q_positions, k, v, k_positions);
+            Self {
+                q: q.shallow_clone(),
+                q_positions: q_positions.shallow_clone(),
+                o,
+                lse,
+            }
+        }
+
+        fn merge(
+            &mut self,
+            backend: &HcpRingAttentionBackend,
+            k: &Tensor,
+            v: &Tensor,
+            k_positions: &Tensor,
+        ) {
+            (self.o, self.lse) = backend.positioned_merge_compact_partial(
+                &self.q,
+                &self.q_positions,
+                &self.o,
+                &self.lse,
+                k,
+                v,
+                k_positions,
+            );
+        }
+
+        fn tensor_payload_elements(&self) -> usize {
+            self.q.numel() + self.q_positions.numel() + self.o.numel() + self.lse.numel()
+        }
+    }
+
     /// 【验证 process_kv_block 非因果模式与标准 softmax 等价】
     ///
     /// 这个测试验证：当 apply_causal_mask=false 时，process_kv_block 的 online softmax
@@ -2257,6 +2311,150 @@ mod tests {
         assert!(
             max_diff < 1e-5,
             "ring forward confused query positions with committed KV positions: max diff={max_diff}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "tch-backend")]
+    fn batched_positioned_accumulator_matches_causal_reference_without_history_payload() {
+        let device = Device::Cpu;
+        let batch = 1i64;
+        let num_heads = 2i64;
+        let head_dim = 4i64;
+        let num_domains = 3usize;
+        let scale = 1.0 / (head_dim as f64).sqrt();
+
+        tch::manual_seed(20260805);
+        let backend = HcpRingAttentionBackend {
+            q_proj: Tensor::zeros([1, 1], (Kind::Float, device)),
+            k_proj: Tensor::zeros([1, 1], (Kind::Float, device)),
+            v_proj: Tensor::zeros([1, 1], (Kind::Float, device)),
+            o_proj: Tensor::zeros([1, 1], (Kind::Float, device)),
+            q_bias: None,
+            k_bias: None,
+            v_bias: None,
+            rope: crate::model::layers::RotaryEmbedding::new(
+                head_dim as usize,
+                64,
+                10_000.0,
+                device,
+            ),
+            num_heads: num_heads as usize,
+            num_kv_heads: num_heads as usize,
+            head_dim: head_dim as usize,
+            scale,
+            num_domains,
+            ..Default::default()
+        };
+
+        // This node is deliberately a single-request contract (B=1). Multi-request
+        // batching changes scheduling and is a later service-layer node.
+        let run_case = |total_kv_len: i64, query_len: i64| -> (usize, usize) {
+            let q = Tensor::randn(
+                [batch, num_heads, query_len, head_dim],
+                (Kind::Float, device),
+            );
+            let all_k = Tensor::randn(
+                [batch, num_heads, total_kv_len, head_dim],
+                (Kind::Float, device),
+            );
+            let all_v = Tensor::randn(
+                [batch, num_heads, total_kv_len, head_dim],
+                (Kind::Float, device),
+            );
+            let all_positions = Tensor::arange(total_kv_len, (Kind::Int64, device));
+            let q_positions = Tensor::arange_start(
+                total_kv_len - query_len,
+                total_kv_len,
+                (Kind::Int64, device),
+            )
+            .unsqueeze(0);
+
+            let causal = q_positions
+                .view([-1])
+                .unsqueeze(1)
+                .ge_tensor(&all_positions.unsqueeze(0));
+            let scores = (q.matmul(&all_k.transpose(2, 3)) * scale).masked_fill(
+                &causal.logical_not().unsqueeze(0).unsqueeze(0),
+                f64::NEG_INFINITY,
+            );
+            let expected_lse = scores.logsumexp(-1, false);
+            let expected = scores.softmax(-1, Kind::Float).matmul(&all_v);
+
+            let shards = (0..num_domains)
+                .map(|domain| {
+                    let positions = (domain as i64..total_kv_len)
+                        .step_by(num_domains)
+                        .collect::<Vec<_>>();
+                    let position_tensor = Tensor::from_slice(&positions).to_device(device);
+                    (
+                        all_k.index_select(2, &position_tensor),
+                        all_v.index_select(2, &position_tensor),
+                        position_tensor,
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            let mut payload_elements = None;
+            for starter in 0..num_domains {
+                let (seed_k, seed_v, seed_positions) = &shards[starter];
+                let mut packet = BatchedPositionedAccumulatorPacket::seed(
+                    &backend,
+                    &q,
+                    &q_positions,
+                    seed_k,
+                    seed_v,
+                    seed_positions,
+                );
+                for hop in 1..num_domains {
+                    let domain = (starter + hop) % num_domains;
+                    let (k, v, positions) = &shards[domain];
+                    packet.merge(&backend, k, v, positions);
+                }
+
+                let max_diff = (&packet.o - &expected).abs().max().double_value(&[]);
+                assert!(
+                    max_diff < 1e-5,
+                    "starter {starter} batched accumulator max diff: {max_diff}"
+                );
+                let lse_diff = (&packet.lse - &expected_lse).abs().max().double_value(&[]);
+                assert!(
+                    lse_diff < 1e-5,
+                    "starter {starter} batched accumulator LSE max diff: {lse_diff}"
+                );
+
+                let current_payload = packet.tensor_payload_elements();
+                assert_eq!(
+                    current_payload,
+                    (q.numel() * 2) + q_positions.numel() + packet.lse.numel()
+                );
+                assert_eq!(
+                    payload_elements.get_or_insert(current_payload),
+                    &current_payload,
+                    "starter rotation must not change the packet shape"
+                );
+            }
+
+            let resident_kv_elements = all_k.numel() + all_v.numel();
+            (payload_elements.unwrap(), resident_kv_elements)
+        };
+
+        let (short_payload_m2, _) = run_case(12, 2);
+        let (short_payload_m3, short_history_kv) = run_case(12, 3);
+        let (long_payload_m3, long_history_kv) = run_case(24, 3);
+        assert_eq!(
+            short_payload_m3, long_payload_m3,
+            "fixed query length must produce history-independent accumulator payload"
+        );
+        assert_eq!(
+            long_history_kv,
+            short_history_kv * 2,
+            "the control cases must actually use different history sizes"
+        );
+        assert_eq!(
+            short_payload_m3,
+            short_payload_m2 * 3 / 2,
+            "accumulator payload must scale linearly with query length"
         );
     }
 
