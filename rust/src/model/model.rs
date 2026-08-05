@@ -216,10 +216,12 @@ impl LlamaModel {
         }
 
         // Position IDs: [batch, seq_len]
-        let is_prefill = !self.is_prefill_done;
-        let position_ids = if is_prefill {
-            // Prefill: use explicit position ids for non-contiguous scheduling
-            // (Striped / ZigZag), otherwise fall back to sequential positions.
+        let is_initial_prefill = !self.is_prefill_done;
+        let is_positioned_segment = self.prefill_position_ids.is_some();
+        let is_causal_segment = is_initial_prefill || is_positioned_segment;
+        let position_ids = if is_causal_segment {
+            // Initial prefill and positioned continuation segments both carry
+            // multiple queries and therefore require explicit causal handling.
             if let Some(pos_ids) = self.prefill_position_ids.take() {
                 let max_pos = pos_ids.max().int64_value(&[]);
                 // Guard: prevent position_ids from exceeding RoPE cache / model capacity.
@@ -231,7 +233,7 @@ impl LlamaModel {
                         )));
                     }
                 }
-                self.global_seq_len = (max_pos + 1) as usize;
+                self.global_seq_len = self.global_seq_len.max((max_pos + 1) as usize);
                 self.is_prefill_done = true;
                 pos_ids.unsqueeze(0).repeat([batch, 1])
             } else {
@@ -264,11 +266,11 @@ impl LlamaModel {
                 .repeat([batch, 1])
         };
 
-        // Causal mask for prefill (not needed for single-token decode)
+        // Causal mask for prefill/continuation segments (not needed for single-token decode)
         // For distributed inference, ring_attention only checks is_some() and
         // implements causality via global position comparison; it never reads
         // the dense mask tensor. Use a tiny dummy to avoid O(seq_len²) allocation.
-        let attention_mask = if is_prefill {
+        let attention_mask = if is_causal_segment {
             // For long sequences or distributed mode, skip O(seq_len²) dense mask.
             // HcpRingAttentionBackend implements causality via position comparison
             // and never reads the mask tensor data; it only checks is_some().
@@ -300,7 +302,7 @@ impl LlamaModel {
         }
 
         // Increment global_seq_len after decode step only
-        if !is_prefill {
+        if !is_causal_segment {
             self.global_seq_len += 1;
         }
 

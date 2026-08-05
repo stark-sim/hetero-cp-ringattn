@@ -930,7 +930,8 @@ impl HcpRingAttentionBackend {
         // ====== 准备本地 KV micro blocks ======
         let has_transport = self.kv_transport.is_some();
         let local_micro_blocks: Vec<KvBlock> = if has_transport {
-            let (k_to_send, v_to_send, _send_seq_end) = if seq_len == 1 {
+            let is_single_token_decode = seq_len == 1 && attention_mask.is_none();
+            let (k_to_send, v_to_send, _send_seq_end) = if is_single_token_decode {
                 let history_len = self.prefill_kv_len as i64;
                 (
                     k.narrow(2, 0, history_len),
@@ -1850,10 +1851,13 @@ impl AttentionBackend for HcpRingAttentionBackend {
         //
         // 在 prefill 阶段（第一次处理完整 prompt），kv_cache 为 None，直接返回当前 K/V。
         //
-        // 【decode Q-ring gate】seq_len == 1 且启用 Q-ring 且 transport 支持 packet 时，
+        // 【decode Q-ring gate】单 token、无 causal segment mask，且启用 Q-ring 与 packet
+        // transport 时才进入 decode accumulator。一个 worker 的 positioned continuation
+        // 即使本地只有一个 token，也必须留在 causal KV-ring segment 路径。
         // 本 step 走 (Q, O, LSE) 累加器环：growth KV 按 global_pos % num_domains 分片，
         // 归属节点持久化新 token，其余节点直接丢弃（零传输）。
         let use_decode_ring = seq_len == 1
+            && attention_mask.is_none()
             && self.decode_ring
             && self.num_domains > 1
             && self.is_prefill_done

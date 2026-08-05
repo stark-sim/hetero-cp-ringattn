@@ -192,6 +192,130 @@ impl TchWorkerBackend {
         Ok((logits_vec, self.model.global_seq_len))
     }
 
+    fn do_request_prefill(
+        &mut self,
+        request_id: u64,
+        chunk: &[i64],
+        seq_offset: usize,
+        position_ids: Option<&[i64]>,
+        layer_kv_capacities: Option<&[usize]>,
+    ) -> Result<(Vec<f32>, usize), String> {
+        if self.request_contexts.contains_key(&request_id) {
+            let positions = position_ids.ok_or_else(|| {
+                format!(
+                    "request {request_id} already exists; positioned continuation requires explicit position_ids"
+                )
+            })?;
+            return self.do_positioned_continuation(
+                request_id,
+                chunk,
+                positions,
+                layer_kv_capacities,
+            );
+        }
+
+        let (logits_vec, global_seq_len) =
+            self.do_prefill(chunk, seq_offset, position_ids, layer_kv_capacities)?;
+        self.request_contexts.insert(
+            request_id,
+            RequestContext {
+                kv_caches: std::mem::replace(&mut self.kv_caches, self.model.create_kv_caches()),
+                global_seq_len: self.model.global_seq_len,
+                is_prefill_done: self.model.is_prefill_done,
+            },
+        );
+        Ok((logits_vec, global_seq_len))
+    }
+
+    fn do_positioned_continuation(
+        &mut self,
+        request_id: u64,
+        chunk: &[i64],
+        position_ids: &[i64],
+        layer_kv_capacities: Option<&[usize]>,
+    ) -> Result<(Vec<f32>, usize), String> {
+        if chunk.is_empty() || chunk.len() != position_ids.len() {
+            return Err(format!(
+                "request {request_id} positioned continuation requires one position per token"
+            ));
+        }
+
+        let context = self
+            .request_contexts
+            .get(&request_id)
+            .ok_or_else(|| format!("request {request_id} not found"))?;
+        if !context.is_prefill_done {
+            return Err(format!(
+                "request {request_id} cannot continue before initial prefill completes"
+            ));
+        }
+        if let Some(capacities) = layer_kv_capacities {
+            if capacities.len() != context.kv_caches.len() {
+                return Err(format!(
+                    "positioned continuation requires {} layer capacities, got {}",
+                    context.kv_caches.len(),
+                    capacities.len()
+                ));
+            }
+        }
+        for (layer_idx, cache) in context.kv_caches.iter().enumerate() {
+            let Some(KvCacheImpl::ReservedPositioned(shard)) = cache else {
+                return Err(format!(
+                    "request {request_id} layer {layer_idx} does not have reserved positioned KV"
+                ));
+            };
+            if shard.committed_len() + chunk.len() > shard.reserved_capacity() {
+                return Err(format!(
+                    "request {request_id} layer {layer_idx} continuation exceeds reserved capacity"
+                ));
+            }
+            if position_ids
+                .iter()
+                .any(|position| shard.positions().contains(position))
+            {
+                return Err(format!(
+                    "request {request_id} layer {layer_idx} continuation reuses a committed position"
+                ));
+            }
+            if let Some(capacities) = layer_kv_capacities {
+                if shard.reserved_capacity() != capacities[layer_idx] {
+                    return Err(format!(
+                        "request {request_id} layer {layer_idx} reservation is {}, got continuation capacity {}",
+                        shard.reserved_capacity(),
+                        capacities[layer_idx]
+                    ));
+                }
+            }
+        }
+
+        let context = self
+            .request_contexts
+            .get_mut(&request_id)
+            .ok_or_else(|| format!("request {request_id} not found"))?;
+        self.model.global_seq_len = context.global_seq_len;
+        self.model.is_prefill_done = context.is_prefill_done;
+        self.model.prefill_position_ids = None;
+        self.model
+            .set_prefill_position_ids(position_ids, self.device);
+
+        let input = Tensor::from_slice(chunk)
+            .unsqueeze(0)
+            .to_device(self.device);
+        let logits_result = self
+            .model
+            .forward(&input, &mut context.kv_caches)
+            .map_err(|e| format!("positioned continuation forward failed: {e}"));
+        self.model.prefill_position_ids = None;
+        context.global_seq_len = self.model.global_seq_len;
+        context.is_prefill_done = self.model.is_prefill_done;
+
+        let logits = logits_result?;
+        let last_logits = logits.narrow(1, logits.size()[1] - 1, 1).squeeze();
+        let logits_vec: Vec<f32> = Vec::try_from(&last_logits)
+            .map_err(|e| format!("continuation logits to vec failed: {e}"))?;
+        Ok((logits_vec, context.global_seq_len))
+    }
+
     // Note: do_decode removed to avoid borrow checker issues.
     // decode() and decode_request() inline the small forward logic directly.
 }
@@ -232,7 +356,8 @@ impl WorkerBackend for TchWorkerBackend {
         Ok(logits_vec)
     }
 
-    /// Request-aware prefill: creates an isolated `RequestContext` for the given request_id.
+    /// Request-aware prefill creates a context, or extends an existing reserved context
+    /// when explicit continuation positions are supplied.
     fn prefill_request(
         &mut self,
         request_id: u64,
@@ -240,20 +365,7 @@ impl WorkerBackend for TchWorkerBackend {
         seq_offset: usize,
         position_ids: Option<&[i64]>,
     ) -> Result<(Vec<f32>, usize), String> {
-        let (logits_vec, global_seq_len) =
-            self.do_prefill(chunk, seq_offset, position_ids, None)?;
-
-        // Save the freshly computed KV cache and model state into per-request context.
-        self.request_contexts.insert(
-            request_id,
-            RequestContext {
-                kv_caches: std::mem::replace(&mut self.kv_caches, self.model.create_kv_caches()),
-                global_seq_len: self.model.global_seq_len,
-                is_prefill_done: self.model.is_prefill_done,
-            },
-        );
-
-        Ok((logits_vec, global_seq_len))
+        self.do_request_prefill(request_id, chunk, seq_offset, position_ids, None)
     }
 
     fn prefill_request_with_reservation(
@@ -264,19 +376,13 @@ impl WorkerBackend for TchWorkerBackend {
         position_ids: Option<&[i64]>,
         layer_kv_capacities: Option<&[usize]>,
     ) -> Result<(Vec<f32>, usize), String> {
-        let (logits_vec, global_seq_len) =
-            self.do_prefill(chunk, seq_offset, position_ids, layer_kv_capacities)?;
-
-        self.request_contexts.insert(
+        self.do_request_prefill(
             request_id,
-            RequestContext {
-                kv_caches: std::mem::replace(&mut self.kv_caches, self.model.create_kv_caches()),
-                global_seq_len: self.model.global_seq_len,
-                is_prefill_done: self.model.is_prefill_done,
-            },
-        );
-
-        Ok((logits_vec, global_seq_len))
+            chunk,
+            seq_offset,
+            position_ids,
+            layer_kv_capacities,
+        )
     }
 
     /// Request-aware decode: uses the request's isolated KV cache.
@@ -816,6 +922,256 @@ mod tests {
             .double_value(&[]);
         assert!(first_diff < 1e-3, "first-position max diff: {first_diff}");
         assert!(last_diff < 1e-3, "last-position max diff: {last_diff}");
+    }
+
+    #[test]
+    fn positioned_continuation_reuses_two_worker_reserved_request_cache() {
+        let device = Device::Cpu;
+        let config = ModelConfig {
+            architectures: Some(vec!["LlamaForCausalLM".to_string()]),
+            hidden_size: 32,
+            num_layers: 24,
+            num_heads: 4,
+            num_kv_heads: Some(1),
+            intermediate_size: 64,
+            vocab_size: 100,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-6,
+            tie_word_embeddings: false,
+            torch_dtype: Some("float32".to_string()),
+            hidden_act: "silu".to_string(),
+            max_position_embeddings: Some(128),
+            attention_dropout: 0.0,
+            bos_token_id: None,
+            eos_token_id: None,
+            use_cache: true,
+            sliding_window: None,
+            use_sliding_window: None,
+            partial_rotary_factor: 1.0,
+        };
+        let weights = create_synthetic_weights(&config, device);
+        let mut reference = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+        let mut backend0 = TchWorkerBackend::from_model(
+            LlamaModel::from_weights(config.clone(), &weights, device, 2).unwrap(),
+            device,
+            0,
+        );
+        let mut backend1 = TchWorkerBackend::from_model(
+            LlamaModel::from_weights(config.clone(), &weights, device, 2).unwrap(),
+            device,
+            1,
+        );
+
+        let mut transports0: Vec<Box<dyn KvTransport>> = Vec::with_capacity(config.num_layers);
+        let mut transports1: Vec<Box<dyn KvTransport>> = Vec::with_capacity(config.num_layers);
+        for _ in 0..config.num_layers {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let stream0 = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let stream1 = listener.accept().unwrap().0;
+            transports0.push(Box::new(
+                crate::model::transport::TcpKvTransport::new(stream0, device).unwrap(),
+            ));
+            transports1.push(Box::new(
+                crate::model::transport::TcpKvTransport::new(stream1, device).unwrap(),
+            ));
+        }
+        backend0.setup_kv_transports(transports0);
+        backend1.setup_kv_transports(transports1);
+
+        let request_id = 81;
+        let initial_prompt = [3_i64, 5, 7, 9];
+        let continuation_prompt = [11_i64, 13, 17, 19];
+        let schedule = FrozenKvAssigneeSchedule::new(&[1, 3], request_id, config.num_layers)
+            .expect("one decode token must have a complete assignee schedule");
+        assert_eq!(schedule.counts(), &[6, 18]);
+        let assignees = (0..config.num_layers)
+            .map(|layer_idx| {
+                schedule
+                    .assignee_for(0, layer_idx, config.num_layers)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let capacities0 = assignees
+            .iter()
+            .map(|&assignee| 1 + usize::from(assignee == 0) + 1)
+            .collect::<Vec<_>>();
+        let capacities1 = assignees
+            .iter()
+            .map(|&assignee| 3 + usize::from(assignee == 1) + 3)
+            .collect::<Vec<_>>();
+
+        let mut reference_caches = reference.create_kv_caches();
+        let reference_prefill_logits = reference
+            .forward(
+                &Tensor::from_slice(&initial_prompt).unsqueeze(0),
+                &mut reference_caches,
+            )
+            .unwrap()
+            .select(1, initial_prompt.len() as i64 - 1)
+            .squeeze();
+        let (_, (distributed_prefill_logits, _)) = std::thread::scope(|scope| {
+            let worker0 = scope.spawn(|| {
+                backend0.prefill_request_with_reservation(
+                    request_id,
+                    &initial_prompt[..1],
+                    0,
+                    Some(&[0]),
+                    Some(&capacities0),
+                )
+            });
+            let worker1 = scope.spawn(|| {
+                backend1.prefill_request_with_reservation(
+                    request_id,
+                    &initial_prompt[1..],
+                    1,
+                    Some(&[1, 2, 3]),
+                    Some(&capacities1),
+                )
+            });
+            (
+                worker0.join().unwrap().unwrap(),
+                worker1.join().unwrap().unwrap(),
+            )
+        });
+        let distributed_prefill_logits = Tensor::from_slice(&distributed_prefill_logits);
+        let prefill_diff = (&distributed_prefill_logits - &reference_prefill_logits)
+            .abs()
+            .max()
+            .double_value(&[]);
+        assert!(
+            prefill_diff < 1e-3,
+            "initial prefill max diff: {prefill_diff}"
+        );
+
+        let decode_token = distributed_prefill_logits
+            .argmax(-1, false)
+            .int64_value(&[]);
+        let mut backends = vec![backend0, backend1];
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream0 = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let stream1 = listener.accept().unwrap().0;
+        let mut decode_transports = vec![
+            crate::model::transport::TcpKvTransport::new(stream0, device).unwrap(),
+            crate::model::transport::TcpKvTransport::new(stream1, device).unwrap(),
+        ];
+        let (distributed_decode_logits, _, hops, _) = run_two_backend_reserved_tcp_decode(
+            &mut backends,
+            &mut decode_transports,
+            request_id,
+            decode_token,
+            initial_prompt.len() as i64,
+            1,
+            &assignees,
+        );
+        assert_eq!(hops, config.num_layers);
+        let reference_decode_logits = reference
+            .forward(
+                &Tensor::from_slice(&[decode_token]).unsqueeze(0),
+                &mut reference_caches,
+            )
+            .unwrap()
+            .squeeze();
+        let decode_diff = (&distributed_decode_logits.squeeze() - &reference_decode_logits)
+            .abs()
+            .max()
+            .double_value(&[]);
+        assert!(decode_diff < 1e-3, "decode max diff: {decode_diff}");
+
+        let storage_before = backends
+            .iter()
+            .map(|backend| {
+                let context = backend.request_contexts.get(&request_id).unwrap();
+                context
+                    .kv_caches
+                    .iter()
+                    .map(|cache| {
+                        let Some(KvCacheImpl::ReservedPositioned(shard)) = cache else {
+                            panic!("mixed-history cache must remain reserved positioned KV");
+                        };
+                        (
+                            shard.active_k().data_ptr() as usize,
+                            shard.active_v().data_ptr() as usize,
+                            shard.reserved_capacity(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        let ((_, global_len0), (continuation_logits, global_len1)) = {
+            let (left, right) = backends.split_at_mut(1);
+            std::thread::scope(|scope| {
+                let worker0 = scope.spawn(|| {
+                    left[0].prefill_request_with_reservation(
+                        request_id,
+                        &continuation_prompt[..1],
+                        5,
+                        Some(&[5]),
+                        None,
+                    )
+                });
+                let worker1 = scope.spawn(|| {
+                    right[0].prefill_request_with_reservation(
+                        request_id,
+                        &continuation_prompt[1..],
+                        6,
+                        Some(&[6, 7, 8]),
+                        None,
+                    )
+                });
+                (
+                    worker0.join().unwrap().unwrap(),
+                    worker1.join().unwrap().unwrap(),
+                )
+            })
+        };
+        assert_eq!(global_len0, 6);
+        assert_eq!(global_len1, 9);
+
+        for layer_idx in 0..config.num_layers {
+            let mut positions = Vec::new();
+            for domain in 0..2 {
+                let context = backends[domain].request_contexts.get(&request_id).unwrap();
+                let Some(KvCacheImpl::ReservedPositioned(shard)) = &context.kv_caches[layer_idx]
+                else {
+                    panic!("worker {domain} layer {layer_idx} rebuilt its request cache");
+                };
+                assert_eq!(
+                    shard.active_k().data_ptr() as usize,
+                    storage_before[domain][layer_idx].0
+                );
+                assert_eq!(
+                    shard.active_v().data_ptr() as usize,
+                    storage_before[domain][layer_idx].1
+                );
+                assert_eq!(
+                    shard.reserved_capacity(),
+                    storage_before[domain][layer_idx].2
+                );
+                positions.extend_from_slice(shard.positions());
+            }
+            positions.sort_unstable();
+            assert_eq!(positions, (0_i64..=8).collect::<Vec<_>>());
+        }
+
+        reference.set_prefill_position_ids(&[5, 6, 7, 8], device);
+        let reference_continuation_logits = reference
+            .forward(
+                &Tensor::from_slice(&continuation_prompt).unsqueeze(0),
+                &mut reference_caches,
+            )
+            .unwrap()
+            .select(1, continuation_prompt.len() as i64 - 1)
+            .squeeze();
+        let continuation_diff = (Tensor::from_slice(&continuation_logits)
+            - reference_continuation_logits)
+            .abs()
+            .max()
+            .double_value(&[]);
+        assert!(
+            continuation_diff < 1e-3,
+            "continuation max diff: {continuation_diff}"
+        );
     }
 
     #[test]
