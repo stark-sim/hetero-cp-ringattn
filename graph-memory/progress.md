@@ -13,10 +13,10 @@ Node 4b.2 在提交 3aa7282 上完成实验性 Rust tch backend continuation bas
 4. GREEN：phase 改由 causal segment mask 区分；单 token 且无 mask 才是 decode，positioned continuation 即使 local len=1 也走 causal KV ring并发送完整 committed local KV。
 5. focused oracle：`DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib:/opt/homebrew/opt/libomp/lib cargo test --manifest-path rust/Cargo.toml --features tch-backend positioned_continuation_reuses_two_worker_reserved_request_cache -- --nocapture` -> 1 passed。24 层每层 reservation capacity 与 K/V storage pointer 不变；两 worker position union 精确为 0..=8；initial/decode/continuation logits 均与 contiguous reference max diff <1e-3。
 6. 完整验证：同环境 `cargo test --manifest-path rust/Cargo.toml --features tch-backend` -> library 112 passed, 0 failed, 3 ignored；所有 binaries 0 failed；doc tests 0 failed, 3 ignored。
-7. 静态验证：同环境 `cargo clippy --manifest-path rust/Cargo.toml --features tch-backend --all-targets --message-format short` exit 0，仅既有 warnings；`rustfmt --edition 2021 --check rust/src/model/model.rs rust/src/model/attention/ring.rs rust/src/worker_sdk/tch_backend.rs` 与 `git diff --check` exit 0。
+7. 静态验证：同环境 `cargo clippy --manifest-path rust/Cargo.toml --features tch-backend --all-targets --message-format short` exit 0；warnings 未作为本节点阻断项，其中包含一条本节点测试循环的 iterator lint；`rustfmt --edition 2021 --check rust/src/model/model.rs rust/src/model/attention/ring.rs rust/src/worker_sdk/tch_backend.rs` 与 `git diff --check` exit 0。
 实现边界：同 request_id + explicit positions 复用 ReservedPositionedKvShard；无 explicit positions 的同 ID 重开被拒绝。未实现 runtime/coordinator 接线、多请求并发、失败原子回滚、真实模型/跨硬件验证、batched accumulator 或动态路线 planner。
 
-_updated: 2026-08-05 08:26:40_
+_updated: 2026-08-05 08:45:06_
 ### Node 4b.1 独立 query/KV 位置合同通过 RED/GREEN 与完整回归
 
 type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@82aca48`
