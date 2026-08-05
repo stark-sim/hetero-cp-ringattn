@@ -2,6 +2,28 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 分析同一请求多轮 prefill/decode 的 KV 与 ring 数据流
+
+type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-request-2026-08-05`
+
+只做架构分析：以同一 request_id 的 initial prefill -> decode -> continuation prefill -> decode -> repeated continuation 为时间轴，逐层列出 KV、activation、Q/O/LSE、position metadata、token/logits 的生成者、永久归属、临时持有者、ring 传输和阶段结束状态；区分当前 KV-ring baseline 与 batched accumulator 目标，不修改 runtime、wire 或 planner。
+
+_updated: 2026-08-05 14:07:23_
+### 先建立多轮请求的逐阶段数据账本，再选择 continuation 路线
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-request-2026-08-05`
+
+【动机六问】
+1. 问题：单次 prefill、单 token decode 与 positioned continuation 已各自有 correctness evidence，但同一 request 多轮交替后，每层 KV 的生成位置、capacity-weighted 永久归属、临时数据和 ring payload 尚未形成一份完整账本；KV readiness 也曾被误读为全局预分发。
+2. 现状：initial/continuation baseline 通过 KV ring；m=1 self-driving decode 由 assignee 本地生成并 commit 当前 KV，packet 携带 residual/normalized/Q/O/LSE；batched accumulator 只证明 attention 数学。现有代码对 m>1 仍走 KV-ring baseline，不能把目标路线当成已实现事实。
+3. 目标：对 initial prefill、每个 decode token、每次 continuation prefill 和后续 decode，逐层说明 KV/activation/Q/O/LSE/position/token/logits 的生成者、常驻者、临时持有者、是否上环和阶段结束不变量；比较 KV ring、batched accumulator 与混合路线，列出仍需用户确认的实质取舍。
+4. 他者：主流 serving runtime 使用 request-owned paged/radix KV cache，并以显式 prefill/extend/decode metadata只写新增 KV；context-decomposed attention 通过移动 KV block 或移动 Q 与 partial softmax state获得全局可见性。可复用的是 request 生命周期、增量 append 和阶段显式化；其同构 collective、中心 scheduler 与统一 CUDA allocator不能直接替代 HCP neighbor-only P2P。
+5. 本方案：建立 per-request、per-layer、per-position 的 KV ownership ledger，以及每阶段的 transient packet ledger；先用公式和现有代码事实区分 durable bytes 与 wire bytes，再把未决 activation-to-owner 路线独立列出，不实现动态 selector。
+6. 为什么：这是能同时检查显存硬界、网络 O(T)/O(m)、因果位置和多轮 cache 连续性的最小方法。直接改 batched wire 会把阶段语义、KV ownership 与 transport 绑定，无法判断哪一层假设出错。
+【边界】本节点不决定生产级调度、不实现多请求并发、不改变 N-1/N hops；只产出可审查的架构分析和下一最小实验建议。
+VERDICT: IMPLEMENT ANALYSIS FIRST。
+
+_updated: 2026-08-05 14:07:23_
 ### KV readiness 定义为 owner-local generation，不是全局预分发 barrier
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-05`
