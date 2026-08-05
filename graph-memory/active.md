@@ -2,6 +2,13 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### KV readiness 定义为 owner-local generation，不是全局预分发 barrier
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-05`
+
+术语与数据流修订：在 decode Q/O/LSE 路线中，每个节点只需在执行自己的 attention partial 之前，由本地当前层 activation 生成本节点负责的当前 segment K/V，并 append 到自己的 capacity-weighted positioned shard；不要求所有节点预先拥有完整当前 segment KV，也不要求 decode 阶段把历史 KV 沿 ring 传输。ring packet 负责传递 Q/O/LSE，使各节点用本地 durable KV 完成全局 attention 合并。初始 prefill 仍需 KV ring，因为各 query shard 必须读取其他节点的 prompt KV。当前 m=1 decode 已有该方向的实现；m>1 batched accumulator 仍是 attention oracle，尚未实现 activation 到 KV owner 的完整顺序。
+
+_updated: 2026-08-05 11:34:54_
 ### 先证明 batched positioned accumulator 的 attention-level 合同
 
 type: `decision` · status: `held` · confidence: 0.99 · importance: 1.0 · source: `user-confirmed-2026-08-05`
