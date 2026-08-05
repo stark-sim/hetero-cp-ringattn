@@ -2,6 +2,19 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-08-05] Batched positioned accumulator attention-level 合同验证
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 0.99 · source: `hetero-cp-ringattn@55c2605`
+
+实现提交 55c2605 在 test/core 层加入逻辑 packet {Q,P_Q,O,LSE}，不修改 TCP/QUIC RingPacket wire。测试覆盖 B=1、m=2/3、T=12/24、3 个非连续 P_KV shard，并轮转 3 个 starter（含 wrap-around）。每个 starter 的最终 O 与完整 causal reference max diff < 1e-5，LSE 与 reference logsumexp max diff < 1e-5；固定 m 时 T=12/24 的 tensor payload elements 相同；m=2/3 的 payload 按比例线性增长；控制用 KV resident elements 随历史长度翻倍。
+验证命令：
+1. DYLD_LIBRARY_PATH="$LIBTORCH/lib:${DYLD_LIBRARY_PATH:-}" cargo test --features tch-backend batched_positioned_accumulator_matches_causal_reference_without_history_payload -- --nocapture -> 1 passed, 0 failed。
+2. DYLD_LIBRARY_PATH="$LIBTORCH/lib:${DYLD_LIBRARY_PATH:-}" cargo test --features tch-backend -> 113 passed, 0 failed, 3 ignored。
+3. DYLD_LIBRARY_PATH="$LIBTORCH/lib:${DYLD_LIBRARY_PATH:-}" cargo clippy --features tch-backend --all-targets -- -A clippy::too_many_arguments -> exit 0；仓库既有 warnings 保留，未把 warnings 误记为 clean。
+4. rustfmt --check src/model/attention/ring.rs 与 git diff --check -> pass。
+边界：这是 attention-level 数学/packet oracle，不证明当前 segment 新 KV 的跨 worker placement、完整 norm/MLP/hidden 数据流、wire 接线、runtime、planner 或多请求 batching。
+
+_updated: 2026-08-05 11:01:54_
 ### [2026-08-05] 24 层两 worker positioned continuation 复用 request cache
 
 type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@3aa7282`

@@ -2,6 +2,23 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 先证明 batched positioned accumulator 的 attention-level 合同
+
+type: `decision` · status: `held` · confidence: 0.99 · importance: 1.0 · source: `user-confirmed-2026-08-05`
+
+【动机六问】
+1. 问题：4b.2 已证明 KV-ring continuation 能复用 mixed-history request cache，但短 segment m 仍会逐层搬运与历史 T 成正比的完整 KV shard。单 token decode 的 Q/O/LSE accumulator 不搬历史 KV；现在缺少 m > 1 且带因果位置语义的可执行合同。
+2. 现状：positioned_local_compact_partial 与 positioned_merge_compact_partial 的 online-softmax 数学已经接受 Q [B,H,m,D]、O [B,H,m,D]、LSE [B,H,m] 以及显式 P_Q/P_KV；但生产 RingPacket、decode helper 和 self-driving layer path 仍限定单 query。当前 segment 新 KV 的就绪与归属、完整 activation 的持有方式尚未决定，因此不能直接扩 wire 或宣称完整 continuation layer 已成立。
+3. 目标：建立 test/core 层的最小逻辑 packet {Q,P_Q,O,LSE}，用 mixed-history、m > 1、非连续 P_KV 的多个 shard 做 seed/merge，并与一次性完整 causal attention reference 对齐；对不同历史 T 证明 packet tensor 元素数只随 m 线性变化而不随 T 变化。
+4. 他者：既有 context-decomposed decode attention 通常让 KV 常驻各 shard，传递 query 与可稳定合并的 partial output/softmax statistics；主流 extend/prefill kernel 通过显式 query/KV positions 或 attention metadata表达 causal visibility。可以复用 online-softmax merge 与显式位置原则，但其同构 collective、paged allocator 和中心 scheduler 不适合直接搬入 HCP 的 neighbor-only P2P 实验核心。
+5. 本方案：不改现有 TCP/QUIC RingPacket wire，先在 attention test/core 内定义 batched positioned accumulator 的逻辑 packet 和 seed/merge；测试预先提供已经就绪且互斥完备的本地 KV shards，记录 Q/O/LSE/P_Q tensor payload elements，并用完整 reference 验证数学。
+6. 为什么：这把已知成立的 softmax 数学与仍未决的 KV placement、layer activation 路线隔离开。若先改 wire 或整层执行，测试失败将无法区分数学、顺序、归属和 transport 问题；先做 attention-level 合同能以最小改动给后续路线一个稳定 oracle。
+【边界与未决】本节点假设本层 attention 开始前，当前 segment 的 K/V 已在某组互斥完备 shard 中就绪；它不决定这些 K/V 继续按 layer assignee 放置，还是暂留产生 query 的 worker。它也不选择整段 activation 随包流动或每 worker 保留 query subset。N-1/N hops 继续保留为后续路线选择。
+VERDICT: IMPLEMENT ATTENTION-LEVEL CONTRACT FIRST。
+
+【范围补充】本节点明确限定单请求 B=1；position tensor 当前按 query 维 flatten。多请求 batching 与 B>1 的独立语义验证属于后续服务层节点。
+
+_updated: 2026-08-05 11:01:54_
 ### Prefill causality 必须由 phase 而非本地 seq_len 决定
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `layer-count-diagnosis-2026-08-03`
@@ -682,11 +699,11 @@ C. Rust decode 移植 Q+LSE 累积器环+增长分片(修 007+008)。
 _updated: 2026-07-27 15:10:25_
 ### Baseline 后实验 batched Q/O/LSE continuation ring
 
-type: `task` · status: `planning` · confidence: 0.95 · importance: 0.98 · source: `user-confirmed-2026-08-03`
+type: `task` · status: `active` · confidence: 0.95 · importance: 0.98 · source: `user-confirmed-2026-08-03`
 
 在 4b.2 correctness baseline 通过后，以相同 P_Q/P_KV 与 24 层 mixed-history oracle 实验多-token self-driving accumulator ring。先解决 packet shape、同层新 KV 全部就绪顺序、MLP/norm/hidden 的单点执行与 token-boundary N-1/N hop 选择；只做实验性 correctness 和流量计数，不接动态 planner 或服务 runtime。
 
-_updated: 2026-08-03 15:01:43_
+_updated: 2026-08-05 09:43:13_
 ### Node 4b 先建立两个文件的纯 rustfmt 基线
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 0.98 · source: `user-confirmed-2026-08-03`
