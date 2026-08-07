@@ -2,6 +2,13 @@
 
 产品问题、目标用户、成功标准与产品决策。
 
+### KV-ring 与 KV-stationary accumulator 的 attention 等价性
+
+type: `belief` · status: `held` · confidence: 0.99 · importance: 1.0 · source: `hetero-cp-ringattn@4b6dc76`
+
+对每层互斥完备的 positioned KV 分片 S_i，以及每个 continuation query 的可见集合 V_r={p|p<=T+r}，局部 max/sum/numerator 状态使用 max-shifted online-softmax 合并是结合的；等价地，normalized partial (O_i,LSE_i) 以 LSE-weighted sum 精确合并。因此固定 Q 并环传 KV，与固定 KV 并环传 Q/O/LSE，在实数域中得到相同 attention。历史 KV 移动是执行选择，不是正确性条件。浮点实现仅受合并顺序舍入影响。置信度 0.99：数学推导、vLLM DCP A2A 源码、SGLang extend merge 和现有 Rust batched positioned oracle 相互支持。
+
+_updated: 2026-08-07 10:35:39_
 ### 固定 owner-return 的单向 ring decode 至少需要 N 条网络边
 
 type: `belief` · status: `held` · confidence: 0.98 · importance: 0.95 · source: `docs/plans/2026-07-29-self-driving-ring-decode-revision.md`
@@ -9,6 +16,13 @@ type: `belief` · status: `held` · confidence: 0.98 · importance: 0.95 · sour
 前提:Q 只在 owner 产生;仅允许 successor 链路;全局 attention 结果必须回到同一个 owner forward 栈。在这些前提下,访问其余 N-1 节点并回到 owner 的唯一环路含 N 条边。若允许结果停在 finisher,下限才降为 N-1。
 
 _updated: 2026-07-28 17:11:06_
+### Continuation 路线的 byte-hop 成本模型
+
+type: `belief` · status: `held` · confidence: 0.98 · importance: 0.95 · source: `hetero-cp-ringattn@4b6dc76`
+
+每请求每层的理想 byte-hop 模型：C_KV=(N-1)*2(T+m)D_kv*b；当前完整 residual+normalized+Q+O+LSE packet 为 C_packet4=(N-1)*m(4H+h_q)*b；重算 input Norm 的候选为 C_packet3=(N-1)*m(3H+h_q)*b；query-shard 回原节点为 C_Q_return=N*m(2H+h_q)*b。对 Qwen2-0.5B H=896,D_kv=128,h_q=14,g=7,BF16,N=3，完整 packet 对 KV-ring 的纯网络 break-even 是 T>13.0546875m；重算 Norm 是 T>9.5546875m；Q/O/LSE N-1 理想下界是 T>6.0546875m；query-shard N-hop return 是 T>9.58203125m。公式不含 framing、kernel latency、overlap 和异构最慢边，不能直接成为动态 runtime selector。
+
+_updated: 2026-08-07 10:35:39_
 ### 异构分布式推理的数值验证策略
 
 type: `belief` · status: `held` · confidence: 0.8 · importance: 0.85 · source: `memory-bank/systemPatterns.md`

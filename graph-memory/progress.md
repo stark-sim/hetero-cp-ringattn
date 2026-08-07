@@ -2,6 +2,39 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### Initial prefill 的 KV-ring 是路线选择而非数学必要
+
+type: `revision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@4b6dc76`
+
+旧决策正确识别了 decode 的 owner-local KV generation 和无全局 barrier，但把“initial prefill 仍需 KV ring”写成了必要条件。Ring Attention 原论文证明 circulating KV 有效；FlashInfer/SGLang/vLLM DCP/Helix 与可结合 O/LSE 推导共同证明 KV-stationary 也精确成立。修订后的判断是：initial prefill 使用 KV-ring 属于当前 GQA 通信成本和 query-sharded 并行下的路线选择，而非数学必要性。旧决策保留为 superseded 历史，新决策给出完整替代表述。
+
+_updated: 2026-08-07 10:35:39_
+### Continuation prefill inference 研究与公式核验完成
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@4b6dc76`
+
+研究报告提交 4b6dc76。两轮来源核验覆盖 Ring Attention 论文 Appendix C、作者 JAX inference kernel、PyTorch CP、Megatron Core CP、vLLM Context Parallel 文档与 DCP A2A 源码、FlashInfer paged KV append、SGLang forward_extend/FlashInfer backend 和 Helix Parallelism。主要事实：原论文选择 circulation KV；serving extend 只 append 新 KV；SGLang 可把 new-segment causal partial 与 historical-prefix non-causal partial 用 O/LSE 合并；vLLM DCP A2A 对 stationary KV shards 的 partial O/LSE 做 exact weighted combination。
+新鲜验证：git diff --check -- docs/CONTINUATION_PREFILL_INFERENCE_RESEARCH.md -> exit 0；独立 Python assertions -> report_contract=ok, citations=10, formula_examples=ok；五个主要官方/论文 URL curl 均 HTTP 200；代码核对确认 LayerPacket 字段、m=1 validate_route 限制与 positioned partial/merge API 仍与报告描述一致。
+证据边界：这是数学、权威来源和代码映射研究，不是 m>1 整层实现、真实网络性能或异构硬件结果。
+
+_updated: 2026-08-07 10:35:39_
+### 研究 continuation prefill 是否需要移动历史 KV
+
+type: `task` · status: `closed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@4b6dc76`
+
+只研究推理场景中的 initial prefill、continuation/extend prefill 与 decode。以已有历史长度 T、本轮新增 segment 长度 m 为主变量，核验 Ring Attention 原论文、官方 inference Context Parallel 实现与 serving extend attention 的数据流；比较完整 committed KV ring、历史 KV 原地且 Q/O/LSE 环传、query-shard partial merge 与阶段混合路线。交付物是中文、带数学推导、权威来源与证据强度的多路线实验预期；研究完成前不扩展 Rust activation packet wire。
+
+[2026-08-07 完成]
+研究已完成并形成 docs/CONTINUATION_PREFILL_INFERENCE_RESEARCH.md。结论边界：历史 KV 是否沿 ring 移动不是 attention 数学必要性；KV-ring 与 KV-stationary accumulator 是同一精确 softmax 的两种数据移动对偶。完整 m-segment activation packet 与 continuation prefill 直接交合，因为它同时解决 owner-local new-KV generation、全 shard attention 与层间 residual/Norm/MLP activation。近期保留 KV-ring baseline 和完整 packet 两种显式实验模式，不引入动态 planner；query-shard N-hop return 与重算 Norm 压缩 packet 仅保留为后续候选。
+
+_updated: 2026-08-07 10:35:39_
+### KV readiness 定义为 owner-local generation，不是全局预分发 barrier
+
+type: `decision` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-05`
+
+术语与数据流修订：在 decode Q/O/LSE 路线中，每个节点只需在执行自己的 attention partial 之前，由本地当前层 activation 生成本节点负责的当前 segment K/V，并 append 到自己的 capacity-weighted positioned shard；不要求所有节点预先拥有完整当前 segment KV，也不要求 decode 阶段把历史 KV 沿 ring 传输。ring packet 负责传递 Q/O/LSE，使各节点用本地 durable KV 完成全局 attention 合并。初始 prefill 仍需 KV ring，因为各 query shard 必须读取其他节点的 prompt KV。当前 m=1 decode 已有该方向的实现；m>1 batched accumulator 仍是 attention oracle，尚未实现 activation 到 KV owner 的完整顺序。
+
+_updated: 2026-08-07 10:35:39_
 ### [2026-08-05] Batched positioned accumulator attention-level 合同验证
 
 type: `evidence` · status: `verified` · confidence: 1.0 · importance: 0.99 · source: `hetero-cp-ringattn@55c2605`

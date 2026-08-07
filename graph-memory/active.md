@@ -2,13 +2,26 @@
 
 当前活跃的任务、决策、风险和假设。
 
-### 研究 continuation prefill 是否需要移动历史 KV
+### KV readiness 与阶段路线的研究后修订
 
-type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-approved-2026-08-07`
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@4b6dc76`
 
-只研究推理场景中的 initial prefill、continuation/extend prefill 与 decode。以已有历史长度 T、本轮新增 segment 长度 m 为主变量，核验 Ring Attention 原论文、官方 inference Context Parallel 实现与 serving extend attention 的数据流；比较完整 committed KV ring、历史 KV 原地且 Q/O/LSE 环传、query-shard partial merge 与阶段混合路线。交付物是中文、带数学推导、权威来源与证据强度的多路线实验预期；研究完成前不扩展 Rust activation packet wire。
+KV readiness 的修订定义如下。
+1. 对任意 prefill/decode/continuation attention，每个节点只需在执行自己的 local partial 前，由当前层 normalized activation 生成本节点负责 position 的新 K/V，并 append 到本地 capacity-weighted positioned shard；不需要全局 new-KV barrier。
+2. 对互斥完备的 positioned KV shards，只要每个 query 的 O/LSE accumulator 恰好合并所有可见 shard，历史 KV 数学上不需要移动；绝对位置 p_k<=p_q 给出 segment 内 causal 语义。
+3. Initial prefill 继续使用 KV-ring 是当前 HCP 的阶段性路线选择，不是数学必要性。对 GQA Qwen2-0.5B，T=0 时 KV payload 显著小于完整 activation packet，且 query-sharded non-attention 计算可并行，因此 KV-ring 是近期合理基线。
+4. Decode m=1 保留现有 KV-stationary self-driving packet。Continuation 同时保留 KV-ring baseline 与 m-segment packet 实验路线，先静态比较，不引入动态 planner。
+5. 当前只完成研究与 attention-level batched oracle；m>1 整层 packet、owner-local position subset projection、wire 和 24 层递推仍待验证。
+这份修订替代 2026-08-05 决策中“initial prefill 仍需 KV ring”的必要性表述，同时保留其 owner-local readiness 核心。VERDICT: IMPLEMENT THE SMALLEST PACKET CONTRACT EXPERIMENT AFTER USER CONFIRMATION。
 
-_updated: 2026-08-07 08:51:49_
+_updated: 2026-08-07 10:35:39_
+### 先验证 m>1 LayerPacket 的单层完整合同
+
+type: `task` · status: `planning` · confidence: 0.95 · importance: 1.0 · source: `hetero-cp-ringattn@4b6dc76`
+
+下一最小节点只推广 LayerPacket 的整层 shape 合同：允许 m>1，使用一层 synthetic oracle 验证 residual、normalized、position_ids、Q、O/LSE、output projection、residual、post-attention Norm 与 MLP 的 shape 和 dense-reference 数值。该节点不实现 capacity-weighted position assignment、不接 wire/runtime、多请求或动态 planner，也不声称 continuation 闭环。完成后再单独实现 per-position owner-local K/V generation，最后才做 N=3、L=24、tickets=[1,3,2] mixed-history continuation。开始实现前等待用户确认。
+
+_updated: 2026-08-07 10:35:39_
 ### 先研究 continuation prefill 数据移动，再实现整段 packet
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-approved-2026-08-07`
@@ -46,13 +59,6 @@ type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · sour
 VERDICT: IMPLEMENT ANALYSIS FIRST。
 
 _updated: 2026-08-05 14:07:23_
-### KV readiness 定义为 owner-local generation，不是全局预分发 barrier
-
-type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-05`
-
-术语与数据流修订：在 decode Q/O/LSE 路线中，每个节点只需在执行自己的 attention partial 之前，由本地当前层 activation 生成本节点负责的当前 segment K/V，并 append 到自己的 capacity-weighted positioned shard；不要求所有节点预先拥有完整当前 segment KV，也不要求 decode 阶段把历史 KV 沿 ring 传输。ring packet 负责传递 Q/O/LSE，使各节点用本地 durable KV 完成全局 attention 合并。初始 prefill 仍需 KV ring，因为各 query shard 必须读取其他节点的 prompt KV。当前 m=1 decode 已有该方向的实现；m>1 batched accumulator 仍是 attention oracle，尚未实现 activation 到 KV owner 的完整顺序。
-
-_updated: 2026-08-05 11:34:54_
 ### 先证明 batched positioned accumulator 的 attention-level 合同
 
 type: `decision` · status: `held` · confidence: 0.99 · importance: 1.0 · source: `user-confirmed-2026-08-05`
@@ -750,11 +756,11 @@ C. Rust decode 移植 Q+LSE 累积器环+增长分片(修 007+008)。
 _updated: 2026-07-27 15:10:25_
 ### Baseline 后实验 batched Q/O/LSE continuation ring
 
-type: `task` · status: `active` · confidence: 0.95 · importance: 0.98 · source: `user-confirmed-2026-08-03`
+type: `task` · status: `planning` · confidence: 0.95 · importance: 0.98 · source: `user-confirmed-2026-08-03`
 
 在 4b.2 correctness baseline 通过后，以相同 P_Q/P_KV 与 24 层 mixed-history oracle 实验多-token self-driving accumulator ring。先解决 packet shape、同层新 KV 全部就绪顺序、MLP/norm/hidden 的单点执行与 token-boundary N-1/N hop 选择；只做实验性 correctness 和流量计数，不接动态 planner 或服务 runtime。
 
-_updated: 2026-08-05 09:43:13_
+_updated: 2026-08-07 10:35:39_
 ### Node 4b 先建立两个文件的纯 rustfmt 基线
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 0.98 · source: `user-confirmed-2026-08-03`
