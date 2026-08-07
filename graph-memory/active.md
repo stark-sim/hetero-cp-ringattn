@@ -2,6 +2,46 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 先验证 m>1 LayerPacket 的单层完整合同
+
+type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-07`
+
+下一小节点只推广 LayerPacket 的整层 shape 与 positioned causal 合同。历史 KV 保持在 ReservedPositionedKvShard；只验证一层 synthetic correctness 和 payload 不随 T 增长。整段新 K/V 暂由单一 assignee append，因此不声称 capacity-weighted placement 完成；不接 wire/runtime、多请求或动态 planner。
+
+_updated: 2026-08-07 11:36:59_
+### Continuation prefill 多路线实验组合空间
+
+type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-07`
+
+长期保存 continuation prefill 的可组合实验路线，不把当前优先路线误写成唯一架构。每条路线单独记录通信对象、hop 合同、永久/临时显存、非 attention 计算位置、成立条件、牺牲项和重访触发条件。当前推进顺序由 HCP 的目标环境决定：异构节点间传输带宽是主要瓶颈，因此先实验历史 KV 原地的完整 activation packet；KV-ring 继续作为 correctness/大 segment 基线；其余路线不实现但保留可回溯关系。路线切换现阶段只允许显式实验模式，不引入动态 planner。
+
+_updated: 2026-08-07 11:36:59_
+### 带宽受限异构环境优先探索历史 KV 原地
+
+type: `preference` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-07`
+
+用户确认 HCP 面向传输带宽高度受限的非同构集群，continuation/decode 的近期探索应优先避免传输长度为 T 的历史 KV。这个偏好不删除 KV-ring：initial prefill、大 m/T continuation、并行 query shard 或未来高速互联场景仍可能更适合它。永久 KV 始终按设备 capacity weight 分配；任何候选路线都不得让单节点永久承担不符合其 capacity 的历史 KV。
+
+_updated: 2026-08-07 11:36:59_
+### 先完成不传历史 KV 的 m>1 单层 packet 合同
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-07`
+
+【动机剖析六问】
+1. 问题：attention-level batched positioned accumulator 已证明 m>1 的 O/LSE 合并，但现有 LayerPacket、Q/KV projection 与整层 finisher 路径仍限制 m=1，不能证明 continuation segment 在不传历史 KV 时能完成一整层。
+2. 现状：LayerPacket 已携带 residual、normalized、position_ids、Q、O/LSE；reserved positioned shard 能原地保存 KV；positioned partial kernel 支持 m>1 causal mask。缺口是这些能力尚未通过同一 LayerPacket 状态机组合，普通 tuple history 又没有 position metadata。
+3. 目标：单层 synthetic、N>=2、m>1 测试通过。packet 访问每个节点的 ReservedPositionedKvShard，历史 KV 不进入 payload；唯一临时 assignee 可为本小节点追加整段新 K/V；finisher 的 attention output 与 hidden_states 对齐 dense causal reference；m=1 回归保持。
+4. 他者：SGLang forward_extend 与 FlashInfer paged prefill 都让新增 query 读取 positioned/paged 历史并只 append 新 KV；vLLM DCP 合并 stationary shards 的 O/LSE。可复用的是 positioned causal merge 与增量 append，不复用 collective、paged allocator 或 scheduler。
+5. 本方案：直接把现有 LayerPacket shape 从 m=1 推广到 m>=1；reserved path 使用 packet.position_ids 和 shard.position_tensor 调用 positioned partial/merge；legacy tuple path继续只允许 m=1。先写失败测试，再做最小实现，不改 wire/runtime/capacity schedule。
+6. 为什么：另建 continuation packet 会复制现有状态机；只扩 attention oracle 已经完成却不能证明 Norm/MLP；直接扩现有 packet 是最小纵向证明，并保持 decode 为 m=1 特例。
+【牺牲四问】
+1. 默认 KV-ring 为什么存在：它利用 GQA 较小的 KV width，并让 position-sharded query、Norm 和 MLP 并行，initial prefill 与大 segment 时网络更省。
+2. 当前牺牲什么：完整 packet 传 residual+normalized+Q+O/LSE，单层 attention 按节点串行，MLP 集中在 finisher；本节点还把整段新 K/V 暂交一个 assignee，不能证明最终 capacity weighting。
+3. 被牺牲能力的作用：KV-ring 的 query 并行和紧凑 payload 降低短历史/大 m 的 TTFT；per-position assignment 才能给可变 segment 提供严格的 capacity-weighted byte placement。
+4. 对 HCP 的意义：当前目标环境首先受历史 KV 传输限制，先验证 bytes 与 T 无关值得接受上述实验性牺牲；但这些牺牲禁止被提升为最终性能结论，后续必须单独补 per-position assignment 与 24 层验证。
+VERDICT: IMPLEMENT。用户已确认先沿不传历史 KV 路线探索。
+
+_updated: 2026-08-07 11:36:59_
 ### KV readiness 与阶段路线的研究后修订
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@4b6dc76`
@@ -13,13 +53,6 @@ KV readiness 的修订定义如下。
 4. Decode m=1 保留现有 KV-stationary self-driving packet。Continuation 同时保留 KV-ring baseline 与 m-segment packet 实验路线，先静态比较，不引入动态 planner。
 5. 当前只完成研究与 attention-level batched oracle；m>1 整层 packet、owner-local position subset projection、wire 和 24 层递推仍待验证。
 这份修订替代 2026-08-05 决策中“initial prefill 仍需 KV ring”的必要性表述，同时保留其 owner-local readiness 核心。VERDICT: IMPLEMENT THE SMALLEST PACKET CONTRACT EXPERIMENT AFTER USER CONFIRMATION。
-
-_updated: 2026-08-07 10:35:39_
-### 先验证 m>1 LayerPacket 的单层完整合同
-
-type: `task` · status: `planning` · confidence: 0.95 · importance: 1.0 · source: `hetero-cp-ringattn@4b6dc76`
-
-下一最小节点只推广 LayerPacket 的整层 shape 合同：允许 m>1，使用一层 synthetic oracle 验证 residual、normalized、position_ids、Q、O/LSE、output projection、residual、post-attention Norm 与 MLP 的 shape 和 dense-reference 数值。该节点不实现 capacity-weighted position assignment、不接 wire/runtime、多请求或动态 planner，也不声称 continuation 闭环。完成后再单独实现 per-position owner-local K/V generation，最后才做 N=3、L=24、tickets=[1,3,2] mixed-history continuation。开始实现前等待用户确认。
 
 _updated: 2026-08-07 10:35:39_
 ### 先研究 continuation prefill 数据移动，再实现整段 packet
