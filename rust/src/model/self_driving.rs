@@ -492,6 +492,26 @@ pub(crate) fn process_layer_packet_with_reserved_history(
     packet: LayerPacket,
     local_history: &mut ReservedPositionedKvShard,
 ) -> Result<LayerStepOutcome, ModelError> {
+    let query_len = packet.position_ids.size()[1] as usize;
+    let new_position_offsets = if packet.current_domain == packet.assignee {
+        (0..query_len).collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    process_layer_packet_with_reserved_history_for_positions(
+        layer,
+        packet,
+        local_history,
+        &new_position_offsets,
+    )
+}
+
+pub(crate) fn process_layer_packet_with_reserved_history_for_positions(
+    layer: &mut DecoderLayer,
+    packet: LayerPacket,
+    local_history: &mut ReservedPositionedKvShard,
+    new_position_offsets: &[usize],
+) -> Result<LayerStepOutcome, ModelError> {
     let active_k = local_history.active_k();
     let active_v = local_history.active_v();
     if active_k.size() != active_v.size() {
@@ -501,12 +521,34 @@ pub(crate) fn process_layer_packet_with_reserved_history(
         )));
     }
 
-    if packet.current_domain == packet.assignee {
+    let query_len = packet.position_ids.size()[1] as usize;
+    let mut seen_offsets = vec![false; query_len];
+    for &offset in new_position_offsets {
+        if offset >= query_len || seen_offsets[offset] {
+            return Err(ModelError::Backend(format!(
+                "domain {} received invalid or duplicate new position offset {offset} for query_len={query_len}",
+                packet.current_domain
+            )));
+        }
+        seen_offsets[offset] = true;
+    }
+
+    if !new_position_offsets.is_empty() {
+        let index_values = new_position_offsets
+            .iter()
+            .map(|&offset| offset as i64)
+            .collect::<Vec<_>>();
+        let normalized_indices =
+            Tensor::from_slice(&index_values).to_device(packet.normalized.device());
+        let position_indices =
+            Tensor::from_slice(&index_values).to_device(packet.position_ids.device());
+        let local_normalized = packet.normalized.index_select(1, &normalized_indices);
+        let local_position_ids = packet.position_ids.index_select(1, &position_indices);
         let ring = ring_backend(layer)?;
         let (current_k, current_v) =
-            ring.project_packet_current_kv(&packet.normalized, &packet.position_ids)?;
-        let positions = (0..current_k.size()[2])
-            .map(|offset| packet.position_ids.int64_value(&[0, offset]))
+            ring.project_packet_current_kv(&local_normalized, &local_position_ids)?;
+        let positions = (0..local_position_ids.size()[1])
+            .map(|offset| local_position_ids.int64_value(&[0, offset]))
             .collect::<Vec<_>>();
         local_history
             .append(&current_k, &current_v, &positions)
@@ -2077,6 +2119,169 @@ mod tests {
                 .collect::<Vec<_>>(),
             storage_ptrs
         );
+    }
+
+    #[test]
+    fn multi_token_packet_generates_new_kv_by_capacity_weighted_position_owner() {
+        let device = Device::Cpu;
+        let config = test_config();
+        let weights = deterministic_weights(&config, device);
+        let mut model = LlamaModel::from_weights(config.clone(), &weights, device, 3).unwrap();
+        let mut layer = model.layers.remove(0);
+        let domains = 3_usize;
+        let query_len = 6_i64;
+        let history_len = 9_i64;
+        let hidden =
+            deterministic_tensor(&[1, query_len, config.hidden_size as i64], 311.0, device);
+        let position_ids =
+            Tensor::arange_start(history_len, history_len + query_len, (Kind::Int64, device))
+                .unsqueeze(0);
+        let history_shape = [
+            1,
+            config.num_kv_heads() as i64,
+            history_len,
+            config.head_dim() as i64,
+        ];
+        let history_k = deterministic_tensor(&history_shape, 312.0, device);
+        let history_v = deterministic_tensor(&history_shape, 313.0, device);
+        let history_positions = [vec![0_i64, 3, 6], vec![1_i64, 4, 7], vec![2_i64, 5, 8]];
+
+        let schedule = FrozenKvAssigneeSchedule::new(&[1, 3, 2], 0, query_len as usize).unwrap();
+        assert_eq!(schedule.counts(), &[1, 3, 2]);
+        let mut owner_offsets = vec![Vec::new(); domains];
+        for offset in 0..query_len as usize {
+            let owner = schedule.assignee_for(offset, 0, 1).unwrap();
+            owner_offsets[owner].push(offset);
+        }
+        let mut assigned_offsets = owner_offsets.iter().flatten().copied().collect::<Vec<_>>();
+        assigned_offsets.sort_unstable();
+        assert_eq!(
+            assigned_offsets,
+            (0..query_len as usize).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            owner_offsets.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![1, 3, 2]
+        );
+
+        let mut shards = history_positions
+            .iter()
+            .enumerate()
+            .map(|(domain, positions)| {
+                let mut shard = ReservedPositionedKvShard::new(
+                    &config,
+                    positions.len() + owner_offsets[domain].len(),
+                    device,
+                );
+                let indices = Tensor::from_slice(positions);
+                shard
+                    .append(
+                        &history_k.index_select(2, &indices),
+                        &history_v.index_select(2, &indices),
+                        positions,
+                    )
+                    .unwrap();
+                shard
+            })
+            .collect::<Vec<_>>();
+        let storage_ptrs = shards
+            .iter()
+            .map(ReservedPositionedKvShard::storage_ptrs)
+            .collect::<Vec<_>>();
+        let (reference_attention, reference_hidden) = reference_positioned_layer_output(
+            0,
+            &config,
+            &weights,
+            &hidden,
+            &position_ids,
+            &history_k,
+            &history_v,
+        );
+
+        let mut packet =
+            LayerPacket::start(&mut layer, &hidden, &position_ids, 0, 0, domains).unwrap();
+        let mut packet_payload = None;
+        let (attention_output, hidden_states) = loop {
+            let domain = packet.current_domain;
+            match process_layer_packet_with_reserved_history_for_positions(
+                &mut layer,
+                packet,
+                &mut shards[domain],
+                &owner_offsets[domain],
+            )
+            .unwrap()
+            {
+                LayerStepOutcome::Forward(next_packet) => {
+                    packet_payload.get_or_insert_with(|| next_packet.tensor_payload_elements());
+                    packet = next_packet;
+                }
+                LayerStepOutcome::Finished {
+                    attention_output,
+                    hidden_states,
+                } => break (attention_output, hidden_states),
+            }
+        };
+
+        let expected_payload = query_len as usize * (4 * config.hidden_size + config.num_heads + 1);
+        assert_eq!(packet_payload, Some(expected_payload));
+        let attention_diff = (&attention_output - reference_attention)
+            .abs()
+            .max()
+            .double_value(&[]);
+        let hidden_diff = (&hidden_states - reference_hidden)
+            .abs()
+            .max()
+            .double_value(&[]);
+        assert!(attention_diff < 1e-4, "attention diff: {attention_diff}");
+        assert!(hidden_diff < 2e-4, "hidden diff: {hidden_diff}");
+
+        for domain in 0..domains {
+            let mut expected_positions = history_positions[domain].clone();
+            expected_positions.extend(
+                owner_offsets[domain]
+                    .iter()
+                    .map(|&offset| history_len + offset as i64),
+            );
+            assert_eq!(shards[domain].positions(), expected_positions);
+            assert_eq!(
+                shards[domain].committed_len(),
+                shards[domain].reserved_capacity()
+            );
+        }
+        assert_eq!(
+            shards
+                .iter()
+                .map(ReservedPositionedKvShard::storage_ptrs)
+                .collect::<Vec<_>>(),
+            storage_ptrs
+        );
+    }
+
+    #[test]
+    fn position_owner_offsets_reject_duplicates_and_out_of_range_values() {
+        fn assert_invalid_offsets(offsets: &[usize], expected: &str) {
+            let device = Device::Cpu;
+            let config = test_config();
+            let weights = deterministic_weights(&config, device);
+            let mut model = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+            let mut layer = model.layers.remove(0);
+            let hidden = deterministic_tensor(&[1, 2, config.hidden_size as i64], 321.0, device);
+            let position_ids = Tensor::from_slice(&[4_i64, 5]).unsqueeze(0);
+            let packet = LayerPacket::start(&mut layer, &hidden, &position_ids, 0, 0, 1).unwrap();
+            let mut shard = ReservedPositionedKvShard::new(&config, 2, device);
+
+            let error = process_layer_packet_with_reserved_history_for_positions(
+                &mut layer, packet, &mut shard, offsets,
+            )
+            .unwrap_err()
+            .to_string();
+
+            assert!(error.contains(expected), "unexpected error: {error}");
+            assert_eq!(shard.committed_len(), 0);
+        }
+
+        assert_invalid_offsets(&[0, 0], "duplicate");
+        assert_invalid_offsets(&[2], "query_len=2");
     }
 
     #[test]
