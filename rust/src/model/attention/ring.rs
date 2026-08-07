@@ -363,18 +363,19 @@ impl HcpRingAttentionBackend {
         *rs = new_sum;
     }
 
-    /// Project the single current token's query on the logical starter.
+    /// Project the current self-driving packet's queries on the logical starter.
     #[allow(dead_code)]
-    pub(crate) fn project_decode_q(
+    pub(crate) fn project_packet_q(
         &self,
         hidden_states: &Tensor,
         position_ids: &Tensor,
     ) -> Result<Tensor, ModelError> {
         let batch = hidden_states.size()[0];
         let seq_len = hidden_states.size()[1];
-        if seq_len != 1 {
+        if seq_len < 1 || position_ids.size() != [batch, seq_len] {
             return Err(ModelError::Backend(format!(
-                "self-driving decode query projection requires seq_len=1, got {seq_len}"
+                "self-driving query projection requires non-empty position_ids [{batch}, {seq_len}], got {:?}",
+                position_ids.size()
             )));
         }
 
@@ -389,19 +390,20 @@ impl HcpRingAttentionBackend {
         Ok(q)
     }
 
-    /// Project the single current token's K/V on its logical KV assignee.
+    /// Project the current self-driving packet's K/V on its logical KV assignee.
     /// K/V remain in their compact GQA head layout.
     #[allow(dead_code)]
-    pub(crate) fn project_decode_current_kv(
+    pub(crate) fn project_packet_current_kv(
         &self,
         hidden_states: &Tensor,
         position_ids: &Tensor,
     ) -> Result<(Tensor, Tensor), ModelError> {
         let batch = hidden_states.size()[0];
         let seq_len = hidden_states.size()[1];
-        if seq_len != 1 {
+        if seq_len < 1 || position_ids.size() != [batch, seq_len] {
             return Err(ModelError::Backend(format!(
-                "self-driving decode KV projection requires seq_len=1, got {seq_len}"
+                "self-driving KV projection requires non-empty position_ids [{batch}, {seq_len}], got {:?}",
+                position_ids.size()
             )));
         }
 
@@ -527,7 +529,6 @@ impl HcpRingAttentionBackend {
         self.decode_merge_packet(q, o, lse, &k, &v)
     }
 
-    #[cfg(test)]
     pub(crate) fn positioned_local_compact_partial(
         &self,
         q: &Tensor,
@@ -563,7 +564,6 @@ impl HcpRingAttentionBackend {
         (obh, lse)
     }
 
-    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn positioned_merge_compact_partial(
         &self,

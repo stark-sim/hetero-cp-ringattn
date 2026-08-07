@@ -1,4 +1,4 @@
-//! Experimental single-layer self-driving decode ring.
+//! Experimental self-driving inference ring.
 
 use crate::model::attention::HcpRingAttentionBackend;
 use crate::model::cache::KvCache;
@@ -315,10 +315,10 @@ impl LayerPacket {
         assignee: usize,
         domains: usize,
     ) -> Result<Self, ModelError> {
-        validate_route(hidden_states, starter, assignee, domains)?;
+        validate_route(hidden_states, position_ids, starter, assignee, domains)?;
         let residual = hidden_states.shallow_clone();
         let normalized = layer.input_layernorm.forward(hidden_states);
-        let q = ring_backend(layer)?.project_decode_q(&normalized, position_ids)?;
+        let q = ring_backend(layer)?.project_packet_q(&normalized, position_ids)?;
         Ok(Self {
             residual,
             normalized,
@@ -407,6 +407,7 @@ pub enum LayerStepOutcome {
 
 fn validate_route(
     hidden_states: &Tensor,
+    position_ids: &Tensor,
     starter: usize,
     assignee: usize,
     domains: usize,
@@ -421,10 +422,18 @@ fn validate_route(
             "self-driving route out of range: domains={domains}, starter={starter}, assignee={assignee}"
         )));
     }
-    if hidden_states.size().get(1) != Some(&1) {
+    let hidden_shape = hidden_states.size();
+    if hidden_shape.len() != 3 || hidden_shape[0] != 1 || hidden_shape[1] < 1 {
         return Err(ModelError::Backend(
-            "self-driving layer requires one decode token".to_string(),
+            "self-driving layer requires hidden_states shaped [1, seq_len>=1, hidden]".to_string(),
         ));
+    }
+    if position_ids.size() != [1, hidden_shape[1]] {
+        return Err(ModelError::Backend(format!(
+            "self-driving layer requires position_ids [1, {}], got {:?}",
+            hidden_shape[1],
+            position_ids.size()
+        )));
     }
     Ok(())
 }
@@ -455,6 +464,11 @@ pub fn process_layer_packet(
     packet: LayerPacket,
     local_history: &mut (Tensor, Tensor),
 ) -> Result<LayerStepOutcome, ModelError> {
+    if packet.position_ids.size()[1] != 1 {
+        return Err(ModelError::Backend(
+            "multi-token self-driving packets require positioned reserved KV history".to_string(),
+        ));
+    }
     if local_history.0.size() != local_history.1.size() {
         return Err(ModelError::Backend(format!(
             "domain {} has mismatched K/V shapes",
@@ -465,12 +479,12 @@ pub fn process_layer_packet(
     if packet.current_domain == packet.assignee {
         let ring = ring_backend(layer)?;
         let (current_k, current_v) =
-            ring.project_decode_current_kv(&packet.normalized, &packet.position_ids)?;
+            ring.project_packet_current_kv(&packet.normalized, &packet.position_ids)?;
         local_history.0 = Tensor::cat(&[&local_history.0, &current_k], 2);
         local_history.1 = Tensor::cat(&[&local_history.1, &current_v], 2);
     }
 
-    continue_layer_packet(layer, packet, &local_history.0, &local_history.1)
+    continue_layer_packet(layer, packet, &local_history.0, &local_history.1, None)
 }
 
 pub(crate) fn process_layer_packet_with_reserved_history(
@@ -490,7 +504,7 @@ pub(crate) fn process_layer_packet_with_reserved_history(
     if packet.current_domain == packet.assignee {
         let ring = ring_backend(layer)?;
         let (current_k, current_v) =
-            ring.project_decode_current_kv(&packet.normalized, &packet.position_ids)?;
+            ring.project_packet_current_kv(&packet.normalized, &packet.position_ids)?;
         let positions = (0..current_k.size()[2])
             .map(|offset| packet.position_ids.int64_value(&[0, offset]))
             .collect::<Vec<_>>();
@@ -499,11 +513,13 @@ pub(crate) fn process_layer_packet_with_reserved_history(
             .map_err(ModelError::Backend)?;
     }
 
+    let local_positions = local_history.position_tensor();
     continue_layer_packet(
         layer,
         packet,
         &local_history.active_k(),
         &local_history.active_v(),
+        Some(&local_positions),
     )
 }
 
@@ -512,16 +528,37 @@ fn continue_layer_packet(
     mut packet: LayerPacket,
     local_k: &Tensor,
     local_v: &Tensor,
+    local_positions: Option<&Tensor>,
 ) -> Result<LayerStepOutcome, ModelError> {
     let finished = packet.visited_domains + 1 == packet.domains;
     let projected_output = {
         let ring = ring_backend(layer)?;
 
         let (next_output, next_lse) = match (packet.attention_output.take(), packet.lse.take()) {
-            (None, None) => ring.decode_local_compact_partial(&packet.q, local_k, local_v),
-            (Some(output), Some(lse)) => {
-                ring.decode_merge_compact_partial(&packet.q, &output, &lse, local_k, local_v)
-            }
+            (None, None) => match local_positions {
+                Some(k_positions) => ring.positioned_local_compact_partial(
+                    &packet.q,
+                    &packet.position_ids,
+                    local_k,
+                    local_v,
+                    k_positions,
+                ),
+                None => ring.decode_local_compact_partial(&packet.q, local_k, local_v),
+            },
+            (Some(output), Some(lse)) => match local_positions {
+                Some(k_positions) => ring.positioned_merge_compact_partial(
+                    &packet.q,
+                    &packet.position_ids,
+                    &output,
+                    &lse,
+                    local_k,
+                    local_v,
+                    k_positions,
+                ),
+                None => {
+                    ring.decode_merge_compact_partial(&packet.q, &output, &lse, local_k, local_v)
+                }
+            },
             _ => {
                 return Err(ModelError::Backend(
                     "self-driving packet has incomplete attention accumulator".to_string(),
@@ -944,6 +981,60 @@ mod tests {
         (attention_output, post_attention + mlp_output)
     }
 
+    fn reference_positioned_layer_output(
+        layer_idx: usize,
+        config: &ModelConfig,
+        weights: &ModelWeights,
+        hidden: &Tensor,
+        position_ids: &Tensor,
+        history_k: &Tensor,
+        history_v: &Tensor,
+    ) -> (Tensor, Tensor) {
+        let device = hidden.device();
+        let rope = RotaryEmbedding::new(
+            config.head_dim(),
+            config.max_position_embeddings.unwrap(),
+            config.rope_theta,
+            device,
+        );
+        let attention = GqaAttention::from_weights(weights, layer_idx, config, &rope).unwrap();
+        let input_norm = RmsNorm::from_weights(
+            weights,
+            &WeightNames::rms_norm_weight(layer_idx),
+            config.rms_norm_eps,
+        )
+        .unwrap();
+        let post_norm = RmsNorm::from_weights(
+            weights,
+            &WeightNames::post_attn_norm_weight(layer_idx),
+            config.rms_norm_eps,
+        )
+        .unwrap();
+        let mlp = Mlp::from_weights(weights, layer_idx).unwrap();
+        let mut cache = ContiguousKvCache::new();
+        let _ = cache.update(history_k, history_v).unwrap();
+
+        let query_len = hidden.size()[1];
+        let history_len = history_k.size()[2];
+        let key_len = history_len + query_len;
+        let key_positions = Tensor::arange(key_len, (Kind::Int64, device));
+        let causal = position_ids
+            .view([query_len, 1])
+            .ge_tensor(&key_positions.view([1, key_len]));
+        let mask = Tensor::zeros([query_len, key_len], (Kind::Float, device))
+            .masked_fill(&causal.logical_not(), f64::NEG_INFINITY)
+            .unsqueeze(0)
+            .unsqueeze(0);
+
+        let normed = input_norm.forward(hidden);
+        let attention_output = attention
+            .forward(&normed, position_ids, Some(&mut cache), Some(&mask))
+            .unwrap();
+        let post_attention = &attention_output + hidden;
+        let mlp_output = mlp.forward(&post_norm.forward(&post_attention));
+        (attention_output, post_attention + mlp_output)
+    }
+
     fn reference_current_kv(
         layer_idx: usize,
         config: &ModelConfig,
@@ -966,7 +1057,7 @@ mod tests {
         )
         .unwrap();
         backend
-            .project_decode_current_kv(&input_norm.forward(hidden), position_ids)
+            .project_packet_current_kv(&input_norm.forward(hidden), position_ids)
             .unwrap()
     }
 
@@ -1314,7 +1405,7 @@ mod tests {
             let finisher = (current_starter + domains - 1) % domains;
             let (projected_attention, visited_domains) = {
                 let ring = ring_backend(&mut model.layers[layer_idx]).unwrap();
-                let q = ring.project_decode_q(&normalized, &position_ids).unwrap();
+                let q = ring.project_packet_q(&normalized, &position_ids).unwrap();
                 let mut partial = None;
                 let mut visited_domains = Vec::with_capacity(domains);
 
@@ -1323,7 +1414,7 @@ mod tests {
                     visited_domains.push(domain);
                     if domain == assignee {
                         let (current_k, current_v) = ring
-                            .project_decode_current_kv(&normalized, &position_ids)
+                            .project_packet_current_kv(&normalized, &position_ids)
                             .unwrap();
                         shards[domain]
                             .append(&current_k, &current_v, &[position])
@@ -1893,6 +1984,102 @@ mod tests {
     }
 
     #[test]
+    fn multi_token_layer_packet_completes_positioned_causal_layer_without_history_payload() {
+        let device = Device::Cpu;
+        let config = test_config();
+        let weights = deterministic_weights(&config, device);
+        let mut model = LlamaModel::from_weights(config.clone(), &weights, device, 2).unwrap();
+        let mut layer = model.layers.remove(0);
+        let query_len = 3_i64;
+        let history_len = 6_i64;
+        let hidden =
+            deterministic_tensor(&[1, query_len, config.hidden_size as i64], 301.0, device);
+        let position_ids =
+            Tensor::arange_start(history_len, history_len + query_len, (Kind::Int64, device))
+                .unsqueeze(0);
+        let history_shape = [
+            1,
+            config.num_kv_heads() as i64,
+            history_len,
+            config.head_dim() as i64,
+        ];
+        let history_k = deterministic_tensor(&history_shape, 302.0, device);
+        let history_v = deterministic_tensor(&history_shape, 303.0, device);
+        let domain_positions = [vec![0_i64, 3, 4], vec![1_i64, 2, 5]];
+        let mut shards = domain_positions
+            .iter()
+            .enumerate()
+            .map(|(domain, positions)| {
+                let capacity = positions.len() + if domain == 1 { query_len as usize } else { 0 };
+                let mut shard = ReservedPositionedKvShard::new(&config, capacity, device);
+                let indices = Tensor::from_slice(positions);
+                shard
+                    .append(
+                        &history_k.index_select(2, &indices),
+                        &history_v.index_select(2, &indices),
+                        positions,
+                    )
+                    .unwrap();
+                shard
+            })
+            .collect::<Vec<_>>();
+        let storage_ptrs = shards
+            .iter()
+            .map(ReservedPositionedKvShard::storage_ptrs)
+            .collect::<Vec<_>>();
+        let (reference_attention, reference_hidden) = reference_positioned_layer_output(
+            0,
+            &config,
+            &weights,
+            &hidden,
+            &position_ids,
+            &history_k,
+            &history_v,
+        );
+
+        let packet = LayerPacket::start(&mut layer, &hidden, &position_ids, 0, 1, 2).unwrap();
+        let packet =
+            match process_layer_packet_with_reserved_history(&mut layer, packet, &mut shards[0])
+                .unwrap()
+            {
+                LayerStepOutcome::Forward(packet) => packet,
+                LayerStepOutcome::Finished { .. } => panic!("N=2 packet finished before successor"),
+            };
+        let expected_payload = query_len as usize * (4 * config.hidden_size + config.num_heads + 1);
+        assert_eq!(packet.tensor_payload_elements(), expected_payload);
+        let (attention_output, hidden_states) =
+            match process_layer_packet_with_reserved_history(&mut layer, packet, &mut shards[1])
+                .unwrap()
+            {
+                LayerStepOutcome::Finished {
+                    attention_output,
+                    hidden_states,
+                } => (attention_output, hidden_states),
+                LayerStepOutcome::Forward(_) => panic!("N=2 packet did not finish at successor"),
+            };
+
+        let attention_diff = (&attention_output - reference_attention)
+            .abs()
+            .max()
+            .double_value(&[]);
+        let hidden_diff = (&hidden_states - reference_hidden)
+            .abs()
+            .max()
+            .double_value(&[]);
+        assert!(attention_diff < 1e-4, "attention diff: {attention_diff}");
+        assert!(hidden_diff < 2e-4, "hidden diff: {hidden_diff}");
+        assert_eq!(shards[0].positions(), &[0, 3, 4]);
+        assert_eq!(shards[1].positions(), &[1, 2, 5, 6, 7, 8]);
+        assert_eq!(
+            shards
+                .iter()
+                .map(ReservedPositionedKvShard::storage_ptrs)
+                .collect::<Vec<_>>(),
+            storage_ptrs
+        );
+    }
+
+    #[test]
     fn layer_packet_payload_does_not_grow_with_history_context() {
         fn payload_after_first_hop(history_len: i64) -> usize {
             let device = Device::Cpu;
@@ -1900,20 +2087,35 @@ mod tests {
             let weights = deterministic_weights(&config, device);
             let mut model = LlamaModel::from_weights(config.clone(), &weights, device, 2).unwrap();
             let mut layer = model.layers.remove(0);
-            let hidden = deterministic_tensor(&[1, 1, config.hidden_size as i64], 100.0, device);
-            let position_ids = Tensor::from_slice(&[history_len * 2]).unsqueeze(0);
+            let query_len = 3_i64;
+            let hidden =
+                deterministic_tensor(&[1, query_len, config.hidden_size as i64], 100.0, device);
+            let position_ids = Tensor::arange_start(
+                history_len * 2,
+                history_len * 2 + query_len,
+                (Kind::Int64, device),
+            )
+            .unsqueeze(0);
             let shape = [
                 1,
                 config.num_kv_heads() as i64,
                 history_len,
                 config.head_dim() as i64,
             ];
-            let mut local_history = (
-                deterministic_tensor(&shape, 110.0, device),
-                deterministic_tensor(&shape, 120.0, device),
-            );
+            let mut local_history =
+                ReservedPositionedKvShard::new(&config, history_len as usize, device);
+            let positions = (0..history_len).collect::<Vec<_>>();
+            local_history
+                .append(
+                    &deterministic_tensor(&shape, 110.0, device),
+                    &deterministic_tensor(&shape, 120.0, device),
+                    &positions,
+                )
+                .unwrap();
             let packet = LayerPacket::start(&mut layer, &hidden, &position_ids, 0, 1, 2).unwrap();
-            match process_layer_packet(&mut layer, packet, &mut local_history).unwrap() {
+            match process_layer_packet_with_reserved_history(&mut layer, packet, &mut local_history)
+                .unwrap()
+            {
                 LayerStepOutcome::Forward(packet) => packet.tensor_payload_elements(),
                 LayerStepOutcome::Finished { .. } => panic!("N=2 packet finished before successor"),
             }
