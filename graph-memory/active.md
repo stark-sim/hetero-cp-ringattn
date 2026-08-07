@@ -2,13 +2,13 @@
 
 当前活跃的任务、决策、风险和假设。
 
-### 先验证 m>1 LayerPacket 的单层完整合同
+### 候选：m-segment 新 KV 按 position owner-local 生成
 
-type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-07`
+type: `task` · status: `planning` · confidence: 0.95 · importance: 1.0 · source: `proposed-after-5777d51`
 
-下一小节点只推广 LayerPacket 的整层 shape 与 positioned causal 合同。历史 KV 保持在 ReservedPositionedKvShard；只验证一层 synthetic correctness 和 payload 不随 T 增长。整段新 K/V 暂由单一 assignee append，因此不声称 capacity-weighted placement 完成；不接 wire/runtime、多请求或动态 planner。
+下一候选小节点：让 m-segment 内不同 absolute positions 按既有 frozen capacity-weighted calendar 分配到不同 worker；每个 worker 只投影并 append 自己负责的 position subset，同时 packet 的每个 query 仍对所有 local positioned KV 做 causal partial。验收应覆盖 m 内 assignees 不均等且跨 worker、每个 (layer,position) K/V exact-once、各 shard 不越 reservation、合并结果与 dense reference 一致。范围只到单层 synthetic；不接 wire/runtime、不做 24 层、多请求或动态 planner。开始前需完成独立动机剖析并确认 LayerPacket 如何表达 position assignment。
 
-_updated: 2026-08-07 11:36:59_
+_updated: 2026-08-07 12:52:46_
 ### Continuation prefill 多路线实验组合空间
 
 type: `task` · status: `ongoing` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-07`

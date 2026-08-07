@@ -2,6 +2,20 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### m>1 stationary LayerPacket 单层合同验证完成
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@5777d51`
+
+实现提交 5777d51（rust: validate multi-token stationary layer packet）。
+新鲜验证：
+1. cargo test ... multi_token_layer_packet_completes_positioned_causal_layer_without_history_payload：1 passed。m=3、T=6、两个非连续 positioned shards 的 attention 与 dense reference max diff <1e-4，整层 hidden max diff <2e-4；新 KV 仅 append 到指定 shard，预分配 storage pointer 不变。
+2. cargo test ... layer_packet_payload_does_not_grow_with_history_context：1 passed。m=3 时 T=2 与 T=47 的 packet tensor element count 相等；payload 公式为 m*(4H+h_q+1)，不含历史 T。
+3. cargo test ... model::self_driving::tests：21 passed、0 failed、1 ignored（需要本地 Qwen 权重的既有测试）。既有 m=1 decode、任意 N、wrap-around、24 层 cache reuse 等回归保持通过。
+4. cargo clippy --features tch-backend --lib --tests：exit 0，只有仓内既存 warnings；本节点两文件 rustfmt --check 与 git diff --check：exit 0。
+调试记录：首次编译发现 validate_route 使用 position_ids 却遗漏函数参数；确认唯一调用点后以显式借用参数修复，同一测试随后通过。
+证据边界：CPU synthetic correctness，不是 MPS/CUDA/HIP 性能或真实网络结果；整段新 KV 仍由一个 assignee 接收。
+
+_updated: 2026-08-07 12:52:46_
 ### Initial prefill 的 KV-ring 是路线选择而非数学必要
 
 type: `revision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@4b6dc76`
@@ -18,6 +32,16 @@ type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · sour
 证据边界：这是数学、权威来源和代码映射研究，不是 m>1 整层实现、真实网络性能或异构硬件结果。
 
 _updated: 2026-08-07 10:35:39_
+### 先验证 m>1 LayerPacket 的单层完整合同
+
+type: `task` · status: `closed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@5777d51`
+
+下一小节点只推广 LayerPacket 的整层 shape 与 positioned causal 合同。历史 KV 保持在 ReservedPositionedKvShard；只验证一层 synthetic correctness 和 payload 不随 T 增长。整段新 K/V 暂由单一 assignee append，因此不声称 capacity-weighted placement 完成；不接 wire/runtime、多请求或动态 planner。
+
+[2026-08-07 完成]
+m>1 单层完整 LayerPacket 合同已由 Rust synthetic oracle 验证。LayerPacket 接受 [1,m,H] hidden 与 [1,m] absolute position_ids，携带 residual、normalized、Q、O/LSE，依次合并各节点 ReservedPositionedKvShard 的 causal partial；finisher 唯一执行 W_o、residual、post-attention Norm 与 MLP。历史 KV 不进入 packet。当前实现把整段 m 个新 K/V 暂时 append 到单一 assignee；它证明整层数学与 shape 合同，不证明 capacity-weighted per-position placement、wire/runtime 或 24 层 continuation 闭环。
+
+_updated: 2026-08-07 12:52:46_
 ### 研究 continuation prefill 是否需要移动历史 KV
 
 type: `task` · status: `closed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@4b6dc76`
