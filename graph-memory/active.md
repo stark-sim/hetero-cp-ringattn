@@ -2,6 +2,22 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 项目工作流已沉淀为通用 skill：三处合并、一处新建
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
+
+
+【动机六问】
+1. 问题：项目实际使用的工作流（必要性审计、证据边界、路线对比门禁）散落在 graph 节点与个人习惯中，跨 session/跨项目不可复用。
+2. 现状：九个原子工作流中七个已有 skill 覆盖（motivation-analysis、graph-memory、tdd、writing-plans、executing-plans、verification-before-completion、using-git-worktrees、learning-from-incidents、academic-deep-research）；三个缺口无主。
+3. 终态：每个缺口并入最小既有主或新建一个 skill，零重复能力。
+4. 他者：learning-from-incidents 的晋升表要求优先更新既有主而非新建。
+5. 本方案：Necessity Audit 并入 motivation-analysis（数学必要性 vs 工程习惯的证伪）；Scope the Claim 并入 verification-before-completion（声明必须写明不证明什么）；graph-memory 的 evidence 落盘格式同步要求显式边界；唯一新建 route-experimentation（branch-per-route 公平对比 + 三期里程碑门禁）。
+6. 为什么：合并避免同一判断逻辑两处漂移；route-experimentation 无既有主且非项目专属，符合新建门槛。
+【影响面】本项目 agent 规则已通过 AGENTS.md 指向 motivation-analysis 与 graph-memory；route-experimentation 的三期门禁由 decision-route-milestone-gating-20260809 在本项目实例化。skill 库位于 ~/.agents/skills/，跨项目生效。
+VERDICT: IMPLEMENTED。用户于 2026-08-09 确认通用化方向。
+
+_updated: 2026-08-08 18:19:36_
 ### 路线 B 一期：核心方案可行性（大）
 
 type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
@@ -84,13 +100,6 @@ type: `preference` · status: `held` · confidence: 1.0 · importance: 1.0 · so
 用户于 2026-08-09 确认并通用化：当被改动的语言或文件格式存在公认的 canonical 格式化工具（rustfmt、gofmt、prettier、black、clang-format 等），每次改动后先对改动文件统一运行该工具，再执行 git diff 审查与提交。目的：diff 只呈现语义变化，避免“未整理格式 vs 格式化后”的文本干扰掩盖业务差异。该规则不限于 Rust。仓库基线未整体采纳工具输出时，只对实际改动的文件运行（如 rustfmt --edition 2021 <file>），不做全仓格式化；纯格式基线须为独立提交。多节点源码同步仍以格式化后的 Git commit/remote 为唯一通道。本条取代 preference-rustfmt-before-diff-git-remote-sync-20260803 的 Rust 限定表述。
 
 _updated: 2026-08-08 17:29:16_
-### m-segment 新 KV 按 position owner-local 生成
-
-type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-07`
-
-当前小节点只证明 m-segment 的新 K/V 能按 position 分散到多个 ReservedPositionedKvShard。使用 tickets=[1,3,2]、N=3、m=6 的单层 synthetic case：请求级 frozen schedule 产生 1:3:2 owner counts；每个 domain 只投影并 append 自己负责的 normalized/position subset；全部 m 个 Q 仍逐节点合并 local causal partial。验收包括 owner 完备且无重复、各 shard 不越预留容量、storage pointer 稳定、attention 与整层 hidden 对 dense reference 数值一致、packet payload 不携带历史 KV 或 per-layer owner vector。范围不含 wire/runtime、24 层、多请求、动态 planner 或性能结论。
-
-_updated: 2026-08-07 14:08:49_
 ### position ownership 留在 frozen request plan
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-07`
