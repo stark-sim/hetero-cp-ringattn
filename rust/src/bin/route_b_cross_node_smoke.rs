@@ -770,7 +770,7 @@ fn run_local(device: Device, model_dir: &Path, out_dir: &Path) -> Result<(), Str
     let mut reference_caches = reference.create_kv_caches();
     let reference_prefill_logits = reference
         .forward(
-            &Tensor::from_slice(&PROMPT).unsqueeze(0),
+            &Tensor::from_slice(&PROMPT).unsqueeze(0).to_device(device),
             &mut reference_caches,
         )
         .unwrap()
@@ -818,7 +818,9 @@ fn run_local(device: Device, model_dir: &Path, out_dir: &Path) -> Result<(), Str
     assert_eq!(decode_handoffs, layers * (DOMAINS - 1));
     let reference_decode_logits = reference
         .forward(
-            &Tensor::from_slice(&[decode_token]).unsqueeze(0),
+            &Tensor::from_slice(&[decode_token])
+                .unsqueeze(0)
+                .to_device(device),
             &mut reference_caches,
         )
         .unwrap()
@@ -907,7 +909,9 @@ fn run_local(device: Device, model_dir: &Path, out_dir: &Path) -> Result<(), Str
     reference.set_prefill_position_ids(&scenario.continuation_positions, device);
     let reference_continuation_logits = reference
         .forward(
-            &Tensor::from_slice(&CONTINUATION_PROMPT).unsqueeze(0),
+            &Tensor::from_slice(&CONTINUATION_PROMPT)
+                .unsqueeze(0)
+                .to_device(device),
             &mut reference_caches,
         )
         .unwrap()
