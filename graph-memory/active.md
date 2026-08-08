@@ -2,6 +2,41 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 路线 B 一期：核心方案可行性（大）
+
+type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
+
+出口标准（6 项全过才考虑 correctness 核心合 main）：
+1. [done] m>1 stationary LayerPacket 单层合同（5777d51）
+2. [done] position owner-local KV 分散（73cd0e8）
+3. [done] 24 层 mixed-history continuation（a7a583d）
+4. [done] continuation 后 decode 闭环（b523bc7）
+5. [done] 真实 Qwen 权重的路线 B continuation correctness（97ca355，路线分支；argmax exact、mean 0.078890、max 0.476562、24 层 totals [54,162]）
+6. [done] 跨设备数值验证（Mac MPS 与 white CUDA 各跑 worker；evidence-route-b-cross-device-mac-mps-white-cuda-20260809，d9c1d35/ed6e658/9490c6f）
+边界：本期全部是 correctness 证据，不含性能声明。
+
+_updated: 2026-08-08 19:32:10_
+### 路线 B 跨设备数值验证：真实分布式合作 + 单机数据交叉验证
+
+type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
+
+路线 B 一期出口标准第 6 项。Mac 本机 MPS 与 white CUDA(RTX 4090, Tailscale 100.118.253.68)各跑一个真实 worker 进程，执行与 97ca355 相同的 prefill(0..3) -> decode(4) -> owner-local stationary continuation(5..8) 场景；分布式输出与单机(97ca355 in-process LinkedMock)输出交叉对比，证明真实异构设备与真实网络传输不破坏数学流程。pearl(RX 9060 XT HIP, 100.111.242.55)环境也就绪，可作为第三平台补充验证。验收：分布式 argmax exact、mean/max diff 落在既有 BF16 容差内；单机参考数据作为 golden。边界：correctness 证据，不含性能声明；stationary packet 的生产 wire codec 仍属二期第 1 项，本期只允许最小实验性传输机制。
+
+_updated: 2026-08-08 18:39:45_
+### 跨设备数值验证采用真实分布式执行并以单机结果为 golden 交叉验证
+
+type: `decision` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
+
+【动机六问】
+1. 问题：路线 B 一期 6 项出口标准仅剩第 6 项；此前全部 correctness 证据均为单机(合成 tensor 或 97ca355 单进程双 backend + LinkedMock transport),未证明真实异构硬件(Apple MPS vs NVIDIA CUDA BF16 kernel)与真实网络传输下数学流程仍然成立。
+2. 现状:97ca355 在单进程内用两个 TchWorkerBackend + LinkedMock 验证真实 Qwen 权重 continuation(argmax exact 15/15, mean 0.078890, max 0.476562);white(libtorch 2.11.0+cu130, RTX 4090, cargo 1.97.1)与 pearl(libtorch 2.11.0+rocm7.2, RX 9060 XT, cargo 1.96.0)环境探测就绪,仓库分别在 main@58dccc5 / main@c4a3e7f,需 git pull 到 route 分支;stationary packet 的生产 wire codec 按计划属二期第 1 项。
+3. 终态：两个真实 worker 进程(Mac worker0=MPS domain0, white worker1=CUDA domain1)经真实网络传输完成同一 continuation 场景并产出逐 position logits;与单机 golden(同场景同权重)交叉对比,argmax exact 且 mean/max diff 不超出既有 BF16 容差;记录于 graph evidence 并标注硬件/传输边界。
+4. 他者:PyTorch distributed / vLLM 的多机 CP 验证方法均为真实进程 + 真实互联运行,再与单设备 golden reference 对比;其 NCCL/RDMA collective 栈不可复用,但"分布式输出 vs 单机 golden"这一验证方法可直接复用。
+5. 本方案：用户确认要真实分布式合作验证可行,再用单机数据交叉验证分布式未破坏数学。先用既有最小真实传输机制跑通跨机 continuation,不提前实现二期生产 wire codec;若现有 wire 无法承载 stationary packet,把"最小实验性传输扩展"作为本子任务的第一个小节点单独 RED/GREEN。
+6. 为什么:HCP 的核心主张就是异构跨机 P2P;单机 mock 无法暴露跨平台 BF16 kernel 差异与真实 transport 序列化误差。用户已明确选择真实分布式而非各机自跑自证。
+VERDICT: IMPLEMENT。用户于 2026-08-09 确认方向。
+
+_updated: 2026-08-08 18:39:45_
 ### 项目工作流已沉淀为通用 skill：三处合并、一处新建
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
@@ -18,20 +53,6 @@ type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · sour
 VERDICT: IMPLEMENTED。用户于 2026-08-09 确认通用化方向。
 
 _updated: 2026-08-08 18:19:36_
-### 路线 B 一期：核心方案可行性（大）
-
-type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
-
-出口标准（6 项全过才考虑 correctness 核心合 main）：
-1. [done] m>1 stationary LayerPacket 单层合同（5777d51）
-2. [done] position owner-local KV 分散（73cd0e8）
-3. [done] 24 层 mixed-history continuation（a7a583d）
-4. [done] continuation 后 decode 闭环（b523bc7）
-5. [done] 真实 Qwen 权重的路线 B continuation correctness（97ca355，路线分支；argmax exact、mean 0.078890、max 0.476562、24 层 totals [54,162]）
-6. [pending] 跨设备数值验证（Mac MPS 与 white CUDA 各跑 worker）
-边界：本期全部是 correctness 证据，不含性能声明。
-
-_updated: 2026-08-08 18:15:36_
 ### main 工作区 placement/ledger WIP 暂缓提交，待工程期重启
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
