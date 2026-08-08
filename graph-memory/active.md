@@ -2,6 +2,41 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 路线 B 三节点 ring 拓扑数值验证:Mac MPS + white CUDA + pearl HIP
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
+
+用户指出 N=2 的 server/client 直连无法区分 ring 拓扑,不能证明核心方案在目标 P2P ring 线性增长网络拓扑上可行。本子任务:把 route_b_cross_node_smoke 泛化到 N domain 的真实 ring 接线(每节点只与 successor/predecessor 相连,packet 逐跳转发),以 Mac(domain0, mps) -> white(domain1, cuda) -> pearl(domain2, hip/cuda:0) -> Mac 组成 3 节点环跑 continuation 场景;同步泛化 local 模式产出 3-backend 单机 golden 做交叉验证。验收:分布式输出 vs 各平台 golden argmax exact、mean/max 在既有 BF16 容差内;packet 严格 N-1=2 跳经中间节点转发,无任何直连捷径。边界:correctness 证据,不含性能声明。
+
+_updated: 2026-08-08 21:34:04_
+### N=2 直连证据不足,须以 N=3 逐跳 ring 验证拓扑可行性
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
+
+【动机六问】
+1. 问题:route_b_cross_node_smoke 的 N=2 server/client 每节点与对方直连,数学上等价于点对点;HCP 的核心主张是 neighbor-only P2P ring 的线性增长拓扑,N=2 证据无法区分"ring 可行"与"直连可行"。
+2. 现状:跨设备数值验证已通过(Mac MPS + white CUDA, argmax exact);smoke 二进制的 RingTransport 假设 successor==predecessor(N=2 特例);pearl(RX 9060 XT HIP, Tailscale 100.111.242.55, libtorch 2.11.0+rocm7.2 需 LD_PRELOAD libtorch_hip.so)环境就绪但仓库停在 main@c4a3e7f 且 remote 为 HTTPS。
+3. 终态:3 节点真实 ring:每节点只有 successor 出站与 predecessor 入站两类连接,prefill KV 与 stationary packet 都逐跳流动;分布式输出与三平台单机 golden 交叉验证 argmax exact、容差内;证据记录拓扑事实(N-1 跳、无直连)。
+4. 他者:Ring Attention 原论文与 PyTorch CP 的 ring 实现均以 N>=2 的逐跳 send/recv 定义;self_driving.rs 的多线程测试已在单进程内验证任意 N 的 packet 路由,缺的是跨进程真实网络版本。
+5. 本方案:泛化 smoke 二进制:RingTransport 改为 outgoing(至 successor)+ incoming(自 predecessor)双流;每节点 --bind 收 predecessor、--peer 指 successor;场景参数(tickets、prefix splits)由 CLI 给定,两端确定性推导;local 模式泛化为 N-backend mock ring 产 golden。pearl 侧用 LD_PRELOAD=libtorch_hip.so + LIBTORCH_BYPASS_VERSION_CHECK=1 运行 --device cuda:0(ROCm 在 PyTorch 内表现为 CUDA)。
+6. 为什么:只有 N>=3 才存在"中间节点转发"这一 ring 本质行为;三平台(MPS/CUDA/HIP)同时补强跨设备数值证据与拓扑证据,一次实验回答两个不确定性。
+VERDICT: IMPLEMENT。用户于 2026-08-09 确认。
+
+_updated: 2026-08-08 21:34:04_
+### 路线 B 三节点真 ring 跨平台验证通过:Mac MPS + white CUDA + pearl HIP
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@8a5b04e`
+
+实现提交 246aa8c(N 节点 ring 泛化)+ 0a67cce(诊断 probe)+ 9ab909b(tie-aware 断言)+ 8a5b04e(对比脚本修复),均在 codex/route-b-continuation-stationary-packet 分支。
+拓扑事实(日志实证):Mac(domain0, mps) -> white(domain1, cuda:0) -> pearl(domain2, ROCm cuda:0) -> Mac;每节点只有 successor 出站 dial 与 predecessor 入站 accept 两类 TCP 连接(每层一条,共 24),无任何非邻居直连;prefill KV 经 ring.rs N-1=2 跳逐跳转发,decode/continuation stationary LayerPacket 逐跳(starter->middle->finisher)流动。
+验证命令与结果:
+1. 三平台单机 golden(各机 route_b_cross_node_smoke local --domains 3 --tickets 1,2,3 --prefix-splits 1,1,2):全部通过;decode_token=198、continuation argmax=15 与 contiguous reference 一致;domain totals=[52,56,108]。pearl HIP 初跑失败诊断为合法 bf16 精确平局(token 17 与 198 同为 12.0625,dense_forward_probe 实测,HIP vs CPU mean 0.0436/max 0.297 在容差内),已将 smoke 与对比脚本改为 tie-aware(1 ulp=0.0625),非 kernel bug。
+2. 三节点真实分布式(setsid nohup 脱离 ssh 生命周期;Mac 29610 / white 29611 / pearl 29612):三端全部正常退出,kv_totals=[52,56,108] 与 golden 一致,每节点 sends=32、ring 合计 96=golden handoffs,decode/continuation finisher 均为 domain2(pearl)。
+3. 交叉验证(compare_route_b_dumps.py):分布式 finisher(pearl HIP)输出 vs pearl HIP / white CUDA / Mac MPS 三份 golden——prefill/decode/continuation argmax 全等(198/6667/15,本次无需动用 tie 豁免),mean 0.021-0.058,max 0.148-0.375,全部 PASS。
+运维教训:ssh 前台长进程会因会话 SIGHUP 导致远端半启动(bind/dial 中途死亡),远端节点必须 setsid nohup 脱离会话;pkill -f 模式会匹配自身命令行,需用 [r] 括号技巧。
+证据边界:仅 N=3、m=4、24 层、Qwen2-0.5B BF16、Tailscale TCP 单请求场景;correctness 证据,不含性能声明;未覆盖 N>3、多请求、QUIC 生产 wire、容量 tickets 非 [1,2,3] 的分布。reports/routeb-ring3-20260809-050707/(Mac)与 reports/routeb-ring3-run1/(white/pearl)留存 dump。
+
+_updated: 2026-08-08 21:34:04_
 ### 路线 B 一期：核心方案可行性（大）
 
 type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
@@ -1149,6 +1184,13 @@ type: `belief` · status: `held` · confidence: 0.85 · importance: 0.95 · sour
 基于 white-pearl 限速矩阵：\n- 2.35 Gbps 基线 20.5 s\n- 1 Gbps 29.5 s（1.44x）\n- 500 Mbps 50 s（2.44x）\n- 100 Mbps 445 s（21.7x）\n\n在 Qwen2-0.5B-1M、seq=4096、max_tokens=5 的异构推理任务中，端到端 latency 随跨节点带宽下降呈非线性增长。低于 1 Gbps 时，P2P KV ring 的通信时间显著超过计算时间；100 Mbps 时通信完全主导总时间。\n\n推论：若要在生产环境中部署异构 CP 推理，需要 CXL / RDMA / 高速 NVLink 等级别的互联带宽，否则网络将把多卡聚合的显存优势抵消为极高的延迟惩罚。
 
 _updated: 2026-06-29 14:32:15_
+### 跨设备 BF16 验证的 argmax 判据必须容忍精确平局翻转
+
+type: `belief` · status: `held` · confidence: 0.98 · importance: 0.9 · source: `hetero-cp-ringattn@9ab909b`
+
+pearl HIP 实测:同一参考前向中 token 17 与 198 的 logits 在 bf16 下完全相等(12.0625),argmax 取首个最大索引导致跨平台结果不同(HIP=17,CPU/MPS/CUDA=198),而向量级 mean/max 差异远在容差内。因此严格 argmax 相等在 near-tie 处不是合法的跨设备判据;正确判据是 tie-aware argmax(双方所选 token 均在各自 max 的 1 个 bf16 ulp 内)或 top-k 成员资格。已落地于 route_b_cross_node_smoke 与 compare_route_b_dumps.py(9ab909b)。
+
+_updated: 2026-08-08 21:34:04_
 ### Cargo 经 rsproxy 联网运行，不使用 offline
 
 type: `preference` · status: `held` · confidence: 1.0 · importance: 0.9 · source: `user-correction-2026-08-03`
