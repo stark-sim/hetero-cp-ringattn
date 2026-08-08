@@ -2,6 +2,20 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 路线 B 一期：核心方案可行性（大）
+
+type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
+
+出口标准（6 项全过才考虑 correctness 核心合 main）：
+1. [done] m>1 stationary LayerPacket 单层合同（5777d51）
+2. [done] position owner-local KV 分散（73cd0e8）
+3. [done] 24 层 mixed-history continuation（a7a583d）
+4. [done] continuation 后 decode 闭环（b523bc7）
+5. [done] 真实 Qwen 权重的路线 B continuation correctness（97ca355，路线分支；argmax exact、mean 0.078890、max 0.476562、24 层 totals [54,162]）
+6. [pending] 跨设备数值验证（Mac MPS 与 white CUDA 各跑 worker）
+边界：本期全部是 correctness 证据，不含性能声明。
+
+_updated: 2026-08-08 18:15:36_
 ### main 工作区 placement/ledger WIP 暂缓提交，待工程期重启
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
@@ -30,20 +44,6 @@ type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · sour
 5. 本方案：graph 建决策 + 三个 phase 任务节点并以 DEPENDS_ON 串联；同步把里程碑门禁写入 route-experimentation skill 作为跨项目通用机制。
 6. 为什么：比直接合并保住对比公平性，比永不合并给出产品化路径；skill 化使机制可复用而非项目一次性规则。
 VERDICT: IMPLEMENT。用户于 2026-08-09 确认这是对 branch-per-route 的正规产品设计化提升。
-
-_updated: 2026-08-08 17:45:36_
-### 路线 B 一期：核心方案可行性（大）
-
-type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
-
-出口标准（6 项全过才考虑 correctness 核心合 main）：
-1. [done] m>1 stationary LayerPacket 单层合同（5777d51）
-2. [done] position owner-local KV 分散（73cd0e8）
-3. [done] 24 层 mixed-history continuation（a7a583d）
-4. [done] continuation 后 decode 闭环（b523bc7）
-5. [pending] 真实 Qwen 权重的路线 B continuation correctness（synthetic→real model）
-6. [pending] 跨设备数值验证（Mac MPS 与 white CUDA 各跑 worker）
-边界：本期全部是 correctness 证据，不含性能声明。
 
 _updated: 2026-08-08 17:45:36_
 ### 路线 B 二期：工程性能力（中）
