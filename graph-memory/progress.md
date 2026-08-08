@@ -2,6 +2,32 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### 24 层 mixed-history stationary continuation 验证完成
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@a7a583d`
+
+路线分支 codex/route-b-continuation-stationary-packet；动机与计划提交 cc542e0；实现提交 a7a583d（rust: validate 24-layer stationary continuation）。
+TDD 与验证：
+1. RED：新增 twenty_four_layer_stationary_continuation_uses_mixed_positioned_history 后，focused cargo test 因 run_model_ring_with_reserved_history_for_positions 不存在而以 E0425 失败；既有 primitive 未被误判为 24 层闭环。
+2. GREEN：focused test 1 passed、0 failed。runner 在任何 shard mutation 前校验所有 domain offsets 对 0..m 互斥完备；每层只调用 process_layer_packet_with_reserved_history_for_positions，并把 finisher hidden 交给下一层 starter。
+3. 数据流：initial prefill positions 0..5 按 [1,3,2] 保存，一轮 decode 写 position 6；stationary continuation 写 positions 7..12。每层实际 shard position union 严格等于 0..13，continuation 增量为 [1,3,2]，storage pointer 不变且 committed_len 等于 reservation；24 层总 domain KV 为 [52,156,104]。
+4. 路由与数值：starter/finisher 逐层轮转，visited_domains 逐层等于 successor 顺序；总 hops=24*(3-1)=48，末层 logits producer 回到初始 domain。最终 hidden/logits 与 contiguous dense reference 在既有 1e-3 容差内一致。
+5. 完整验证：cargo test --features tch-backend 为 106 passed、0 failed、3 ignored；model::self_driving::tests 为 24 passed、0 failed、1 ignored；cargo clippy --features tch-backend --lib --tests exit 0，仅既存 warnings；file-scoped rustfmt --check、git diff --check 均 exit 0。
+证据边界：mac-local-shell + libtorch CPU synthetic；不证明 MPS/CUDA/HIP、TCP/QUIC、runtime、多请求、性能，亦未在 continuation 后再执行 decode。
+
+_updated: 2026-08-08 09:28:16_
+### 路线 worktree 使用 file-scoped rustfmt
+
+type: `lesson` · status: `held` · confidence: 1.0 · importance: 0.9 · source: `hetero-cp-ringattn@a7a583d`
+
+[2026-08-08 verified incident]
+症状：在干净的路线 B worktree 对单一 Rust 文件改动后运行 cargo fmt --manifest-path rust/Cargo.toml，产生 55 个文件 diff，其中 54 个与任务无关。
+根因：cargo fmt 以整个 crate 为格式化范围，而该分支基线尚未整体采用当前 rustfmt 输出；除空白折行外还会重排 use/mod，造成大面积非业务 diff。
+影响：若直接提交会污染路线比较锚点，使功能 diff 难以审查。
+已验证恢复：规划提交后工作树原本为空，测试 patch 只改 self_driving.rs；对其余 Rust diff reverse apply 后，git status 只剩目标文件，随后 focused/full tests 与 clippy 全部通过，最终 a7a583d 只包含 self_driving.rs。
+预防条件：本仓库的小节点只对实际修改文件运行 rustfmt --edition 2021 <file>，然后执行 git diff --name-only、git diff --check；除非任务本身就是全 crate 格式化，不运行 crate-wide cargo fmt。
+
+_updated: 2026-08-08 09:28:16_
 ### Position owner-local continuation KV 单层合同验证完成
 
 type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@73cd0e8`
@@ -17,6 +43,16 @@ TDD 与验证：
 证据边界：本机 CPU synthetic，不证明 MPS/CUDA/HIP、wire/runtime、24 层 continuation 或路线性能。全局 owner 完备性由 frozen plan 生成/校验，packet 本身不携带或重复校验全局 owner vector。
 
 _updated: 2026-08-08 07:22:27_
+### 24 层 mixed-history stationary continuation
+
+type: `task` · status: `closed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@a7a583d`
+
+当前小节点只验证路线 B 的 24 层 mixed-history stationary continuation。N=3、L=24、tickets=[1,3,2]；先用 positioned shards 建立 initial prefill 历史，再追加一轮 m=1 decode，使 continuation 起点同时含 prefix KV 与 decode KV；随后仅运行一个 m=6 continuation segment。每层用 position owner-local KV 和 self-driving LayerPacket 遍历三节点，历史 KV 不进入 packet。验收包括：每层新增 position union 完整无重复且 owner counts=[1,3,2]；每层各 worker 增量匹配冻结 schedule；reservation 不越界且 storage pointer 不变；starter/finisher 逐层轮转；总 hops=24*(3-1)=48；最终 hidden/logits 对齐 contiguous dense reference。范围限本机 CPU synthetic correctness，不追加 continuation 后 decode，不接 wire/runtime、多请求或性能测量。
+
+[2026-08-08 完成]
+路线 B 已完成 N=3、L=24、m=6、tickets=[1,3,2] 的 mixed-history stationary continuation。起点由六位置 initial prefill 和一轮 capacity-scheduled decode 构成；continuation 历史 KV 全程留在 ReservedPositionedKvShard，LayerPacket 只沿 successor ring 合并本地 positioned attention partial。每层新增 KV 精确按 [1,3,2] append，24 层最终 domain KV 总量为 [52,156,104]，仍严格 1:3:2；每层 N-1=2 hops，总计 48 hops。该结论限本机 CPU synthetic correctness，不是性能、真实网络或异构硬件证据。
+
+_updated: 2026-08-08 09:28:16_
 ### m>1 stationary LayerPacket 单层合同验证完成
 
 type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@5777d51`

@@ -2,13 +2,13 @@
 
 当前活跃的任务、决策、风险和假设。
 
-### 24 层 mixed-history stationary continuation
+### 候选：stationary continuation 后恢复 decode
 
-type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-08`
+type: `task` · status: `planning` · confidence: 0.95 · importance: 1.0 · source: `proposed-after-a7a583d`
 
-当前小节点只验证路线 B 的 24 层 mixed-history stationary continuation。N=3、L=24、tickets=[1,3,2]；先用 positioned shards 建立 initial prefill 历史，再追加一轮 m=1 decode，使 continuation 起点同时含 prefix KV 与 decode KV；随后仅运行一个 m=6 continuation segment。每层用 position owner-local KV 和 self-driving LayerPacket 遍历三节点，历史 KV 不进入 packet。验收包括：每层新增 position union 完整无重复且 owner counts=[1,3,2]；每层各 worker 增量匹配冻结 schedule；reservation 不越界且 storage pointer 不变；starter/finisher 逐层轮转；总 hops=24*(3-1)=48；最终 hidden/logits 对齐 contiguous dense reference。范围限本机 CPU synthetic correctness，不追加 continuation 后 decode，不接 wire/runtime、多请求或性能测量。
+下一候选小节点：在当前路线 B CPU synthetic oracle 上，从 prefix + 第一轮 decode + m=6 stationary continuation 的同一 request state 继续一次 m=1 decode。预先把两轮 decode 的 48 个 layer-KV append 一起纳入 [1,3,2] frozen schedule 和 reservation；用 continuation 的末位置 logits 采样 token，由其 finisher domain 启动 position 13 的 decode。验收包括 dense reference hidden/logits/token 对齐、每层 position union=0..14、post-continuation decode 每层只 append 一次、两轮 decode 总 capacity counts=[8,24,16]、storage pointer 不变、阶段边界仍为 N-1 hops/layer。范围仍限 in-process CPU synthetic，不接 wire/runtime、多请求或性能测量；开始前做独立动机剖析。
 
-_updated: 2026-08-08 08:26:23_
+_updated: 2026-08-08 09:28:16_
 ### 用最小 runner 验证 24 层 route B continuation
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-08`
