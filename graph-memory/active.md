@@ -2,13 +2,13 @@
 
 当前活跃的任务、决策、风险和假设。
 
-### m-segment 新 KV 按 position owner-local 生成
+### 候选：24 层 mixed-history stationary continuation
 
-type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-07`
+type: `task` · status: `planning` · confidence: 0.95 · importance: 1.0 · source: `proposed-after-73cd0e8`
 
-当前小节点只证明 m-segment 的新 K/V 能按 position 分散到多个 ReservedPositionedKvShard。使用 tickets=[1,3,2]、N=3、m=6 的单层 synthetic case：请求级 frozen schedule 产生 1:3:2 owner counts；每个 domain 只投影并 append 自己负责的 normalized/position subset；全部 m 个 Q 仍逐节点合并 local causal partial。验收包括 owner 完备且无重复、各 shard 不越预留容量、storage pointer 稳定、attention 与整层 hidden 对 dense reference 数值一致、packet payload 不携带历史 KV 或 per-layer owner vector。范围不含 wire/runtime、24 层、多请求、动态 planner 或性能结论。
+下一候选小节点：在路线 B 分支用 N=3、L=24、tickets=[1,3,2] 验证 mixed-history continuation。起点应包含已经按 positioned shards 保存的历史 prefix 与至少一轮 decode 增量；随后对 m>1 continuation segment 逐层使用 position owner-local KV 和 self-driving activation packet，验证每层 position union 完整无重复、累计 KV 字节不越各 worker reservation、starter/finisher 跨层轮转、最终 logits 对齐 dense reference。仍限 in-process synthetic，不接 wire/runtime、多请求或性能测量。开始前单独做动机剖析，明确是否在同一节点内再追加一个 decode token，避免把两个里程碑混成一项。
 
-_updated: 2026-08-07 14:08:49_
+_updated: 2026-08-08 07:22:27_
 ### position ownership 留在 frozen request plan
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-07`
@@ -816,13 +816,6 @@ B. vLLM decode ≥2 并发+增长分片保持(修 004,PoC 最小要求);
 C. Rust decode 移植 Q+LSE 累积器环+增长分片(修 007+008)。
 
 _updated: 2026-07-27 15:10:25_
-### Baseline 后实验 batched Q/O/LSE continuation ring
-
-type: `task` · status: `planning` · confidence: 0.95 · importance: 0.98 · source: `user-confirmed-2026-08-03`
-
-在 4b.2 correctness baseline 通过后，以相同 P_Q/P_KV 与 24 层 mixed-history oracle 实验多-token self-driving accumulator ring。先解决 packet shape、同层新 KV 全部就绪顺序、MLP/norm/hidden 的单点执行与 token-boundary N-1/N hop 选择；只做实验性 correctness 和流量计数，不接动态 planner 或服务 runtime。
-
-_updated: 2026-08-07 10:35:39_
 ### Node 4b 先建立两个文件的纯 rustfmt 基线
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 0.98 · source: `user-confirmed-2026-08-03`

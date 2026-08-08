@@ -2,6 +2,21 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### Position owner-local continuation KV 单层合同验证完成
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@73cd0e8`
+
+路线分支 codex/route-b-continuation-stationary-packet；计划提交 99c3084；实现提交 73cd0e8（rust: distribute continuation KV by position owner）。
+TDD 与验证：
+1. RED：新增 multi_token_packet_generates_new_kv_by_capacity_weighted_position_owner 后，cargo test 因 process_layer_packet_with_reserved_history_for_positions 不存在而以 E0425 失败，证明测试命中缺失合同。
+2. GREEN：同一测试通过。N=3、m=6、tickets=[1,3,2]，owner offsets 完备且无重复；三个 ReservedPositionedKvShard 新增数为 [1,3,2]，全部写满但不越过预留容量，storage pointer 不变；packet tensor payload 仍为 m*(4H+h_q+1)，不含历史 KV 或 owner vector；attention max diff <1e-4，整层 hidden max diff <2e-4。
+3. 负路径 position_owner_offsets_reject_duplicates_and_out_of_range_values 通过：重复/越界 offset 在任何 append 前返回错误，committed_len 保持 0。
+4. cargo test --features tch-backend model::self_driving::tests：23 passed、0 failed、1 ignored；旧 m=1 decode、m>1 uniform assignee、任意 N、wrap-around 与 24 层 cache reuse 回归保持通过。
+5. cargo clippy --features tch-backend --lib --tests、目标文件 rustfmt --check、git diff --check 均 exit 0；clippy 仅报告仓内既存 warnings。
+审查修订：normalized 与 position_ids 的 index tensors 分别放到各自输入 device，避免隐含同设备假设。
+证据边界：本机 CPU synthetic，不证明 MPS/CUDA/HIP、wire/runtime、24 层 continuation 或路线性能。全局 owner 完备性由 frozen plan 生成/校验，packet 本身不携带或重复校验全局 owner vector。
+
+_updated: 2026-08-08 07:22:27_
 ### m>1 stationary LayerPacket 单层合同验证完成
 
 type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@5777d51`
@@ -16,6 +31,16 @@ type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · 
 证据边界：CPU synthetic correctness，不是 MPS/CUDA/HIP 性能或真实网络结果；整段新 KV 仍由一个 assignee 接收。
 
 _updated: 2026-08-07 12:52:46_
+### m-segment 新 KV 按 position owner-local 生成
+
+type: `task` · status: `closed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@73cd0e8`
+
+当前小节点只证明 m-segment 的新 K/V 能按 position 分散到多个 ReservedPositionedKvShard。使用 tickets=[1,3,2]、N=3、m=6 的单层 synthetic case：请求级 frozen schedule 产生 1:3:2 owner counts；每个 domain 只投影并 append 自己负责的 normalized/position subset；全部 m 个 Q 仍逐节点合并 local causal partial。验收包括 owner 完备且无重复、各 shard 不越预留容量、storage pointer 稳定、attention 与整层 hidden 对 dense reference 数值一致、packet payload 不携带历史 KV 或 per-layer owner vector。范围不含 wire/runtime、24 层、多请求、动态 planner 或性能结论。
+
+[2026-08-08 完成]
+路线 B 分支 codex/route-b-continuation-stationary-packet 已完成单层 position owner-local KV 合同。N=3、m=6、tickets=[1,3,2] 的 frozen request schedule 把新增 positions 精确分成 [1,3,2]；每个 domain 只 index-select、投影并 append 自己的 normalized/absolute-position subset，随后仍用全部 m 个 Q 对本地完整 positioned shard 计算 causal partial。旧单-assignee API 保留为 all-or-empty offsets wrapper；LayerPacket、SelfDrivingPacket、transport 与 runtime 均未增加 owner vector。该节点是 CPU synthetic correctness，不是性能或真实异构部署结果。
+
+_updated: 2026-08-08 07:22:27_
 ### Initial prefill 的 KV-ring 是路线选择而非数学必要
 
 type: `revision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@4b6dc76`
@@ -102,6 +127,13 @@ Node 4b.1 已建立 P_Q/P_KV 双位置合同并验证本地计算与 wire metada
 提交：31a2559 为 ring.rs 独立 rustfmt 基线；82aca48 为本节点实现。
 
 _updated: 2026-08-04 13:02:27_
+### Baseline 后实验 batched Q/O/LSE continuation ring
+
+type: `task` · status: `superseded` · confidence: 0.95 · importance: 0.98 · source: `user-confirmed-2026-08-03`
+
+在 4b.2 correctness baseline 通过后，以相同 P_Q/P_KV 与 24 层 mixed-history oracle 实验多-token self-driving accumulator ring。先解决 packet shape、同层新 KV 全部就绪顺序、MLP/norm/hidden 的单点执行与 token-boundary N-1/N hop 选择；只做实验性 correctness 和流量计数，不接动态 planner 或服务 runtime。
+
+_updated: 2026-08-08 07:22:27_
 ### Continuation/extend 主流 cache 元数据一手资料审计
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `primary-source-audit-2026-08-03`
