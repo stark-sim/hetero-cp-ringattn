@@ -87,6 +87,9 @@ def main() -> int:
             ok = False
             continue
         argmax_ok, argmax_desc = argmax_verdict(va, vb)
+        diffs = [abs(x - y) for x, y in zip(va, vb)]
+        mean_diff = sum(diffs) / len(diffs)
+        max_diff = max(diffs)
         status = (
             "OK"
             if argmax_ok and mean_diff <= args.mean_tol and max_diff <= args.max_tol
