@@ -54,13 +54,15 @@ pub struct RequestContext {
 /// let backend = TchWorkerBackend::load("/path/to/model", Device::Mps, domain_id, num_domains)?;
 /// ```
 pub struct TchWorkerBackend {
-    model: LlamaModel,
+    // experimental: raised for route_b_cross_node_smoke
+    pub model: LlamaModel,
     device: Device,
     /// Backward-compatible single-request KV cache.
     kv_caches: KvCaches,
     domain_id: usize,
     /// Per-request KV cache and model state (M13 continuous batching).
-    request_contexts: HashMap<u64, RequestContext>,
+    // experimental: raised for route_b_cross_node_smoke
+    pub request_contexts: HashMap<u64, RequestContext>,
 }
 
 impl TchWorkerBackend {

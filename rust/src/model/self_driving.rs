@@ -199,23 +199,28 @@ impl ReservedPositionedKvShard {
         Ok(())
     }
 
-    pub(crate) fn reserved_capacity(&self) -> usize {
+    // experimental: raised for route_b_cross_node_smoke
+    pub fn reserved_capacity(&self) -> usize {
         self.k_storage.size()[2] as usize
     }
 
-    pub(crate) fn committed_len(&self) -> usize {
+    // experimental: raised for route_b_cross_node_smoke
+    pub fn committed_len(&self) -> usize {
         self.committed_len
     }
 
-    pub(crate) fn positions(&self) -> &[i64] {
+    // experimental: raised for route_b_cross_node_smoke
+    pub fn positions(&self) -> &[i64] {
         &self.positions
     }
 
-    pub(crate) fn active_k(&self) -> Tensor {
+    // experimental: raised for route_b_cross_node_smoke
+    pub fn active_k(&self) -> Tensor {
         self.k_storage.narrow(2, 0, self.committed_len as i64)
     }
 
-    pub(crate) fn active_v(&self) -> Tensor {
+    // experimental: raised for route_b_cross_node_smoke
+    pub fn active_v(&self) -> Tensor {
         self.v_storage.narrow(2, 0, self.committed_len as i64)
     }
 
@@ -448,7 +453,8 @@ fn ring_backend(layer: &mut DecoderLayer) -> Result<&mut HcpRingAttentionBackend
         })
 }
 
-pub(crate) fn project_final_logits(model: &LlamaModel, hidden_states: &Tensor) -> Tensor {
+// experimental: raised for route_b_cross_node_smoke
+pub fn project_final_logits(model: &LlamaModel, hidden_states: &Tensor) -> Tensor {
     let normalized = model.norm.forward(hidden_states);
     let lm_head = model.lm_head.as_ref().unwrap_or(&model.embedding);
     let logits = normalized.matmul(&lm_head.transpose(0, 1));
@@ -487,7 +493,8 @@ pub fn process_layer_packet(
     continue_layer_packet(layer, packet, &local_history.0, &local_history.1, None)
 }
 
-pub(crate) fn process_layer_packet_with_reserved_history(
+// experimental: raised for route_b_cross_node_smoke
+pub fn process_layer_packet_with_reserved_history(
     layer: &mut DecoderLayer,
     packet: LayerPacket,
     local_history: &mut ReservedPositionedKvShard,
@@ -506,7 +513,8 @@ pub(crate) fn process_layer_packet_with_reserved_history(
     )
 }
 
-pub(crate) fn process_layer_packet_with_reserved_history_for_positions(
+// experimental: raised for route_b_cross_node_smoke
+pub fn process_layer_packet_with_reserved_history_for_positions(
     layer: &mut DecoderLayer,
     packet: LayerPacket,
     local_history: &mut ReservedPositionedKvShard,
