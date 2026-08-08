@@ -2,13 +2,13 @@
 
 当前活跃的任务、决策、风险和假设。
 
-### stationary continuation 后恢复 decode
+### 候选：m>1 SelfDrivingPacket wire 合同
 
-type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-08`
+type: `task` · status: `planning` · confidence: 0.9 · importance: 1.0 · source: `proposed-after-b523bc7`
 
-当前小节点只验证同一 request 从 stationary continuation 返回 m=1 decode。N=3、L=24、tickets=[1,3,2]；数据流为 initial prefill positions 0..5、第一轮 decode position 6、m=6 route B continuation positions 7..12、第二轮 decode position 13。两轮 decode 的 48 个 layer-KV append 必须在执行前共同进入 frozen schedule 与 reservation。验收包括 continuation 末位置 token 与 dense reference 一致；第二轮 decode 由 continuation finisher 启动；每层只在计划 assignee append position 13；两轮 decode 总 counts=[8,24,16]；每层 position union=0..14；storage pointer 稳定；第二轮 decode 仍为 48 hops；hidden/logits/token 对齐 contiguous dense reference。范围限本机 CPU synthetic correctness，不接 wire/runtime、多请求或性能测量。
+下一候选小节点：在继续真实网络计算前，先验证 route B 的 m>1 SelfDrivingPacket wire 合同。构造带 m=6 residual、normalized、position_ids、Q、O/LSE accumulator 和 route metadata 的 packet，在现有共享 codec/transport 边界完成 roundtrip，断言 tensor shape/value 与 metadata 不变、payload 不包含历史 KV且不随历史 T 增长。开始前通过独立动机剖析决定最小边界是共享 codec、TCP 还是 TCP+QUIC；不得顺带接 24 层网络循环、runtime、多请求或性能测量。
 
-_updated: 2026-08-08 09:43:30_
+_updated: 2026-08-08 10:06:52_
 ### 先用 test-only composition 验证 continuation 到 decode
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-08`
