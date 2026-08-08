@@ -2,6 +2,20 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### Rust 代码先 rustfmt，再 diff；多节点源码只经 Git remote 同步
+
+type: `preference` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-03`
+
+用户确认：我们新增或修改 Rust 代码后先运行 rustfmt，再检查 git diff、验证和提交。业务等价但文本格式不同不应跨节点传播；多节点源码同步以格式化后的 Git commit/remote 为唯一通道，不额外复制源码。历史大范围格式债若会污染业务提交，先做独立纯格式基线提交。
+
+_updated: 2026-08-08 17:29:16_
+### 整理格式再对比内容：改动后先用 canonical formatter 统一格式，再 git diff
+
+type: `preference` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
+
+用户于 2026-08-09 确认并通用化：当被改动的语言或文件格式存在公认的 canonical 格式化工具（rustfmt、gofmt、prettier、black、clang-format 等），每次改动后先对改动文件统一运行该工具，再执行 git diff 审查与提交。目的：diff 只呈现语义变化，避免“未整理格式 vs 格式化后”的文本干扰掩盖业务差异。该规则不限于 Rust。仓库基线未整体采纳工具输出时，只对实际改动的文件运行（如 rustfmt --edition 2021 <file>），不做全仓格式化；纯格式基线须为独立提交。多节点源码同步仍以格式化后的 Git commit/remote 为唯一通道。本条取代 preference-rustfmt-before-diff-git-remote-sync-20260803 的 Rust 限定表述。
+
+_updated: 2026-08-08 17:29:16_
 ### m-segment 新 KV 按 position owner-local 生成
 
 type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-07`
@@ -206,13 +220,6 @@ type: `belief` · status: `held` · confidence: 0.99 · importance: 1.0 · sourc
 Continuation/extend attention 必须把本轮 query 的逻辑位置集合 P_Q 与 attention 所读完整 KV 的逻辑位置集合 P_KV 分开。初始 prefill 中二者常因 Q/K/V 同批投影且本地 shard 连续而表面相同；经历 capacity-weighted initial shard 与 layer-assigned decode 后，每层每节点的 P_KV 是非连续 owned-position 集合，而 continuation 的 P_Q 只含本轮新增 segment。正确 causal 条件是逐元素 p_k <= p_q，不是 local index、seq_offset 或 cache length 比较。该结论同时受主流 cache API 与项目已有 24 层 test-only positioned continuation 数据流支持。
 
 _updated: 2026-08-03 09:14:32_
-### Rust 代码先 rustfmt，再 diff；多节点源码只经 Git remote 同步
-
-type: `preference` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-03`
-
-用户确认：我们新增或修改 Rust 代码后先运行 rustfmt，再检查 git diff、验证和提交。业务等价但文本格式不同不应跨节点传播；多节点源码同步以格式化后的 Git commit/remote 为唯一通道，不额外复制源码。历史大范围格式债若会污染业务提交，先做独立纯格式基线提交。
-
-_updated: 2026-08-03 05:09:31_
 ### 同步 TCP submit 必须同步写 socket
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `controlled-comparison-2026-08-03`

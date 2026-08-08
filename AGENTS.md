@@ -29,6 +29,7 @@ This project uses a graph-backed memory system in `graph-memory/` for cross-sess
 - Raw `reports/**/*.json` files are ignored by git by default. Do not commit generated report JSON unless the user explicitly asks for that exact artifact to be versioned.
 - When an experiment documents project progress or a known-good validation point, summarize the result in docs or graph-memory instead of committing raw generated JSON.
 - Do not commit build outputs, transient logs, cache directories, or large binary artifacts unless explicitly requested.
+- **整理格式再对比内容（通用）**：当被改动的语言或文件格式有公认的 canonical 格式化工具（rustfmt、gofmt、prettier、black、clang-format 等），每次改动后先对改动文件统一运行该工具，再做 `git diff` 审查与提交；diff 应只呈现语义变化，不掺杂格式整理的干扰。若仓库基线尚未整体采纳该工具的输出，只对实际改动的文件运行（如 `rustfmt --edition 2021 <file>`），不做 crate-wide/全仓格式化；需要纯格式基线时，它必须是独立的格式化专用提交。
 - After committing on `main`, push the commit to the configured remote.
 - Never use `git push --force`, `git push -f`, or any force-push variant. Force-push is prohibited for all branches and remotes unless the user explicitly changes this rule in writing.
 
@@ -84,7 +85,7 @@ Before starting any non-trivial work — optimization or ordinary — you MUST b
 5. **Our approach**: the concrete plan for this project.
 6. **Why ours**: how does it differ from the ready-made option in (4), and why is that difference necessary?
 
-The canonical home of this methodology is the `graph-memory` skill (Pre-Action Motivation Analysis section), which also defines how the analysis maps onto node/edge types (`DEPENDS_ON` for ordering, `belief`+evidence for external-world claims, `GOVERNS` from the rule node).
+The canonical home of this methodology is the `motivation-analysis` skill (including its Necessity Audit for claimed necessities); the `graph-memory` skill owns persistence and defines how the analysis maps onto node/edge types (`DEPENDS_ON` for ordering, `belief`+evidence for external-world claims, `GOVERNS` from the rule node).
 
 ### Sacrifice Extension (optimization / subtraction work):
 When the work discards existing behavior in exchange for speed, memory, or simplicity, append four more questions before implementing:
