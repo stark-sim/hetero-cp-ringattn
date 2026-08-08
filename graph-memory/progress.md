@@ -2,6 +2,20 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### 真实 Qwen 路线 B stationary continuation correctness 验证完成
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@97ca355`
+
+路线分支 codex/route-b-continuation-stationary-packet；计划提交 5506684；test-only checkpoint 97ca355（test: validate real-qwen route-B stationary continuation）。
+组合探针结果：首次 GREEN 前无生产代码改动，既有路线 B 原语直接组合成立（同 b523bc7 先例）。
+场景：Qwen2-0.5B、24 层、两 worker、tickets=[1,3]；prefill(0..3) -> decode(4) -> stationary continuation(5..8)；continuation owner offsets 由 FrozenKvAssigneeSchedule 派生（counts=[1,3]，offset 集合按 phase 日历分配）。
+数值：continuation 末位置 logits 对 contiguous reference：argmax 精确一致（15/15）、mean diff=0.078890（<0.1）、max diff=0.476562（<0.75 guard）；pre-continuation decode max diff=0.500000，argmax 一致。
+不变量：每层 position union 精确 0..=8；continuation owner 增量 [1,3]；K/V storage data_ptr 跨 prefill/decode/continuation 不变；结束时 committed_len==reserved_capacity；24 层 domain KV totals=[54,162] 严格 1:3；packet handoffs=24*(2-1)=24。
+验证命令（均 LIBTORCH/DYLD_LIBRARY_PATH/HCP_ENABLE_TORCH=1 前缀）：focused --lib --ignored 1 passed；model::self_driving::tests 24 passed、0 failed、1 ignored；cargo test --lib 106 passed、0 failed、4 ignored；cargo clippy --lib --tests exit 0（29 条仓内既存 warnings）；rustfmt --edition 2021 --check 与 git diff --check 均 exit 0。
+调试记录：LayerPacket.current_domain 私有字段编译错误改用 visit-index 环序（与 39ba09a 同一解法）；frozen schedule 的 phase 日历只保证 owner 集合与 counts，不保证具体 offset 身份，断言改为互斥完备；reserved prefill 的初始 KV-ring 需要 LinkedMock transports，即使 decode/continuation 走 in-process。
+证据边界：mac-local libtorch CPU BF16、单请求；不证明 MPS/CUDA（一期第 6 项）、TCP/QUIC wire、runtime/coordinator、多请求或性能。
+
+_updated: 2026-08-08 18:14:52_
 ### continuation oracle horizon 已从 checkpoint 场景派生
 
 type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@f9d90c7`

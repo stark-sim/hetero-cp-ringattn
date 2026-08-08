@@ -2,6 +2,22 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 真实权重 continuation 采用 test-first 组合探针，不改生产代码
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
+
+
+【动机六问】
+1. 问题：路线 B 一期可行性 6 项中前 4 项都是 synthetic correctness；真实 BF16 权重下 stationary continuation 未验证，synthetic 不能暴露真实数值包络与真实 RoPE/Norm 行为。
+2. 现状：路线 B 原语（process_layer_packet_with_reserved_history_for_positions、LayerPacket m>=1、FrozenKvAssigneeSchedule）已在 synthetic 24 层闭环；真实模型 harness（两独立 backend、reserved prefill、contiguous reference、数值合同 argmax exact + mean<0.1 + max guard）已存在。缺口是二者未组合。
+3. 终态：ignored 真实 oracle：24 层、两 worker、tickets=[1,3]，prefill(0..3) -> decode(4) -> stationary continuation(5..8 按 owner [1,3])；每层 position union=0..8、continuation owner 增量=[1,3]、storage pointer 稳定、reservation 精确写满；末位置 logits argmax 与 reference 一致，mean<0.1、max<0.75；完整回归不退化。
+4. 他者：vLLM/SGLang 用真实权重加分页 KV 验证 extend correctness；其 collective/paged allocator 不适用于 HCP，可复用的是真实权重加 contiguous reference oracle 的方法。
+5. 本方案：test-first 组合探针（同 post-continuation decode 先例 b523bc7）。复用既有原语与 harness，在 tch_backend.rs 新增 ignored oracle；decode 段走 in-process packet，不接 TCP/QUIC；若组合直接通过则记录为组合证据，不为制造 RED 改生产代码。
+6. 为什么：这是把 synthetic 信任转化为真实权重信任的最小一步；先接 wire 或 runtime 会把数值故障与传输/控制故障混在一起。
+【边界】本机 CPU BF16；不证明 MPS/CUDA（一期第 6 项）、wire/runtime、多请求或性能。
+VERDICT: IMPLEMENT。用户于 2026-08-09 确认开始。
+
+_updated: 2026-08-08 17:57:27_
 ### 从阶段场景派生 decode horizon 与 positions
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@f9d90c7`
