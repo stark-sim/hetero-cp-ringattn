@@ -3,18 +3,21 @@
 //! Replicates the verified single-process test
 //! `real_qwen_two_worker_stationary_continuation_matches_reference`
 //! (rust/src/worker_sdk/tch_backend.rs) as:
-//! - `local`:  single-process golden that reproduces the test scenario and all
-//!   of its assertions, then dumps logits + meta to `--out`.
-//! - `server`: domain-1 worker over real TCP (`--bind 0.0.0.0:29511`).
-//! - `client`: domain-0 worker over real TCP (`--peer <host>:29511`).
+//! - `local`:  single-process golden with N in-process backends (mock ring),
+//!   reproducing the test scenario and all of its assertions, then dumping
+//!   logits + meta to `--out`.
+//! - `server` / `client`: legacy N=2 pair mode (domain 1 / domain 0) over one
+//!   full-duplex TCP connection per layer.
+//! - `node`:  true N-domain ring topology. Each node only connects to its
+//!   successor (outgoing dial to `--peer`) and its predecessor (incoming
+//!   accept on `--bind`). Prefill KV blocks and stationary `LayerPacket`s
+//!   both flow hop by hop around the ring.
 //!
-//! Both node modes hardcode the same scenario constants (no coordinator):
-//! model Qwen2-0.5B BF16, request_id=75, capacity_tickets=[1,3],
-//! prompt=[151644,9707,0,16] split [1,3], one decode token at position 4,
-//! continuation [11,13,17,19] at positions [5,6,7,8].
-//!
-//! One full-duplex TCP connection per layer carries both the prefill KV ring
-//! blocks and the decode/continuation self-driving `LayerPacket`s.
+//! Scenario constants (no coordinator): model Qwen2-0.5B BF16, request_id=75,
+//! prompt=[151644,9707,0,16], one decode token at position 4, continuation
+//! [11,13,17,19] at positions [5,6,7,8]. tickets / prefix_splits / domains
+//! come from the CLI (defaults: N=2, tickets=[1,3], splits=[1,3], exactly the
+//! original test); every node derives the full scenario deterministically.
 
 use hcp_ringattn_rust::{
     process_layer_packet_with_reserved_history,
@@ -29,48 +32,80 @@ use std::sync::{Arc, Mutex};
 use tch::{Device, Kind, Tensor};
 
 const REQUEST_ID: u64 = 75;
-const CAPACITY_TICKETS: [u64; 2] = [1, 3];
-const DOMAINS: usize = 2;
 const PROMPT: [i64; 4] = [151644, 9707, 0, 16];
-const PREFIX_SPLITS: [usize; 2] = [1, 3];
 const CONTINUATION_PROMPT: [i64; 4] = [11, 13, 17, 19];
-const DECODE_STARTER: usize = 1;
 const EXPECTED_NUM_LAYERS: usize = 24;
-const EXPECTED_DOMAIN_KV_TOTALS: [usize; 2] = [54, 162];
+const DEFAULT_TICKETS: [u64; 2] = [1, 3];
+const DEFAULT_PREFIX_SPLITS: [usize; 2] = [1, 3];
 
-/// Scenario constants derived deterministically on both ends from the frozen
+/// Scenario constants derived deterministically on every node from the frozen
 /// schedules, exactly like the single-process test.
 struct Scenario {
+    domains: usize,
+    tickets: Vec<u64>,
+    prefix_splits: Vec<usize>,
+    /// (start, end) contiguous prompt slice per domain.
+    prefix_ranges: Vec<(usize, usize)>,
+    /// Owner of the last prefix position; produces prefill last logits and
+    /// starts the decode ping-pong.
+    decode_starter: usize,
     decode_position: i64,
     continuation_positions: Vec<i64>,
+    decode_counts: Vec<usize>,
     decode_assignees: Vec<usize>,
     continuation_offsets_by_domain: Vec<Vec<usize>>,
     capacities: Vec<Vec<usize>>,
 }
 
-fn build_scenario(layers: usize) -> Result<Scenario, String> {
-    let decode_schedule = FrozenKvAssigneeSchedule::new(&CAPACITY_TICKETS, REQUEST_ID, layers)?;
-    if decode_schedule.counts() != [6, 18] {
+fn build_scenario(
+    layers: usize,
+    tickets: Vec<u64>,
+    prefix_splits: Vec<usize>,
+) -> Result<Scenario, String> {
+    let domains = tickets.len();
+    if domains < 2 {
         return Err(format!(
-            "decode schedule counts {:?} != [6, 18]",
-            decode_schedule.counts()
+            "scenario requires at least 2 domains, got {domains}"
         ));
     }
+    if prefix_splits.len() != domains {
+        return Err(format!(
+            "prefix_splits len {} != domains {domains}",
+            prefix_splits.len()
+        ));
+    }
+    if prefix_splits.iter().sum::<usize>() != PROMPT.len() {
+        return Err(format!(
+            "prefix_splits sum {} != prompt length {}",
+            prefix_splits.iter().sum::<usize>(),
+            PROMPT.len()
+        ));
+    }
+    if prefix_splits.contains(&0) {
+        return Err("prefix_splits must be non-zero for every domain".to_string());
+    }
+    if tickets.iter().all(|&t| t == 0) {
+        return Err("tickets must not be all zero".to_string());
+    }
+
+    let mut prefix_ranges = Vec::with_capacity(domains);
+    let mut cursor = 0_usize;
+    for &split in &prefix_splits {
+        prefix_ranges.push((cursor, cursor + split));
+        cursor += split;
+    }
+    let decode_starter = domains - 1; // splits are non-zero, so the last domain owns the last position
+
+    let decode_schedule = FrozenKvAssigneeSchedule::new(&tickets, REQUEST_ID, layers)?;
+    let decode_counts = decode_schedule.counts().to_vec();
     let decode_assignees = (0..layers)
         .map(|layer_idx| decode_schedule.assignee_for(0, layer_idx, layers).unwrap())
         .collect::<Vec<_>>();
 
     let continuation_len = CONTINUATION_PROMPT.len();
     let continuation_schedule =
-        FrozenKvAssigneeSchedule::new(&CAPACITY_TICKETS, REQUEST_ID, continuation_len)?;
-    if continuation_schedule.counts() != PREFIX_SPLITS {
-        return Err(format!(
-            "continuation schedule counts {:?} != {:?}",
-            continuation_schedule.counts(),
-            PREFIX_SPLITS
-        ));
-    }
-    let mut continuation_offsets_by_domain = vec![Vec::new(); DOMAINS];
+        FrozenKvAssigneeSchedule::new(&tickets, REQUEST_ID, continuation_len)?;
+    let mut continuation_offsets_by_domain = vec![Vec::new(); domains];
     for offset in 0..continuation_len {
         let domain = continuation_schedule.assignee_for(offset, 0, 1).unwrap();
         continuation_offsets_by_domain[domain].push(offset);
@@ -88,11 +123,11 @@ fn build_scenario(layers: usize) -> Result<Scenario, String> {
     let decode_position = PROMPT.len() as i64;
     let continuation_positions =
         (decode_position + 1..=decode_position + continuation_len as i64).collect::<Vec<_>>();
-    let capacities = (0..DOMAINS)
+    let capacities = (0..domains)
         .map(|domain| {
             (0..layers)
                 .map(|layer_idx| {
-                    PREFIX_SPLITS[domain]
+                    prefix_splits[domain]
                         + usize::from(decode_assignees[layer_idx] == domain)
                         + continuation_offsets_by_domain[domain].len()
                 })
@@ -101,8 +136,14 @@ fn build_scenario(layers: usize) -> Result<Scenario, String> {
         .collect::<Vec<_>>();
 
     Ok(Scenario {
+        domains,
+        tickets,
+        prefix_splits,
+        prefix_ranges,
+        decode_starter,
         decode_position,
         continuation_positions,
+        decode_counts,
         decode_assignees,
         continuation_offsets_by_domain,
         capacities,
@@ -113,7 +154,8 @@ fn build_scenario(layers: usize) -> Result<Scenario, String> {
 /// order: prefix positions, then the decode position (if assignee), then the
 /// domain's frozen continuation offsets.
 fn expected_positions(scenario: &Scenario, domain: usize, layer_idx: usize) -> Vec<i64> {
-    let mut positions: Vec<i64> = if domain == 0 { vec![0] } else { vec![1, 2, 3] };
+    let (start, end) = scenario.prefix_ranges[domain];
+    let mut positions: Vec<i64> = (start as i64..end as i64).collect();
     if scenario.decode_assignees[layer_idx] == domain {
         positions.push(scenario.decode_position);
     }
@@ -121,6 +163,20 @@ fn expected_positions(scenario: &Scenario, domain: usize, layer_idx: usize) -> V
         positions.push(scenario.decode_position + 1 + offset as i64);
     }
     positions
+}
+
+/// Expected 24-layer KV total per domain, derived from the scenario (never
+/// hardcoded): prefix + decode assignee count + continuation offsets.
+fn expected_domain_kv_total(scenario: &Scenario, domain: usize, layers: usize) -> usize {
+    layers * scenario.prefix_splits[domain]
+        + scenario.decode_counts[domain]
+        + layers * scenario.continuation_offsets_by_domain[domain].len()
+}
+
+/// Finisher of a ring ping-pong layer: the packet visits all N domains in
+/// successor order and stops one hop before the starter.
+fn layer_finisher(starter: usize, domains: usize) -> usize {
+    (starter + domains - 1) % domains
 }
 
 fn parse_device(value: &str) -> Result<Device, String> {
@@ -139,6 +195,28 @@ fn parse_device(value: &str) -> Result<Device, String> {
                     .map_err(|e| format!("invalid --device {value}: {e}"))
             }),
     }
+}
+
+fn parse_usize_list(value: &str, flag: &str) -> Result<Vec<usize>, String> {
+    value
+        .split(',')
+        .map(|item| {
+            item.trim()
+                .parse::<usize>()
+                .map_err(|e| format!("invalid {flag} value {value}: {e}"))
+        })
+        .collect()
+}
+
+fn parse_u64_list(value: &str, flag: &str) -> Result<Vec<u64>, String> {
+    value
+        .split(',')
+        .map(|item| {
+            item.trim()
+                .parse::<u64>()
+                .map_err(|e| format!("invalid {flag} value {value}: {e}"))
+        })
+        .collect()
 }
 
 fn default_model_dir() -> PathBuf {
@@ -193,7 +271,7 @@ fn storage_snapshot(
 }
 
 /// Per-domain tail checks: stable storage, committed == reserved, positions
-/// match the frozen offsets, and the expected 24-layer KV total.
+/// match the frozen offsets, and the scenario-derived 24-layer KV total.
 fn verify_domain_kv_state(
     backend: &TchWorkerBackend,
     scenario: &Scenario,
@@ -241,10 +319,10 @@ fn verify_domain_kv_state(
         }
         kv_total += shard.committed_len();
     }
-    if kv_total != EXPECTED_DOMAIN_KV_TOTALS[domain] {
+    let expected_total = expected_domain_kv_total(scenario, domain, storage_before.len());
+    if kv_total != expected_total {
         return Err(format!(
-            "domain {domain} KV total {kv_total} != {}",
-            EXPECTED_DOMAIN_KV_TOTALS[domain]
+            "domain {domain} KV total {kv_total} != scenario-derived {expected_total}"
         ));
     }
     Ok(kv_total)
@@ -302,7 +380,449 @@ impl KvTransport for SharedTcpTransport {
     }
 }
 
-fn run_node(
+/// True ring per-layer transport: sends go to the successor (outgoing dial),
+/// receives come from the predecessor (incoming accept). There is no direct
+/// connection to any other domain, so both prefill KV blocks and stationary
+/// self-driving packets flow hop by hop around the ring.
+#[derive(Clone)]
+struct RingTcpTransport {
+    outgoing: SharedTcpTransport,
+    incoming: SharedTcpTransport,
+}
+
+impl RingTcpTransport {
+    fn send_packet(&self, packet: &SelfDrivingPacket) -> Result<usize, String> {
+        self.outgoing.lock().send_self_driving_packet(packet)
+    }
+
+    fn recv_packet(&self) -> Result<Option<SelfDrivingPacket>, String> {
+        self.incoming.lock().recv_self_driving_packet()
+    }
+}
+
+impl KvTransport for RingTcpTransport {
+    fn submit_send(&mut self, block: &KvBlock) -> Result<(), String> {
+        self.outgoing.lock().submit_send(block)
+    }
+
+    fn poll_recv(&mut self) -> Result<Option<KvBlock>, String> {
+        self.incoming.lock().poll_recv()
+    }
+
+    fn flush_send(&mut self) -> Result<(), String> {
+        self.outgoing.lock().flush_send()
+    }
+
+    fn supports_ring_packets(&self) -> bool {
+        self.outgoing.lock().supports_ring_packets()
+    }
+
+    fn submit_send_packet(&mut self, packet: &RingPacket) -> Result<(), String> {
+        self.outgoing.lock().submit_send_packet(packet)
+    }
+
+    fn poll_recv_packet(&mut self) -> Result<Option<RingPacket>, String> {
+        self.incoming.lock().poll_recv_packet()
+    }
+
+    fn supports_self_driving_packets(&self) -> bool {
+        self.outgoing.lock().supports_self_driving_packets()
+    }
+
+    fn submit_send_self_driving_packet(
+        &mut self,
+        packet: &SelfDrivingPacket,
+    ) -> Result<(), String> {
+        self.outgoing.lock().submit_send_self_driving_packet(packet)
+    }
+
+    fn poll_recv_self_driving_packet(&mut self) -> Result<Option<SelfDrivingPacket>, String> {
+        self.incoming.lock().poll_recv_self_driving_packet()
+    }
+}
+
+/// One ring ping-pong phase (decode or continuation) for this node.
+///
+/// Per layer the packet starts at `phase_starter(layer)`, visits every domain
+/// in successor order, and finishes one hop before the starter. This node is
+/// exactly one of: starter (build + process + forward), middle (recv +
+/// process + forward), or finisher (recv + process + keep hidden states).
+/// Returns (sends, finisher-of-last-layer, hidden states).
+#[allow(clippy::too_many_arguments)]
+fn run_ring_phase(
+    phase: &str,
+    backend: &mut TchWorkerBackend,
+    ring: &[RingTcpTransport],
+    scenario: &Scenario,
+    domain: usize,
+    mut current_starter: usize,
+    tokens: &[i64],
+    position_ids: &Tensor,
+    for_positions: bool,
+    embed_first: bool,
+    device: Device,
+) -> Result<(usize, usize, Tensor), String> {
+    let mut sends = 0_usize;
+    let mut hidden_states: Option<Tensor> = None;
+    for (layer_idx, transport) in ring.iter().enumerate() {
+        let finisher = layer_finisher(current_starter, scenario.domains);
+        if domain == current_starter {
+            if hidden_states.is_none() {
+                if !embed_first {
+                    return Err(format!(
+                        "{phase} layer {layer_idx}: starter has no hidden states"
+                    ));
+                }
+                hidden_states = Some(embed_tokens(&backend.model, tokens, device));
+            }
+            let assignee = if for_positions {
+                // Stationary continuation: every domain appends only its own
+                // frozen offsets; the legacy scalar assignee is the starter.
+                domain
+            } else {
+                scenario.decode_assignees[layer_idx]
+            };
+            let packet = LayerPacket::start(
+                &mut backend.model.layers[layer_idx],
+                hidden_states.as_ref().unwrap(),
+                position_ids,
+                domain,
+                assignee,
+                scenario.domains,
+            )
+            .map_err(|e| format!("{phase} layer {layer_idx} start failed: {e}"))?;
+            let outcome = {
+                let context = backend.request_contexts.get_mut(&REQUEST_ID).unwrap();
+                let Some(KvCacheImpl::ReservedPositioned(shard)) =
+                    &mut context.kv_caches[layer_idx]
+                else {
+                    return Err(format!(
+                        "domain {domain} layer {layer_idx} did not use reserved positioned KV"
+                    ));
+                };
+                if for_positions {
+                    process_layer_packet_with_reserved_history_for_positions(
+                        &mut backend.model.layers[layer_idx],
+                        packet,
+                        shard,
+                        &scenario.continuation_offsets_by_domain[domain],
+                    )
+                } else {
+                    process_layer_packet_with_reserved_history(
+                        &mut backend.model.layers[layer_idx],
+                        packet,
+                        shard,
+                    )
+                }
+                .map_err(|e| format!("{phase} layer {layer_idx} starter step failed: {e}"))?
+            };
+            let LayerStepOutcome::Forward(next_packet) = outcome else {
+                return Err(format!(
+                    "{phase} layer {layer_idx} starter finished a {}-domain route",
+                    scenario.domains
+                ));
+            };
+            let wire = next_packet
+                .into_self_driving_packet(layer_idx)
+                .map_err(|e| format!("{phase} layer {layer_idx} wire encode failed: {e}"))?;
+            transport
+                .send_packet(&wire)
+                .map_err(|e| format!("{phase} layer {layer_idx} forward failed: {e}"))?;
+            sends += 1;
+        } else {
+            let wire = transport
+                .recv_packet()
+                .map_err(|e| format!("{phase} layer {layer_idx} recv failed: {e}"))?
+                .ok_or_else(|| format!("{phase} layer {layer_idx} predecessor closed"))?;
+            if wire.layer_idx != layer_idx {
+                return Err(format!(
+                    "{phase} layer {layer_idx} received packet for layer {}",
+                    wire.layer_idx
+                ));
+            }
+            let packet = LayerPacket::from_self_driving_packet(wire)
+                .map_err(|e| format!("{phase} layer {layer_idx} wire decode failed: {e}"))?;
+            let outcome = {
+                let context = backend.request_contexts.get_mut(&REQUEST_ID).unwrap();
+                let Some(KvCacheImpl::ReservedPositioned(shard)) =
+                    &mut context.kv_caches[layer_idx]
+                else {
+                    return Err(format!(
+                        "domain {domain} layer {layer_idx} did not use reserved positioned KV"
+                    ));
+                };
+                if for_positions {
+                    process_layer_packet_with_reserved_history_for_positions(
+                        &mut backend.model.layers[layer_idx],
+                        packet,
+                        shard,
+                        &scenario.continuation_offsets_by_domain[domain],
+                    )
+                } else {
+                    process_layer_packet_with_reserved_history(
+                        &mut backend.model.layers[layer_idx],
+                        packet,
+                        shard,
+                    )
+                }
+                .map_err(|e| format!("{phase} layer {layer_idx} ring step failed: {e}"))?
+            };
+            if domain == finisher {
+                let LayerStepOutcome::Finished {
+                    hidden_states: next_hidden,
+                    ..
+                } = outcome
+                else {
+                    return Err(format!(
+                        "{phase} layer {layer_idx} finisher forwarded a {}-domain route",
+                        scenario.domains
+                    ));
+                };
+                hidden_states = Some(next_hidden);
+            } else {
+                let LayerStepOutcome::Forward(next_packet) = outcome else {
+                    return Err(format!(
+                        "{phase} layer {layer_idx} middle node finished a {}-domain route",
+                        scenario.domains
+                    ));
+                };
+                let wire = next_packet
+                    .into_self_driving_packet(layer_idx)
+                    .map_err(|e| format!("{phase} layer {layer_idx} wire encode failed: {e}"))?;
+                transport
+                    .send_packet(&wire)
+                    .map_err(|e| format!("{phase} layer {layer_idx} forward failed: {e}"))?;
+                sends += 1;
+            }
+        }
+        current_starter = layer_finisher(current_starter, scenario.domains);
+    }
+    let hidden_states =
+        hidden_states.ok_or_else(|| format!("{phase}: this node never finished a layer"))?;
+    Ok((sends, current_starter, hidden_states))
+}
+
+/// `node` mode: one domain of a true N-domain ring over real TCP.
+#[allow(clippy::too_many_arguments)]
+fn run_ring_node(
+    domain: usize,
+    device: Device,
+    bind: &str,
+    peer: &str,
+    tickets: Vec<u64>,
+    prefix_splits: Vec<usize>,
+    model_dir: &Path,
+    out_dir: &Path,
+) -> Result<(), String> {
+    let config = ModelConfig::from_file(model_dir.join("config.json"))
+        .map_err(|e| format!("load config failed: {e}"))?;
+    if config.num_layers != EXPECTED_NUM_LAYERS {
+        return Err(format!(
+            "num_layers {} != {EXPECTED_NUM_LAYERS}",
+            config.num_layers
+        ));
+    }
+    let layers = config.num_layers;
+    let scenario = build_scenario(layers, tickets, prefix_splits)?;
+    let domains = scenario.domains;
+    if domain >= domains {
+        return Err(format!(
+            "domain {domain} out of range for {domains} domains"
+        ));
+    }
+    std::fs::create_dir_all(out_dir)
+        .map_err(|e| format!("create {} failed: {e}", out_dir.display()))?;
+    let weights = ModelWeights::from_dir(model_dir, device)
+        .map_err(|e| format!("load weights failed: {e}"))?;
+    let model = LlamaModel::from_weights(config, &weights, device, domains)
+        .map_err(|e| format!("build model failed: {e}"))?;
+    let mut backend = TchWorkerBackend::from_model(model, device, domain);
+
+    // Ring wiring: bind first so successors can dial, then dial the successor
+    // (with retry), then accept the predecessor — both in layer order.
+    let listener = TcpListener::bind(bind).map_err(|e| format!("bind {bind} failed: {e}"))?;
+    let mut outgoing = Vec::with_capacity(layers);
+    for layer_idx in 0..layers {
+        let mut attempt = 0_u32;
+        let stream = loop {
+            match TcpStream::connect(peer) {
+                Ok(stream) => break stream,
+                Err(e) => {
+                    attempt += 1;
+                    if attempt >= 240 {
+                        return Err(format!(
+                            "connect layer {layer_idx} to successor {peer} failed after {attempt} attempts: {e}"
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            }
+        };
+        outgoing.push(SharedTcpTransport(Arc::new(Mutex::new(
+            TcpKvTransport::new(stream, device)?,
+        ))));
+    }
+    println!("[route-b smoke] domain {domain}: dialed successor {peer} ({layers} connections)");
+    let mut incoming = Vec::with_capacity(layers);
+    for layer_idx in 0..layers {
+        let (stream, addr) = listener
+            .accept()
+            .map_err(|e| format!("accept layer {layer_idx} failed: {e}"))?;
+        if layer_idx == 0 {
+            println!("[route-b smoke] domain {domain}: accepted predecessor {addr} on {bind}");
+        }
+        incoming.push(SharedTcpTransport(Arc::new(Mutex::new(
+            TcpKvTransport::new(stream, device)?,
+        ))));
+    }
+    let ring = (0..layers)
+        .map(|layer_idx| RingTcpTransport {
+            outgoing: outgoing[layer_idx].clone(),
+            incoming: incoming[layer_idx].clone(),
+        })
+        .collect::<Vec<_>>();
+    let transports = ring
+        .iter()
+        .map(|transport| Box::new(transport.clone()) as Box<dyn KvTransport>)
+        .collect::<Vec<_>>();
+    backend.setup_kv_transports(transports);
+
+    // ===== Phase 1: prefill (KV ring exchange happens inside the backend,
+    // flowing successor-wards hop by hop through RingTcpTransport). =====
+    let (prefix_start, prefix_end) = scenario.prefix_ranges[domain];
+    let chunk = &PROMPT[prefix_start..prefix_end];
+    let positions = (prefix_start as i64..prefix_end as i64).collect::<Vec<_>>();
+    let (logits_vec, global_len) = backend
+        .prefill_request_with_reservation(
+            REQUEST_ID,
+            chunk,
+            prefix_start,
+            Some(&positions),
+            Some(&scenario.capacities[domain]),
+        )
+        .map_err(|e| format!("prefill failed: {e}"))?;
+    if global_len != prefix_end {
+        return Err(format!(
+            "domain {domain} global_seq_len {global_len} != prefix end {prefix_end}"
+        ));
+    }
+    let prefill_logits = Tensor::from_slice(&logits_vec);
+    let prefill_argmax = prefill_logits.argmax(-1, false).int64_value(&[]);
+    let mut decode_token = None;
+    if domain == scenario.decode_starter {
+        decode_token = Some(prefill_argmax);
+        write_tensor_f32le(&out_dir.join("prefill_last_logits.f32le"), &prefill_logits)?;
+    }
+    println!("[route-b smoke] domain {domain} prefill done: global_len={global_len}");
+
+    let storage_before = storage_snapshot(&backend, layers)?;
+
+    // ===== Phase 2: decode (24-layer ring ping-pong). =====
+    let decode_position_ids = Tensor::from_slice(&[scenario.decode_position])
+        .unsqueeze(0)
+        .to_device(device);
+    let (decode_sends, decode_finisher, decode_hidden) = run_ring_phase(
+        "decode",
+        &mut backend,
+        &ring,
+        &scenario,
+        domain,
+        scenario.decode_starter,
+        &decode_token.map_or([0_i64; 1], |token| [token]),
+        &decode_position_ids,
+        false,
+        domain == scenario.decode_starter,
+        device,
+    )?;
+    backend
+        .request_contexts
+        .get_mut(&REQUEST_ID)
+        .unwrap()
+        .global_seq_len = scenario.decode_position as usize + 1;
+    let mut decode_argmax = None;
+    if decode_finisher == domain {
+        let logits = project_final_logits(&backend.model, &decode_hidden).squeeze();
+        decode_argmax = Some(logits.argmax(-1, false).int64_value(&[]));
+        write_tensor_f32le(&out_dir.join("decode_logits.f32le"), &logits)?;
+    }
+    println!("[route-b smoke] domain {domain} decode done: finisher={decode_finisher}");
+
+    // ===== Phase 3: stationary continuation (24-layer ring ping-pong, m=4). =====
+    let continuation_position_ids = Tensor::from_slice(&scenario.continuation_positions)
+        .unsqueeze(0)
+        .to_device(device);
+    let (continuation_sends, continuation_finisher, continuation_hidden) = run_ring_phase(
+        "continuation",
+        &mut backend,
+        &ring,
+        &scenario,
+        domain,
+        decode_finisher,
+        &CONTINUATION_PROMPT,
+        &continuation_position_ids,
+        true,
+        domain == decode_finisher,
+        device,
+    )?;
+    let mut continuation_argmax = None;
+    if continuation_finisher == domain {
+        let last = project_final_logits(&backend.model, &continuation_hidden)
+            .select(1, CONTINUATION_PROMPT.len() as i64 - 1)
+            .squeeze();
+        continuation_argmax = Some(last.argmax(-1, false).int64_value(&[]));
+        write_tensor_f32le(&out_dir.join("continuation_last_logits.f32le"), &last)?;
+    }
+    println!("[route-b smoke] domain {domain} continuation done: finisher={continuation_finisher}");
+
+    // ===== Phase 4: per-domain tail checks. =====
+    let kv_total = verify_domain_kv_state(&backend, &scenario, domain, &storage_before)?;
+    let handoffs = decode_sends + continuation_sends;
+
+    let meta = serde_json::json!({
+        "mode": "node",
+        "device": format!("{device:?}"),
+        "domain": domain,
+        "domains": domains,
+        "tickets": scenario.tickets,
+        "prefix_splits": scenario.prefix_splits,
+        "decode_starter": scenario.decode_starter,
+        "decode_finisher": decode_finisher,
+        "continuation_finisher": continuation_finisher,
+        "ring": {
+            "incoming_bind": bind,
+            "outgoing_peer": peer,
+        },
+        "decode_token": decode_token,
+        "prefill_argmax": if domain == scenario.decode_starter { Some(prefill_argmax) } else { None },
+        "decode_argmax": decode_argmax,
+        "continuation_argmax": continuation_argmax,
+        "domain_kv_totals": { domain.to_string(): kv_total },
+        "handoffs": handoffs,
+        "decode_sends": decode_sends,
+        "continuation_sends": continuation_sends,
+        "checks": {
+            "num_layers": layers == EXPECTED_NUM_LAYERS,
+            "kv_total_matches_expected": kv_total == expected_domain_kv_total(&scenario, domain, layers),
+            "storage_stable": true,
+            "committed_eq_reserved": true,
+            "positions_match_frozen_offsets": true,
+        },
+    });
+    std::fs::write(
+        out_dir.join("meta.json"),
+        serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("write meta.json failed: {e}"))?;
+    println!(
+        "[route-b smoke] domain {domain} done: kv_total={kv_total} handoffs={handoffs} out={}",
+        out_dir.display()
+    );
+    Ok(())
+}
+
+/// Legacy N=2 pair mode (`server` / `client`): one full-duplex TCP connection
+/// per layer, exactly the originally validated two-process behavior.
+fn run_pair_node(
     mode: &str,
     domain: usize,
     device: Device,
@@ -320,12 +840,17 @@ fn run_node(
         ));
     }
     let layers = config.num_layers;
-    let scenario = build_scenario(layers)?;
+    let scenario = build_scenario(
+        layers,
+        DEFAULT_TICKETS.to_vec(),
+        DEFAULT_PREFIX_SPLITS.to_vec(),
+    )?;
+    let domains = scenario.domains;
     std::fs::create_dir_all(out_dir)
         .map_err(|e| format!("create {} failed: {e}", out_dir.display()))?;
     let weights = ModelWeights::from_dir(model_dir, device)
         .map_err(|e| format!("load weights failed: {e}"))?;
-    let model = LlamaModel::from_weights(config, &weights, device, DOMAINS)
+    let model = LlamaModel::from_weights(config, &weights, device, domains)
         .map_err(|e| format!("build model failed: {e}"))?;
     let mut backend = TchWorkerBackend::from_model(model, device, domain);
 
@@ -369,30 +894,27 @@ fn run_node(
     backend.setup_kv_transports(transports);
 
     // ===== Phase 1: prefill (KV ring exchange happens inside the backend). =====
-    let (chunk, seq_offset, positions): (&[i64], usize, Vec<i64>) = if domain == 0 {
-        (&PROMPT[..1], 0, vec![0])
-    } else {
-        (&PROMPT[1..], 1, vec![1, 2, 3])
-    };
+    let (prefix_start, prefix_end) = scenario.prefix_ranges[domain];
+    let chunk = &PROMPT[prefix_start..prefix_end];
+    let positions = (prefix_start as i64..prefix_end as i64).collect::<Vec<_>>();
     let (logits_vec, global_len) = backend
         .prefill_request_with_reservation(
             REQUEST_ID,
             chunk,
-            seq_offset,
+            prefix_start,
             Some(&positions),
             Some(&scenario.capacities[domain]),
         )
         .map_err(|e| format!("prefill failed: {e}"))?;
-    let expected_global_len = if domain == 1 { PROMPT.len() } else { 1 };
-    if global_len != expected_global_len {
+    if global_len != prefix_end {
         return Err(format!(
-            "domain {domain} global_seq_len {global_len} != {expected_global_len}"
+            "domain {domain} global_seq_len {global_len} != prefix end {prefix_end}"
         ));
     }
     let prefill_logits = Tensor::from_slice(&logits_vec);
     let prefill_argmax = prefill_logits.argmax(-1, false).int64_value(&[]);
     let mut decode_token = None;
-    if domain == 1 {
+    if domain == scenario.decode_starter {
         decode_token = Some(prefill_argmax);
         write_tensor_f32le(&out_dir.join("prefill_last_logits.f32le"), &prefill_logits)?;
     }
@@ -402,7 +924,7 @@ fn run_node(
 
     // ===== Phase 2: decode (24-layer ping-pong, starter = 1). =====
     let mut handoffs = 0_usize;
-    let mut current_starter = DECODE_STARTER;
+    let mut current_starter = scenario.decode_starter;
     let decode_position_ids = Tensor::from_slice(&[scenario.decode_position])
         .unsqueeze(0)
         .to_device(device);
@@ -420,7 +942,7 @@ fn run_node(
                 &decode_position_ids,
                 domain,
                 scenario.decode_assignees[layer_idx],
-                DOMAINS,
+                domains,
             )
             .map_err(|e| format!("decode layer {layer_idx} start failed: {e}"))?;
             let outcome = {
@@ -493,7 +1015,7 @@ fn run_node(
             };
             hidden_states = Some(next_hidden);
         }
-        current_starter = (current_starter + 1) % DOMAINS;
+        current_starter = layer_finisher(current_starter, domains);
     }
     let decode_finisher = current_starter;
     backend
@@ -528,7 +1050,7 @@ fn run_node(
                 &continuation_position_ids,
                 domain,
                 domain,
-                DOMAINS,
+                domains,
             )
             .map_err(|e| format!("continuation layer {layer_idx} start failed: {e}"))?;
             let outcome = {
@@ -605,7 +1127,7 @@ fn run_node(
             };
             hidden_states = Some(next_hidden);
         }
-        current_starter = (current_starter + 1) % DOMAINS;
+        current_starter = layer_finisher(current_starter, domains);
     }
     let continuation_finisher = current_starter;
     let mut continuation_argmax = None;
@@ -627,21 +1149,19 @@ fn run_node(
         "device": format!("{device:?}"),
         "domains": [domain],
         "decode_token": decode_token,
-        "prefill_argmax": if domain == 1 { Some(prefill_argmax) } else { None },
+        "prefill_argmax": if domain == scenario.decode_starter { Some(prefill_argmax) } else { None },
         "decode_argmax": decode_argmax,
         "continuation_argmax": continuation_argmax,
         "domain_kv_totals": { domain.to_string(): kv_total },
         "handoffs": handoffs,
         "checks": {
             "num_layers": layers == EXPECTED_NUM_LAYERS,
-            "kv_total_matches_expected": kv_total == EXPECTED_DOMAIN_KV_TOTALS[domain],
+            "kv_total_matches_expected": kv_total == expected_domain_kv_total(&scenario, domain, layers),
             "storage_stable": true,
             "committed_eq_reserved": true,
             "positions_match_frozen_offsets": true,
         },
     });
-    std::fs::create_dir_all(out_dir)
-        .map_err(|e| format!("create {} failed: {e}", out_dir.display()))?;
     std::fs::write(
         out_dir.join("meta.json"),
         serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?,
@@ -655,8 +1175,8 @@ fn run_node(
 }
 
 /// In-process decode identical to the test helper
-/// `run_two_backend_reserved_local_decode`, additionally counting packet
-/// handoffs so the golden meta matches the two-process send totals.
+/// `run_two_backend_reserved_local_decode`, generalized to N domains and
+/// counting packet handoffs so the golden meta matches the ring send totals.
 fn local_decode(
     backends: &mut [TchWorkerBackend],
     scenario: &Scenario,
@@ -664,6 +1184,7 @@ fn local_decode(
     starter: usize,
     device: Device,
 ) -> (Tensor, usize, usize) {
+    let domains = scenario.domains;
     let input_ids = Tensor::from_slice(&[decode_token])
         .unsqueeze(0)
         .to_device(device);
@@ -688,13 +1209,13 @@ fn local_decode(
                 &position_ids,
                 current_starter,
                 assignee,
-                DOMAINS,
+                domains,
             )
             .unwrap(),
         );
         let mut next_hidden = None;
-        for visit_index in 0..DOMAINS {
-            let domain = (current_starter + visit_index) % DOMAINS;
+        for visit_index in 0..domains {
+            let domain = (current_starter + visit_index) % domains;
             let outcome = {
                 let backend = &mut backends[domain];
                 let context = backend.request_contexts.get_mut(&REQUEST_ID).unwrap();
@@ -716,13 +1237,13 @@ fn local_decode(
                     packet = Some(next_packet);
                 }
                 LayerStepOutcome::Finished { hidden_states, .. } => {
-                    assert_eq!(visit_index + 1, DOMAINS);
+                    assert_eq!(visit_index + 1, domains);
                     next_hidden = Some(hidden_states);
                 }
             }
         }
         hidden_states = next_hidden.expect("the final worker must finish the layer");
-        current_starter = (current_starter + DOMAINS - 1) % DOMAINS;
+        current_starter = layer_finisher(current_starter, domains);
     }
 
     let logits = project_final_logits(&backends[current_starter].model, &hidden_states);
@@ -734,38 +1255,51 @@ fn local_decode(
 }
 
 /// Single-process golden: exact replica of
-/// `real_qwen_two_worker_stationary_continuation_matches_reference`,
-/// including every assertion, plus dump files.
-fn run_local(device: Device, model_dir: &Path, out_dir: &Path) -> Result<(), String> {
+/// `real_qwen_two_worker_stationary_continuation_matches_reference`
+/// generalized to N in-process backends on a mock ring, including every
+/// assertion, plus dump files.
+fn run_local(
+    device: Device,
+    tickets: Vec<u64>,
+    prefix_splits: Vec<usize>,
+    model_dir: &Path,
+    out_dir: &Path,
+) -> Result<(), String> {
     let config = ModelConfig::from_file(model_dir.join("config.json"))
         .map_err(|e| format!("load config failed: {e}"))?;
     assert_eq!(config.num_layers, EXPECTED_NUM_LAYERS);
     let layers = config.num_layers;
-    let scenario = build_scenario(layers)?;
+    let scenario = build_scenario(layers, tickets, prefix_splits)?;
+    let domains = scenario.domains;
     let weights = ModelWeights::from_dir(model_dir, device)
         .map_err(|e| format!("load weights failed: {e}"))?;
 
     let mut reference = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
-    let mut backend0 = TchWorkerBackend::from_model(
-        LlamaModel::from_weights(config.clone(), &weights, device, 2).unwrap(),
-        device,
-        0,
-    );
-    let mut backend1 = TchWorkerBackend::from_model(
-        LlamaModel::from_weights(config.clone(), &weights, device, 2).unwrap(),
-        device,
-        1,
-    );
-    let mut transports0: Vec<Box<dyn KvTransport>> = Vec::with_capacity(layers);
-    let mut transports1: Vec<Box<dyn KvTransport>> = Vec::with_capacity(layers);
+    let mut backends = (0..domains)
+        .map(|domain| {
+            TchWorkerBackend::from_model(
+                LlamaModel::from_weights(config.clone(), &weights, device, domains).unwrap(),
+                device,
+                domain,
+            )
+        })
+        .collect::<Vec<_>>();
+    // Mock ring per layer: backend d sends into d+1's inbox, receives from its
+    // own inbox (fed by d-1) — identical direction semantics to RingTcpTransport.
+    let mut per_backend = (0..domains)
+        .map(|_| Vec::with_capacity(layers))
+        .collect::<Vec<_>>();
     for _ in 0..layers {
-        let (transport0, transport1) = LinkedMockKvTransport::create_pair();
-        transports0.push(Box::new(transport0));
-        transports1.push(Box::new(transport1));
+        for (domain, endpoint) in LinkedMockKvTransport::create_ring(domains)
+            .into_iter()
+            .enumerate()
+        {
+            per_backend[domain].push(Box::new(endpoint) as Box<dyn KvTransport>);
+        }
     }
-    backend0.setup_kv_transports(transports0);
-    backend1.setup_kv_transports(transports1);
-    let mut backends = vec![backend0, backend1];
+    for (domain, transports) in per_backend.into_iter().enumerate() {
+        backends[domain].setup_kv_transports(transports);
+    }
 
     let mut reference_caches = reference.create_kv_caches();
     let reference_prefill_logits = reference
@@ -777,26 +1311,28 @@ fn run_local(device: Device, model_dir: &Path, out_dir: &Path) -> Result<(), Str
         .select(1, PROMPT.len() as i64 - 1)
         .squeeze();
 
-    let (_, global_len0) = backends[0]
-        .prefill_request_with_reservation(
-            REQUEST_ID,
-            &PROMPT[..1],
-            0,
-            Some(&[0]),
-            Some(&scenario.capacities[0]),
-        )
-        .unwrap();
-    let (distributed_prefill_logits, global_len1) = backends[1]
-        .prefill_request_with_reservation(
-            REQUEST_ID,
-            &PROMPT[1..],
-            1,
-            Some(&[1, 2, 3]),
-            Some(&scenario.capacities[1]),
-        )
-        .unwrap();
-    assert_eq!((global_len0, global_len1), (1, PROMPT.len()));
-    let distributed_prefill_logits = Tensor::from_slice(&distributed_prefill_logits);
+    // Sequential per-backend prefill; mock inboxes buffer the ring traffic and
+    // causality lets early domains complete without future peer KV.
+    let mut distributed_prefill_logits = None;
+    for (domain, backend) in backends.iter_mut().enumerate() {
+        let (prefix_start, prefix_end) = scenario.prefix_ranges[domain];
+        let positions = (prefix_start as i64..prefix_end as i64).collect::<Vec<_>>();
+        let (logits, global_len) = backend
+            .prefill_request_with_reservation(
+                REQUEST_ID,
+                &PROMPT[prefix_start..prefix_end],
+                prefix_start,
+                Some(&positions),
+                Some(&scenario.capacities[domain]),
+            )
+            .unwrap();
+        assert_eq!(global_len, prefix_end);
+        if domain == scenario.decode_starter {
+            distributed_prefill_logits = Some(logits);
+        }
+    }
+    let distributed_prefill_logits =
+        Tensor::from_slice(&distributed_prefill_logits.expect("decode starter produced logits"));
     let decode_token = distributed_prefill_logits
         .argmax(-1, false)
         .int64_value(&[]);
@@ -812,10 +1348,10 @@ fn run_local(device: Device, model_dir: &Path, out_dir: &Path) -> Result<(), Str
         &mut backends,
         &scenario,
         decode_token,
-        DECODE_STARTER,
+        scenario.decode_starter,
         device,
     );
-    assert_eq!(decode_handoffs, layers * (DOMAINS - 1));
+    assert_eq!(decode_handoffs, layers * (domains - 1));
     let reference_decode_logits = reference
         .forward(
             &Tensor::from_slice(&[decode_token])
@@ -861,13 +1397,13 @@ fn run_local(device: Device, model_dir: &Path, out_dir: &Path) -> Result<(), Str
                 &position_ids,
                 current_starter,
                 current_starter,
-                DOMAINS,
+                domains,
             )
             .unwrap(),
         );
         let mut next_hidden = None;
-        for visit_index in 0..DOMAINS {
-            let domain = (current_starter + visit_index) % DOMAINS;
+        for visit_index in 0..domains {
+            let domain = (current_starter + visit_index) % domains;
             let outcome = {
                 let backend = &mut backends[domain];
                 let context = backend.request_contexts.get_mut(&REQUEST_ID).unwrap();
@@ -890,15 +1426,15 @@ fn run_local(device: Device, model_dir: &Path, out_dir: &Path) -> Result<(), Str
                     packet = Some(next_packet);
                 }
                 LayerStepOutcome::Finished { hidden_states, .. } => {
-                    assert_eq!(visit_index + 1, DOMAINS);
+                    assert_eq!(visit_index + 1, domains);
                     next_hidden = Some(hidden_states);
                 }
             }
         }
         hidden_states = next_hidden.expect("the final worker must finish the layer");
-        current_starter = (current_starter + DOMAINS - 1) % DOMAINS;
+        current_starter = layer_finisher(current_starter, domains);
     }
-    assert_eq!(handoffs, layers * (DOMAINS - 1));
+    assert_eq!(handoffs, layers * (domains - 1));
 
     let continuation_logits =
         project_final_logits(&backends[current_starter].model, &hidden_states);
@@ -942,14 +1478,14 @@ fn run_local(device: Device, model_dir: &Path, out_dir: &Path) -> Result<(), Str
     );
     assert!(max_diff < 0.75, "continuation max logits diff: {max_diff}");
 
-    let mut domain_totals = Vec::with_capacity(DOMAINS);
+    let mut domain_totals = Vec::with_capacity(domains);
     for (domain, backend) in backends.iter().enumerate() {
         let total =
             verify_domain_kv_state(backend, &scenario, domain, &storage_before[domain]).unwrap();
         domain_totals.push(total);
     }
-    assert_eq!(domain_totals, EXPECTED_DOMAIN_KV_TOTALS);
 
+    let last_position = (PROMPT.len() + CONTINUATION_PROMPT.len()) as i64;
     for layer_idx in 0..layers {
         let mut positions = Vec::new();
         for backend in &backends {
@@ -960,7 +1496,7 @@ fn run_local(device: Device, model_dir: &Path, out_dir: &Path) -> Result<(), Str
             positions.extend_from_slice(shard.positions());
         }
         positions.sort_unstable();
-        assert_eq!(positions, (0_i64..=8).collect::<Vec<_>>());
+        assert_eq!(positions, (0_i64..=last_position).collect::<Vec<_>>());
     }
 
     // ===== Dump. =====
@@ -978,10 +1514,20 @@ fn run_local(device: Device, model_dir: &Path, out_dir: &Path) -> Result<(), Str
         &out_dir.join("continuation_last_logits.f32le"),
         &distributed_continuation_last,
     )?;
+    let domain_kv_totals = domain_totals
+        .iter()
+        .enumerate()
+        .map(|(domain, total)| (domain.to_string(), serde_json::Value::from(*total)))
+        .collect::<serde_json::Map<_, _>>();
     let meta = serde_json::json!({
         "mode": "local",
         "device": format!("{device:?}"),
-        "domains": [0, 1],
+        "domains": (0..domains).collect::<Vec<_>>(),
+        "tickets": scenario.tickets,
+        "prefix_splits": scenario.prefix_splits,
+        "decode_starter": scenario.decode_starter,
+        "decode_finisher": decode_finisher,
+        "continuation_finisher": current_starter,
         "decode_token": decode_token,
         "prefill_argmax": decode_token,
         "decode_argmax": decode_argmax,
@@ -989,7 +1535,7 @@ fn run_local(device: Device, model_dir: &Path, out_dir: &Path) -> Result<(), Str
         "reference_prefill_argmax": reference_prefill_token,
         "reference_decode_argmax": reference_decode_token,
         "reference_continuation_argmax": reference_continuation_token,
-        "domain_kv_totals": { "0": domain_totals[0], "1": domain_totals[1] },
+        "domain_kv_totals": domain_kv_totals,
         "handoffs": decode_handoffs + handoffs,
         "checks": {
             "num_layers": layers == EXPECTED_NUM_LAYERS,
@@ -1001,8 +1547,11 @@ fn run_local(device: Device, model_dir: &Path, out_dir: &Path) -> Result<(), Str
             "continuation_mean_diff_lt_0_1": mean_diff < 0.1,
             "continuation_max_diff": max_diff,
             "continuation_max_diff_lt_0_75": max_diff < 0.75,
-            "domain_kv_totals_eq_54_162": domain_totals == EXPECTED_DOMAIN_KV_TOTALS,
-            "position_union_0_to_8": true,
+            "domain_kv_totals_match_scenario": domain_totals
+                .iter()
+                .enumerate()
+                .all(|(domain, &total)| total == expected_domain_kv_total(&scenario, domain, layers)),
+            "position_union_covers_all": true,
             "storage_stable": true,
             "committed_eq_reserved": true,
         },
@@ -1013,7 +1562,7 @@ fn run_local(device: Device, model_dir: &Path, out_dir: &Path) -> Result<(), Str
     )
     .map_err(|e| format!("write meta.json failed: {e}"))?;
     println!(
-        "[route-b smoke] local golden done: decode_token={decode_token} continuation_argmax={continuation_argmax} out={}",
+        "[route-b smoke] local golden done: domains={domains} decode_token={decode_token} continuation_argmax={continuation_argmax} domain_totals={domain_totals:?} out={}",
         out_dir.display()
     );
     Ok(())
@@ -1022,6 +1571,10 @@ fn run_local(device: Device, model_dir: &Path, out_dir: &Path) -> Result<(), Str
 struct Cli {
     mode: String,
     device: Device,
+    domain: Option<usize>,
+    domains: Option<usize>,
+    tickets: Option<Vec<u64>>,
+    prefix_splits: Option<Vec<usize>>,
     bind: Option<String>,
     peer: Option<String>,
     out: PathBuf,
@@ -1032,14 +1585,20 @@ fn parse_cli() -> Result<Cli, String> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let Some(mode) = args.first().cloned() else {
         return Err(
-            "usage: route_b_cross_node_smoke <local|server|client> [--device cpu|mps|cuda:N] [--bind host:port] [--peer host:port] --out <dir> [--model-dir <dir>]"
+            "usage: route_b_cross_node_smoke <local|server|client|node> [--domain D] [--domains N] [--tickets t0,t1,...] [--prefix-splits s0,s1,...] [--device cpu|mps|cuda:N] [--bind host:port] [--peer host:port] --out <dir> [--model-dir <dir>]"
                 .to_string(),
         );
     };
-    if !matches!(mode.as_str(), "local" | "server" | "client") {
-        return Err(format!("invalid mode {mode}: expected local|server|client"));
+    if !matches!(mode.as_str(), "local" | "server" | "client" | "node") {
+        return Err(format!(
+            "invalid mode {mode}: expected local|server|client|node"
+        ));
     }
     let mut device = Device::Cpu;
+    let mut domain = None;
+    let mut domains = None;
+    let mut tickets = None;
+    let mut prefix_splits = None;
     let mut bind = None;
     let mut peer = None;
     let mut out = None;
@@ -1052,6 +1611,22 @@ fn parse_cli() -> Result<Cli, String> {
             .ok_or_else(|| format!("flag {flag} requires a value"))?;
         match flag {
             "--device" => device = parse_device(value)?,
+            "--domain" => {
+                domain = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|e| format!("invalid --domain {value}: {e}"))?,
+                )
+            }
+            "--domains" => {
+                domains = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|e| format!("invalid --domains {value}: {e}"))?,
+                )
+            }
+            "--tickets" => tickets = Some(parse_u64_list(value, "--tickets")?),
+            "--prefix-splits" => prefix_splits = Some(parse_usize_list(value, "--prefix-splits")?),
             "--bind" => bind = Some(value.clone()),
             "--peer" => peer = Some(value.clone()),
             "--out" => out = Some(PathBuf::from(value)),
@@ -1064,6 +1639,10 @@ fn parse_cli() -> Result<Cli, String> {
     Ok(Cli {
         mode,
         device,
+        domain,
+        domains,
+        tickets,
+        prefix_splits,
         bind,
         peer,
         out,
@@ -1074,8 +1653,22 @@ fn parse_cli() -> Result<Cli, String> {
 fn main() -> Result<(), String> {
     let cli = parse_cli()?;
     match cli.mode.as_str() {
-        "local" => run_local(cli.device, &cli.model_dir, &cli.out),
-        "server" => run_node(
+        "local" => {
+            let domains = cli.domains.unwrap_or(DEFAULT_TICKETS.len());
+            let tickets = cli.tickets.unwrap_or_else(|| DEFAULT_TICKETS.to_vec());
+            let prefix_splits = cli
+                .prefix_splits
+                .unwrap_or_else(|| DEFAULT_PREFIX_SPLITS.to_vec());
+            if tickets.len() != domains || prefix_splits.len() != domains {
+                return Err(format!(
+                    "--tickets (len {}) and --prefix-splits (len {}) must match --domains {domains}",
+                    tickets.len(),
+                    prefix_splits.len()
+                ));
+            }
+            run_local(cli.device, tickets, prefix_splits, &cli.model_dir, &cli.out)
+        }
+        "server" => run_pair_node(
             "server",
             1,
             cli.device,
@@ -1084,7 +1677,7 @@ fn main() -> Result<(), String> {
             &cli.model_dir,
             &cli.out,
         ),
-        "client" => run_node(
+        "client" => run_pair_node(
             "client",
             0,
             cli.device,
@@ -1093,6 +1686,39 @@ fn main() -> Result<(), String> {
             &cli.model_dir,
             &cli.out,
         ),
+        "node" => {
+            let domain = cli
+                .domain
+                .ok_or_else(|| "node mode requires --domain D".to_string())?;
+            let peer = cli
+                .peer
+                .ok_or_else(|| "node mode requires --peer <host>:<port> (successor)".to_string())?;
+            let bind = cli
+                .bind
+                .ok_or_else(|| "node mode requires --bind <host>:<port>".to_string())?;
+            let domains = cli.domains.unwrap_or(DEFAULT_TICKETS.len());
+            let tickets = cli.tickets.unwrap_or_else(|| DEFAULT_TICKETS.to_vec());
+            let prefix_splits = cli
+                .prefix_splits
+                .unwrap_or_else(|| DEFAULT_PREFIX_SPLITS.to_vec());
+            if tickets.len() != domains || prefix_splits.len() != domains {
+                return Err(format!(
+                    "--tickets (len {}) and --prefix-splits (len {}) must match --domains {domains}",
+                    tickets.len(),
+                    prefix_splits.len()
+                ));
+            }
+            run_ring_node(
+                domain,
+                cli.device,
+                &bind,
+                &peer,
+                tickets,
+                prefix_splits,
+                &cli.model_dir,
+                &cli.out,
+            )
+        }
         _ => unreachable!("mode validated by parse_cli"),
     }
 }
