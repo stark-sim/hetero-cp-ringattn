@@ -173,6 +173,45 @@ fn expected_domain_kv_total(scenario: &Scenario, domain: usize, layers: usize) -
         + layers * scenario.continuation_offsets_by_domain[domain].len()
 }
 
+/// BF16 near-tie aware argmax equality. Cross-device bf16 rounding can
+/// legitimately flip an exact tie (observed on ROCm HIP: tokens 17/198 both
+/// 12.0625 in the prefill reference). Passes when both argmaxes agree, or when
+/// each side's chosen token is within one bf16 ulp of that side's max logit.
+fn assert_argmax_tie_aware(distributed: &Tensor, reference: &Tensor, label: &str) -> (i64, i64) {
+    const TIE_EPS: f32 = 0.0625; // one bf16 ulp at |logit| in [8, 16)
+    let d = distributed
+        .to_kind(Kind::Float)
+        .to_device(Device::Cpu)
+        .squeeze();
+    let r = reference
+        .to_kind(Kind::Float)
+        .to_device(Device::Cpu)
+        .squeeze();
+    let dv = Vec::<f32>::try_from(&d).unwrap();
+    let rv = Vec::<f32>::try_from(&r).unwrap();
+    let argmax_of = |v: &[f32]| -> usize {
+        v.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i)
+            .unwrap()
+    };
+    let d_arg = argmax_of(&dv);
+    let r_arg = argmax_of(&rv);
+    if d_arg != r_arg {
+        let d_gap = dv[d_arg] - dv[r_arg];
+        let r_gap = rv[r_arg] - rv[d_arg];
+        assert!(
+            d_gap <= TIE_EPS && r_gap <= TIE_EPS,
+            "{label}: argmax {d_arg} vs {r_arg} is not a near-tie (gaps {d_gap:.6}/{r_gap:.6})"
+        );
+        println!(
+            "{label}: argmax {d_arg} vs {r_arg} accepted as bf16 near-tie (gaps {d_gap:.6}/{r_gap:.6})"
+        );
+    }
+    (d_arg as i64, r_arg as i64)
+}
+
 /// Finisher of a ring ping-pong layer: the packet visits all N domains in
 /// successor order and stops one hop before the starter.
 fn layer_finisher(starter: usize, domains: usize) -> usize {
@@ -1333,11 +1372,11 @@ fn run_local(
     }
     let distributed_prefill_logits =
         Tensor::from_slice(&distributed_prefill_logits.expect("decode starter produced logits"));
-    let decode_token = distributed_prefill_logits
-        .argmax(-1, false)
-        .int64_value(&[]);
-    let reference_prefill_token = reference_prefill_logits.argmax(-1, false).int64_value(&[]);
-    assert_eq!(decode_token, reference_prefill_token);
+    let (decode_token, reference_prefill_token) = assert_argmax_tie_aware(
+        &distributed_prefill_logits,
+        &reference_prefill_logits,
+        "prefill",
+    );
 
     let storage_before = backends
         .iter()
@@ -1366,10 +1405,9 @@ fn run_local(
         .abs()
         .max()
         .double_value(&[]);
-    let decode_argmax = distributed_decode_last.argmax(-1, false).int64_value(&[]);
-    let reference_decode_token = reference_decode_logits.argmax(-1, false).int64_value(&[]);
+    let (decode_argmax, reference_decode_token) =
+        assert_argmax_tie_aware(&distributed_decode_last, &reference_decode_logits, "decode");
     println!("local pre-continuation decode: max_diff={decode_max_diff:.6}");
-    assert_eq!(decode_argmax, reference_decode_token);
 
     // Route B stationary continuation: historical KV never enters the packet;
     // each worker projects and appends only its own position offsets.
@@ -1462,16 +1500,14 @@ fn run_local(
         .abs()
         .mean(Kind::Float)
         .double_value(&[]);
-    let reference_continuation_token = reference_continuation_logits
-        .argmax(-1, false)
-        .int64_value(&[]);
-    let continuation_argmax = distributed_continuation_last
-        .argmax(-1, false)
-        .int64_value(&[]);
+    let (continuation_argmax, reference_continuation_token) = assert_argmax_tie_aware(
+        &distributed_continuation_last,
+        &reference_continuation_logits,
+        "continuation",
+    );
     println!(
         "local stationary continuation: max_diff={max_diff:.6}, mean_diff={mean_diff:.6}, tokens={continuation_argmax}/{reference_continuation_token}"
     );
-    assert_eq!(reference_continuation_token, continuation_argmax);
     assert!(
         mean_diff < 0.1,
         "continuation mean logits diff: {mean_diff}"
