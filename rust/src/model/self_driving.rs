@@ -3452,7 +3452,7 @@ mod tests {
     }
 
     #[test]
-    fn twenty_four_layer_stationary_continuation_uses_mixed_positioned_history() {
+    fn twenty_four_layer_stationary_continuation_returns_to_decode() {
         let device = Device::Cpu;
         let domains = 3_usize;
         let layers = 24_usize;
@@ -3468,11 +3468,26 @@ mod tests {
             .map(|_| ContiguousKvCache::new())
             .collect::<Vec<_>>();
 
-        let decode_schedule = FrozenKvAssigneeSchedule::new(&[1, 3, 2], 41, layers).unwrap();
-        assert_eq!(decode_schedule.counts(), &[4, 12, 8]);
-        let decode_assignees = (0..layers)
-            .map(|layer_idx| decode_schedule.assignee_for(0, layer_idx, layers).unwrap())
+        let decode_schedule = FrozenKvAssigneeSchedule::new(&[1, 3, 2], 41, 2 * layers).unwrap();
+        assert_eq!(decode_schedule.counts(), &[8, 24, 16]);
+        let decode_assignees = (0..2)
+            .map(|token_offset| {
+                (0..layers)
+                    .map(|layer_idx| {
+                        decode_schedule
+                            .assignee_for(token_offset, layer_idx, layers)
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>()
+            })
             .collect::<Vec<_>>();
+        for assignees in &decode_assignees {
+            let mut counts = vec![0_usize; domains];
+            for &domain in assignees {
+                counts[domain] += 1;
+            }
+            assert_eq!(counts, [4, 12, 8]);
+        }
 
         let continuation_schedule =
             FrozenKvAssigneeSchedule::new(&[1, 3, 2], 0, continuation_len).unwrap();
@@ -3497,8 +3512,10 @@ mod tests {
                     .zip(continuation_schedule.counts())
                     .map(|(&prefix, &continuation)| prefix + continuation)
                     .collect::<Vec<_>>();
-                capacities[decode_assignees[layer_idx]] += 1;
-                assert_eq!(capacities.iter().sum::<usize>(), 13);
+                for assignees in &decode_assignees {
+                    capacities[assignees[layer_idx]] += 1;
+                }
+                assert_eq!(capacities.iter().sum::<usize>(), 14);
                 capacities
             })
             .collect::<Vec<_>>();
@@ -3555,7 +3572,7 @@ mod tests {
             6,
             &mut distributed_shards,
             1,
-            &decode_assignees,
+            &decode_assignees[0],
         );
         let decode_positions = Tensor::from_slice(&[6_i64]).unsqueeze(0);
         let (reference_decode_hidden, reference_decode_logits) = run_contiguous_reference_block(
@@ -3667,6 +3684,99 @@ mod tests {
                 assert_eq!(
                     shard.committed_len() - committed_before_continuation[layer_idx][domain],
                     continuation_schedule.counts()[domain]
+                );
+                assert_eq!(
+                    shard.committed_len() + usize::from(domain == decode_assignees[1][layer_idx]),
+                    reservation_plan[layer_idx][domain]
+                );
+                assert_eq!(
+                    shard.storage_ptrs(),
+                    initial_storage_ptrs[layer_idx][domain]
+                );
+            }
+        }
+
+        let post_continuation_token = sample_last_token(&continuation.logits);
+        assert_eq!(
+            post_continuation_token,
+            sample_last_token(&reference_continuation_logits)
+        );
+        let post_continuation_ids = Tensor::from_slice(&[post_continuation_token]).unsqueeze(0);
+        let distributed_post_continuation_hidden = Tensor::embedding(
+            &distributed_model.embedding,
+            &post_continuation_ids,
+            -1,
+            false,
+            false,
+        );
+        let reference_post_continuation_hidden = Tensor::embedding(
+            &reference_model.embedding,
+            &post_continuation_ids,
+            -1,
+            false,
+            false,
+        );
+        let committed_before_post_continuation_decode = distributed_shards
+            .iter()
+            .map(|shards| {
+                shards
+                    .iter()
+                    .map(ReservedPositionedKvShard::committed_len)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let post_continuation_decode = run_reserved_positioned_decode(
+            &mut distributed_model,
+            &distributed_post_continuation_hidden,
+            13,
+            &mut distributed_shards,
+            continuation.logits_producer_domain,
+            &decode_assignees[1],
+        );
+        let post_continuation_positions = Tensor::from_slice(&[13_i64]).unsqueeze(0);
+        let (reference_post_continuation_hidden, reference_post_continuation_logits) =
+            run_contiguous_reference_block(
+                &mut reference_model,
+                &reference_post_continuation_hidden,
+                &post_continuation_positions,
+                &mut reference_caches,
+            );
+        assert_phase_matches(
+            "post_stationary_continuation_decode",
+            &post_continuation_decode.hidden_states,
+            &post_continuation_decode.logits,
+            &reference_post_continuation_hidden,
+            &reference_post_continuation_logits,
+        );
+        assert_eq!(
+            sample_last_token(&post_continuation_decode.logits),
+            sample_last_token(&reference_post_continuation_logits)
+        );
+        assert!(reference_caches.iter().all(|cache| cache.seq_len() == 14));
+        assert_eq!(
+            post_continuation_decode
+                .layer_stats
+                .iter()
+                .map(|stats| stats.hops)
+                .sum::<usize>(),
+            layers * (domains - 1)
+        );
+        assert_eq!(
+            post_continuation_decode.logits_producer_domain,
+            continuation.logits_producer_domain
+        );
+
+        assert_reserved_positioned_history(&distributed_shards, 0..14);
+        assert_eq!(
+            reserved_positioned_domain_totals(&distributed_shards),
+            [56, 168, 112]
+        );
+        for (layer_idx, shards) in distributed_shards.iter().enumerate() {
+            for (domain, shard) in shards.iter().enumerate() {
+                assert_eq!(
+                    shard.committed_len()
+                        - committed_before_post_continuation_decode[layer_idx][domain],
+                    usize::from(domain == decode_assignees[1][layer_idx])
                 );
                 assert_eq!(shard.committed_len(), reservation_plan[layer_idx][domain]);
                 assert_eq!(
