@@ -681,6 +681,25 @@ pub struct ModelRingResult {
     pub logits_projections: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PositionedLayerRingStats {
+    pub domains: usize,
+    pub hops: usize,
+    pub visited_domains: Vec<usize>,
+    pub new_kv_positions_by_domain: Vec<usize>,
+    pub starter: usize,
+    pub finisher: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct PositionedModelRingResult {
+    pub hidden_states: Tensor,
+    pub logits: Tensor,
+    pub layer_stats: Vec<PositionedLayerRingStats>,
+    pub logits_producer_domain: usize,
+    pub logits_projections: usize,
+}
+
 /// Run one real decoder layer over already-sharded history KV.
 ///
 /// This is deliberately an in-process experiment: it proves the tensor data
@@ -749,6 +768,106 @@ pub fn run_single_layer_ring(
             assignee,
             finisher,
         },
+    })
+}
+
+pub(crate) fn run_model_ring_with_reserved_history_for_positions(
+    model: &mut LlamaModel,
+    hidden_states: &Tensor,
+    position_ids: &Tensor,
+    layer_history_shards: &mut [Vec<ReservedPositionedKvShard>],
+    starter: usize,
+    new_position_offsets_by_domain: &[Vec<usize>],
+) -> Result<PositionedModelRingResult, ModelError> {
+    let layers = model.layers.len();
+    if layers == 0 || layer_history_shards.len() != layers {
+        return Err(ModelError::Backend(format!(
+            "reserved positioned model ring requires matching non-empty layers and shard sets: layers={layers}, shard_sets={}",
+            layer_history_shards.len()
+        )));
+    }
+    let domains = layer_history_shards[0].len();
+    validate_route(hidden_states, position_ids, starter, starter, domains)?;
+    if new_position_offsets_by_domain.len() != domains
+        || layer_history_shards
+            .iter()
+            .any(|shards| shards.len() != domains)
+    {
+        return Err(ModelError::Backend(format!(
+            "reserved positioned model ring requires {domains} domain offset and shard sets"
+        )));
+    }
+
+    let query_len = position_ids.size()[1] as usize;
+    let mut seen_offsets = vec![false; query_len];
+    for offsets in new_position_offsets_by_domain {
+        for &offset in offsets {
+            if offset >= query_len || seen_offsets[offset] {
+                return Err(ModelError::Backend(format!(
+                    "reserved positioned model ring received invalid or duplicate new position offset {offset} for query_len={query_len}"
+                )));
+            }
+            seen_offsets[offset] = true;
+        }
+    }
+    if let Some(missing) = seen_offsets.iter().position(|seen| !seen) {
+        return Err(ModelError::Backend(format!(
+            "reserved positioned model ring is missing new position offset {missing} for query_len={query_len}"
+        )));
+    }
+
+    let new_kv_positions_by_domain = new_position_offsets_by_domain
+        .iter()
+        .map(Vec::len)
+        .collect::<Vec<_>>();
+    let mut current_hidden = hidden_states.shallow_clone();
+    let mut current_starter = starter;
+    let mut layer_stats = Vec::with_capacity(layers);
+
+    for (layer_idx, shards) in layer_history_shards.iter_mut().enumerate() {
+        // Position ownership comes from the frozen offsets, not this legacy scalar field.
+        let mut packet = LayerPacket::start(
+            &mut model.layers[layer_idx],
+            &current_hidden,
+            position_ids,
+            current_starter,
+            current_starter,
+            domains,
+        )?;
+        let mut visited_domains = Vec::with_capacity(domains);
+        current_hidden = loop {
+            let domain = packet.current_domain;
+            visited_domains.push(domain);
+            match process_layer_packet_with_reserved_history_for_positions(
+                &mut model.layers[layer_idx],
+                packet,
+                &mut shards[domain],
+                &new_position_offsets_by_domain[domain],
+            )? {
+                LayerStepOutcome::Forward(next_packet) => packet = next_packet,
+                LayerStepOutcome::Finished { hidden_states, .. } => break hidden_states,
+            }
+        };
+
+        let finisher = (current_starter + domains - 1) % domains;
+        layer_stats.push(PositionedLayerRingStats {
+            domains,
+            hops: domains - 1,
+            visited_domains,
+            new_kv_positions_by_domain: new_kv_positions_by_domain.clone(),
+            starter: current_starter,
+            finisher,
+        });
+        current_starter = finisher;
+    }
+
+    let logits = project_final_logits(model, &current_hidden);
+    Ok(PositionedModelRingResult {
+        hidden_states: current_hidden,
+        logits,
+        layer_stats,
+        logits_producer_domain: current_starter,
+        logits_projections: 1,
     })
 }
 
@@ -3330,6 +3449,232 @@ mod tests {
     #[test]
     fn full_model_ring_rotates_producer_when_layers_do_not_divide_domains() {
         assert_full_model_ring_case(4, 1);
+    }
+
+    #[test]
+    fn twenty_four_layer_stationary_continuation_uses_mixed_positioned_history() {
+        let device = Device::Cpu;
+        let domains = 3_usize;
+        let layers = 24_usize;
+        let continuation_len = 6_usize;
+        let prefix_splits = [1_usize, 3, 2];
+        let mut config = test_config();
+        config.num_layers = layers;
+        let weights = deterministic_weights(&config, device);
+        let mut distributed_model =
+            LlamaModel::from_weights(config.clone(), &weights, device, domains).unwrap();
+        let mut reference_model = local_reference_model(&config, &weights, device);
+        let mut reference_caches = (0..layers)
+            .map(|_| ContiguousKvCache::new())
+            .collect::<Vec<_>>();
+
+        let decode_schedule = FrozenKvAssigneeSchedule::new(&[1, 3, 2], 41, layers).unwrap();
+        assert_eq!(decode_schedule.counts(), &[4, 12, 8]);
+        let decode_assignees = (0..layers)
+            .map(|layer_idx| decode_schedule.assignee_for(0, layer_idx, layers).unwrap())
+            .collect::<Vec<_>>();
+
+        let continuation_schedule =
+            FrozenKvAssigneeSchedule::new(&[1, 3, 2], 0, continuation_len).unwrap();
+        assert_eq!(continuation_schedule.counts(), &[1, 3, 2]);
+        let mut continuation_offsets_by_domain = vec![Vec::new(); domains];
+        for offset in 0..continuation_len {
+            let domain = continuation_schedule.assignee_for(offset, 0, 1).unwrap();
+            continuation_offsets_by_domain[domain].push(offset);
+        }
+        assert_eq!(
+            continuation_offsets_by_domain
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
+            [1, 3, 2]
+        );
+
+        let reservation_plan = (0..layers)
+            .map(|layer_idx| {
+                let mut capacities = prefix_splits
+                    .iter()
+                    .zip(continuation_schedule.counts())
+                    .map(|(&prefix, &continuation)| prefix + continuation)
+                    .collect::<Vec<_>>();
+                capacities[decode_assignees[layer_idx]] += 1;
+                assert_eq!(capacities.iter().sum::<usize>(), 13);
+                capacities
+            })
+            .collect::<Vec<_>>();
+        let mut distributed_shards =
+            reserved_positioned_layer_shards(&config, &reservation_plan, device);
+        let initial_storage_ptrs = distributed_shards
+            .iter()
+            .map(|shards| {
+                shards
+                    .iter()
+                    .map(ReservedPositionedKvShard::storage_ptrs)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        let prefix_ids = Tensor::from_slice(&[3_i64, 5, 7, 9, 11, 13]).unsqueeze(0);
+        let prefix_positions = Tensor::arange(6, (Kind::Int64, device)).unsqueeze(0);
+        let distributed_prefix_hidden =
+            Tensor::embedding(&distributed_model.embedding, &prefix_ids, -1, false, false);
+        let reference_prefix_hidden =
+            Tensor::embedding(&reference_model.embedding, &prefix_ids, -1, false, false);
+        let (distributed_prefix_hidden, distributed_prefix_logits, _) =
+            run_reserved_positioned_prefill_block(
+                &mut distributed_model,
+                &distributed_prefix_hidden,
+                &prefix_positions,
+                &mut distributed_shards,
+                &prefix_splits,
+            );
+        let (reference_prefix_hidden, reference_prefix_logits) = run_contiguous_reference_block(
+            &mut reference_model,
+            &reference_prefix_hidden,
+            &prefix_positions,
+            &mut reference_caches,
+        );
+        assert_phase_matches(
+            "stationary_prefix",
+            &distributed_prefix_hidden,
+            &distributed_prefix_logits,
+            &reference_prefix_hidden,
+            &reference_prefix_logits,
+        );
+
+        let decode_token = sample_last_token(&distributed_prefix_logits);
+        assert_eq!(decode_token, sample_last_token(&reference_prefix_logits));
+        let decode_ids = Tensor::from_slice(&[decode_token]).unsqueeze(0);
+        let distributed_decode_hidden =
+            Tensor::embedding(&distributed_model.embedding, &decode_ids, -1, false, false);
+        let reference_decode_hidden =
+            Tensor::embedding(&reference_model.embedding, &decode_ids, -1, false, false);
+        let distributed_decode = run_reserved_positioned_decode(
+            &mut distributed_model,
+            &distributed_decode_hidden,
+            6,
+            &mut distributed_shards,
+            1,
+            &decode_assignees,
+        );
+        let decode_positions = Tensor::from_slice(&[6_i64]).unsqueeze(0);
+        let (reference_decode_hidden, reference_decode_logits) = run_contiguous_reference_block(
+            &mut reference_model,
+            &reference_decode_hidden,
+            &decode_positions,
+            &mut reference_caches,
+        );
+        assert_phase_matches(
+            "stationary_decode_history",
+            &distributed_decode.hidden_states,
+            &distributed_decode.logits,
+            &reference_decode_hidden,
+            &reference_decode_logits,
+        );
+
+        let committed_before_continuation = distributed_shards
+            .iter()
+            .map(|shards| {
+                shards
+                    .iter()
+                    .map(ReservedPositionedKvShard::committed_len)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let continuation_ids = Tensor::from_slice(&[17_i64, 19, 23, 29, 31, 37]).unsqueeze(0);
+        let continuation_positions =
+            (Tensor::arange(continuation_len as i64, (Kind::Int64, device)) + 7).unsqueeze(0);
+        let distributed_continuation_hidden = Tensor::embedding(
+            &distributed_model.embedding,
+            &continuation_ids,
+            -1,
+            false,
+            false,
+        );
+        let reference_continuation_hidden = Tensor::embedding(
+            &reference_model.embedding,
+            &continuation_ids,
+            -1,
+            false,
+            false,
+        );
+
+        let continuation = run_model_ring_with_reserved_history_for_positions(
+            &mut distributed_model,
+            &distributed_continuation_hidden,
+            &continuation_positions,
+            &mut distributed_shards,
+            distributed_decode.logits_producer_domain,
+            &continuation_offsets_by_domain,
+        )
+        .unwrap();
+        let (reference_continuation_hidden, reference_continuation_logits) =
+            run_contiguous_reference_block(
+                &mut reference_model,
+                &reference_continuation_hidden,
+                &continuation_positions,
+                &mut reference_caches,
+            );
+
+        assert_phase_matches(
+            "stationary_continuation",
+            &continuation.hidden_states,
+            &continuation.logits,
+            &reference_continuation_hidden,
+            &reference_continuation_logits,
+        );
+        assert!(reference_caches.iter().all(|cache| cache.seq_len() == 13));
+        assert_eq!(continuation.layer_stats.len(), layers);
+        assert_eq!(
+            continuation
+                .layer_stats
+                .iter()
+                .map(|stats| stats.hops)
+                .sum::<usize>(),
+            layers * (domains - 1)
+        );
+        assert_eq!(
+            continuation
+                .layer_stats
+                .iter()
+                .map(|stats| stats.starter)
+                .collect::<Vec<_>>(),
+            (0..layers)
+                .map(|layer_idx| (1 + domains - (layer_idx % domains)) % domains)
+                .collect::<Vec<_>>()
+        );
+        for stats in &continuation.layer_stats {
+            assert_eq!(stats.domains, domains);
+            assert_eq!(stats.finisher, (stats.starter + domains - 1) % domains);
+            assert_eq!(
+                stats.visited_domains,
+                (0..domains)
+                    .map(|step| (stats.starter + step) % domains)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(stats.new_kv_positions_by_domain, [1, 3, 2]);
+        }
+        assert_eq!(continuation.logits_producer_domain, 1);
+        assert_eq!(continuation.logits_projections, 1);
+
+        assert_reserved_positioned_history(&distributed_shards, 0..13);
+        assert_eq!(
+            reserved_positioned_domain_totals(&distributed_shards),
+            [52, 156, 104]
+        );
+        for (layer_idx, shards) in distributed_shards.iter().enumerate() {
+            for (domain, shard) in shards.iter().enumerate() {
+                assert_eq!(
+                    shard.committed_len() - committed_before_continuation[layer_idx][domain],
+                    continuation_schedule.counts()[domain]
+                );
+                assert_eq!(shard.committed_len(), reservation_plan[layer_idx][domain]);
+                assert_eq!(
+                    shard.storage_ptrs(),
+                    initial_storage_ptrs[layer_idx][domain]
+                );
+            }
+        }
     }
 
     #[test]
