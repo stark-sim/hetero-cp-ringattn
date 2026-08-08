@@ -2,6 +2,26 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### continuation oracle horizon 已从 checkpoint 场景派生
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@f9d90c7`
+
+提交 f9d90c7（test: derive continuation decode horizon from scenario）仅修改 rust/src/model/self_driving.rs 的 24 层 stationary continuation oracle，没有修改 scheduler、runner、packet、cache 或 runtime API。
+场景语义：两个 decode checkpoint 分别位于 initial prefill 后与 continuation prefill 后；decode_steps=decode_checkpoint_positions.len()，decode_horizon=decode_steps*layers。固定验收参数 N=3、L=24、tickets=[1,3,2] 保持显式；positions、history bounds、reservation 总长、每轮/全 horizon capacity counts 与最终 KV totals 改为派生值。同一请求的 decode 与 continuation schedule 统一使用 request_id=41。
+验证：rustfmt --edition 2021 --check rust/src/model/self_driving.rs 与 git diff --check 均 exit 0；focused oracle 1 passed、0 failed；model::self_driving::tests 24 passed、0 failed、1 ignored；cargo test --manifest-path rust/Cargo.toml --features tch-backend 106 passed、0 failed、3 ignored；cargo clippy --manifest-path rust/Cargo.toml --features tch-backend --lib --tests exit 0，仅仓库既有 warnings。
+证据边界：这是 mac-local libtorch CPU synthetic correctness oracle；不声称 runtime 支持被限制为两个 decode step，也不新增性能、真实模型或跨节点结论。
+
+_updated: 2026-08-08 12:07:57_
+### 移除 continuation oracle 的魔法数字
+
+type: `task` · status: `closed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@f9d90c7`
+
+修订 24 层 post-continuation decode oracle 中把场景语义写成裸数字的部分。保持有意的实验参数 N=3、L=24、tickets=[1,3,2]、一个 m=6 continuation，以及 initial decode 与 post-continuation decode 两个验收事件；先列出两个具名 checkpoint position，再从 checkpoint 集合长度派生 schedule horizon。验收：positions、history ranges、reservation 总长、capacity-weighted counts 和最终 KV totals 都从具名场景参数派生；测试中不存在 2*layers、0..2、decode_assignees[0]/[1] 等隐藏组合关系的裸表达；测试语义、数值与完整回归保持。
+
+[2026-08-08 完成]
+24 层 oracle 仍验证 initial prefill -> decode -> stationary continuation prefill -> decode，因此场景中客观存在两个 decode checkpoint；但 scheduler 不再接收手写的 2*layers。测试先列出 initial_decode_position 与 post_continuation_decode_position，再以 decode_checkpoint_positions.len()*layers 派生有限 horizon。positions、history bounds、reservation 长度、capacity-weighted counts 和最终 domain KV totals 也全部从具名场景参数派生。该 horizon 只属于有限 correctness oracle，不是 runtime decode 上限。
+
+_updated: 2026-08-08 12:07:57_
 ### stationary continuation 后恢复 decode 验证完成
 
 type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@b523bc7`

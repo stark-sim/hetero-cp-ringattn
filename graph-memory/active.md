@@ -2,27 +2,20 @@
 
 当前活跃的任务、决策、风险和假设。
 
-### 移除 continuation oracle 的魔法数字
-
-type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-review-2026-08-08`
-
-修订 24 层 post-continuation decode oracle 中把场景语义写成裸数字的部分。保持实验参数 N=3、L=24、tickets=[1,3,2]、一个 m=6 continuation 和两次 decode 不变，但用命名的 decode_steps、阶段索引、prefix_len、position 边界与派生 expected totals 表达。验收：schedule horizon 明确等于 decode_steps*layers；第一/第二 decode position 与 history ranges 从阶段长度派生；不再使用 decode_assignees[0]/[1] 或 2*layers；测试语义、数值与完整回归保持。
-
-_updated: 2026-08-08 11:38:56_
 ### 从阶段场景派生 decode horizon 与 positions
 
-type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-review-2026-08-08`
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@f9d90c7`
 
 动机剖析六问：
 1. 问题：oracle 中的 2*layers、0..2、decode_assignees[0]/[1]、positions 6/13 和 totals 常量虽然与当前场景数学一致，但没有说明单位和来源，容易被误读为系统把 decode 长度写死为 2，也让后续调整 prefix/continuation 长度时产生联动遗漏。
-2. 现状：FrozenKvAssigneeSchedule 的 total_kv_units 实际单位是 (decode_step, layer) append 事件；本场景有两次 decode、每次 24 层，所以 horizon=48。生产调度器没有两 token 上限，问题只在 test fixture 表达不清。N=3、L=24、tickets=[1,3,2] 本身是有意选择的验收参数，不应隐藏。
-3. 终态：用 decode_steps、initial_decode_step、post_continuation_decode_step、prefix_len、initial_decode_position、continuation_start_position 和 post_continuation_decode_position 表达阶段；horizon、history ranges、reservation 总长和最终 KV totals 从这些参数派生。focused/full tests 保持通过。
+2. 现状：FrozenKvAssigneeSchedule 的 total_kv_units 实际单位是 (decode checkpoint, layer) append 事件；本场景为了证明 continuation 后仍可 decode，客观包含 initial decode 与 post-continuation decode 两个 checkpoint。生产调度器没有两 token 上限，问题只在 test fixture 表达不清。N=3、L=24、tickets=[1,3,2] 本身是有意选择的验收参数，不应隐藏。
+3. 终态：先用 initial_decode_position 与 post_continuation_decode_position 表达两个验收事件，再从 decode_checkpoint_positions.len() 派生 checkpoint 数；horizon、history ranges、reservation 总长和最终 KV totals 均从具名场景参数派生。focused/full tests 保持通过。
 4. 业界做法：可维护的 table-driven 测试通常把场景输入作为命名 fixture，把期望值从独立的不变量公式派生；关键固定参数仍显式断言，避免测试完全复制被测实现而失去检错能力。
 5. 本方案：只重构现有 oracle 的局部变量和期望计算，不改 FrozenKvAssigneeSchedule、runner、packet、cache 或 runtime。capacity-weighted 期望由 tickets 与总 unit 数计算，最终 KV totals 由 prefix split、continuation counts 和 decode counts 组合。
-6. 为什么：引入通用 scenario struct 会为单个测试增加不必要抽象；保留裸数字则继续掩盖单位。局部命名参数加独立公式是最小、可审查且不会改变核心方案的修订。
+6. 为什么：引入通用 scenario struct 会为单个测试增加不必要抽象；保留裸数字则继续掩盖单位。具名 checkpoint 集合加独立公式是最小、可审查且不会改变核心方案的修订。
 VERDICT: IMPLEMENT。
 
-_updated: 2026-08-08 11:38:56_
+_updated: 2026-08-08 12:07:57_
 ### 实验代码避免隐藏领域语义的魔法数字
 
 type: `preference` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-review-2026-08-08`
