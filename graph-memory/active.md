@@ -2,6 +2,74 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### main 工作区 placement/ledger WIP 暂缓提交，待工程期重启
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
+
+
+【动机六问】
+1. 问题：main 工作区存在未提交 WIP（placement.rs 1079 行生产草稿、capacity.rs 的 allocate_largest_remainder、mod 接线、Cargo.toml example 注册），身份不明，易被误读为脏工作区。
+2. 现状：路线 B correctness 已用 FrozenKvAssigneeSchedule 硬编码 tickets=[1,3,2] 完成验证；schedule 内部已内联 largest-remainder 量化，WIP 原语与之算法重复（仅新版允许零份额、返回 Option）。placement.rs 是用户 2026-08-02 起未提交的生产 placement/ledger 草稿，既定只读。
+3. 终态：WIP 不提交、不丢弃，身份在 graph 中显式登记为 production admission 层的候选素材；路线对比锚点不受污染。
+4. 业界：vLLM 的 block table/scheduler metadata 同样把 placement 作为控制状态而非 activation；其 allocator 不可直接复用，但分层边界一致。
+5. 本方案：DEFER。placement 层（why & how many）→ schedule（which event where）→ 路线 B 执行原语（execution）是接力关系；将来由 placement 产 tickets 喂 schedule。
+6. 为什么：现在提交会让 main 与路线 B 锚点产生无业务价值分叉；重构 schedule 复用原语会触碰已验证对比基线。
+VERDICT: DEFER。重访触发条件：路线 B 进入工程期，开始 runtime/coordinator 容量接线或 byte-level admission（即 task-route-b-phase2-engineering-20260809 第 4 项）。届时先做 motivation-analysis 决定 allocate_largest_remainder 归谁。
+
+_updated: 2026-08-08 17:45:36_
+### 路线合并实行三期里程碑门禁：可行性→工程→生态，过关才谈合 main
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
+
+
+【动机六问】
+1. 问题：graph 已记录多条 continuation 路线，主线 B（continuation prefill/decode 不移动历史 KV）已由用户确认；但「何时路线成果可以合入 main」没有显式门禁，凭进度感合并会污染 main 与测量锚点。
+2. 现状：branch-per-route 只规定隔离与对齐测量；路线 B 的 synthetic correctness 连续通过，但真实模型、跨设备、wire/runtime、benchmark 均未覆盖，阶段性目标缺失。
+3. 终态：每条路线按三期推进——核心方案可行性（大）、工程性能力（中）、生态能力完善（小）；graph 显式记录当前期与出口标准；里程碑到达才考虑合 main，不到达不讨论。
+4. 业界：产品化 stage-gate/里程碑制与 Linux experimental→staging→mainline 的渐进信任模型；vLLM 的 feature 经 RFC+review+benchmark 才入 main。可复用的是出口标准显式化；其中心化 review 流程以 graph 里程碑与 oracle 替代。
+5. 本方案：graph 建决策 + 三个 phase 任务节点并以 DEPENDS_ON 串联；同步把里程碑门禁写入 route-experimentation skill 作为跨项目通用机制。
+6. 为什么：比直接合并保住对比公平性，比永不合并给出产品化路径；skill 化使机制可复用而非项目一次性规则。
+VERDICT: IMPLEMENT。用户于 2026-08-09 确认这是对 branch-per-route 的正规产品设计化提升。
+
+_updated: 2026-08-08 17:45:36_
+### 路线 B 一期：核心方案可行性（大）
+
+type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
+
+出口标准（6 项全过才考虑 correctness 核心合 main）：
+1. [done] m>1 stationary LayerPacket 单层合同（5777d51）
+2. [done] position owner-local KV 分散（73cd0e8）
+3. [done] 24 层 mixed-history continuation（a7a583d）
+4. [done] continuation 后 decode 闭环（b523bc7）
+5. [pending] 真实 Qwen 权重的路线 B continuation correctness（synthetic→real model）
+6. [pending] 跨设备数值验证（Mac MPS 与 white CUDA 各跑 worker）
+边界：本期全部是 correctness 证据，不含性能声明。
+
+_updated: 2026-08-08 17:45:36_
+### 路线 B 二期：工程性能力（中）
+
+type: `task` · status: `planning` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
+
+出口标准（真实跨节点 E2E 通过才考虑工程层合 main）：
+1. [pending] m>1 stationary packet 的 TCP/QUIC wire codec
+2. [pending] WorkerRuntime/coordinator 一等命令（continuation stationary 主路径，不调 legacy Decode）
+3. [pending] frozen request plan 的分发/重建机制
+4. [pending] capacity/placement byte-level admission（重启 decision-defer-placement-ledger-wip-20260809 的 WIP）
+5. [pending] Mac + white 双 worker stationary continuation 真实 QUIC smoke
+依赖一期完成；每项独立小节点 RED/GREEN。
+
+_updated: 2026-08-08 17:45:36_
+### 路线 B 三期：生态能力完善（小）
+
+type: `task` · status: `planning` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
+
+出口标准（比较结论产出后才定路线组合关系）：
+1. [pending] 与 KV-ring baseline 对齐公共测量锚点的公平 benchmark（route-experimentation 纪律）
+2. [pending] 多请求并发与调度行为
+3. [pending] 文档/论文证据链与可运维性
+依赖二期完成；本期结论决定路线 B 是收敛为主架构还是与 KV-ring 长期共存。
+
+_updated: 2026-08-08 17:45:36_
 ### Rust 代码先 rustfmt，再 diff；多节点源码只经 Git remote 同步
 
 type: `preference` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-03`
