@@ -2,19 +2,62 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 三机 production QUIC 可观测性与同配置 golden 门禁
+
+type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
+
+为三机 production QUIC continuation E2E 补最小 test-only 可观测性。验收：1) coordinator 的实验 continuation 入口复用 --export-logits，导出 prefill last、第一次 legacy decode、stationary continuation last 三份 f32 logits 和场景 meta；2) 每个 worker 对一次 StationaryContinuation 汇总 starter/middle/finisher 角色数与 send/recv 数，可由三机日志验证 24 层、N=3 的总发送与总接收均为 24*(3-1)=48；3) Mac/white/pearl wrapper 持久保存日志和精确 exit code；4) 使用同 capacity tickets、prefix splits 的 local golden，现有 tie-aware + mean/max 比较通过。边界：只增加实验观察与证据，不改 wire、packet、schedule、KV 归属、数值流程或 byte-level admission。
+
+_updated: 2026-08-09 12:43:26_
+### 用 test-only 导出与 backend 汇总完成 N=3 直接证据
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
+
+动机剖析六问：
+1. 问题：当前三机 production QUIC 运行已有 token-level 成功输出，但缺少同 tickets golden 的向量级数值比较、三个进程的持久 exit code，以及 stationary packet 每层恰好 N-1 hops 的直接计数。
+2. 现状：coordinator 已支持 --export-logits，但 test-only continuation E2E 没有接入；run_stationary_continuation 已在每层明确执行 starter/middle/finisher 分支，却未汇总角色和 send/recv；route_b golden 与 compare_route_b_dumps.py 已有 tie-aware、mean/max 判据。
+3. 终态：production E2E 导出 prefill/decode/continuation logits 与 meta；每 worker 单行输出角色和 send/recv 汇总；三机 wrapper 留存精确 exit status；同 capacity tickets、prefix splits 的 local golden 与 production dump 通过 tie-aware、mean<0.1、max<0.75 比较。
+4. 他者：分布式推理系统通常用请求级 trace/metrics 证明数据面路径，并用离线 golden 做 correctness 门禁；这里复用“结构化计数 + golden 对照”的原则，不引入完整 telemetry 框架或同构 collective profiler。
+5. 本方案：只扩展实验 continuation 入口的文件导出，并在现有 backend 驱动中累加本次调用的 starter/middle/finisher/send/recv 计数；不改变 WorkerCommand/WorkerResponse，日志由现有 worker 进程持久化。
+6. 为什么：把计数加入 wire/protocol 会扩大稳定协议面，单为实验出口不值得；只从连接配置推导 hop 又不足以证明运行时 middle relay。backend 汇总日志是同时满足最小改动与直接运行证据的方案。
+VERDICT: IMPLEMENT。
+
+_updated: 2026-08-09 12:43:26_
 ### 路线 B 二期：工程性能力（中）
 
 type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
 
 出口标准（真实跨节点 E2E 通过才考虑工程层合 main）：
-1. [done] m>1 stationary packet 的 TCP/QUIC wire codec（129de9b；codec 本就 shape-generic，新增 m>1 回环测试固化 + smoke --transport quic，含 connect/accept 并发与 done/ack 退出 barrier 两个协议级修复）
-2. [done] WorkerRuntime/coordinator 一等命令（StationaryContinuation 主路径，不调 legacy Decode；2592795/a4ab7f4/1aee8e6）
+1. [done] m>1 stationary packet 的 TCP/QUIC wire codec（129de9b；codec shape-generic，m>1 回环测试与 N=3 QUIC loopback 已固化）
+2. [done] WorkerRuntime/coordinator 一等命令（StationaryContinuation 主路径；2592795/a4ab7f4/1aee8e6）
 3. [done] frozen request plan 的分发/重建机制（plan 随 StationaryContinuation 命令广播，worker 无状态推导；1aee8e6）
-4. [pending] capacity/placement byte-level admission（重启 decision-defer-placement-ledger-wip-20260809 的 WIP）
-5. [done] Mac + white 双 worker stationary continuation 真实 QUIC smoke（经生产命令路径于 2c 提前交付：跨机 E2E generated=[198,15,15] 对齐 golden；1aee8e6）
-依赖一期完成；每项独立小节点 RED/GREEN。
+4. [pending] capacity/placement byte-level admission（重启 decision-defer-placement-ledger-wip-20260809 的必要子集，不引入三期多请求能力）
+5. [partial] production-path QUIC E2E：Mac MPS + white CUDA 的 N=2 已通过（generated=[198,15,15]），但 N=2 是 predecessor==successor 的退化环，不能证明 middle relay。正式出口要求 Mac MPS + white CUDA + pearl HIP 三个 worker 经 coordinator/WorkerRuntime/StationaryContinuation 在 N=3 neighbor-only QUIC ring 上通过。
+依赖一期完成；当前剩余第 4 项与第 5 项 N=3 部分，每项独立小节点验证。
 
-_updated: 2026-08-09 09:17:08_
+_updated: 2026-08-09 09:43:14_
+### 二期第 5 项：三机 production QUIC neighbor-only E2E
+
+type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
+
+把二期 production path 的跨机验证从 N=2 扩展为 N=3：Mac 运行 coordinator + domain0 worker(MPS)，white 运行 domain1 worker(CUDA)，pearl 运行 domain2 worker(HIP/ROCm)。三个 worker 的数据面只能连接 predecessor/successor，StationaryContinuation packet 必须经过 middle worker 逐跳到 finisher；coordinator 仅广播命令与收集唯一 logits，不参与模型计算或 worker 间数据转发。
+验收：真实 Qwen2-0.5B 请求完成 prefill -> decode -> stationary continuation -> 后续 decode；三端正常退出；generated tokens 与同场景 golden/tie-aware 数值判据一致；日志证明每个 worker 只有 neighbor data-plane 连接且 packet 为 N-1=2 hops；记录 capacity tickets、prefix splits、offsets、finisher 与 KV totals。边界：单请求 correctness，不含性能、多请求、故障恢复或 byte-level admission。
+
+_updated: 2026-08-09 09:43:14_
+### N=3 才能完成 production neighbor-only ring 出口
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
+
+动机剖析六问：
+1. 问题：N=2 production QUIC E2E 被记作二期第 5 项完成，但两节点环中 predecessor==successor，不存在可观察的中间节点转发，不能证明 HCP 的 neighbor-only P2P ring 拓扑。
+2. 现状：一期的 Mac MPS + white CUDA + pearl HIP 三机 TCP smoke 已证明 N=3 数学、异构 kernel 与逐跳 ring；二期的 N=3 QUIC 只在 loopback smoke 通过；production WorkerRuntime/coordinator/StationaryContinuation 路径目前只有 Mac+white N=2 跨机证据。这三份证据尚未在同一次实验中取交集。
+3. 终态：Mac coordinator+MPS worker、white CUDA worker、pearl HIP worker 经 production QUIC 数据面完成同一真实 Qwen continuation 请求；每个 worker 只连接 predecessor/successor，packet 每层走 N-1=2 hops，输出与 golden 对齐，三端正常退出。
+4. 他者：Ring Attention 和常见 P2P ring 都以相邻 send/recv 定义；N=2 是合法但退化的功能场景，只有 N>=3 才能用 middle relay 证伪全连接或 coordinator relay。其 collective runtime 不能替代 HCP 的 QUIC neighbor-only 验证。
+5. 本方案：复用 1aee8e6 的 production command path、129de9b 的 QUIC packet wire 与既有三机 inventory；先做 N=3 production-path 配置/代码审计，只修实际阻塞任意 N 的最小缺口，再按 Mac->white->pearl->Mac 接线运行真实 Qwen E2E。
+6. 为什么：单独重复三机 TCP smoke不能证明 production QUIC 接线；重复 N=2 production run 不能证明 middle relay。三机 production QUIC 是最小且直接覆盖项目拓扑主张的交叉证据，不引入性能、多请求或动态 planner。
+VERDICT: IMPLEMENT。用户明确要求所有跨机验证从 Mac+white 扩展到 Mac+white+pearl，只有 N=3 才计为 neighbor-only P2P ring 出口。
+
+_updated: 2026-08-09 09:43:14_
 ### 二期第 2+3 项(合并):WorkerRuntime/coordinator 一等 stationary continuation 命令 + frozen plan 分发
 
 type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
@@ -1116,6 +1159,14 @@ type: `decision` · status: `held` · confidence: 0.95 · importance: 0.96 · so
 结论：Node 4b DEFER multi-query continuation ring，只实现有证据的 KV-ring correctness；把 Q-ring 作为独立路线选择记忆，待 baseline 可运行后按 payload bytes 与实测带宽决定。VERDICT: DEFER。
 
 _updated: 2026-08-03 09:14:32_
+### legacy decode 跨硬件 mean=0.107887 超出现有统一 0.1 guard
+
+type: `risk` · status: `active` · confidence: 1.0 · importance: 0.95 · source: `hetero-cp-ringattn@ccc838c+run-20260809-222750`
+
+当前通用 compare_route_b_dumps.py 对 prefill/decode/continuation 统一使用 mean<0.1。正式 N=3 production mixed-hardware run 的 legacy decode 与同 production-path 三 MPS golden 稳定得到 mean=0.107887，超限 0.007887；argmax exact、max=0.648438<0.75、top5=5/5，且两侧各自重复运行逐位确定。目标 stationary continuation 自身 mean=0.030063/max=0.203125 严格通过。
+在现有验收文字未修订前，该差异阻塞 observability/golden task 关闭。可选路线：(A) 保持统一 mean<0.1，新增 legacy decode 数值调查/修复子任务；(B) 将 phase-2 stationary continuation 出口按阶段判定：prefill+continuation 保持完整 tie-aware/mean/max 门，既有 legacy decode baseline 要求 argmax/top-k/max 并将 mean 记录为诊断。路线 B 是验收标准修订，需用户确认。
+
+_updated: 2026-08-09 18:23:35_
 ### KV-ring continuation 正确但会重传完整历史 shard
 
 type: `risk` · status: `open` · confidence: 1.0 · importance: 0.95 · source: `analysis-2026-08-03`

@@ -2,6 +2,24 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### N=3 production QUIC observability 通过，legacy decode mean guard 边界暴露
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@ccc838c+run-20260809-222750`
+
+提交 ccc838c 为 test-only production continuation E2E 增加三阶段 raw logits/meta 导出、request_id/capacity tickets golden 对齐参数，以及每 worker stationary 角色/send/recv 汇总。
+正式三机 production QUIC：Mac domain0(MPS)+coordinator -> white domain1(CUDA) -> pearl domain2(HIP) -> Mac，request_id=75，Qwen2-0.5B BF16，24 层，m=4，splits=[1,1,2]，实际 tickets=[8192,21913,14525]，offsets=[[2],[0,1],[3]]，starter=2。coordinator/Mac/white/pearl wrapper exit 均为 0，generated=[198,15,15]。三个 worker 各统计 starter/middle/finisher=8/8/8、send/recv=16/16；全局 send=recv=48=24*(3-1)，直接证明每层 N-1=2 hops 且三节点均承担 middle relay。
+同 request/tickets/splits 的三 MPS production WorkerRuntime+QUIC golden 四进程 exit 均为 0。mixed vs golden：prefill argmax 198/198、mean=0.035258、max=0.187500；stationary continuation argmax 15/15、mean=0.030063、max=0.203125，均通过 tie-aware+mean<0.1+max<0.75；legacy decode argmax 6667/6667、max=0.648438，但 mean=0.107887 高于现有 0.1 guard，整体通用 compare 脚本因此严格 FAIL。decode top-k overlap 为 5/5、9/10、48/50、95/100。
+可复现性与输入一致性：两次 mixed 三机 run 三阶段 logits 逐位一致；两次本地 production golden 逐位一致；三机 model.safetensors SHA256 均为 9cd8fc8c...；config 原文件仅 white 格式不同，jq 规范化后三机 SHA256 均为 32b95f05...。
+边界：这是单请求、N=3、24 层、m=4、Qwen2-0.5B BF16、Tailscale QUIC correctness 证据，不含性能、多请求、N>3、故障恢复或 byte-level admission。stationary continuation 的目标阶段已通过原数值门；legacy decode mean guard 是否作为本任务阻塞项需要显式决策，不能由该证据自动放宽。
+
+_updated: 2026-08-09 18:23:35_
+### N=2 production QUIC 足以完成二期拓扑出口
+
+type: `belief` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@45f2f54`
+
+二期第 5 项曾因 Mac MPS + white CUDA 的 N=2 production-path QUIC E2E 通过而被标记完成。该证据确实证明跨机 QUIC、runtime/coordinator 命令和异构双 worker 数值正确，但 N=2 时 predecessor 与 successor 是同一 peer，无法区分 neighbor-only ring 与普通点对点直连，因此不足以完成拓扑出口。
+
+_updated: 2026-08-09 09:43:14_
 ### m>1 stationary LayerPacket 单层合同验证完成
 
 type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@5777d51`
