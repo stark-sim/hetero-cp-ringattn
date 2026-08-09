@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 #[cfg(feature = "tch-backend")]
-use super::block::{KvBlock, RingPacket};
+use super::block::{KvBlock, RingPacket, SelfDrivingPacket};
 use super::r#trait::KvTransport;
 
 /// In-memory transport for unit testing distributed attention logic.
@@ -100,7 +100,7 @@ pub struct LinkedMockKvTransport {
     // 【peer_inbox：对方的收件箱】
     // 当我们调用 send 时，数据会被推入这个队列。
     // 这个队列实际上是对端（peer）的 self_inbox，所以对方调用 recv 时就能读到。
-    // 
+    //
     // 用 Arc<Mutex<VecDeque>> 的原因是：
     // - VecDeque：双端队列，支持从尾部 push、从头部 pop（先进先出）。
     // - Mutex：多线程锁，保证同一时间只有一个线程能读写队列。
@@ -111,6 +111,13 @@ pub struct LinkedMockKvTransport {
     // 当我们调用 recv 时，数据会从这个队列弹出。
     // 这个队列由对端在 send 时写入。
     self_inbox: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<KvBlock>>>,
+
+    // experimental: raised for the stationary continuation driver (route-B 2b)
+    // 与 KV inbox 同结构的 self-driving packet 收发队列。
+    peer_packet_inbox:
+        std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<SelfDrivingPacket>>>,
+    self_packet_inbox:
+        std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<SelfDrivingPacket>>>,
 }
 
 #[cfg(feature = "tch-backend")]
@@ -130,10 +137,15 @@ impl LinkedMockKvTransport {
         let queues: Vec<_> = (0..n)
             .map(|_| std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())))
             .collect();
+        let packet_queues: Vec<_> = (0..n)
+            .map(|_| std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())))
+            .collect();
         (0..n)
             .map(|i| Self {
                 peer_inbox: queues[(i + 1) % n].clone(),
                 self_inbox: queues[i].clone(),
+                peer_packet_inbox: packet_queues[(i + 1) % n].clone(),
+                self_packet_inbox: packet_queues[i].clone(),
             })
             .collect()
     }
@@ -183,5 +195,27 @@ impl KvTransport for LinkedMockKvTransport {
     /// 内存 transport 中队列为空即表示无数据，直接返回 None。
     fn recv_kv_block(&mut self) -> Result<Option<KvBlock>, String> {
         Ok(self.self_inbox.lock().unwrap().pop_front())
+    }
+
+    // experimental: raised for the stationary continuation driver (route-B 2b)
+    // recv 保持 trait 默认忙等：测试用两个线程并发驱动两个 backend 时，
+    // 接收方需要在队列为空时等待发送方，而不是立即拿到 None。
+    fn supports_self_driving_packets(&self) -> bool {
+        true
+    }
+
+    fn submit_send_self_driving_packet(
+        &mut self,
+        packet: &SelfDrivingPacket,
+    ) -> Result<(), String> {
+        self.peer_packet_inbox
+            .lock()
+            .unwrap()
+            .push_back(packet.clone());
+        Ok(())
+    }
+
+    fn poll_recv_self_driving_packet(&mut self) -> Result<Option<SelfDrivingPacket>, String> {
+        Ok(self.self_packet_inbox.lock().unwrap().pop_front())
     }
 }

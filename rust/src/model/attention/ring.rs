@@ -177,6 +177,12 @@ impl HcpRingAttentionBackend {
         self.kv_transport = Some(transport);
     }
 
+    /// experimental: raised for the stationary continuation driver (route-B 2b)
+    #[cfg(feature = "tch-backend")]
+    pub fn kv_transport_mut(&mut self) -> Option<&mut Box<dyn KvTransport>> {
+        self.kv_transport.as_mut()
+    }
+
     #[allow(dead_code)]
     pub fn set_local_domain_id(&mut self, id: usize) {
         self.local_domain_id = id;
