@@ -999,6 +999,40 @@ mod tests {
         }
     }
 
+    /// m>1 stationary continuation packet with real Qwen2-0.5B GQA shapes
+    /// (hidden 896, 24 heads, head_dim 64, 2 kv heads -> packet heads 24).
+    /// `positions` selects the query count m and proves the codec makes no
+    /// position-contiguity assumption.
+    fn multi_query_self_driving_packet(device: Device, positions: &[i64]) -> SelfDrivingPacket {
+        let m = positions.len() as i64;
+        let hidden = 896_i64;
+        let heads = 24_i64;
+        let head_dim = 64_i64;
+        let residual_elements = m * hidden;
+        let q_elements = heads * m * head_dim;
+        SelfDrivingPacket {
+            layer_idx: 11,
+            residual: (Tensor::arange(residual_elements, (Kind::Float, device)) * 0.001)
+                .reshape([1, m, hidden])
+                .to_kind(Kind::BFloat16),
+            normalized: (Tensor::arange(residual_elements, (Kind::Float, device)) * -0.0005)
+                .reshape([1, m, hidden])
+                .to_kind(Kind::BFloat16),
+            position_ids: Tensor::from_slice(positions).reshape([1, m]),
+            q: (Tensor::arange(q_elements, (Kind::Float, device)) * 0.00025)
+                .reshape([1, heads, m, head_dim])
+                .to_kind(Kind::BFloat16),
+            attention_output: (Tensor::arange(q_elements, (Kind::Float, device)) * 0.000125)
+                .reshape([1, heads, m, head_dim])
+                .to_kind(Kind::BFloat16),
+            lse: (Tensor::arange(heads * m, (Kind::Float, device)) * 0.01).reshape([1, heads, m]),
+            assignee: 2,
+            current_domain: 1,
+            domains: 3,
+            visited_domains: 1,
+        }
+    }
+
     fn assert_self_driving_packet_eq(actual: &SelfDrivingPacket, expected: &SelfDrivingPacket) {
         assert_eq!(actual.layer_idx, expected.layer_idx);
         assert_eq!(actual.assignee, expected.assignee);
@@ -1018,6 +1052,7 @@ mod tests {
             ("lse", &actual.lse, &expected.lse),
         ] {
             assert_eq!(actual.kind(), wanted.kind(), "{name} dtype changed");
+            assert_eq!(actual.size(), wanted.size(), "{name} shape changed");
             let diff = (actual - wanted)
                 .abs()
                 .to_kind(Kind::Float)
@@ -1155,5 +1190,50 @@ mod tests {
         server.flush_send().unwrap();
         let echoed = client.recv_self_driving_packet().unwrap().unwrap();
         assert_self_driving_packet_eq(&echoed, &expected);
+    }
+
+    #[test]
+    fn quic_kv_transport_roundtrips_multi_query_self_driving_packet() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let TestQuicStreams {
+            _client_endpoint,
+            _server_endpoint,
+            client_send,
+            client_recv,
+            server_send,
+            server_recv,
+        } = connected_quic_streams(&runtime);
+
+        let device = Device::Cpu;
+        let mut client: Box<dyn KvTransport> = Box::new(QuicKvTransport::new(
+            client_send,
+            client_recv,
+            runtime.handle().clone(),
+            device,
+        ));
+        let mut server: Box<dyn KvTransport> = Box::new(QuicKvTransport::new(
+            server_send,
+            server_recv,
+            runtime.handle().clone(),
+            device,
+        ));
+
+        // Real continuation shapes: m=4 queries at positions [5,6,7,8].
+        let contiguous = multi_query_self_driving_packet(device, &[5, 6, 7, 8]);
+        // Non-contiguous position ids: m=2 queries at positions [5,7] prove the
+        // codec carries position_ids verbatim without a contiguity assumption.
+        let strided = multi_query_self_driving_packet(device, &[5, 7]);
+
+        for expected in [&contiguous, &strided] {
+            client.submit_send_self_driving_packet(expected).unwrap();
+            client.flush_send().unwrap();
+            let received = server.recv_self_driving_packet().unwrap().unwrap();
+            assert_self_driving_packet_eq(&received, expected);
+
+            server.submit_send_self_driving_packet(&received).unwrap();
+            server.flush_send().unwrap();
+            let echoed = client.recv_self_driving_packet().unwrap().unwrap();
+            assert_self_driving_packet_eq(&echoed, expected);
+        }
     }
 }

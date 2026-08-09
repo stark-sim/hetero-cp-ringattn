@@ -11,7 +11,9 @@
 //! - `node`:  true N-domain ring topology. Each node only connects to its
 //!   successor (outgoing dial to `--peer`) and its predecessor (incoming
 //!   accept on `--bind`). Prefill KV blocks and stationary `LayerPacket`s
-//!   both flow hop by hop around the ring.
+//!   both flow hop by hop around the ring. `--transport tcp|quic` selects
+//!   per-layer TCP connections or per-layer QUIC bidirectional streams over
+//!   one connection per neighbor (default tcp).
 //!
 //! Scenario constants (no coordinator): model Qwen2-0.5B BF16, request_id=75,
 //! prompt=[151644,9707,0,16], one decode token at position 4, continuation
@@ -20,11 +22,11 @@
 //! original test); every node derives the full scenario deterministically.
 
 use hcp_ringattn_rust::{
-    process_layer_packet_with_reserved_history,
+    create_endpoint, process_layer_packet_with_reserved_history,
     process_layer_packet_with_reserved_history_for_positions, project_final_logits,
     FrozenKvAssigneeSchedule, KvBlock, KvCacheImpl, KvTransport, LayerPacket, LayerStepOutcome,
-    LinkedMockKvTransport, LlamaModel, ModelConfig, ModelWeights, RingPacket, SelfDrivingPacket,
-    TchWorkerBackend, TcpKvTransport, WorkerBackend,
+    LinkedMockKvTransport, LlamaModel, ModelConfig, ModelWeights, QuicKvTransport, RingPacket,
+    SelfDrivingPacket, TchWorkerBackend, TcpKvTransport, WorkerBackend,
 };
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -419,6 +421,14 @@ impl KvTransport for SharedTcpTransport {
     }
 }
 
+/// Transport-agnostic view of one per-layer ring link: KvTransport for the
+/// backend's prefill KV exchange, plus bin-level self-driving packet I/O for
+/// the decode/continuation ping-pong. Sends always go successor-wards.
+trait RingTransportOps: KvTransport + Clone + 'static {
+    fn send_packet(&self, packet: &SelfDrivingPacket) -> Result<(), String>;
+    fn recv_packet(&self) -> Result<Option<SelfDrivingPacket>, String>;
+}
+
 /// True ring per-layer transport: sends go to the successor (outgoing dial),
 /// receives come from the predecessor (incoming accept). There is no direct
 /// connection to any other domain, so both prefill KV blocks and stationary
@@ -429,9 +439,12 @@ struct RingTcpTransport {
     incoming: SharedTcpTransport,
 }
 
-impl RingTcpTransport {
-    fn send_packet(&self, packet: &SelfDrivingPacket) -> Result<usize, String> {
-        self.outgoing.lock().send_self_driving_packet(packet)
+impl RingTransportOps for RingTcpTransport {
+    fn send_packet(&self, packet: &SelfDrivingPacket) -> Result<(), String> {
+        self.outgoing
+            .lock()
+            .send_self_driving_packet(packet)
+            .map(|_| ())
     }
 
     fn recv_packet(&self) -> Result<Option<SelfDrivingPacket>, String> {
@@ -480,6 +493,265 @@ impl KvTransport for RingTcpTransport {
     }
 }
 
+/// Shared QUIC ring link. `QuicKvTransport::new(send, recv, ...)` already
+/// separates the two halves: constructed with the send half of the stream to
+/// the successor and the recv half of the stream from the predecessor, it
+/// natively satisfies the ring direction semantics. The Arc<Mutex> wrapper
+/// solves the `setup_kv_transports` ownership hand-off, same as the TCP path.
+#[derive(Clone)]
+struct SharedQuicTransport(Arc<Mutex<QuicKvTransport>>);
+
+impl SharedQuicTransport {
+    fn lock(&self) -> std::sync::MutexGuard<'_, QuicKvTransport> {
+        self.0.lock().expect("shared QUIC transport mutex poisoned")
+    }
+}
+
+impl KvTransport for SharedQuicTransport {
+    fn submit_send(&mut self, block: &KvBlock) -> Result<(), String> {
+        self.lock().submit_send(block)
+    }
+
+    fn poll_recv(&mut self) -> Result<Option<KvBlock>, String> {
+        self.lock().poll_recv()
+    }
+
+    fn flush_send(&mut self) -> Result<(), String> {
+        self.lock().flush_send()
+    }
+
+    fn supports_ring_packets(&self) -> bool {
+        self.lock().supports_ring_packets()
+    }
+
+    fn submit_send_packet(&mut self, packet: &RingPacket) -> Result<(), String> {
+        self.lock().submit_send_packet(packet)
+    }
+
+    fn poll_recv_packet(&mut self) -> Result<Option<RingPacket>, String> {
+        self.lock().poll_recv_packet()
+    }
+
+    fn supports_self_driving_packets(&self) -> bool {
+        self.lock().supports_self_driving_packets()
+    }
+
+    fn submit_send_self_driving_packet(
+        &mut self,
+        packet: &SelfDrivingPacket,
+    ) -> Result<(), String> {
+        self.lock().submit_send_self_driving_packet(packet)
+    }
+
+    fn poll_recv_self_driving_packet(&mut self) -> Result<Option<SelfDrivingPacket>, String> {
+        self.lock().poll_recv_self_driving_packet()
+    }
+}
+
+impl RingTransportOps for SharedQuicTransport {
+    fn send_packet(&self, packet: &SelfDrivingPacket) -> Result<(), String> {
+        let mut transport = self.lock();
+        transport.submit_send_self_driving_packet(packet)?;
+        transport.flush_send()
+    }
+
+    fn recv_packet(&self) -> Result<Option<SelfDrivingPacket>, String> {
+        self.lock().recv_self_driving_packet()
+    }
+}
+
+/// Holds every QUIC object that must stay alive for the whole node run.
+struct QuicRingLinks {
+    runtime: tokio::runtime::Runtime,
+    _endpoint: quinn::Endpoint,
+    outgoing_conn: quinn::Connection,
+    incoming_conn: quinn::Connection,
+    /// Unused stream halves (outgoing recv / incoming send) kept so quinn does
+    /// not signal stream resets to the peer.
+    _unused_halves: Vec<(quinn::SendStream, quinn::RecvStream)>,
+    links: Vec<SharedQuicTransport>,
+}
+
+impl QuicRingLinks {
+    /// Graceful ring shutdown barrier. QUIC delivers nothing after connection
+    /// close, so a node must not exit while its successor can still be missing
+    /// data. Protocol (per node, after all stages):
+    /// 1. send a done byte to the successor (new stream on the outgoing conn),
+    /// 2. read the predecessor's done byte (its connection closing also
+    ///    counts: this node's stages already prove the predecessor sent
+    ///    everything this node needed),
+    /// 3. ack the predecessor on the same stream,
+    /// 4. wait for the successor's ack before closing both connections.
+    ///
+    /// The successor only acks after finishing its own stages, which required
+    /// every packet this node ever sent it — so after step 4 no in-flight
+    /// data can still be needed downstream.
+    fn barrier(&self, domain: usize) -> Result<(), String> {
+        self.runtime.block_on(async {
+            let (mut done_send, mut ack_recv) = self
+                .outgoing_conn
+                .open_bi()
+                .await
+                .map_err(|e| format!("barrier open_bi failed: {e}"))?;
+            done_send
+                .write_all(b"\x01")
+                .await
+                .map_err(|e| format!("barrier done write failed: {e}"))?;
+            done_send
+                .finish()
+                .map_err(|e| format!("barrier done finish failed: {e}"))?;
+
+            let (mut ack_send, mut done_recv) = self
+                .incoming_conn
+                .accept_bi()
+                .await
+                .map_err(|e| format!("barrier accept_bi failed: {e}"))?;
+            let mut byte = [0_u8; 1];
+            // Any resolution (byte or connection close) ends the wait; see step 2.
+            let _ = done_recv.read(&mut byte).await;
+            ack_send
+                .write_all(b"\x02")
+                .await
+                .map_err(|e| format!("barrier ack write failed: {e}"))?;
+            ack_send
+                .finish()
+                .map_err(|e| format!("barrier ack finish failed: {e}"))?;
+
+            // Any resolution (ack byte or connection close) ends the wait;
+            // a peer that exited already proved downstream delivery (step 4).
+            let _ = ack_recv.read(&mut byte).await;
+            self.outgoing_conn.close(0_u32.into(), b"done");
+            self.incoming_conn.close(0_u32.into(), b"done");
+            Ok::<_, String>(())
+        })?;
+        println!("[route-b smoke] domain {domain}: quic barrier complete");
+        Ok(())
+    }
+}
+
+/// Establish the per-layer QUIC ring links: one connection to the successor
+/// (24 `open_bi`, layer order) and one connection from the predecessor (24
+/// `accept_bi`, matching the peer's open order). Every opened stream starts
+/// with the 1-byte dummy that `QuicKvTransport`'s recv task skips.
+fn establish_quic_ring_links(
+    bind: &str,
+    peer: &str,
+    layers: usize,
+    device: Device,
+    domain: usize,
+) -> Result<QuicRingLinks, String> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let runtime =
+        tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime failed: {e}"))?;
+    let bind_addr = bind
+        .parse()
+        .map_err(|e| format!("invalid --bind {bind}: {e}"))?;
+    // `Endpoint::server` spawns the UDP driver task and therefore requires an
+    // active tokio runtime context.
+    let endpoint = runtime
+        .block_on(async { create_endpoint(bind_addr) })
+        .map_err(|e| format!("create quic endpoint on {bind} failed: {e}"))?;
+    eprintln!("[route-b smoke] domain {domain}: quic endpoint bound on {bind}");
+    let peer_addr = peer
+        .parse()
+        .map_err(|e| format!("invalid --peer {peer}: {e}"))?;
+
+    // Drive the outgoing handshake and the incoming accept concurrently: an
+    // endpoint whose peer also dials must progress its server side while its
+    // own client handshake is in flight.
+    let (outgoing_conn, incoming_conn) = runtime.block_on(async {
+        let connect_future = async {
+            let mut attempt = 0_u32;
+            loop {
+                let result = match endpoint.connect(peer_addr, "localhost") {
+                    Ok(connecting) => connecting.await,
+                    Err(e) => {
+                        attempt += 1;
+                        if attempt >= 240 {
+                            return Err(format!(
+                                "quic connect to successor {peer} failed: {e}"
+                            ));
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        continue;
+                    }
+                };
+                match result {
+                    Ok(connection) => return Ok(connection),
+                    Err(e) => {
+                        attempt += 1;
+                        if attempt <= 5 {
+                            eprintln!(
+                                "[route-b smoke] domain {domain}: quic handshake attempt {attempt} failed: {e}"
+                            );
+                        }
+                        if attempt >= 240 {
+                            return Err(format!(
+                                "quic handshake with successor {peer} failed after {attempt} attempts: {e}"
+                            ));
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                }
+            }
+        };
+        let accept_future = async {
+            endpoint
+                .accept()
+                .await
+                .ok_or_else(|| "quic endpoint closed before the predecessor connected".to_string())?
+                .await
+                .map_err(|e| format!("accept predecessor connection failed: {e}"))
+        };
+        tokio::try_join!(connect_future, accept_future)
+    })?;
+    println!("[route-b smoke] domain {domain}: quic ring connections up (successor {peer}, predecessor on {bind})");
+
+    let mut outgoing_halves = Vec::with_capacity(layers);
+    for layer_idx in 0..layers {
+        let (mut send, recv) = runtime
+            .block_on(outgoing_conn.open_bi())
+            .map_err(|e| format!("open_bi layer {layer_idx} failed: {e}"))?;
+        runtime
+            .block_on(send.write_all(&[0_u8]))
+            .map_err(|e| format!("dummy write layer {layer_idx} failed: {e}"))?;
+        outgoing_halves.push((send, recv));
+    }
+    println!("[route-b smoke] domain {domain}: opened {layers} streams to successor {peer}");
+
+    let mut incoming_halves = Vec::with_capacity(layers);
+    for layer_idx in 0..layers {
+        let (send, recv) = runtime
+            .block_on(incoming_conn.accept_bi())
+            .map_err(|e| format!("accept_bi layer {layer_idx} failed: {e}"))?;
+        incoming_halves.push((send, recv));
+    }
+    println!("[route-b smoke] domain {domain}: accepted {layers} streams from predecessor");
+
+    let mut unused_halves = Vec::with_capacity(layers);
+    let links = outgoing_halves
+        .into_iter()
+        .zip(incoming_halves)
+        .map(|((out_send, out_recv), (in_send, in_recv))| {
+            unused_halves.push((in_send, out_recv));
+            SharedQuicTransport(Arc::new(Mutex::new(QuicKvTransport::new(
+                out_send,
+                in_recv,
+                runtime.handle().clone(),
+                device,
+            ))))
+        })
+        .collect::<Vec<_>>();
+    Ok(QuicRingLinks {
+        runtime,
+        _endpoint: endpoint,
+        outgoing_conn,
+        incoming_conn,
+        _unused_halves: unused_halves,
+        links,
+    })
+}
+
 /// One ring ping-pong phase (decode or continuation) for this node.
 ///
 /// Per layer the packet starts at `phase_starter(layer)`, visits every domain
@@ -488,10 +760,10 @@ impl KvTransport for RingTcpTransport {
 /// process + forward), or finisher (recv + process + keep hidden states).
 /// Returns (sends, finisher-of-last-layer, hidden states).
 #[allow(clippy::too_many_arguments)]
-fn run_ring_phase(
+fn run_ring_phase<T: RingTransportOps>(
     phase: &str,
     backend: &mut TchWorkerBackend,
-    ring: &[RingTcpTransport],
+    ring: &[T],
     scenario: &Scenario,
     domain: usize,
     mut current_starter: usize,
@@ -641,44 +913,40 @@ fn run_ring_phase(
     Ok((sends, current_starter, hidden_states))
 }
 
-/// `node` mode: one domain of a true N-domain ring over real TCP.
-#[allow(clippy::too_many_arguments)]
-fn run_ring_node(
-    domain: usize,
-    device: Device,
+/// Wire transport for `node` mode ring links.
+#[derive(Clone, Copy)]
+enum TransportKind {
+    Tcp,
+    Quic,
+}
+
+impl TransportKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            TransportKind::Tcp => "tcp",
+            TransportKind::Quic => "quic",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "tcp" => Ok(TransportKind::Tcp),
+            "quic" => Ok(TransportKind::Quic),
+            _ => Err(format!("invalid --transport {value}: expected tcp|quic")),
+        }
+    }
+}
+
+/// Establish the per-layer TCP ring links: bind first so the successor can
+/// dial, then dial the successor (with retry), then accept the predecessor —
+/// both in layer order.
+fn establish_tcp_ring_links(
     bind: &str,
     peer: &str,
-    tickets: Vec<u64>,
-    prefix_splits: Vec<usize>,
-    model_dir: &Path,
-    out_dir: &Path,
-) -> Result<(), String> {
-    let config = ModelConfig::from_file(model_dir.join("config.json"))
-        .map_err(|e| format!("load config failed: {e}"))?;
-    if config.num_layers != EXPECTED_NUM_LAYERS {
-        return Err(format!(
-            "num_layers {} != {EXPECTED_NUM_LAYERS}",
-            config.num_layers
-        ));
-    }
-    let layers = config.num_layers;
-    let scenario = build_scenario(layers, tickets, prefix_splits)?;
-    let domains = scenario.domains;
-    if domain >= domains {
-        return Err(format!(
-            "domain {domain} out of range for {domains} domains"
-        ));
-    }
-    std::fs::create_dir_all(out_dir)
-        .map_err(|e| format!("create {} failed: {e}", out_dir.display()))?;
-    let weights = ModelWeights::from_dir(model_dir, device)
-        .map_err(|e| format!("load weights failed: {e}"))?;
-    let model = LlamaModel::from_weights(config, &weights, device, domains)
-        .map_err(|e| format!("build model failed: {e}"))?;
-    let mut backend = TchWorkerBackend::from_model(model, device, domain);
-
-    // Ring wiring: bind first so successors can dial, then dial the successor
-    // (with retry), then accept the predecessor — both in layer order.
+    layers: usize,
+    device: Device,
+    domain: usize,
+) -> Result<Vec<RingTcpTransport>, String> {
     let listener = TcpListener::bind(bind).map_err(|e| format!("bind {bind} failed: {e}"))?;
     let mut outgoing = Vec::with_capacity(layers);
     for layer_idx in 0..layers {
@@ -714,12 +982,96 @@ fn run_ring_node(
             TcpKvTransport::new(stream, device)?,
         ))));
     }
-    let ring = (0..layers)
+    Ok((0..layers)
         .map(|layer_idx| RingTcpTransport {
             outgoing: outgoing[layer_idx].clone(),
             incoming: incoming[layer_idx].clone(),
         })
-        .collect::<Vec<_>>();
+        .collect::<Vec<_>>())
+}
+
+/// `node` mode: one domain of a true N-domain ring over real TCP or QUIC.
+#[allow(clippy::too_many_arguments)]
+fn run_ring_node(
+    domain: usize,
+    device: Device,
+    bind: &str,
+    peer: &str,
+    tickets: Vec<u64>,
+    prefix_splits: Vec<usize>,
+    transport: TransportKind,
+    model_dir: &Path,
+    out_dir: &Path,
+) -> Result<(), String> {
+    let config = ModelConfig::from_file(model_dir.join("config.json"))
+        .map_err(|e| format!("load config failed: {e}"))?;
+    if config.num_layers != EXPECTED_NUM_LAYERS {
+        return Err(format!(
+            "num_layers {} != {EXPECTED_NUM_LAYERS}",
+            config.num_layers
+        ));
+    }
+    let layers = config.num_layers;
+    let scenario = build_scenario(layers, tickets, prefix_splits)?;
+    let domains = scenario.domains;
+    if domain >= domains {
+        return Err(format!(
+            "domain {domain} out of range for {domains} domains"
+        ));
+    }
+    std::fs::create_dir_all(out_dir)
+        .map_err(|e| format!("create {} failed: {e}", out_dir.display()))?;
+    let weights = ModelWeights::from_dir(model_dir, device)
+        .map_err(|e| format!("load weights failed: {e}"))?;
+    let model = LlamaModel::from_weights(config, &weights, device, domains)
+        .map_err(|e| format!("build model failed: {e}"))?;
+    let mut backend = TchWorkerBackend::from_model(model, device, domain);
+
+    match transport {
+        TransportKind::Tcp => {
+            let ring = establish_tcp_ring_links(bind, peer, layers, device, domain)?;
+            run_ring_node_stages(
+                &mut backend,
+                &ring,
+                &scenario,
+                domain,
+                device,
+                transport,
+                out_dir,
+            )
+        }
+        TransportKind::Quic => {
+            // `quic_links` must stay alive until every phase is done: it owns
+            // the tokio runtime, the endpoint, and both connections.
+            let quic_links = establish_quic_ring_links(bind, peer, layers, device, domain)?;
+            run_ring_node_stages(
+                &mut backend,
+                &quic_links.links,
+                &scenario,
+                domain,
+                device,
+                transport,
+                out_dir,
+            )?;
+            // QUIC drops unacked data when a connection dies with the process;
+            // drain the ring deterministically before exiting.
+            quic_links.barrier(domain)
+        }
+    }
+}
+
+/// Shared node stages once the per-layer ring links exist: prefill KV ring,
+/// decode + stationary continuation ping-pong, tail checks, and the dump.
+fn run_ring_node_stages<T: RingTransportOps>(
+    backend: &mut TchWorkerBackend,
+    ring: &[T],
+    scenario: &Scenario,
+    domain: usize,
+    device: Device,
+    transport: TransportKind,
+    out_dir: &Path,
+) -> Result<(), String> {
+    let layers = ring.len();
     let transports = ring
         .iter()
         .map(|transport| Box::new(transport.clone()) as Box<dyn KvTransport>)
@@ -727,7 +1079,7 @@ fn run_ring_node(
     backend.setup_kv_transports(transports);
 
     // ===== Phase 1: prefill (KV ring exchange happens inside the backend,
-    // flowing successor-wards hop by hop through RingTcpTransport). =====
+    // flowing successor-wards hop by hop through the ring links). =====
     let (prefix_start, prefix_end) = scenario.prefix_ranges[domain];
     let chunk = &PROMPT[prefix_start..prefix_end];
     let positions = (prefix_start as i64..prefix_end as i64).collect::<Vec<_>>();
@@ -754,7 +1106,7 @@ fn run_ring_node(
     }
     println!("[route-b smoke] domain {domain} prefill done: global_len={global_len}");
 
-    let storage_before = storage_snapshot(&backend, layers)?;
+    let storage_before = storage_snapshot(backend, layers)?;
 
     // ===== Phase 2: decode (24-layer ring ping-pong). =====
     let decode_position_ids = Tensor::from_slice(&[scenario.decode_position])
@@ -762,9 +1114,9 @@ fn run_ring_node(
         .to_device(device);
     let (decode_sends, decode_finisher, decode_hidden) = run_ring_phase(
         "decode",
-        &mut backend,
-        &ring,
-        &scenario,
+        backend,
+        ring,
+        scenario,
         domain,
         scenario.decode_starter,
         &decode_token.map_or([0_i64; 1], |token| [token]),
@@ -792,9 +1144,9 @@ fn run_ring_node(
         .to_device(device);
     let (continuation_sends, continuation_finisher, continuation_hidden) = run_ring_phase(
         "continuation",
-        &mut backend,
-        &ring,
-        &scenario,
+        backend,
+        ring,
+        scenario,
         domain,
         decode_finisher,
         &CONTINUATION_PROMPT,
@@ -814,23 +1166,20 @@ fn run_ring_node(
     println!("[route-b smoke] domain {domain} continuation done: finisher={continuation_finisher}");
 
     // ===== Phase 4: per-domain tail checks. =====
-    let kv_total = verify_domain_kv_state(&backend, &scenario, domain, &storage_before)?;
+    let kv_total = verify_domain_kv_state(backend, scenario, domain, &storage_before)?;
     let handoffs = decode_sends + continuation_sends;
 
     let meta = serde_json::json!({
         "mode": "node",
         "device": format!("{device:?}"),
+        "transport": transport.as_str(),
         "domain": domain,
-        "domains": domains,
+        "domains": scenario.domains,
         "tickets": scenario.tickets,
         "prefix_splits": scenario.prefix_splits,
         "decode_starter": scenario.decode_starter,
         "decode_finisher": decode_finisher,
         "continuation_finisher": continuation_finisher,
-        "ring": {
-            "incoming_bind": bind,
-            "outgoing_peer": peer,
-        },
         "decode_token": decode_token,
         "prefill_argmax": if domain == scenario.decode_starter { Some(prefill_argmax) } else { None },
         "decode_argmax": decode_argmax,
@@ -841,7 +1190,7 @@ fn run_ring_node(
         "continuation_sends": continuation_sends,
         "checks": {
             "num_layers": layers == EXPECTED_NUM_LAYERS,
-            "kv_total_matches_expected": kv_total == expected_domain_kv_total(&scenario, domain, layers),
+            "kv_total_matches_expected": kv_total == expected_domain_kv_total(scenario, domain, layers),
             "storage_stable": true,
             "committed_eq_reserved": true,
             "positions_match_frozen_offsets": true,
@@ -1611,6 +1960,7 @@ struct Cli {
     domains: Option<usize>,
     tickets: Option<Vec<u64>>,
     prefix_splits: Option<Vec<usize>>,
+    transport: TransportKind,
     bind: Option<String>,
     peer: Option<String>,
     out: PathBuf,
@@ -1635,6 +1985,7 @@ fn parse_cli() -> Result<Cli, String> {
     let mut domains = None;
     let mut tickets = None;
     let mut prefix_splits = None;
+    let mut transport = TransportKind::Tcp;
     let mut bind = None;
     let mut peer = None;
     let mut out = None;
@@ -1663,6 +2014,7 @@ fn parse_cli() -> Result<Cli, String> {
             }
             "--tickets" => tickets = Some(parse_u64_list(value, "--tickets")?),
             "--prefix-splits" => prefix_splits = Some(parse_usize_list(value, "--prefix-splits")?),
+            "--transport" => transport = TransportKind::parse(value)?,
             "--bind" => bind = Some(value.clone()),
             "--peer" => peer = Some(value.clone()),
             "--out" => out = Some(PathBuf::from(value)),
@@ -1679,6 +2031,7 @@ fn parse_cli() -> Result<Cli, String> {
         domains,
         tickets,
         prefix_splits,
+        transport,
         bind,
         peer,
         out,
@@ -1751,6 +2104,7 @@ fn main() -> Result<(), String> {
                 &peer,
                 tickets,
                 prefix_splits,
+                cli.transport,
                 &cli.model_dir,
                 &cli.out,
             )
