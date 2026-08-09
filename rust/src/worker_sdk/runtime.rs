@@ -209,16 +209,36 @@ impl WorkerRuntime {
                     self.backend.release_request(request_id);
                     println!("[worker {domain_id}] released request {request_id}");
                 }
-                // Wired in phase-2 node 2c; until then answer with an explicit
-                // error instead of silently ignoring the command.
-                WorkerCommand::StationaryContinuation { request_id, .. } => {
-                    let resp = WorkerResponse::Error {
+                WorkerCommand::StationaryContinuation {
+                    request_id,
+                    tokens,
+                    position_ids,
+                    capacity_tickets,
+                    starter_domain,
+                } => {
+                    let resp = match self.backend.run_stationary_continuation(
                         request_id,
-                        message: "stationary continuation is not wired yet (phase-2 node 2c)"
-                            .to_string(),
+                        &tokens,
+                        &position_ids,
+                        &capacity_tickets,
+                        starter_domain,
+                    ) {
+                        Ok(logits) => WorkerResponse::StationaryContinuationDone {
+                            request_id,
+                            logits_bytes: logits.map(|values| {
+                                values
+                                    .iter()
+                                    .flat_map(|&v| v.to_le_bytes())
+                                    .collect::<Vec<u8>>()
+                            }),
+                        },
+                        Err(message) => WorkerResponse::Error {
+                            request_id,
+                            message,
+                        },
                     };
                     send_response_quic(&mut self.coord_send, &resp, &rt_handle)
-                        .map_err(|e| format!("send StationaryContinuation error failed: {e}"))?;
+                        .map_err(|e| format!("send StationaryContinuationDone failed: {e}"))?;
                 }
                 WorkerCommand::Shutdown => {
                     println!("[worker {domain_id}] shutting down");

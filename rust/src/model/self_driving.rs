@@ -304,8 +304,13 @@ impl KvCache for ReservedPositionedKvShard {
         if keep {
             return self.update(new_k, new_v);
         }
-        Err(ModelError::Backend(
-            "reserved positioned KV decode must use the self-driving ring".to_string(),
+        // experimental: raised for the route-B E2E (phase-2 node 2c) — legacy
+        // decode-ring growth on a non-owner domain drops the new token without
+        // persisting it, mirroring ContiguousKvCache::update_sharded; the
+        // returned concat only feeds this step's attention.
+        Ok((
+            Tensor::cat(&[&self.active_k(), new_k], 2),
+            Tensor::cat(&[&self.active_v(), new_v], 2),
         ))
     }
 

@@ -647,6 +647,26 @@ impl WorkerBackend for TchWorkerBackend {
         self.model.global_seq_len = len;
     }
 
+    // experimental: route-B stationary continuation driver (phase-2 node 2c);
+    // delegates to the inherent implementation.
+    fn run_stationary_continuation(
+        &mut self,
+        request_id: u64,
+        tokens: &[i64],
+        position_ids: &[i64],
+        capacity_tickets: &[u64],
+        starter_domain: usize,
+    ) -> Result<Option<Vec<f32>>, String> {
+        TchWorkerBackend::run_stationary_continuation(
+            self,
+            request_id,
+            tokens,
+            position_ids,
+            capacity_tickets,
+            starter_domain,
+        )
+    }
+
     /// Request-aware sync: updates the per-request context.
     fn sync_global_seq_len_for_request(&mut self, request_id: u64, len: usize) {
         if let Some(ctx) = self.request_contexts.get_mut(&request_id) {

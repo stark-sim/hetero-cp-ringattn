@@ -12,15 +12,19 @@
 use crate::api::types::{InferenceJob, InferenceResult, StreamChunk};
 use crate::api::{build_router, ApiState};
 use crate::distributed::protocol::{
-    recv_response_quic, send_command_quic, WorkerCommand, WorkerResponse,
+    recv_response_quic, send_command_quic, validate_stationary_continuation, WorkerCommand,
+    WorkerResponse,
 };
-use crate::distributed::scheduler::{BatchScheduler, ActiveRequest};
-use crate::model::attention::strategy::{build_assignment, build_domain_positions, RingSchedulingStrategy};
-use crate::model::ModelConfig;
+use crate::distributed::scheduler::{ActiveRequest, BatchScheduler};
+use crate::model::attention::strategy::{
+    build_assignment, build_domain_positions, RingSchedulingStrategy,
+};
 #[cfg(feature = "tch-backend")]
 use crate::model::sampling::sample_token;
 #[cfg(not(feature = "tch-backend"))]
 use crate::model::sampling::sample_token_slice;
+use crate::model::self_driving::{stationary_layer_starters, FrozenKvAssigneeSchedule};
+use crate::model::ModelConfig;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -90,6 +94,12 @@ struct CoordinatorArgs {
     export_logits_dir: Option<String>,
     /// Ring attention scheduling strategy (vanilla/striped/zigzag).
     ring_strategy: RingSchedulingStrategy,
+    /// experimental (route-B 2c, test-only): inject one stationary
+    /// continuation segment after the first legacy decode step.
+    continuation_segment: Option<Vec<i64>>,
+    /// experimental (route-B 2c, test-only): raw prompt token ids, bypassing
+    /// the tokenizer, so the E2E can reproduce the golden scenario exactly.
+    prompt_token_ids: Option<Vec<i64>>,
 }
 
 fn parse_args() -> CoordinatorArgs {
@@ -108,11 +118,15 @@ fn parse_args() -> CoordinatorArgs {
     let mut prompts_file = None;
     let mut export_logits_dir = None;
     let mut ring_strategy = RingSchedulingStrategy::Vanilla;
+    let mut continuation_segment = None;
+    let mut prompt_token_ids = None;
 
     let mut args = std::env::args().skip(1); // skip binary name
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--distributed-role" => { let _ = args.next(); } // consumed by main.rs, skip here
+            "--distributed-role" => {
+                let _ = args.next();
+            } // consumed by main.rs, skip here
             "--model-dir" => model_dir = args.next().unwrap(),
             "--prompt" => prompt = args.next().unwrap(),
             "--max-tokens" => max_tokens = args.next().unwrap().parse().unwrap(),
@@ -120,7 +134,12 @@ fn parse_args() -> CoordinatorArgs {
             "--top-p" => top_p = args.next().unwrap().parse().unwrap(),
             "--num-domains" => num_domains = args.next().unwrap().parse().unwrap(),
             "--worker-addrs" => {
-                worker_addrs = args.next().unwrap().split(',').map(|s| s.to_string()).collect();
+                worker_addrs = args
+                    .next()
+                    .unwrap()
+                    .split(',')
+                    .map(|s| s.to_string())
+                    .collect();
             }
             "--listen-addr" => listen_addr = args.next().unwrap(),
             "--http-addr" => http_addr = args.next().unwrap(),
@@ -136,6 +155,14 @@ fn parse_args() -> CoordinatorArgs {
                 let s = args.next().unwrap();
                 ring_strategy = RingSchedulingStrategy::from_str(&s)
                     .unwrap_or_else(|| panic!("unknown --ring-strategy: {s}"));
+            }
+            "--continuation-segment" => {
+                let s = args.next().unwrap();
+                continuation_segment = Some(s.split(',').map(|x| x.parse().unwrap()).collect());
+            }
+            "--prompt-token-ids" => {
+                let s = args.next().unwrap();
+                prompt_token_ids = Some(s.split(',').map(|x| x.parse().unwrap()).collect());
             }
             _ => eprintln!("[coordinator] unknown arg: {arg}"),
         }
@@ -157,6 +184,8 @@ fn parse_args() -> CoordinatorArgs {
         prompts_file,
         export_logits_dir,
         ring_strategy,
+        continuation_segment,
+        prompt_token_ids,
     }
 }
 
@@ -165,9 +194,13 @@ fn parse_args() -> CoordinatorArgs {
 /// Format matches single-node export:
 ///   - Header: [vocab_size: u64 LE][num_chunks: u64 LE]
 ///   - Body:  contiguous vocab_size f32 LE per chunk
-fn write_logits_file(path: &std::path::Path, vocab_size: usize, chunks: &[Vec<f32>]) -> Result<(), String> {
-    let mut file = std::fs::File::create(path)
-        .map_err(|e| format!("failed to create logits file: {e}"))?;
+fn write_logits_file(
+    path: &std::path::Path,
+    vocab_size: usize,
+    chunks: &[Vec<f32>],
+) -> Result<(), String> {
+    let mut file =
+        std::fs::File::create(path).map_err(|e| format!("failed to create logits file: {e}"))?;
     let num_chunks = chunks.len() as u64;
     file.write_all(&vocab_size.to_le_bytes())
         .map_err(|e| format!("failed to write header: {e}"))?;
@@ -175,7 +208,12 @@ fn write_logits_file(path: &std::path::Path, vocab_size: usize, chunks: &[Vec<f3
         .map_err(|e| format!("failed to write header: {e}"))?;
     for (i, chunk) in chunks.iter().enumerate() {
         if chunk.len() != vocab_size {
-            return Err(format!("logits chunk {} size mismatch: expected {}, got {}", i, vocab_size, chunk.len()));
+            return Err(format!(
+                "logits chunk {} size mismatch: expected {}, got {}",
+                i,
+                vocab_size,
+                chunk.len()
+            ));
         }
         for &f in chunk {
             file.write_all(&f.to_le_bytes())
@@ -222,7 +260,8 @@ fn process_single_request(
         if sizes.len() != num_domains {
             return Err(format!(
                 "--chunk-sizes length ({}) must match num_domains ({})",
-                sizes.len(), num_domains
+                sizes.len(),
+                num_domains
             ));
         }
         let sum: usize = sizes.iter().sum();
@@ -256,7 +295,9 @@ fn process_single_request(
             return Err(format!(
                 "prompt too short: domain {} received 0 tokens (total {} tokens, {} domains). \
                  Each domain needs at least 1 token.",
-                i, prompt_ids.len(), num_domains
+                i,
+                prompt_ids.len(),
+                num_domains
             ));
         }
     }
@@ -274,7 +315,8 @@ fn process_single_request(
             position_ids: Some(position_ids.clone()),
             layer_kv_capacities: None,
         };
-        send_command_quic(send, &cmd, rt.handle()).map_err(|e| format!("send Prefill failed: {e}"))?;
+        send_command_quic(send, &cmd, rt.handle())
+            .map_err(|e| format!("send Prefill failed: {e}"))?;
     }
 
     let mut max_global_seq_len = 0usize;
@@ -283,7 +325,11 @@ fn process_single_request(
         let resp = recv_response_quic(recv, rt.handle())
             .map_err(|e| format!("recv PrefillDone failed: {e}"))?;
         match resp {
-            WorkerResponse::PrefillDone { last_logits_bytes: bytes, global_seq_len, .. } => {
+            WorkerResponse::PrefillDone {
+                last_logits_bytes: bytes,
+                global_seq_len,
+                ..
+            } => {
                 if global_seq_len > max_global_seq_len {
                     max_global_seq_len = global_seq_len;
                     last_logits_bytes = bytes;
@@ -292,13 +338,20 @@ fn process_single_request(
             WorkerResponse::Error { message, .. } => {
                 return Err(format!("worker {domain_id} prefill error: {message}"));
             }
-            _ => return Err(format!("unexpected response from worker {domain_id}: {resp:?}")),
+            _ => {
+                return Err(format!(
+                    "unexpected response from worker {domain_id}: {resp:?}"
+                ))
+            }
         }
     }
 
     // Sync global_seq_len
     for (send, _recv) in worker_streams.iter_mut() {
-        let cmd = WorkerCommand::SyncGlobalSeqLen { request_id, len: max_global_seq_len };
+        let cmd = WorkerCommand::SyncGlobalSeqLen {
+            request_id,
+            len: max_global_seq_len,
+        };
         let _ = send_command_quic(send, &cmd, rt.handle());
     }
 
@@ -310,7 +363,8 @@ fn process_single_request(
     if logits_vec.len() != vocab_size {
         return Err(format!(
             "logits size mismatch: expected {}, got {}",
-            vocab_size, logits_vec.len()
+            vocab_size,
+            logits_vec.len()
         ));
     }
     let mut next_token = match sample_from_logits_vec(&logits_vec, temperature, top_p) {
@@ -338,7 +392,10 @@ fn process_single_request(
         }
 
         for (send, _recv) in worker_streams.iter_mut() {
-            let cmd = WorkerCommand::Decode { request_id, token: next_token };
+            let cmd = WorkerCommand::Decode {
+                request_id,
+                token: next_token,
+            };
             let _ = send_command_quic(send, &cmd, rt.handle());
         }
 
@@ -378,8 +435,7 @@ fn process_single_request(
 
     // Export logits if requested
     if let Some(dir) = export_logits_dir {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| format!("failed to create export dir: {e}"))?;
+        std::fs::create_dir_all(dir).map_err(|e| format!("failed to create export dir: {e}"))?;
         let out_path = Path::new(dir).join(format!("logits_{}.bin", request_id));
         write_logits_file(&out_path, vocab_size, &all_logits)
             .map_err(|e| format!("logits export failed: {e}"))?;
@@ -429,7 +485,11 @@ fn prefill_single_request(
     let chunk_sizes: Vec<usize> = if let Some(ref sizes) = chunk_sizes_override {
         if sizes.len() != num_domains {
             let _ = job.tx.send(InferenceResult {
-                text: format!("[error: --chunk-sizes length ({}) must match num_domains ({})]", sizes.len(), num_domains),
+                text: format!(
+                    "[error: --chunk-sizes length ({}) must match num_domains ({})]",
+                    sizes.len(),
+                    num_domains
+                ),
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 finish_reason: Some("error".to_string()),
@@ -439,7 +499,10 @@ fn prefill_single_request(
         let sum: usize = sizes.iter().sum();
         if sum != seq_len as usize {
             let _ = job.tx.send(InferenceResult {
-                text: format!("[error: --chunk-sizes sum ({}) must equal prompt length ({})]", sum, seq_len),
+                text: format!(
+                    "[error: --chunk-sizes sum ({}) must equal prompt length ({})]",
+                    sum, seq_len
+                ),
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 finish_reason: Some("error".to_string()),
@@ -526,7 +589,11 @@ fn prefill_single_request(
             }
         };
         match resp {
-            WorkerResponse::PrefillDone { last_logits_bytes: bytes, global_seq_len, .. } => {
+            WorkerResponse::PrefillDone {
+                last_logits_bytes: bytes,
+                global_seq_len,
+                ..
+            } => {
                 if global_seq_len > max_global_seq_len {
                     max_global_seq_len = global_seq_len;
                     last_logits_bytes = bytes;
@@ -548,14 +615,19 @@ fn prefill_single_request(
                     completion_tokens: 0,
                     finish_reason: Some("error".to_string()),
                 });
-                return Err(format!("unexpected response from worker {domain_id}: {resp:?}"));
+                return Err(format!(
+                    "unexpected response from worker {domain_id}: {resp:?}"
+                ));
             }
         }
     }
 
     // Sync global_seq_len
     for (send, _recv) in worker_streams.iter_mut() {
-        let cmd = WorkerCommand::SyncGlobalSeqLen { request_id: job.request_id, len: max_global_seq_len };
+        let cmd = WorkerCommand::SyncGlobalSeqLen {
+            request_id: job.request_id,
+            len: max_global_seq_len,
+        };
         let _ = send_command_quic(send, &cmd, rt.handle());
     }
 
@@ -566,12 +638,20 @@ fn prefill_single_request(
         .collect();
     if logits_vec.len() != vocab_size {
         let _ = job.tx.send(InferenceResult {
-            text: format!("[error: logits size mismatch: expected {}, got {}]", vocab_size, logits_vec.len()),
+            text: format!(
+                "[error: logits size mismatch: expected {}, got {}]",
+                vocab_size,
+                logits_vec.len()
+            ),
             prompt_tokens: 0,
             completion_tokens: 0,
             finish_reason: Some("error".to_string()),
         });
-        return Err(format!("logits size mismatch: expected {}, got {}", vocab_size, logits_vec.len()));
+        return Err(format!(
+            "logits size mismatch: expected {}, got {}",
+            vocab_size,
+            logits_vec.len()
+        ));
     }
     let first_token = match sample_from_logits_vec(&logits_vec, job.temperature, job.top_p) {
         Ok(t) => t,
@@ -625,7 +705,8 @@ fn decode_iteration(
     let _num_domains = worker_streams.len();
 
     // Collect next tokens from all active requests
-    let request_tokens: Vec<(u64, i64)> = scheduler.active_requests()
+    let request_tokens: Vec<(u64, i64)> = scheduler
+        .active_requests()
         .values()
         .map(|req| (req.request_id, req.next_token))
         .collect();
@@ -636,7 +717,9 @@ fn decode_iteration(
 
     // Send DecodeBatch to all workers
     for (send, _recv) in worker_streams.iter_mut() {
-        let cmd = WorkerCommand::DecodeBatch { request_tokens: request_tokens.clone() };
+        let cmd = WorkerCommand::DecodeBatch {
+            request_tokens: request_tokens.clone(),
+        };
         send_command_quic(send, &cmd, rt.handle())
             .map_err(|e| format!("send DecodeBatch failed: {e}"))?;
     }
@@ -696,28 +779,360 @@ fn decode_iteration(
     Ok(completed)
 }
 
+// ===== experimental route-B stationary continuation E2E (phase-2 node 2c) =====
+
+/// Production legacy decode-ring KV growth rule (attention/ring.rs
+/// `update_sharded` keep rule): position `p` is persisted only by domain
+/// `p % domains`; every other domain drops it. Reserved-capacity planning and
+/// tests share this single derivation.
+fn legacy_decode_owner(position: i64, domains: usize) -> usize {
+    (position as usize) % domains
+}
+
+/// Per-domain per-layer reserved capacities for the continuation E2E:
+/// prefix split + this domain's owned legacy decode positions + this domain's
+/// frozen continuation offsets (identical for every layer).
+fn reserved_layer_capacities(
+    prefix_splits: &[usize],
+    decode_positions: &[i64],
+    continuation_offsets: &[Vec<usize>],
+    layers: usize,
+    domains: usize,
+) -> Vec<Vec<usize>> {
+    (0..domains)
+        .map(|domain| {
+            let owned = decode_positions
+                .iter()
+                .filter(|&&p| legacy_decode_owner(p, domains) == domain)
+                .count();
+            let capacity = prefix_splits[domain] + owned + continuation_offsets[domain].len();
+            vec![capacity; layers]
+        })
+        .collect()
+}
+
+/// Final finisher of a stationary continuation ring run: the finisher of the
+/// last layer (starter rotated `layers` times by `domains - 1`).
+fn continuation_final_finisher(
+    starter: usize,
+    layers: usize,
+    domains: usize,
+) -> Result<usize, String> {
+    let starters = stationary_layer_starters(starter, layers, domains)?;
+    let last_starter = *starters.last().expect("non-empty starters");
+    Ok((last_starter + domains - 1) % domains)
+}
+
+/// Broadcast one StationaryContinuation command and collect the finisher's
+/// logits; every non-finisher worker must acknowledge with `None`.
+#[allow(clippy::too_many_arguments)]
+fn stationary_continuation(
+    request_id: u64,
+    tokens: &[i64],
+    position_ids: &[i64],
+    capacity_tickets: &[u64],
+    starter_domain: usize,
+    layers: usize,
+    worker_streams: &mut [(quinn::SendStream, quinn::RecvStream)],
+    rt: &tokio::runtime::Runtime,
+) -> Result<Vec<f32>, String> {
+    let domains = worker_streams.len();
+    validate_stationary_continuation(
+        domains,
+        tokens,
+        position_ids,
+        capacity_tickets,
+        starter_domain,
+    )?;
+    let cmd = WorkerCommand::StationaryContinuation {
+        request_id,
+        tokens: tokens.to_vec(),
+        position_ids: position_ids.to_vec(),
+        capacity_tickets: capacity_tickets.to_vec(),
+        starter_domain,
+    };
+    for (send, _recv) in worker_streams.iter_mut() {
+        send_command_quic(send, &cmd, rt.handle())
+            .map_err(|e| format!("send StationaryContinuation failed: {e}"))?;
+    }
+    let finisher = continuation_final_finisher(starter_domain, layers, domains)?;
+    let mut logits = None;
+    for (domain, (_send, recv)) in worker_streams.iter_mut().enumerate() {
+        let resp = recv_response_quic(recv, rt.handle())
+            .map_err(|e| format!("recv StationaryContinuationDone failed: {e}"))?;
+        match resp {
+            WorkerResponse::StationaryContinuationDone { logits_bytes, .. } => {
+                if domain == finisher {
+                    let bytes = logits_bytes.ok_or_else(|| {
+                        format!("finisher domain {domain} returned no continuation logits")
+                    })?;
+                    logits = Some(
+                        bytes
+                            .chunks_exact(4)
+                            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                            .collect::<Vec<f32>>(),
+                    );
+                } else if logits_bytes.is_some() {
+                    return Err(format!(
+                        "non-finisher domain {domain} returned continuation logits"
+                    ));
+                }
+            }
+            WorkerResponse::Error { message, .. } => {
+                return Err(format!(
+                    "worker {domain} stationary continuation error: {message}"
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "unexpected response from worker {domain}: {resp:?}"
+                ));
+            }
+        }
+    }
+    logits.ok_or_else(|| "finisher continuation logits missing".to_string())
+}
+
+/// experimental (route-B 2c, test-only) E2E: reserved prefill -> one legacy
+/// decode step -> one injected StationaryContinuation -> remaining legacy
+/// decode steps. Reproduces the route_b_cross_node_smoke golden scenario when
+/// invoked with --prompt-token-ids 151644,9707,0,16 --chunk-sizes 1,3
+/// --continuation-segment 11,13,17,19.
+#[allow(clippy::too_many_arguments)]
+fn run_continuation_e2e(
+    request_id: u64,
+    prompt_ids: &[i64],
+    continuation_tokens: &[i64],
+    max_tokens: usize,
+    chunk_sizes_override: &Option<Vec<usize>>,
+    config: &ModelConfig,
+    worker_capacities: &[u64],
+    worker_streams: &mut [(quinn::SendStream, quinn::RecvStream)],
+    rt: &tokio::runtime::Runtime,
+) -> Result<(), String> {
+    let domains = worker_streams.len();
+    let layers = config.num_layers;
+    let prompt_len = prompt_ids.len();
+    let m = continuation_tokens.len();
+    if max_tokens < 2 {
+        return Err("continuation E2E needs --max-tokens >= 2".to_string());
+    }
+
+    let chunk_sizes: Vec<usize> = if let Some(ref sizes) = chunk_sizes_override {
+        if sizes.len() != domains || sizes.iter().sum::<usize>() != prompt_len {
+            return Err(format!(
+                "--chunk-sizes {sizes:?} must match domains {domains} and prompt length {prompt_len}"
+            ));
+        }
+        sizes.clone()
+    } else {
+        let chunk_size = prompt_len.div_ceil(domains).max(1);
+        let mut chunks = Vec::with_capacity(domains);
+        let mut offset = 0usize;
+        for i in 0..domains {
+            let end = if i == domains - 1 {
+                prompt_len
+            } else {
+                (offset + chunk_size).min(prompt_len)
+            };
+            chunks.push(end - offset);
+            offset = end;
+        }
+        chunks
+    };
+    if chunk_sizes.contains(&0) {
+        return Err("continuation E2E requires a non-zero chunk per domain".to_string());
+    }
+    let domain_inputs =
+        apply_ring_strategy(prompt_ids, &chunk_sizes, RingSchedulingStrategy::Vanilla);
+
+    // Tickets come straight from the worker handshakes (capacity_mb); the
+    // frozen schedule largest-remainder quantization maps them to offsets.
+    let capacity_tickets = worker_capacities.to_vec();
+    let cont_schedule = FrozenKvAssigneeSchedule::new(&capacity_tickets, request_id, m)?;
+    let mut continuation_offsets = vec![Vec::new(); domains];
+    for offset in 0..m {
+        let domain = cont_schedule.assignee_for(offset, 0, 1).unwrap();
+        continuation_offsets[domain].push(offset);
+    }
+    let starter_domain = cont_schedule.assignee_for(m - 1, 0, 1).unwrap();
+
+    // Legacy decode growth positions: step 0 sits at prompt_len; the
+    // post-continuation steps resume after the continuation segment.
+    let mut decode_positions = vec![prompt_len as i64];
+    for step in 0..(max_tokens - 2) {
+        decode_positions.push((prompt_len + 1 + m + step) as i64);
+    }
+    let capacities = reserved_layer_capacities(
+        &chunk_sizes,
+        &decode_positions,
+        &continuation_offsets,
+        layers,
+        domains,
+    );
+    println!(
+        "[coordinator] experimental continuation E2E: tickets={capacity_tickets:?} splits={chunk_sizes:?} starter={starter_domain} offsets={continuation_offsets:?} capacities={capacities:?}"
+    );
+
+    // Prefill with per-domain reservations.
+    for (domain_id, (send, _recv)) in worker_streams.iter_mut().enumerate() {
+        let (chunk, position_ids, seq_offset) = &domain_inputs[domain_id];
+        let cmd = WorkerCommand::Prefill {
+            request_id,
+            chunk: chunk.clone(),
+            seq_offset: *seq_offset,
+            position_ids: Some(position_ids.clone()),
+            layer_kv_capacities: Some(capacities[domain_id].clone()),
+        };
+        send_command_quic(send, &cmd, rt.handle())
+            .map_err(|e| format!("send Prefill failed: {e}"))?;
+    }
+    let mut max_global_seq_len = 0usize;
+    let mut last_logits_bytes: Vec<u8> = Vec::new();
+    for (domain_id, (_send, recv)) in worker_streams.iter_mut().enumerate() {
+        let resp = recv_response_quic(recv, rt.handle())
+            .map_err(|e| format!("recv PrefillDone failed: {e}"))?;
+        match resp {
+            WorkerResponse::PrefillDone {
+                last_logits_bytes: bytes,
+                global_seq_len,
+                ..
+            } => {
+                if global_seq_len > max_global_seq_len {
+                    max_global_seq_len = global_seq_len;
+                    last_logits_bytes = bytes;
+                }
+            }
+            WorkerResponse::Error { message, .. } => {
+                return Err(format!("worker {domain_id} prefill error: {message}"));
+            }
+            _ => {
+                return Err(format!(
+                    "unexpected response from worker {domain_id}: {resp:?}"
+                ))
+            }
+        }
+    }
+    for (send, _recv) in worker_streams.iter_mut() {
+        let cmd = WorkerCommand::SyncGlobalSeqLen {
+            request_id,
+            len: max_global_seq_len,
+        };
+        let _ = send_command_quic(send, &cmd, rt.handle());
+    }
+
+    let logits_vec: Vec<f32> = last_logits_bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    let mut next_token = sample_from_logits_vec(&logits_vec, 0.0, 1.0)?;
+    let decode_token = next_token;
+    let mut generated_ids: Vec<i64> = vec![next_token];
+
+    // One legacy decode step (decode-ring growth rule: position p persists on
+    // domain p % domains).
+    for (send, _recv) in worker_streams.iter_mut() {
+        let cmd = WorkerCommand::Decode {
+            request_id,
+            token: next_token,
+        };
+        let _ = send_command_quic(send, &cmd, rt.handle());
+    }
+    let _ = recv_response_quic(&mut worker_streams[0].1, rt.handle())
+        .map_err(|e| format!("recv DecodeDone failed: {e}"))?;
+    for (_send, recv) in worker_streams.iter_mut().skip(1) {
+        let _ = recv_response_quic(recv, rt.handle());
+    }
+
+    // Injected stationary continuation.
+    let continuation_positions: Vec<i64> =
+        (prompt_len as i64 + 1..prompt_len as i64 + 1 + m as i64).collect();
+    let continuation_logits = stationary_continuation(
+        request_id,
+        continuation_tokens,
+        &continuation_positions,
+        &capacity_tickets,
+        starter_domain,
+        layers,
+        worker_streams,
+        rt,
+    )?;
+    let (continuation_argmax, _) = continuation_logits
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or((0, &0.0));
+    next_token = sample_from_logits_vec(&continuation_logits, 0.0, 1.0)?;
+    generated_ids.push(next_token);
+    println!(
+        "[coordinator] experimental stationary continuation: decode_token={decode_token} continuation_argmax={continuation_argmax} sampled_next={next_token}"
+    );
+
+    // Remaining legacy decode steps.
+    for _ in 0..(max_tokens - 2) {
+        for (send, _recv) in worker_streams.iter_mut() {
+            let cmd = WorkerCommand::Decode {
+                request_id,
+                token: next_token,
+            };
+            let _ = send_command_quic(send, &cmd, rt.handle());
+        }
+        let resp = recv_response_quic(&mut worker_streams[0].1, rt.handle())
+            .map_err(|e| format!("recv DecodeDone failed: {e}"))?;
+        let logits_bytes = match resp {
+            WorkerResponse::DecodeDone { logits_bytes, .. } => logits_bytes,
+            WorkerResponse::Error { message, .. } => {
+                return Err(format!("worker 0 decode error: {message}"));
+            }
+            _ => return Err(format!("unexpected response from worker 0: {resp:?}")),
+        };
+        for (_send, recv) in worker_streams.iter_mut().skip(1) {
+            let _ = recv_response_quic(recv, rt.handle());
+        }
+        let logits_vec: Vec<f32> = logits_bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        next_token = sample_from_logits_vec(&logits_vec, 0.0, 1.0)?;
+        generated_ids.push(next_token);
+    }
+
+    for (send, _recv) in worker_streams.iter_mut() {
+        let cmd = WorkerCommand::ReleaseRequest { request_id };
+        let _ = send_command_quic(send, &cmd, rt.handle());
+    }
+    println!("[coordinator] experimental continuation E2E generated ids: {generated_ids:?}");
+    Ok(())
+}
+
 /// Coordinator 主入口。
 pub fn run() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let args = parse_args();
-    println!("[coordinator] starting, num_domains={}, workers={:?}, listen={}",
-             args.num_domains, args.worker_addrs, args.listen_addr);
+    println!(
+        "[coordinator] starting, num_domains={}, workers={:?}, listen={}",
+        args.num_domains, args.worker_addrs, args.listen_addr
+    );
 
     // Load tokenizer and config
     let config_path = Path::new(&args.model_dir).join("config.json");
     let config = ModelConfig::from_file(&config_path).expect("load config failed");
     let tokenizer_path = Path::new(&args.model_dir).join("tokenizer.json");
-    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).expect("load tokenizer failed");
+    let tokenizer =
+        tokenizers::Tokenizer::from_file(&tokenizer_path).expect("load tokenizer failed");
 
     // Determine serving mode
-    let has_cli_prompts = args.prompts_file.is_some()
-        || args.prompt_file.is_some()
-        || !args.prompt.is_empty();
+    let has_cli_prompts =
+        args.prompts_file.is_some() || args.prompt_file.is_some() || !args.prompt.is_empty();
 
     let cli_prompts: Vec<String> = if let Some(ref path) = args.prompts_file {
         let content = std::fs::read_to_string(path).expect("read prompts-file failed");
-        content.lines().map(|s| s.to_string()).filter(|s| !s.is_empty()).collect()
+        content
+            .lines()
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
     } else if let Some(ref path) = args.prompt_file {
         vec![std::fs::read_to_string(path).expect("read prompt-file failed")]
     } else {
@@ -728,34 +1143,49 @@ pub fn run() {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime failed");
     let listen_addr: SocketAddr = args.listen_addr.parse().expect("invalid listen_addr");
 
-    let endpoint = rt.block_on(async {
-        crate::distributed::transport::quic::create_endpoint(listen_addr)
-    }).expect("create_endpoint failed");
-    println!("[coordinator] QUIC endpoint listening on {}", args.listen_addr);
+    let endpoint = rt
+        .block_on(async { crate::distributed::transport::quic::create_endpoint(listen_addr) })
+        .expect("create_endpoint failed");
+    println!(
+        "[coordinator] QUIC endpoint listening on {}",
+        args.listen_addr
+    );
 
     let mut worker_handshakes: Vec<(usize, u64, quinn::SendStream, quinn::RecvStream)> =
         Vec::with_capacity(args.num_domains);
     for i in 0..args.num_domains {
-        let (send, mut recv) = rt.block_on(async {
-            let incoming = match tokio::time::timeout(
-                std::time::Duration::from_secs(crate::distributed::protocol::default_quic_timeout_secs()),
-                endpoint.accept()
-            ).await {
-                Ok(Some(incoming)) => incoming,
-                Ok(None) => return Err("endpoint closed".to_string()),
-                Err(_) => return Err("accept timeout after 600s".to_string()),
-            };
-            let conn = incoming.await.map_err(|e| format!("connection failed: {e}"))?;
-            println!("[coordinator] worker connection established (accept order {i})");
-            let (send, recv) = conn.accept_bi().await
-                .map_err(|e| format!("accept_bi failed: {e}"))?;
-            Ok::<_, String>((send, recv))
-        }).unwrap_or_else(|e| panic!("accept worker {i} failed: {e}"));
+        let (send, mut recv) = rt
+            .block_on(async {
+                let incoming = match tokio::time::timeout(
+                    std::time::Duration::from_secs(
+                        crate::distributed::protocol::default_quic_timeout_secs(),
+                    ),
+                    endpoint.accept(),
+                )
+                .await
+                {
+                    Ok(Some(incoming)) => incoming,
+                    Ok(None) => return Err("endpoint closed".to_string()),
+                    Err(_) => return Err("accept timeout after 600s".to_string()),
+                };
+                let conn = incoming
+                    .await
+                    .map_err(|e| format!("connection failed: {e}"))?;
+                println!("[coordinator] worker connection established (accept order {i})");
+                let (send, recv) = conn
+                    .accept_bi()
+                    .await
+                    .map_err(|e| format!("accept_bi failed: {e}"))?;
+                Ok::<_, String>((send, recv))
+            })
+            .unwrap_or_else(|e| panic!("accept worker {i} failed: {e}"));
 
         let handshake = crate::distributed::protocol::read_handshake_quic(&mut recv, rt.handle())
             .expect("handshake read failed");
-        println!("[coordinator] worker {} connected (accept order {i}), capacity={} MB",
-                 handshake.domain_id, handshake.capacity_mb);
+        println!(
+            "[coordinator] worker {} connected (accept order {i}), capacity={} MB",
+            handshake.domain_id, handshake.capacity_mb
+        );
         worker_handshakes.push((
             handshake.domain_id as usize,
             handshake.capacity_mb,
@@ -764,7 +1194,10 @@ pub fn run() {
         ));
     }
     worker_handshakes.sort_by_key(|(domain_id, _, _, _)| *domain_id);
-    let worker_capacities: Vec<u64> = worker_handshakes.iter().map(|(_, cap, _, _)| *cap).collect();
+    let worker_capacities: Vec<u64> = worker_handshakes
+        .iter()
+        .map(|(_, cap, _, _)| *cap)
+        .collect();
     let worker_streams: Vec<(quinn::SendStream, quinn::RecvStream)> = worker_handshakes
         .into_iter()
         .map(|(_, _, send, recv)| (send, recv))
@@ -773,12 +1206,70 @@ pub fn run() {
     // Wrap worker_streams in Arc<Mutex> for shared access between concurrent requests.
     let worker_streams = Arc::new(std::sync::Mutex::new(worker_streams));
 
+    // experimental (route-B 2c, test-only): stationary continuation E2E entry.
+    // Default off — without --continuation-segment the behavior is unchanged.
+    if let Some(ref segment) = args.continuation_segment {
+        if args.ring_strategy != RingSchedulingStrategy::Vanilla {
+            eprintln!("[coordinator] --continuation-segment requires the vanilla ring strategy");
+            std::process::exit(1);
+        }
+        let prompt_ids: Vec<i64> = if let Some(ref ids) = args.prompt_token_ids {
+            ids.clone()
+        } else {
+            tokenizer
+                .encode(args.prompt.as_str(), true)
+                .expect("encode failed")
+                .get_ids()
+                .iter()
+                .map(|&id| id as i64)
+                .collect()
+        };
+        let result = {
+            let mut guard = worker_streams.lock().unwrap_or_else(|e| e.into_inner());
+            run_continuation_e2e(
+                1,
+                &prompt_ids,
+                segment,
+                args.max_tokens,
+                &args.chunk_sizes,
+                &config,
+                &worker_capacities,
+                &mut guard,
+                &rt,
+            )
+        };
+        let mut worker_streams = match Arc::try_unwrap(worker_streams) {
+            Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| e.into_inner()),
+            Err(_) => {
+                eprintln!(
+                    "[coordinator] warning: worker_streams still shared, cannot shutdown cleanly"
+                );
+                return;
+            }
+        };
+        shutdown_workers(&mut worker_streams, &endpoint, &rt);
+        match result {
+            Ok(()) => {
+                println!("[coordinator] experimental continuation E2E done");
+                return;
+            }
+            Err(e) => {
+                eprintln!("[coordinator] experimental continuation E2E failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     if has_cli_prompts && !cli_prompts.is_empty() {
         // Batch mode: process CLI prompts then exit (serial, no concurrency needed)
         println!("[coordinator] loaded {} prompt(s)", cli_prompts.len());
         for (req_idx, prompt_text) in cli_prompts.iter().enumerate() {
             let request_id = (req_idx + 1) as u64;
-            println!("\n[coordinator] === Request {} / {} ===", request_id, cli_prompts.len());
+            println!(
+                "\n[coordinator] === Request {} / {} ===",
+                request_id,
+                cli_prompts.len()
+            );
             let mut guard = worker_streams.lock().unwrap_or_else(|e| e.into_inner());
             match process_single_request(
                 request_id,
@@ -808,7 +1299,9 @@ pub fn run() {
         let mut worker_streams = match Arc::try_unwrap(worker_streams) {
             Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| e.into_inner()),
             Err(_) => {
-                eprintln!("[coordinator] warning: worker_streams still shared, cannot shutdown cleanly");
+                eprintln!(
+                    "[coordinator] warning: worker_streams still shared, cannot shutdown cleanly"
+                );
                 return;
             }
         };
@@ -887,7 +1380,17 @@ pub fn run() {
             // 2a: Prefill a pending request if batch has room
             if scheduler.can_admit() && !scheduler.pending_is_empty() {
                 if let Some(job) = scheduler.try_dequeue_pending() {
-                    match prefill_single_request(job, &tokenizer, &config, &mut guard, &args.chunk_sizes, args.capacity_aware, &worker_capacities, &rt, args.ring_strategy) {
+                    match prefill_single_request(
+                        job,
+                        &tokenizer,
+                        &config,
+                        &mut guard,
+                        &args.chunk_sizes,
+                        args.capacity_aware,
+                        &worker_capacities,
+                        &rt,
+                        args.ring_strategy,
+                    ) {
                         Ok(active_req) => {
                             active_counter.fetch_add(1, Ordering::SeqCst);
                             scheduler.add_active(active_req);
@@ -925,7 +1428,9 @@ pub fn run() {
                         // Release per-request state on workers for completed requests.
                         for request_id in &completed {
                             for (send, _recv) in guard.iter_mut() {
-                                let cmd = WorkerCommand::ReleaseRequest { request_id: *request_id };
+                                let cmd = WorkerCommand::ReleaseRequest {
+                                    request_id: *request_id,
+                                };
                                 let _ = send_command_quic(send, &cmd, rt.handle());
                             }
                         }
@@ -1003,7 +1508,9 @@ pub fn run() {
     let mut worker_streams = match Arc::try_unwrap(worker_streams) {
         Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| e.into_inner()),
         Err(_) => {
-            eprintln!("[coordinator] warning: worker_streams still shared, using best-effort shutdown");
+            eprintln!(
+                "[coordinator] warning: worker_streams still shared, using best-effort shutdown"
+            );
             return;
         }
     };
@@ -1033,7 +1540,10 @@ fn shutdown_workers(
 ) {
     for (send, _recv) in worker_streams.iter_mut() {
         let _ = crate::distributed::protocol::send_command_quic_timeout(
-            send, &WorkerCommand::Shutdown, rt.handle(), 10,
+            send,
+            &WorkerCommand::Shutdown,
+            rt.handle(),
+            10,
         );
         let _ = send.finish();
     }
@@ -1042,4 +1552,64 @@ fn shutdown_workers(
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     });
     println!("[coordinator] shutdown complete");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_decode_owner_is_position_mod_domains() {
+        assert_eq!(legacy_decode_owner(4, 2), 0);
+        assert_eq!(legacy_decode_owner(5, 2), 1);
+        assert_eq!(legacy_decode_owner(9, 2), 1);
+        assert_eq!(legacy_decode_owner(4, 3), 1);
+        assert_eq!(legacy_decode_owner(9, 3), 0);
+    }
+
+    #[test]
+    fn reserved_layer_capacities_cover_golden_e2e_scenario() {
+        // Golden E2E shape: prompt 4 tokens split [1,3], one pre-continuation
+        // decode at position 4, continuation m=4, then 2 more decode steps at
+        // positions 9 and 10 (max_tokens = 4), continuation offsets [0] / [1,2,3].
+        let decode_positions = [4_i64, 9, 10];
+        let continuation_offsets = vec![vec![0_usize], vec![1_usize, 2, 3]];
+        let capacities =
+            reserved_layer_capacities(&[1, 3], &decode_positions, &continuation_offsets, 24, 2);
+        assert_eq!(capacities.len(), 2);
+        // domain 0: 1 prefix + {4, 10} decode + 1 continuation offset
+        assert!(capacities[0].iter().all(|&c| c == 4));
+        // domain 1: 3 prefix + {9} decode + 3 continuation offsets
+        assert!(capacities[1].iter().all(|&c| c == 7));
+        assert_eq!(capacities[0].len(), 24);
+    }
+
+    #[test]
+    fn continuation_final_finisher_matches_starter_rotation() {
+        // N=2 golden: starter 1, 24 layers -> finisher 1.
+        assert_eq!(continuation_final_finisher(1, 24, 2).unwrap(), 1);
+        // N=3 smoke scenario: starter 2, 24 layers -> finisher 2.
+        assert_eq!(continuation_final_finisher(2, 24, 3).unwrap(), 2);
+        // Single layer: finisher is one hop before the starter.
+        assert_eq!(continuation_final_finisher(0, 1, 3).unwrap(), 2);
+        assert!(continuation_final_finisher(3, 24, 3).is_err());
+    }
+
+    #[test]
+    fn frozen_continuation_offsets_cover_segment() {
+        // 97ca355 tickets [1,3], request 75, m=4 -> counts [1,3], full cover.
+        let schedule = FrozenKvAssigneeSchedule::new(&[1, 3], 75, 4).unwrap();
+        let mut offsets = vec![Vec::new(); 2];
+        for offset in 0..4 {
+            let domain = schedule.assignee_for(offset, 0, 1).unwrap();
+            offsets[domain].push(offset);
+        }
+        assert_eq!(offsets[0].len(), 1);
+        assert_eq!(offsets[1].len(), 3);
+        let mut union = offsets.concat();
+        union.sort_unstable();
+        assert_eq!(union, vec![0, 1, 2, 3]);
+        // starter = owner of the last continuation position.
+        assert_eq!(schedule.assignee_for(3, 0, 1).unwrap(), 1);
+    }
 }

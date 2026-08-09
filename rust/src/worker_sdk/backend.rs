@@ -114,7 +114,10 @@ pub trait WorkerBackend: Send {
     ///
     /// # Returns
     /// - `request_logits`: (request_id, logits) 列表
-    fn decode_batch(&mut self, request_tokens: &[(u64, i64)]) -> Result<Vec<(u64, Vec<f32>)>, String> {
+    fn decode_batch(
+        &mut self,
+        request_tokens: &[(u64, i64)],
+    ) -> Result<Vec<(u64, Vec<f32>)>, String> {
         let mut results = Vec::with_capacity(request_tokens.len());
         for &(request_id, token) in request_tokens {
             let logits = self.decode_request(request_id, token)?;
@@ -144,6 +147,31 @@ pub trait WorkerBackend: Send {
     /// 然后广播给所有 worker。后端需要更新内部状态以确保 decode 阶段
     /// position_ids 和 causal mask 使用正确的全局位置。
     fn sync_global_seq_len(&mut self, len: usize);
+
+    /// experimental: route-B stationary continuation driver (phase-2 node 2c).
+    ///
+    /// Drives one m>1 stationary continuation segment through the self-driving
+    /// ring on this worker. Returns the last-position logits on the final
+    /// finisher domain, `None` on every other domain.
+    ///
+    /// 默认实现返回错误：没有 reserved positioned KV 驱动的后端保持既有行为。
+    fn run_stationary_continuation(
+        &mut self,
+        request_id: u64,
+        tokens: &[i64],
+        position_ids: &[i64],
+        capacity_tickets: &[u64],
+        starter_domain: usize,
+    ) -> Result<Option<Vec<f32>>, String> {
+        let _ = (
+            request_id,
+            tokens,
+            position_ids,
+            capacity_tickets,
+            starter_domain,
+        );
+        Err("stationary continuation not supported by this backend".to_string())
+    }
 
     /// 上报本节点的可用计算资源（显存或内存），单位 MB。
     ///
