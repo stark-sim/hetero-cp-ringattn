@@ -8,13 +8,48 @@ type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source
 
 出口标准（真实跨节点 E2E 通过才考虑工程层合 main）：
 1. [done] m>1 stationary packet 的 TCP/QUIC wire codec（129de9b；codec 本就 shape-generic，新增 m>1 回环测试固化 + smoke --transport quic，含 connect/accept 并发与 done/ack 退出 barrier 两个协议级修复）
-2. [pending] WorkerRuntime/coordinator 一等命令（continuation stationary 主路径，不调 legacy Decode）
-3. [pending] frozen request plan 的分发/重建机制
+2. [done] WorkerRuntime/coordinator 一等命令（StationaryContinuation 主路径，不调 legacy Decode；2592795/a4ab7f4/1aee8e6）
+3. [done] frozen request plan 的分发/重建机制（plan 随 StationaryContinuation 命令广播，worker 无状态推导；1aee8e6）
 4. [pending] capacity/placement byte-level admission（重启 decision-defer-placement-ledger-wip-20260809 的 WIP）
-5. [pending] Mac + white 双 worker stationary continuation 真实 QUIC smoke
+5. [done] Mac + white 双 worker stationary continuation 真实 QUIC smoke（经生产命令路径于 2c 提前交付：跨机 E2E generated=[198,15,15] 对齐 golden；1aee8e6）
 依赖一期完成；每项独立小节点 RED/GREEN。
 
-_updated: 2026-08-09 05:00:20_
+_updated: 2026-08-09 09:17:08_
+### 二期第 2+3 项(合并):WorkerRuntime/coordinator 一等 stationary continuation 命令 + frozen plan 分发
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
+
+出口标准:1) WorkerCommand/Response 新增 StationaryContinuation(Done),bincode roundtrip 与 plan 校验单测通过;2) TchWorkerBackend::run_stationary_continuation 经 LinkedMock 双 backend 复现 97ca355 数值(argmax exact、mean<0.1、max<0.75、totals [54,162]);3) 经 coordinator 全链路 E2E(prefill -> legacy decode -> StationaryContinuation),先 loopback 再 Mac+white 真实双机,输出与 golden 对齐;4) legacy Decode、do_positioned_continuation、prefill 零改动。实现分 2a/2b/2c 三个独立 RED/GREEN 节点。边界:不含 byte-level admission(第 4 项,仅做 reserved 不足报错)、不含多请求 batching(三期)。
+
+_updated: 2026-08-09 09:17:08_
+### 二期第 2+3 项完成:stationary continuation 一等命令经 coordinator 跨机 E2E 通过(预演第 5 项)
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@1aee8e6`
+
+实现提交 2592795(2a 协议/plan 校验)+ a4ab7f4(2b backend 驱动)+ 1aee8e6(2c 接线),codex/route-b-continuation-stationary-packet 分支。
+1. 2a:StationaryContinuation(Done) bincode roundtrip、validate_stationary_continuation 拒绝非法 plan、stationary_layer_starters N=2/N=3 轮转、schedule 派生与 97ca355/246aa8c 场景一致;protocol 3/3、self_driving 26/26。
+2. 2b:TchWorkerBackend::run_stationary_continuation 经 kv_transport_mut accessor(DecoderLayer->HcpRingAttentionBackend)驱动本进程 transport;synthetic 24 层 mock-ring 测试 argmax exact、max diff<1e-3;#[ignore] 真实 Qwen 测试逐位复现 97ca355(mean 0.078890、max 0.476562、15/15、totals [54,162])。
+3. 2c:runtime 真实臂 + coordinator stationary_continuation helper(logits-authority+drain 模式)+ test-only 入口 --prompt-token-ids/--continuation-segment;关键调查:legacy decode-ring 的 KV 归属规则是 assignee=position%N(ring.rs:1876),ReservedPositionedKvShard::update_sharded(keep=false) 据此从报错改为静默丢弃(镜像 ContiguousKvCache);容量推导 capacity[d][l]=splits[d]+decode 份额+cont offsets。
+4. loopback E2E(coordinator+2 QUIC worker,CPU):decode_token=198、continuation_argmax=15;tickets=[8192,8192] 导致 offsets [[1,3],[0,2]]、starter=0 与 golden 方案不同仍同 argmax,实证 starter/分配无关性。
+5. 真实跨机 E2E(Mac coordinator+worker0 MPS,white worker1 CUDA,QUIC over Tailscale):tickets=[8192,21813](真实 capacity_mb 派生)、splits=[1,3]、starter=1、offsets=[[0],[1,2,3]],generated=[198,15,15] 与 golden 完全一致;worker1 正常处理 StationaryContinuation 命令并优雅退出。reports/routeb-p2-e2e-20260809-171330/。
+证据边界:单请求、m=4、24 层、Qwen2-0.5B BF16、N=2(loopback+跨机);不含性能声明;容量推导为静态一次性,byte-level admission 属二期第 4 项;多请求并发属三期。
+
+_updated: 2026-08-09 09:17:08_
+### 第 2+3 项合并设计:plan 随命令广播使 worker 无状态,backend 生产驱动复用一期原语
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
+
+【动机六问】
+1. 问题:路线 B continuation 只能经实验二进制运行;生产路径无 stationary continuation 一等命令,带宽受限异构环境的核心优势进不了真实服务路径。
+2. 现状:一期+二期第 1 项备齐底层件(路线 B 原语已合 main、shape-generic codec、生产 worker QUIC ring 接线、smoke 跨进程驱动循环);缺口是命令面无 continuation 变体、backend 无生产驱动方法、worker 间无 frozen plan 共识通道(握手只上报各自 capacity)。
+3. 终态:coordinator 广播 StationaryContinuation,各 worker 经生产 QUIC ring 自主完成 24 层逐跳 continuation,finisher 回 logits;E2E 与 golden 对齐(tie-aware argmax + mean/max 容差)。
+4. 他者:vLLM/SGLang 以 scheduler metadata + paged KV 管 continuation,通信走同构 collective;可复用"请求级 plan 作为控制状态下发、kernel 只消费本地映射"的分层,其中心 scheduler 与 NCCL 不适用。
+5. 本方案:命令携带全部 plan 要素(capacity_tickets + starter_domain + tokens + position_ids),worker 无状态;backend 新增 run_stationary_continuation 复用 process_layer_packet_with_reserved_history_for_positions 与 smoke 同构角色推导;coordinator 沿用 DecodeBatch 的 logits-authority + drain 模式;starter 规则文档化(coordinator 选 continuation 最后 position owner,正确性 starter-agnostic)。
+6. 为什么:相比 handshake 一次性分发,随命令分发无需 worker 维护集群拓扑与一致性协议;相比扩写 do_positioned_continuation,不动 KV-ring baseline(三期公平对比需要原样保留)。
+【牺牲四问】1. 默认存在原因:KV-ring continuation 是已验证 baseline,query 并行、大 m/T 更省;legacy Decode 已生产化。2. 牺牲:无行为牺牲;取舍是 plan 随命令重复分发(几十字节)换 worker 无状态、starter 由 coordinator 选定免去 worker 历史状态、continuation 不做 query 并行(一期已接受)。3. 被牺牲能力作用:query 并行降大 segment TTFT;一次性分发省字节。4. 本项目意义:命令频率低,字节可忽略;TTFT 属三期。结论:接受。
+VERDICT: IMPLEMENT。用户于 2026-08-09 批准合并设计方案。
+
+_updated: 2026-08-09 05:33:36_
 ### 二期第 1 项:m>1 stationary packet 的 TCP/QUIC wire codec 验证与补齐
 
 type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
