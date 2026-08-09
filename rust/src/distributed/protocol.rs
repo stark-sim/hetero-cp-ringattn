@@ -26,24 +26,28 @@ pub enum WorkerCommand {
         layer_kv_capacities: Option<Vec<usize>>,
     },
     /// Run single-token decode for a specific request.
-    Decode {
-        request_id: u64,
-        token: i64,
-    },
+    Decode { request_id: u64, token: i64 },
     /// Run batch decode for multiple requests in a single forward pass.
     /// Each tuple is (request_id, token_to_decode).
-    DecodeBatch {
-        request_tokens: Vec<(u64, i64)>,
+    DecodeBatch { request_tokens: Vec<(u64, i64)> },
+    /// Run route-B stationary continuation for a specific request:
+    /// the continuation segment's historical KV never moves; each worker
+    /// projects/appends only its own position offsets from the frozen plan
+    /// and the LayerPacket travels hop-by-hop around the ring.
+    /// `capacity_tickets` carries the whole-ring tickets so workers stay
+    /// stateless about cluster topology; `starter_domain` is selected by the
+    /// coordinator (correctness is starter-agnostic).
+    StationaryContinuation {
+        request_id: u64,
+        tokens: Vec<i64>,
+        position_ids: Vec<i64>,
+        capacity_tickets: Vec<u64>,
+        starter_domain: usize,
     },
     /// Synchronize global sequence length before decode.
-    SyncGlobalSeqLen {
-        request_id: u64,
-        len: usize,
-    },
+    SyncGlobalSeqLen { request_id: u64, len: usize },
     /// Release per-request state (KV cache, past_key_values, etc.) for a completed request.
-    ReleaseRequest {
-        request_id: u64,
-    },
+    ReleaseRequest { request_id: u64 },
     /// Shutdown the worker.
     Shutdown,
 }
@@ -65,14 +69,56 @@ pub enum WorkerResponse {
     },
     /// Batch decode completed; includes logits for each request.
     /// Each tuple is (request_id, logits_bytes).
-    DecodeBatchDone {
-        request_logits: Vec<(u64, Vec<u8>)>,
+    DecodeBatchDone { request_logits: Vec<(u64, Vec<u8>)> },
+    /// Stationary continuation completed; `logits_bytes` is `Some` only on
+    /// the finisher domain (all other workers acknowledge with `None`).
+    StationaryContinuationDone {
+        request_id: u64,
+        logits_bytes: Option<Vec<u8>>,
     },
     /// Worker encountered an error.
-    Error {
-        request_id: u64,
-        message: String,
-    },
+    Error { request_id: u64, message: String },
+}
+
+/// Validate the frozen-plan fields of a `StationaryContinuation` command.
+/// Pure and transport-free so both coordinator (before broadcast) and every
+/// worker (before execution) can run the same check.
+pub fn validate_stationary_continuation(
+    domains: usize,
+    tokens: &[i64],
+    position_ids: &[i64],
+    capacity_tickets: &[u64],
+    starter_domain: usize,
+) -> Result<(), String> {
+    if domains == 0 {
+        return Err("stationary continuation requires at least one domain".to_string());
+    }
+    if tokens.is_empty() {
+        return Err("stationary continuation requires a non-empty segment".to_string());
+    }
+    if tokens.len() != position_ids.len() {
+        return Err(format!(
+            "stationary continuation segment/position length mismatch: {} vs {}",
+            tokens.len(),
+            position_ids.len()
+        ));
+    }
+    if capacity_tickets.len() != domains {
+        return Err(format!(
+            "stationary continuation tickets/domains mismatch: {} vs {}",
+            capacity_tickets.len(),
+            domains
+        ));
+    }
+    if capacity_tickets.iter().all(|&t| t == 0) {
+        return Err("stationary continuation tickets must not be all zero".to_string());
+    }
+    if starter_domain >= domains {
+        return Err(format!(
+            "stationary continuation starter {starter_domain} out of {domains} domains"
+        ));
+    }
+    Ok(())
 }
 
 /// Serialize a message to bytes using bincode.
@@ -359,7 +405,8 @@ pub fn write_handshake_quic(
     rt: &Handle,
 ) -> Result<(), String> {
     rt.block_on(async {
-        send.write_all(&handshake.to_bytes()).await
+        send.write_all(&handshake.to_bytes())
+            .await
             .map_err(|e| format!("write_handshake_quic failed: {e}"))
     })
 }
@@ -368,7 +415,8 @@ pub fn write_handshake_quic(
 pub fn read_handshake_quic(recv: &mut RecvStream, rt: &Handle) -> Result<WorkerHandshake, String> {
     let mut buf = [0u8; WorkerHandshake::SIZE];
     rt.block_on(async {
-        crate::distributed::transport::quic::read_exact(recv, &mut buf).await
+        crate::distributed::transport::quic::read_exact(recv, &mut buf)
+            .await
             .map_err(|e| format!("read_handshake_quic failed: {e}"))
     })?;
     Ok(WorkerHandshake::from_bytes(&buf))
@@ -387,7 +435,9 @@ pub fn connect_with_retry(addr: &str, attempts: usize, delay_ms: u64) -> Result<
             }
             Err(e) => {
                 if i == attempts - 1 {
-                    return Err(format!("failed to connect to {addr} after {attempts} attempts: {e}"));
+                    return Err(format!(
+                        "failed to connect to {addr} after {attempts} attempts: {e}"
+                    ));
                 }
                 std::thread::sleep(Duration::from_millis(delay_ms));
             }
@@ -398,7 +448,11 @@ pub fn connect_with_retry(addr: &str, attempts: usize, delay_ms: u64) -> Result<
 
 /// Accept a connection with retry (polls non-blocking listener).
 #[allow(dead_code)]
-pub fn accept_with_retry(listener: &std::net::TcpListener, attempts: usize, delay_ms: u64) -> Result<TcpStream, String> {
+pub fn accept_with_retry(
+    listener: &std::net::TcpListener,
+    attempts: usize,
+    delay_ms: u64,
+) -> Result<TcpStream, String> {
     listener
         .set_nonblocking(true)
         .map_err(|e| format!("set_nonblocking failed: {e}"))?;
@@ -450,11 +504,17 @@ mod tests {
         };
         assert_eq!(layer_kv_capacities, Some(vec![5, 6]));
 
-        let cmd2 = WorkerCommand::Decode { request_id: 1, token: 42 };
+        let cmd2 = WorkerCommand::Decode {
+            request_id: 1,
+            token: 42,
+        };
         let bytes2 = bincode::serialize(&cmd2).unwrap();
         println!("Decode cmd: {:?}", bytes2);
 
-        let cmd3 = WorkerCommand::SyncGlobalSeqLen { request_id: 1, len: 11 };
+        let cmd3 = WorkerCommand::SyncGlobalSeqLen {
+            request_id: 1,
+            len: 11,
+        };
         let bytes3 = bincode::serialize(&cmd3).unwrap();
         println!("SyncGlobalSeqLen cmd: {:?}", bytes3);
 
@@ -471,7 +531,77 @@ mod tests {
         println!("PrefillDone resp: {:?}", rbytes);
 
         // WorkerHandshake: domain_id(u64 LE) + capacity_mb(u64 LE) = 16 bytes
-        let hs_bytes: Vec<u8> = vec![0,0,0,0,0,0,0,0, 0,16,0,0,0,0,0,0];
+        let hs_bytes: Vec<u8> = vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0];
         println!("Handshake (expected): {:?}", hs_bytes);
+    }
+
+    #[test]
+    fn stationary_continuation_roundtrips_bincode() {
+        let cmd = WorkerCommand::StationaryContinuation {
+            request_id: 75,
+            tokens: vec![11, 13, 17, 19],
+            position_ids: vec![5, 6, 7, 8],
+            capacity_tickets: vec![1, 2, 3],
+            starter_domain: 2,
+        };
+        let bytes = serialize(&cmd).unwrap();
+        let decoded: WorkerCommand = deserialize(&bytes).unwrap();
+        let WorkerCommand::StationaryContinuation {
+            request_id,
+            tokens,
+            position_ids,
+            capacity_tickets,
+            starter_domain,
+        } = decoded
+        else {
+            panic!("expected StationaryContinuation command");
+        };
+        assert_eq!(request_id, 75);
+        assert_eq!(tokens, vec![11, 13, 17, 19]);
+        assert_eq!(position_ids, vec![5, 6, 7, 8]);
+        assert_eq!(capacity_tickets, vec![1, 2, 3]);
+        assert_eq!(starter_domain, 2);
+
+        let resp = WorkerResponse::StationaryContinuationDone {
+            request_id: 75,
+            logits_bytes: Some(vec![0xAB, 0xCD]),
+        };
+        let bytes = serialize(&resp).unwrap();
+        let WorkerResponse::StationaryContinuationDone { logits_bytes, .. } =
+            deserialize(&bytes).unwrap()
+        else {
+            panic!("expected StationaryContinuationDone response");
+        };
+        assert_eq!(logits_bytes, Some(vec![0xAB, 0xCD]));
+
+        let ack = WorkerResponse::StationaryContinuationDone {
+            request_id: 75,
+            logits_bytes: None,
+        };
+        let bytes = serialize(&ack).unwrap();
+        let WorkerResponse::StationaryContinuationDone { logits_bytes, .. } =
+            deserialize(&bytes).unwrap()
+        else {
+            panic!("expected StationaryContinuationDone ack");
+        };
+        assert_eq!(logits_bytes, None);
+    }
+
+    #[test]
+    fn validate_stationary_continuation_rejects_bad_plans() {
+        let ok = validate_stationary_continuation(2, &[11, 13], &[5, 6], &[1, 3], 1);
+        assert!(ok.is_ok());
+        // empty segment
+        assert!(validate_stationary_continuation(2, &[], &[], &[1, 3], 1).is_err());
+        // segment/position length mismatch
+        assert!(validate_stationary_continuation(2, &[11], &[5, 6], &[1, 3], 1).is_err());
+        // tickets/domains mismatch
+        assert!(validate_stationary_continuation(2, &[11], &[5], &[1, 3, 2], 1).is_err());
+        // all-zero tickets
+        assert!(validate_stationary_continuation(2, &[11], &[5], &[0, 0], 1).is_err());
+        // starter out of range
+        assert!(validate_stationary_continuation(2, &[11], &[5], &[1, 3], 2).is_err());
+        // zero domains
+        assert!(validate_stationary_continuation(0, &[11], &[5], &[], 0).is_err());
     }
 }

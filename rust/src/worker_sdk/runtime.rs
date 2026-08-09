@@ -10,8 +10,8 @@
 //! 模型计算层通过 `WorkerBackend` trait 解耦，默认实现为 `TchWorkerBackend`。
 
 use crate::distributed::protocol::{
-    recv_command_quic, send_response_quic, write_handshake_quic, WorkerCommand, WorkerResponse,
-    WorkerHandshake,
+    recv_command_quic, send_response_quic, write_handshake_quic, WorkerCommand, WorkerHandshake,
+    WorkerResponse,
 };
 use crate::model::transport::KvTransport;
 use crate::worker_sdk::backend::WorkerBackend;
@@ -199,12 +199,26 @@ impl WorkerRuntime {
                         .map_err(|e| format!("send DecodeBatchDone failed: {e}"))?;
                 }
                 WorkerCommand::SyncGlobalSeqLen { request_id, len } => {
-                    self.backend.sync_global_seq_len_for_request(request_id, len);
-                    println!("[worker {domain_id}] request {request_id} synced global_seq_len = {len}");
+                    self.backend
+                        .sync_global_seq_len_for_request(request_id, len);
+                    println!(
+                        "[worker {domain_id}] request {request_id} synced global_seq_len = {len}"
+                    );
                 }
                 WorkerCommand::ReleaseRequest { request_id } => {
                     self.backend.release_request(request_id);
                     println!("[worker {domain_id}] released request {request_id}");
+                }
+                // Wired in phase-2 node 2c; until then answer with an explicit
+                // error instead of silently ignoring the command.
+                WorkerCommand::StationaryContinuation { request_id, .. } => {
+                    let resp = WorkerResponse::Error {
+                        request_id,
+                        message: "stationary continuation is not wired yet (phase-2 node 2c)"
+                            .to_string(),
+                    };
+                    send_response_quic(&mut self.coord_send, &resp, &rt_handle)
+                        .map_err(|e| format!("send StationaryContinuation error failed: {e}"))?;
                 }
                 WorkerCommand::Shutdown => {
                     println!("[worker {domain_id}] shutting down");
@@ -236,11 +250,8 @@ impl WorkerRuntime {
             loop {
                 match endpoint_for_dial.connect(next_peer_addr, "localhost") {
                     Ok(connecting) => {
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(30),
-                            connecting,
-                        )
-                        .await
+                        match tokio::time::timeout(std::time::Duration::from_secs(30), connecting)
+                            .await
                         {
                             Ok(Ok(conn)) => break conn,
                             Ok(Err(e)) => {
@@ -271,7 +282,9 @@ impl WorkerRuntime {
                 )
                 .await
                 {
-                    Ok(Some(incoming)) => break incoming.await.expect("prev peer connection failed"),
+                    Ok(Some(incoming)) => {
+                        break incoming.await.expect("prev peer connection failed")
+                    }
                     Ok(None) => panic!("endpoint closed"),
                     Err(_) => {
                         println!("[worker {domain_id}] accept timeout, retrying...");
