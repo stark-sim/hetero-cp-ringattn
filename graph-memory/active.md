@@ -2,6 +2,48 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 路线 B 一期：核心方案可行性（大）
+
+type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
+
+出口标准（6 项全过才考虑 correctness 核心合 main）：
+1. [done] m>1 stationary LayerPacket 单层合同（5777d51）
+2. [done] position owner-local KV 分散（73cd0e8）
+3. [done] 24 层 mixed-history continuation（a7a583d）
+4. [done] continuation 后 decode 闭环（b523bc7）
+5. [done] 真实 Qwen 权重的路线 B continuation correctness（97ca355，路线分支；argmax exact、mean 0.078890、max 0.476562、24 层 totals [54,162]）
+6. [done] 跨设备数值验证（Mac MPS 与 white CUDA 各跑 worker；evidence-route-b-cross-device-mac-mps-white-cuda-20260809，d9c1d35/ed6e658/9490c6f）
+边界：本期全部是 correctness 证据，不含性能声明。
+【收尾】一期成果于 2026-08-09 经 merge commit 5f7a3e2 合入 main(边界见 docs/CONTINUATION_ROUTE_BOUNDARIES.md 与 decision-route-b-phase1-merge-main-20260809);路线分支保留供二期探索。
+
+_updated: 2026-08-09 03:49:35_
+### 路线 B 一期 correctness 核心合入 main,边界以 CONTINUATION_ROUTE_BOUNDARIES.md 为准
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@5f7a3e2`
+
+【动机六问】
+1. 问题：路线 B 一期 6 项出口标准全过后,成果仍只在路线分支;main 缺少 KV-stationary packet 族资产,后续路线组合/公平比较没有共同锚点。
+2. 现状：分支领先 main 22 个 checkpoint 提交;差异为 self_driving.rs 路线 B 原语(+758)、tch_backend.rs 测试(+409)、lib.rs 可见性重导出(+23)、实验 harness(smoke/probe/compare)、docs/plans 与 graph 记录;main 生产路径未被分支触碰。
+3. 终态:merge commit 5f7a3e2 把一期资产纯增量合入 main;边界文档 docs/CONTINUATION_ROUTE_BOUNDARIES.md 定义路线中性基建/路线 B 原语/验证资产/不变项/组合接缝/对比锚点;main 行为零变化;分支保留继续二期探索。
+4. 他者:Linux experimental->staging->mainline 与 vLLM 的 RFC+benchmark 入门禁;可复用的是"功能增量合入+显式边界文档",其中心化 review 以 graph 里程碑与 oracle 替代。
+5. 本方案：边界分六类(A 路线中性基建已在 main;B 路线 B 执行原语新增;C 实验态验证资产;D 不改变项含 placement WIP 的 DEFER 状态;E 组合接缝 A/C/F/G;F 对比锚点=合并后 main tip 与一期验证矩阵)。graph.db/active/progress 冲突取 main 超集版,合并后重新 export。
+6. 为什么:merge commit 保留 22 个 checkpoint 的 RED/GREEN 历史供回溯;边界文档使"路线可组合性"与"公平比较锚点"成为显式资产而非口头约定,直接服务用户"结合优势或分阶段比较"的要求。
+VERDICT: MERGED(5f7a3e2)。用户于 2026-08-09 批准合并方案。
+
+_updated: 2026-08-09 03:49:11_
+### 合并后 main 上路线 B 资产回归验证通过
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@5f7a3e2`
+
+合并 commit 5f7a3e2 后于 main 工作区验证:
+1. cargo build --release --bin route_b_cross_node_smoke:通过。
+2. DYLD_LIBRARY_PATH=~/libtorch/lib cargo test --release --lib model::self_driving:24 passed / 0 failed / 1 ignored(与分支基线一致)。
+3. cargo test --release --lib worker_sdk:5 passed / 0 failed / 3 ignored。
+4. route_b_cross_node_smoke local --device cpu:N=2 golden 回归 decode_token=198、continuation argmax=15、totals=[54,162]、mean 0.078890/max 0.476562,与分支数值逐位一致。
+5. git status:placement/ledger WIP 四个未提交文件原样保留。
+证据边界:仅证明合并后 main 上路线 B 资产可用且 KV-ring baseline 行为未变;不含新场景、不含性能声明。
+
+_updated: 2026-08-09 03:49:11_
 ### 路线 B 三节点 ring 拓扑数值验证:Mac MPS + white CUDA + pearl HIP
 
 type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
@@ -37,20 +79,6 @@ type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · 
 证据边界:仅 N=3、m=4、24 层、Qwen2-0.5B BF16、Tailscale TCP 单请求场景;correctness 证据,不含性能声明;未覆盖 N>3、多请求、QUIC 生产 wire、容量 tickets 非 [1,2,3] 的分布。reports/routeb-ring3-20260809-050707/(Mac)与 reports/routeb-ring3-run1/(white/pearl)留存 dump。
 
 _updated: 2026-08-08 21:34:04_
-### 路线 B 一期：核心方案可行性（大）
-
-type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
-
-出口标准（6 项全过才考虑 correctness 核心合 main）：
-1. [done] m>1 stationary LayerPacket 单层合同（5777d51）
-2. [done] position owner-local KV 分散（73cd0e8）
-3. [done] 24 层 mixed-history continuation（a7a583d）
-4. [done] continuation 后 decode 闭环（b523bc7）
-5. [done] 真实 Qwen 权重的路线 B continuation correctness（97ca355，路线分支；argmax exact、mean 0.078890、max 0.476562、24 层 totals [54,162]）
-6. [done] 跨设备数值验证（Mac MPS 与 white CUDA 各跑 worker；evidence-route-b-cross-device-mac-mps-white-cuda-20260809，d9c1d35/ed6e658/9490c6f）
-边界：本期全部是 correctness 证据，不含性能声明。
-
-_updated: 2026-08-08 19:32:10_
 ### 路线 B 跨设备数值验证：真实分布式合作 + 单机数据交叉验证
 
 type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
