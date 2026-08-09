@@ -100,6 +100,12 @@ struct CoordinatorArgs {
     /// experimental (route-B 2c, test-only): raw prompt token ids, bypassing
     /// the tokenizer, so the E2E can reproduce the golden scenario exactly.
     prompt_token_ids: Option<Vec<i64>>,
+    /// experimental (route-B observability, test-only): align the frozen
+    /// schedule phase with a local golden request.
+    continuation_request_id: u64,
+    /// experimental (route-B observability, test-only): reproduce a remote
+    /// handshake's capacity-weighted frozen schedule in a local golden.
+    continuation_capacity_tickets: Option<Vec<u64>>,
 }
 
 fn parse_args() -> CoordinatorArgs {
@@ -120,6 +126,8 @@ fn parse_args() -> CoordinatorArgs {
     let mut ring_strategy = RingSchedulingStrategy::Vanilla;
     let mut continuation_segment = None;
     let mut prompt_token_ids = None;
+    let mut continuation_request_id = 1_u64;
+    let mut continuation_capacity_tickets = None;
 
     let mut args = std::env::args().skip(1); // skip binary name
     while let Some(arg) = args.next() {
@@ -164,6 +172,14 @@ fn parse_args() -> CoordinatorArgs {
                 let s = args.next().unwrap();
                 prompt_token_ids = Some(s.split(',').map(|x| x.parse().unwrap()).collect());
             }
+            "--continuation-request-id" => {
+                continuation_request_id = args.next().unwrap().parse().unwrap();
+            }
+            "--continuation-capacity-tickets" => {
+                let s = args.next().unwrap();
+                continuation_capacity_tickets =
+                    Some(s.split(',').map(|x| x.parse().unwrap()).collect());
+            }
             _ => eprintln!("[coordinator] unknown arg: {arg}"),
         }
     }
@@ -186,6 +202,8 @@ fn parse_args() -> CoordinatorArgs {
         ring_strategy,
         continuation_segment,
         prompt_token_ids,
+        continuation_request_id,
+        continuation_capacity_tickets,
     }
 }
 
@@ -219,6 +237,18 @@ fn write_logits_file(
             file.write_all(&f.to_le_bytes())
                 .map_err(|e| format!("failed to write logits: {e}"))?;
         }
+    }
+    Ok(())
+}
+
+/// Write a single logits vector as headerless little-endian f32 values.
+/// This matches the route-B dump format consumed by compare_route_b_dumps.py.
+fn write_raw_logits_file(path: &Path, logits: &[f32]) -> Result<(), String> {
+    let mut file =
+        std::fs::File::create(path).map_err(|e| format!("failed to create logits file: {e}"))?;
+    for value in logits {
+        file.write_all(&value.to_le_bytes())
+            .map_err(|e| format!("failed to write logits: {e}"))?;
     }
     Ok(())
 }
@@ -897,7 +927,9 @@ fn stationary_continuation(
 /// decode step -> one injected StationaryContinuation -> remaining legacy
 /// decode steps. Reproduces the route_b_cross_node_smoke golden scenario when
 /// invoked with --prompt-token-ids 151644,9707,0,16 --chunk-sizes 1,3
-/// --continuation-segment 11,13,17,19.
+/// --continuation-segment 11,13,17,19 --continuation-request-id 75. A local
+/// production-path golden can also pass --continuation-capacity-tickets with
+/// the remote workers' handshake values to reproduce the same frozen schedule.
 #[allow(clippy::too_many_arguments)]
 fn run_continuation_e2e(
     request_id: u64,
@@ -909,6 +941,7 @@ fn run_continuation_e2e(
     worker_capacities: &[u64],
     worker_streams: &mut [(quinn::SendStream, quinn::RecvStream)],
     rt: &tokio::runtime::Runtime,
+    export_logits_dir: Option<&str>,
 ) -> Result<(), String> {
     let domains = worker_streams.len();
     let layers = config.num_layers;
@@ -1021,11 +1054,11 @@ fn run_continuation_e2e(
         let _ = send_command_quic(send, &cmd, rt.handle());
     }
 
-    let logits_vec: Vec<f32> = last_logits_bytes
+    let prefill_logits: Vec<f32> = last_logits_bytes
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect();
-    let mut next_token = sample_from_logits_vec(&logits_vec, 0.0, 1.0)?;
+    let mut next_token = sample_from_logits_vec(&prefill_logits, 0.0, 1.0)?;
     let decode_token = next_token;
     let mut generated_ids: Vec<i64> = vec![next_token];
 
@@ -1038,8 +1071,25 @@ fn run_continuation_e2e(
         };
         let _ = send_command_quic(send, &cmd, rt.handle());
     }
-    let _ = recv_response_quic(&mut worker_streams[0].1, rt.handle())
+    let decode_response = recv_response_quic(&mut worker_streams[0].1, rt.handle())
         .map_err(|e| format!("recv DecodeDone failed: {e}"))?;
+    let decode_logits = match decode_response {
+        WorkerResponse::DecodeDone { logits_bytes, .. } => logits_bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect::<Vec<f32>>(),
+        WorkerResponse::Error { message, .. } => {
+            return Err(format!("worker 0 decode error: {message}"));
+        }
+        response => {
+            return Err(format!("unexpected response from worker 0: {response:?}"));
+        }
+    };
+    let (decode_argmax, _) = decode_logits
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or((0, &0.0));
     for (_send, recv) in worker_streams.iter_mut().skip(1) {
         let _ = recv_response_quic(recv, rt.handle());
     }
@@ -1100,6 +1150,45 @@ fn run_continuation_e2e(
     for (send, _recv) in worker_streams.iter_mut() {
         let cmd = WorkerCommand::ReleaseRequest { request_id };
         let _ = send_command_quic(send, &cmd, rt.handle());
+    }
+    if let Some(dir) = export_logits_dir {
+        let out_dir = Path::new(dir);
+        std::fs::create_dir_all(out_dir)
+            .map_err(|e| format!("failed to create continuation export dir: {e}"))?;
+        write_raw_logits_file(&out_dir.join("prefill_last_logits.f32le"), &prefill_logits)?;
+        write_raw_logits_file(&out_dir.join("decode_logits.f32le"), &decode_logits)?;
+        write_raw_logits_file(
+            &out_dir.join("continuation_last_logits.f32le"),
+            &continuation_logits,
+        )?;
+        let meta = serde_json::json!({
+            "mode": "production-quic",
+            "device": "distributed-workers",
+            "request_id": request_id,
+            "domains": domains,
+            "layers": layers,
+            "tickets": capacity_tickets,
+            "capacity_tickets": capacity_tickets,
+            "prefix_splits": chunk_sizes,
+            "starter_domain": starter_domain,
+            "continuation_offsets_by_domain": &continuation_offsets,
+            "layer_kv_capacities": &capacities,
+            "decode_token": decode_token,
+            "prefill_argmax": decode_token,
+            "decode_argmax": decode_argmax,
+            "continuation_argmax": continuation_argmax,
+            "generated_ids": &generated_ids,
+        });
+        std::fs::write(
+            out_dir.join("meta.json"),
+            serde_json::to_vec_pretty(&meta)
+                .map_err(|e| format!("continuation meta encode failed: {e}"))?,
+        )
+        .map_err(|e| format!("continuation meta write failed: {e}"))?;
+        println!(
+            "[coordinator] exported experimental continuation logits to {}",
+            out_dir.display()
+        );
     }
     println!("[coordinator] experimental continuation E2E generated ids: {generated_ids:?}");
     Ok(())
@@ -1226,16 +1315,21 @@ pub fn run() {
         };
         let result = {
             let mut guard = worker_streams.lock().unwrap_or_else(|e| e.into_inner());
+            let capacity_tickets = args
+                .continuation_capacity_tickets
+                .as_deref()
+                .unwrap_or(&worker_capacities);
             run_continuation_e2e(
-                1,
+                args.continuation_request_id,
                 &prompt_ids,
                 segment,
                 args.max_tokens,
                 &args.chunk_sizes,
                 &config,
-                &worker_capacities,
+                capacity_tickets,
                 &mut guard,
                 &rt,
+                args.export_logits_dir.as_deref(),
             )
         };
         let mut worker_streams = match Arc::try_unwrap(worker_streams) {

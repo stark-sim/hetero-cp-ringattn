@@ -406,6 +406,11 @@ impl TchWorkerBackend {
         };
 
         let mut final_finisher = starter_domain;
+        let mut starter_layers = 0_usize;
+        let mut middle_layers = 0_usize;
+        let mut finisher_layers = 0_usize;
+        let mut sends = 0_usize;
+        let mut recvs = 0_usize;
         for (layer_idx, &starter) in starters.iter().enumerate() {
             let finisher = (starter + domains - 1) % domains;
             final_finisher = finisher;
@@ -460,6 +465,8 @@ impl TchWorkerBackend {
                         })?;
                 transport.submit_send_self_driving_packet(&wire)?;
                 transport.flush_send()?;
+                starter_layers += 1;
+                sends += 1;
             } else {
                 let wire = {
                     let transport =
@@ -474,6 +481,7 @@ impl TchWorkerBackend {
                         format!("stationary continuation layer {layer_idx} predecessor closed")
                     })?
                 };
+                recvs += 1;
                 let packet = LayerPacket::from_self_driving_packet(wire).map_err(|e| {
                     format!("stationary continuation layer {layer_idx} wire decode failed: {e}")
                 })?;
@@ -507,6 +515,7 @@ impl TchWorkerBackend {
                         ));
                     };
                     hidden_states = Some(next_hidden);
+                    finisher_layers += 1;
                 } else {
                     let LayerStepOutcome::Forward(next_packet) = outcome else {
                         return Err(format!(
@@ -526,9 +535,18 @@ impl TchWorkerBackend {
                             })?;
                     transport.submit_send_self_driving_packet(&wire)?;
                     transport.flush_send()?;
+                    middle_layers += 1;
+                    sends += 1;
                 }
             }
         }
+
+        println!(
+            "[TchWorkerBackend] stationary continuation stats: request_id={request_id} domain={} layers={} domains={domains} starter_layers={starter_layers} middle_layers={middle_layers} finisher_layers={finisher_layers} sends={sends} recvs={recvs} expected_hops_per_layer={}",
+            self.domain_id,
+            starters.len(),
+            domains - 1,
+        );
 
         // Every domain resyncs the request horizon to the segment end.
         {
