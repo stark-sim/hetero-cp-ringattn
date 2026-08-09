@@ -33,6 +33,29 @@ mod transport_smoke;
 #[cfg(feature = "tch-backend")]
 mod worker_sdk;
 
+// experimental: raised for route_b_cross_node_smoke (bin targets are separate
+// crates and cannot see pub(crate) items; only re-exports, no behavior change)
+#[cfg(feature = "tch-backend")]
+pub use model::cache::KvCaches;
+#[cfg(feature = "tch-backend")]
+pub use model::layers::DecoderLayer;
+#[cfg(feature = "tch-backend")]
+pub use model::self_driving::{
+    FrozenKvAssigneeSchedule, LayerPacket, LayerStepOutcome, ReservedPositionedKvShard,
+    process_layer_packet_with_reserved_history,
+    process_layer_packet_with_reserved_history_for_positions, project_final_logits,
+};
+#[cfg(feature = "tch-backend")]
+pub use model::transport::{
+    KvBlock, KvTransport, LinkedMockKvTransport, RingPacket, SelfDrivingPacket, TcpKvTransport,
+};
+#[cfg(feature = "tch-backend")]
+pub use model::{KvCacheImpl, LlamaModel, ModelConfig, ModelError, ModelWeights};
+#[cfg(feature = "tch-backend")]
+pub use worker_sdk::tch_backend::RequestContext;
+#[cfg(feature = "tch-backend")]
+pub use worker_sdk::{TchWorkerBackend, WorkerBackend};
+
 pub use cli::{CliArgs, parse_cli_args, next_cli_value};
 pub use error::{RingError, Tolerance, ToleranceTier};
 pub use report::*;

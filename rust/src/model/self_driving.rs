@@ -199,23 +199,28 @@ impl ReservedPositionedKvShard {
         Ok(())
     }
 
-    pub(crate) fn reserved_capacity(&self) -> usize {
+    // experimental: raised for route_b_cross_node_smoke
+    pub fn reserved_capacity(&self) -> usize {
         self.k_storage.size()[2] as usize
     }
 
-    pub(crate) fn committed_len(&self) -> usize {
+    // experimental: raised for route_b_cross_node_smoke
+    pub fn committed_len(&self) -> usize {
         self.committed_len
     }
 
-    pub(crate) fn positions(&self) -> &[i64] {
+    // experimental: raised for route_b_cross_node_smoke
+    pub fn positions(&self) -> &[i64] {
         &self.positions
     }
 
-    pub(crate) fn active_k(&self) -> Tensor {
+    // experimental: raised for route_b_cross_node_smoke
+    pub fn active_k(&self) -> Tensor {
         self.k_storage.narrow(2, 0, self.committed_len as i64)
     }
 
-    pub(crate) fn active_v(&self) -> Tensor {
+    // experimental: raised for route_b_cross_node_smoke
+    pub fn active_v(&self) -> Tensor {
         self.v_storage.narrow(2, 0, self.committed_len as i64)
     }
 
@@ -448,7 +453,8 @@ fn ring_backend(layer: &mut DecoderLayer) -> Result<&mut HcpRingAttentionBackend
         })
 }
 
-pub(crate) fn project_final_logits(model: &LlamaModel, hidden_states: &Tensor) -> Tensor {
+// experimental: raised for route_b_cross_node_smoke
+pub fn project_final_logits(model: &LlamaModel, hidden_states: &Tensor) -> Tensor {
     let normalized = model.norm.forward(hidden_states);
     let lm_head = model.lm_head.as_ref().unwrap_or(&model.embedding);
     let logits = normalized.matmul(&lm_head.transpose(0, 1));
@@ -487,10 +493,32 @@ pub fn process_layer_packet(
     continue_layer_packet(layer, packet, &local_history.0, &local_history.1, None)
 }
 
-pub(crate) fn process_layer_packet_with_reserved_history(
+// experimental: raised for route_b_cross_node_smoke
+pub fn process_layer_packet_with_reserved_history(
     layer: &mut DecoderLayer,
     packet: LayerPacket,
     local_history: &mut ReservedPositionedKvShard,
+) -> Result<LayerStepOutcome, ModelError> {
+    let query_len = packet.position_ids.size()[1] as usize;
+    let new_position_offsets = if packet.current_domain == packet.assignee {
+        (0..query_len).collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    process_layer_packet_with_reserved_history_for_positions(
+        layer,
+        packet,
+        local_history,
+        &new_position_offsets,
+    )
+}
+
+// experimental: raised for route_b_cross_node_smoke
+pub fn process_layer_packet_with_reserved_history_for_positions(
+    layer: &mut DecoderLayer,
+    packet: LayerPacket,
+    local_history: &mut ReservedPositionedKvShard,
+    new_position_offsets: &[usize],
 ) -> Result<LayerStepOutcome, ModelError> {
     let active_k = local_history.active_k();
     let active_v = local_history.active_v();
@@ -501,12 +529,34 @@ pub(crate) fn process_layer_packet_with_reserved_history(
         )));
     }
 
-    if packet.current_domain == packet.assignee {
+    let query_len = packet.position_ids.size()[1] as usize;
+    let mut seen_offsets = vec![false; query_len];
+    for &offset in new_position_offsets {
+        if offset >= query_len || seen_offsets[offset] {
+            return Err(ModelError::Backend(format!(
+                "domain {} received invalid or duplicate new position offset {offset} for query_len={query_len}",
+                packet.current_domain
+            )));
+        }
+        seen_offsets[offset] = true;
+    }
+
+    if !new_position_offsets.is_empty() {
+        let index_values = new_position_offsets
+            .iter()
+            .map(|&offset| offset as i64)
+            .collect::<Vec<_>>();
+        let normalized_indices =
+            Tensor::from_slice(&index_values).to_device(packet.normalized.device());
+        let position_indices =
+            Tensor::from_slice(&index_values).to_device(packet.position_ids.device());
+        let local_normalized = packet.normalized.index_select(1, &normalized_indices);
+        let local_position_ids = packet.position_ids.index_select(1, &position_indices);
         let ring = ring_backend(layer)?;
         let (current_k, current_v) =
-            ring.project_packet_current_kv(&packet.normalized, &packet.position_ids)?;
-        let positions = (0..current_k.size()[2])
-            .map(|offset| packet.position_ids.int64_value(&[0, offset]))
+            ring.project_packet_current_kv(&local_normalized, &local_position_ids)?;
+        let positions = (0..local_position_ids.size()[1])
+            .map(|offset| local_position_ids.int64_value(&[0, offset]))
             .collect::<Vec<_>>();
         local_history
             .append(&current_k, &current_v, &positions)
@@ -639,6 +689,25 @@ pub struct ModelRingResult {
     pub logits_projections: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PositionedLayerRingStats {
+    pub domains: usize,
+    pub hops: usize,
+    pub visited_domains: Vec<usize>,
+    pub new_kv_positions_by_domain: Vec<usize>,
+    pub starter: usize,
+    pub finisher: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct PositionedModelRingResult {
+    pub hidden_states: Tensor,
+    pub logits: Tensor,
+    pub layer_stats: Vec<PositionedLayerRingStats>,
+    pub logits_producer_domain: usize,
+    pub logits_projections: usize,
+}
+
 /// Run one real decoder layer over already-sharded history KV.
 ///
 /// This is deliberately an in-process experiment: it proves the tensor data
@@ -707,6 +776,106 @@ pub fn run_single_layer_ring(
             assignee,
             finisher,
         },
+    })
+}
+
+pub(crate) fn run_model_ring_with_reserved_history_for_positions(
+    model: &mut LlamaModel,
+    hidden_states: &Tensor,
+    position_ids: &Tensor,
+    layer_history_shards: &mut [Vec<ReservedPositionedKvShard>],
+    starter: usize,
+    new_position_offsets_by_domain: &[Vec<usize>],
+) -> Result<PositionedModelRingResult, ModelError> {
+    let layers = model.layers.len();
+    if layers == 0 || layer_history_shards.len() != layers {
+        return Err(ModelError::Backend(format!(
+            "reserved positioned model ring requires matching non-empty layers and shard sets: layers={layers}, shard_sets={}",
+            layer_history_shards.len()
+        )));
+    }
+    let domains = layer_history_shards[0].len();
+    validate_route(hidden_states, position_ids, starter, starter, domains)?;
+    if new_position_offsets_by_domain.len() != domains
+        || layer_history_shards
+            .iter()
+            .any(|shards| shards.len() != domains)
+    {
+        return Err(ModelError::Backend(format!(
+            "reserved positioned model ring requires {domains} domain offset and shard sets"
+        )));
+    }
+
+    let query_len = position_ids.size()[1] as usize;
+    let mut seen_offsets = vec![false; query_len];
+    for offsets in new_position_offsets_by_domain {
+        for &offset in offsets {
+            if offset >= query_len || seen_offsets[offset] {
+                return Err(ModelError::Backend(format!(
+                    "reserved positioned model ring received invalid or duplicate new position offset {offset} for query_len={query_len}"
+                )));
+            }
+            seen_offsets[offset] = true;
+        }
+    }
+    if let Some(missing) = seen_offsets.iter().position(|seen| !seen) {
+        return Err(ModelError::Backend(format!(
+            "reserved positioned model ring is missing new position offset {missing} for query_len={query_len}"
+        )));
+    }
+
+    let new_kv_positions_by_domain = new_position_offsets_by_domain
+        .iter()
+        .map(Vec::len)
+        .collect::<Vec<_>>();
+    let mut current_hidden = hidden_states.shallow_clone();
+    let mut current_starter = starter;
+    let mut layer_stats = Vec::with_capacity(layers);
+
+    for (layer_idx, shards) in layer_history_shards.iter_mut().enumerate() {
+        // Position ownership comes from the frozen offsets, not this legacy scalar field.
+        let mut packet = LayerPacket::start(
+            &mut model.layers[layer_idx],
+            &current_hidden,
+            position_ids,
+            current_starter,
+            current_starter,
+            domains,
+        )?;
+        let mut visited_domains = Vec::with_capacity(domains);
+        current_hidden = loop {
+            let domain = packet.current_domain;
+            visited_domains.push(domain);
+            match process_layer_packet_with_reserved_history_for_positions(
+                &mut model.layers[layer_idx],
+                packet,
+                &mut shards[domain],
+                &new_position_offsets_by_domain[domain],
+            )? {
+                LayerStepOutcome::Forward(next_packet) => packet = next_packet,
+                LayerStepOutcome::Finished { hidden_states, .. } => break hidden_states,
+            }
+        };
+
+        let finisher = (current_starter + domains - 1) % domains;
+        layer_stats.push(PositionedLayerRingStats {
+            domains,
+            hops: domains - 1,
+            visited_domains,
+            new_kv_positions_by_domain: new_kv_positions_by_domain.clone(),
+            starter: current_starter,
+            finisher,
+        });
+        current_starter = finisher;
+    }
+
+    let logits = project_final_logits(model, &current_hidden);
+    Ok(PositionedModelRingResult {
+        hidden_states: current_hidden,
+        logits,
+        layer_stats,
+        logits_producer_domain: current_starter,
+        logits_projections: 1,
     })
 }
 
@@ -2080,6 +2249,169 @@ mod tests {
     }
 
     #[test]
+    fn multi_token_packet_generates_new_kv_by_capacity_weighted_position_owner() {
+        let device = Device::Cpu;
+        let config = test_config();
+        let weights = deterministic_weights(&config, device);
+        let mut model = LlamaModel::from_weights(config.clone(), &weights, device, 3).unwrap();
+        let mut layer = model.layers.remove(0);
+        let domains = 3_usize;
+        let query_len = 6_i64;
+        let history_len = 9_i64;
+        let hidden =
+            deterministic_tensor(&[1, query_len, config.hidden_size as i64], 311.0, device);
+        let position_ids =
+            Tensor::arange_start(history_len, history_len + query_len, (Kind::Int64, device))
+                .unsqueeze(0);
+        let history_shape = [
+            1,
+            config.num_kv_heads() as i64,
+            history_len,
+            config.head_dim() as i64,
+        ];
+        let history_k = deterministic_tensor(&history_shape, 312.0, device);
+        let history_v = deterministic_tensor(&history_shape, 313.0, device);
+        let history_positions = [vec![0_i64, 3, 6], vec![1_i64, 4, 7], vec![2_i64, 5, 8]];
+
+        let schedule = FrozenKvAssigneeSchedule::new(&[1, 3, 2], 0, query_len as usize).unwrap();
+        assert_eq!(schedule.counts(), &[1, 3, 2]);
+        let mut owner_offsets = vec![Vec::new(); domains];
+        for offset in 0..query_len as usize {
+            let owner = schedule.assignee_for(offset, 0, 1).unwrap();
+            owner_offsets[owner].push(offset);
+        }
+        let mut assigned_offsets = owner_offsets.iter().flatten().copied().collect::<Vec<_>>();
+        assigned_offsets.sort_unstable();
+        assert_eq!(
+            assigned_offsets,
+            (0..query_len as usize).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            owner_offsets.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![1, 3, 2]
+        );
+
+        let mut shards = history_positions
+            .iter()
+            .enumerate()
+            .map(|(domain, positions)| {
+                let mut shard = ReservedPositionedKvShard::new(
+                    &config,
+                    positions.len() + owner_offsets[domain].len(),
+                    device,
+                );
+                let indices = Tensor::from_slice(positions);
+                shard
+                    .append(
+                        &history_k.index_select(2, &indices),
+                        &history_v.index_select(2, &indices),
+                        positions,
+                    )
+                    .unwrap();
+                shard
+            })
+            .collect::<Vec<_>>();
+        let storage_ptrs = shards
+            .iter()
+            .map(ReservedPositionedKvShard::storage_ptrs)
+            .collect::<Vec<_>>();
+        let (reference_attention, reference_hidden) = reference_positioned_layer_output(
+            0,
+            &config,
+            &weights,
+            &hidden,
+            &position_ids,
+            &history_k,
+            &history_v,
+        );
+
+        let mut packet =
+            LayerPacket::start(&mut layer, &hidden, &position_ids, 0, 0, domains).unwrap();
+        let mut packet_payload = None;
+        let (attention_output, hidden_states) = loop {
+            let domain = packet.current_domain;
+            match process_layer_packet_with_reserved_history_for_positions(
+                &mut layer,
+                packet,
+                &mut shards[domain],
+                &owner_offsets[domain],
+            )
+            .unwrap()
+            {
+                LayerStepOutcome::Forward(next_packet) => {
+                    packet_payload.get_or_insert_with(|| next_packet.tensor_payload_elements());
+                    packet = next_packet;
+                }
+                LayerStepOutcome::Finished {
+                    attention_output,
+                    hidden_states,
+                } => break (attention_output, hidden_states),
+            }
+        };
+
+        let expected_payload = query_len as usize * (4 * config.hidden_size + config.num_heads + 1);
+        assert_eq!(packet_payload, Some(expected_payload));
+        let attention_diff = (&attention_output - reference_attention)
+            .abs()
+            .max()
+            .double_value(&[]);
+        let hidden_diff = (&hidden_states - reference_hidden)
+            .abs()
+            .max()
+            .double_value(&[]);
+        assert!(attention_diff < 1e-4, "attention diff: {attention_diff}");
+        assert!(hidden_diff < 2e-4, "hidden diff: {hidden_diff}");
+
+        for domain in 0..domains {
+            let mut expected_positions = history_positions[domain].clone();
+            expected_positions.extend(
+                owner_offsets[domain]
+                    .iter()
+                    .map(|&offset| history_len + offset as i64),
+            );
+            assert_eq!(shards[domain].positions(), expected_positions);
+            assert_eq!(
+                shards[domain].committed_len(),
+                shards[domain].reserved_capacity()
+            );
+        }
+        assert_eq!(
+            shards
+                .iter()
+                .map(ReservedPositionedKvShard::storage_ptrs)
+                .collect::<Vec<_>>(),
+            storage_ptrs
+        );
+    }
+
+    #[test]
+    fn position_owner_offsets_reject_duplicates_and_out_of_range_values() {
+        fn assert_invalid_offsets(offsets: &[usize], expected: &str) {
+            let device = Device::Cpu;
+            let config = test_config();
+            let weights = deterministic_weights(&config, device);
+            let mut model = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+            let mut layer = model.layers.remove(0);
+            let hidden = deterministic_tensor(&[1, 2, config.hidden_size as i64], 321.0, device);
+            let position_ids = Tensor::from_slice(&[4_i64, 5]).unsqueeze(0);
+            let packet = LayerPacket::start(&mut layer, &hidden, &position_ids, 0, 0, 1).unwrap();
+            let mut shard = ReservedPositionedKvShard::new(&config, 2, device);
+
+            let error = process_layer_packet_with_reserved_history_for_positions(
+                &mut layer, packet, &mut shard, offsets,
+            )
+            .unwrap_err()
+            .to_string();
+
+            assert!(error.contains(expected), "unexpected error: {error}");
+            assert_eq!(shard.committed_len(), 0);
+        }
+
+        assert_invalid_offsets(&[0, 0], "duplicate");
+        assert_invalid_offsets(&[2], "query_len=2");
+    }
+
+    #[test]
     fn layer_packet_payload_does_not_grow_with_history_context() {
         fn payload_after_first_hop(history_len: i64) -> usize {
             let device = Device::Cpu;
@@ -3125,6 +3457,410 @@ mod tests {
     #[test]
     fn full_model_ring_rotates_producer_when_layers_do_not_divide_domains() {
         assert_full_model_ring_case(4, 1);
+    }
+
+    #[test]
+    fn twenty_four_layer_stationary_continuation_returns_to_decode() {
+        let device = Device::Cpu;
+        let domains = 3_usize;
+        let layers = 24_usize;
+        let request_id = 41_u64;
+        let initial_starter = 1_usize;
+        let continuation_len = 6_usize;
+        let capacity_tickets = [1_u64, 3, 2];
+        let prefix_splits = [1_usize, 3, 2];
+        let prefix_len = prefix_splits.iter().sum::<usize>();
+        let decode_token_len = 1_i64;
+        let initial_decode_position = prefix_len as i64;
+        let continuation_start_position = initial_decode_position + decode_token_len;
+        let post_continuation_decode_position =
+            continuation_start_position + continuation_len as i64;
+        let final_context_len = (post_continuation_decode_position + decode_token_len) as usize;
+        let decode_checkpoint_positions =
+            [initial_decode_position, post_continuation_decode_position];
+        let decode_steps = decode_checkpoint_positions.len();
+        let capacity_ticket_sum = capacity_tickets.iter().sum::<u64>() as usize;
+        let expected_capacity_counts = |units: usize| {
+            capacity_tickets
+                .iter()
+                .map(|&tickets| units * tickets as usize / capacity_ticket_sum)
+                .collect::<Vec<_>>()
+        };
+        let mut config = test_config();
+        config.num_layers = layers;
+        let weights = deterministic_weights(&config, device);
+        let mut distributed_model =
+            LlamaModel::from_weights(config.clone(), &weights, device, domains).unwrap();
+        let mut reference_model = local_reference_model(&config, &weights, device);
+        let mut reference_caches = (0..layers)
+            .map(|_| ContiguousKvCache::new())
+            .collect::<Vec<_>>();
+
+        let decode_horizon = decode_steps * layers;
+        let decode_schedule =
+            FrozenKvAssigneeSchedule::new(&capacity_tickets, request_id, decode_horizon).unwrap();
+        let expected_decode_counts = expected_capacity_counts(decode_horizon);
+        assert_eq!(decode_schedule.counts(), expected_decode_counts);
+        let decode_assignees = (0..decode_steps)
+            .map(|token_offset| {
+                (0..layers)
+                    .map(|layer_idx| {
+                        decode_schedule
+                            .assignee_for(token_offset, layer_idx, layers)
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let expected_per_decode_step_counts = expected_capacity_counts(layers);
+        for assignees in &decode_assignees {
+            let mut counts = vec![0_usize; domains];
+            for &domain in assignees {
+                counts[domain] += 1;
+            }
+            assert_eq!(counts, expected_per_decode_step_counts);
+        }
+        let initial_decode_assignees = decode_assignees
+            .first()
+            .expect("the scenario includes an initial decode checkpoint");
+        let post_continuation_decode_assignees = decode_assignees
+            .last()
+            .expect("the scenario includes a post-continuation decode checkpoint");
+
+        let continuation_schedule =
+            FrozenKvAssigneeSchedule::new(&capacity_tickets, request_id, continuation_len).unwrap();
+        assert_eq!(continuation_schedule.counts(), prefix_splits);
+        let position_schedule_layer = 0_usize;
+        let position_schedule_layers = 1_usize;
+        let mut continuation_offsets_by_domain = vec![Vec::new(); domains];
+        for offset in 0..continuation_len {
+            let domain = continuation_schedule
+                .assignee_for(offset, position_schedule_layer, position_schedule_layers)
+                .unwrap();
+            continuation_offsets_by_domain[domain].push(offset);
+        }
+        assert_eq!(
+            continuation_offsets_by_domain
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
+            continuation_schedule.counts()
+        );
+
+        let reservation_plan = (0..layers)
+            .map(|layer_idx| {
+                let mut capacities = prefix_splits
+                    .iter()
+                    .zip(continuation_schedule.counts())
+                    .map(|(&prefix, &continuation)| prefix + continuation)
+                    .collect::<Vec<_>>();
+                for assignees in &decode_assignees {
+                    capacities[assignees[layer_idx]] += 1;
+                }
+                assert_eq!(
+                    capacities.iter().sum::<usize>(),
+                    prefix_len + continuation_len + decode_steps
+                );
+                capacities
+            })
+            .collect::<Vec<_>>();
+        let mut distributed_shards =
+            reserved_positioned_layer_shards(&config, &reservation_plan, device);
+        let initial_storage_ptrs = distributed_shards
+            .iter()
+            .map(|shards| {
+                shards
+                    .iter()
+                    .map(ReservedPositionedKvShard::storage_ptrs)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        let prefix_token_ids = [3_i64, 5, 7, 9, 11, 13];
+        assert_eq!(prefix_token_ids.len(), prefix_len);
+        let prefix_ids = Tensor::from_slice(&prefix_token_ids).unsqueeze(0);
+        let prefix_positions =
+            Tensor::arange(prefix_len as i64, (Kind::Int64, device)).unsqueeze(0);
+        let distributed_prefix_hidden =
+            Tensor::embedding(&distributed_model.embedding, &prefix_ids, -1, false, false);
+        let reference_prefix_hidden =
+            Tensor::embedding(&reference_model.embedding, &prefix_ids, -1, false, false);
+        let (distributed_prefix_hidden, distributed_prefix_logits, _) =
+            run_reserved_positioned_prefill_block(
+                &mut distributed_model,
+                &distributed_prefix_hidden,
+                &prefix_positions,
+                &mut distributed_shards,
+                &prefix_splits,
+            );
+        let (reference_prefix_hidden, reference_prefix_logits) = run_contiguous_reference_block(
+            &mut reference_model,
+            &reference_prefix_hidden,
+            &prefix_positions,
+            &mut reference_caches,
+        );
+        assert_phase_matches(
+            "stationary_prefix",
+            &distributed_prefix_hidden,
+            &distributed_prefix_logits,
+            &reference_prefix_hidden,
+            &reference_prefix_logits,
+        );
+
+        let decode_token = sample_last_token(&distributed_prefix_logits);
+        assert_eq!(decode_token, sample_last_token(&reference_prefix_logits));
+        let decode_ids = Tensor::from_slice(&[decode_token]).unsqueeze(0);
+        let distributed_decode_hidden =
+            Tensor::embedding(&distributed_model.embedding, &decode_ids, -1, false, false);
+        let reference_decode_hidden =
+            Tensor::embedding(&reference_model.embedding, &decode_ids, -1, false, false);
+        let distributed_decode = run_reserved_positioned_decode(
+            &mut distributed_model,
+            &distributed_decode_hidden,
+            initial_decode_position,
+            &mut distributed_shards,
+            initial_starter,
+            initial_decode_assignees,
+        );
+        let decode_positions = Tensor::from_slice(&[initial_decode_position]).unsqueeze(0);
+        let (reference_decode_hidden, reference_decode_logits) = run_contiguous_reference_block(
+            &mut reference_model,
+            &reference_decode_hidden,
+            &decode_positions,
+            &mut reference_caches,
+        );
+        assert_phase_matches(
+            "stationary_decode_history",
+            &distributed_decode.hidden_states,
+            &distributed_decode.logits,
+            &reference_decode_hidden,
+            &reference_decode_logits,
+        );
+
+        let committed_before_continuation = distributed_shards
+            .iter()
+            .map(|shards| {
+                shards
+                    .iter()
+                    .map(ReservedPositionedKvShard::committed_len)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let continuation_token_ids = [17_i64, 19, 23, 29, 31, 37];
+        assert_eq!(continuation_token_ids.len(), continuation_len);
+        let continuation_ids = Tensor::from_slice(&continuation_token_ids).unsqueeze(0);
+        let continuation_positions =
+            (Tensor::arange(continuation_len as i64, (Kind::Int64, device))
+                + continuation_start_position)
+                .unsqueeze(0);
+        let distributed_continuation_hidden = Tensor::embedding(
+            &distributed_model.embedding,
+            &continuation_ids,
+            -1,
+            false,
+            false,
+        );
+        let reference_continuation_hidden = Tensor::embedding(
+            &reference_model.embedding,
+            &continuation_ids,
+            -1,
+            false,
+            false,
+        );
+
+        let continuation = run_model_ring_with_reserved_history_for_positions(
+            &mut distributed_model,
+            &distributed_continuation_hidden,
+            &continuation_positions,
+            &mut distributed_shards,
+            distributed_decode.logits_producer_domain,
+            &continuation_offsets_by_domain,
+        )
+        .unwrap();
+        let (reference_continuation_hidden, reference_continuation_logits) =
+            run_contiguous_reference_block(
+                &mut reference_model,
+                &reference_continuation_hidden,
+                &continuation_positions,
+                &mut reference_caches,
+            );
+
+        assert_phase_matches(
+            "stationary_continuation",
+            &continuation.hidden_states,
+            &continuation.logits,
+            &reference_continuation_hidden,
+            &reference_continuation_logits,
+        );
+        assert!(reference_caches
+            .iter()
+            .all(|cache| cache.seq_len() == post_continuation_decode_position as usize));
+        assert_eq!(continuation.layer_stats.len(), layers);
+        assert_eq!(
+            continuation
+                .layer_stats
+                .iter()
+                .map(|stats| stats.hops)
+                .sum::<usize>(),
+            layers * (domains - 1)
+        );
+        assert_eq!(
+            continuation
+                .layer_stats
+                .iter()
+                .map(|stats| stats.starter)
+                .collect::<Vec<_>>(),
+            (0..layers)
+                .map(|layer_idx| { (initial_starter + domains - (layer_idx % domains)) % domains })
+                .collect::<Vec<_>>()
+        );
+        for stats in &continuation.layer_stats {
+            assert_eq!(stats.domains, domains);
+            assert_eq!(stats.finisher, (stats.starter + domains - 1) % domains);
+            assert_eq!(
+                stats.visited_domains,
+                (0..domains)
+                    .map(|step| (stats.starter + step) % domains)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                stats.new_kv_positions_by_domain,
+                continuation_schedule.counts()
+            );
+        }
+        assert_eq!(continuation.logits_producer_domain, initial_starter);
+        assert_eq!(continuation.logits_projections, 1);
+
+        assert_reserved_positioned_history(
+            &distributed_shards,
+            0..post_continuation_decode_position,
+        );
+        let expected_pre_post_decode_totals = (0..domains)
+            .map(|domain| {
+                layers * (prefix_splits[domain] + continuation_schedule.counts()[domain])
+                    + expected_per_decode_step_counts[domain]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reserved_positioned_domain_totals(&distributed_shards),
+            expected_pre_post_decode_totals
+        );
+        for (layer_idx, shards) in distributed_shards.iter().enumerate() {
+            for (domain, shard) in shards.iter().enumerate() {
+                assert_eq!(
+                    shard.committed_len() - committed_before_continuation[layer_idx][domain],
+                    continuation_schedule.counts()[domain]
+                );
+                assert_eq!(
+                    shard.committed_len()
+                        + usize::from(domain == post_continuation_decode_assignees[layer_idx]),
+                    reservation_plan[layer_idx][domain]
+                );
+                assert_eq!(
+                    shard.storage_ptrs(),
+                    initial_storage_ptrs[layer_idx][domain]
+                );
+            }
+        }
+
+        let post_continuation_token = sample_last_token(&continuation.logits);
+        assert_eq!(
+            post_continuation_token,
+            sample_last_token(&reference_continuation_logits)
+        );
+        let post_continuation_ids = Tensor::from_slice(&[post_continuation_token]).unsqueeze(0);
+        let distributed_post_continuation_hidden = Tensor::embedding(
+            &distributed_model.embedding,
+            &post_continuation_ids,
+            -1,
+            false,
+            false,
+        );
+        let reference_post_continuation_hidden = Tensor::embedding(
+            &reference_model.embedding,
+            &post_continuation_ids,
+            -1,
+            false,
+            false,
+        );
+        let committed_before_post_continuation_decode = distributed_shards
+            .iter()
+            .map(|shards| {
+                shards
+                    .iter()
+                    .map(ReservedPositionedKvShard::committed_len)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let post_continuation_decode = run_reserved_positioned_decode(
+            &mut distributed_model,
+            &distributed_post_continuation_hidden,
+            post_continuation_decode_position,
+            &mut distributed_shards,
+            continuation.logits_producer_domain,
+            post_continuation_decode_assignees,
+        );
+        let post_continuation_positions =
+            Tensor::from_slice(&[post_continuation_decode_position]).unsqueeze(0);
+        let (reference_post_continuation_hidden, reference_post_continuation_logits) =
+            run_contiguous_reference_block(
+                &mut reference_model,
+                &reference_post_continuation_hidden,
+                &post_continuation_positions,
+                &mut reference_caches,
+            );
+        assert_phase_matches(
+            "post_stationary_continuation_decode",
+            &post_continuation_decode.hidden_states,
+            &post_continuation_decode.logits,
+            &reference_post_continuation_hidden,
+            &reference_post_continuation_logits,
+        );
+        assert_eq!(
+            sample_last_token(&post_continuation_decode.logits),
+            sample_last_token(&reference_post_continuation_logits)
+        );
+        assert!(reference_caches
+            .iter()
+            .all(|cache| cache.seq_len() == final_context_len));
+        assert_eq!(
+            post_continuation_decode
+                .layer_stats
+                .iter()
+                .map(|stats| stats.hops)
+                .sum::<usize>(),
+            layers * (domains - 1)
+        );
+        assert_eq!(
+            post_continuation_decode.logits_producer_domain,
+            continuation.logits_producer_domain
+        );
+
+        assert_reserved_positioned_history(&distributed_shards, 0..final_context_len as i64);
+        let expected_final_totals = (0..domains)
+            .map(|domain| {
+                layers * (prefix_splits[domain] + continuation_schedule.counts()[domain])
+                    + expected_decode_counts[domain]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reserved_positioned_domain_totals(&distributed_shards),
+            expected_final_totals
+        );
+        for (layer_idx, shards) in distributed_shards.iter().enumerate() {
+            for (domain, shard) in shards.iter().enumerate() {
+                assert_eq!(
+                    shard.committed_len()
+                        - committed_before_post_continuation_decode[layer_idx][domain],
+                    usize::from(domain == post_continuation_decode_assignees[layer_idx])
+                );
+                assert_eq!(shard.committed_len(), reservation_plan[layer_idx][domain]);
+                assert_eq!(
+                    shard.storage_ptrs(),
+                    initial_storage_ptrs[layer_idx][domain]
+                );
+            }
+        }
     }
 
     #[test]
