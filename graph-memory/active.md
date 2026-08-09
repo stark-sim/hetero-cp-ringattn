@@ -2,6 +2,51 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 路线 B 二期：工程性能力（中）
+
+type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
+
+出口标准（真实跨节点 E2E 通过才考虑工程层合 main）：
+1. [done] m>1 stationary packet 的 TCP/QUIC wire codec（129de9b；codec 本就 shape-generic，新增 m>1 回环测试固化 + smoke --transport quic，含 connect/accept 并发与 done/ack 退出 barrier 两个协议级修复）
+2. [pending] WorkerRuntime/coordinator 一等命令（continuation stationary 主路径，不调 legacy Decode）
+3. [pending] frozen request plan 的分发/重建机制
+4. [pending] capacity/placement byte-level admission（重启 decision-defer-placement-ledger-wip-20260809 的 WIP）
+5. [pending] Mac + white 双 worker stationary continuation 真实 QUIC smoke
+依赖一期完成；每项独立小节点 RED/GREEN。
+
+_updated: 2026-08-09 05:00:20_
+### 二期第 1 项:m>1 stationary packet 的 TCP/QUIC wire codec 验证与补齐
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
+
+出口标准:1) m>1 且 position_ids 为任意子集的 SelfDrivingPacket 在 TCP 与 QUIC 双进程回环中字段/shape/数值逐位一致;2) route_b_cross_node_smoke node 模式支持 --transport tcp|quic;3) N=3 loopback 用 QUIC 跑通且与 golden 对齐(argmax/mean/max 判据);4) 测试 RED/GREEN 提交于路线分支。边界:不含 WorkerRuntime/coordinator 命令接线(二期第 2 项)、不含 frozen plan 分发(第 3 项)。
+
+_updated: 2026-08-09 05:00:20_
+### 二期第 1 项完成:m>1 stationary packet TCP/QUIC codec 验证 + smoke QUIC ring
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@129de9b`
+
+实现提交 129de9b(codex/route-b-continuation-stationary-packet 分支,自 main tip acb918b 起)。
+1. codec 验证:既有 SelfDrivingPacket codec 本就 shape-generic,新增 m>1 回环测试固化——quic.rs 与 tcp.rs 各一组(m=4 连续 [5,6,7,8] 与 m=2 非连续 [5,7],Qwen2-0.5B GQA 形状:q/attn [1,24,m,64] bf16、residual/normalized [1,m,896]、lse [1,24,m]),字段/shape/dtype/数值逐位一致,双向回环。cargo test --release --lib:108 passed / 0 failed / 4 ignored。
+2. smoke 工程化:node 模式新增 --transport tcp|quic(RingTransportOps 抽象,run_ring_phase 零改动);QUIC ring 为每邻居一条 quinn 连接 + 24 条 bi-stream;两个必要的协议级修复——connect/accept 必须并发(quinn 不被 poll accept 就不完成 server 侧握手)与 done/ack 优雅退出 barrier(QUIC 关连接不保序在途数据,TCP FIN 保序;barrier 传递性保证无下游需要的在途数据时进程才退出)。
+3. 回归:N=2 TCP loopback 与 golden 逐位一致;N=3 TCP loopback 逐位一致;N=3 QUIC loopback 三端 exit 0,kv_totals=[52,56,108]、ring sends=96,finisher dump 与 N=3 local golden 逐位一致(mean=max diff=0.0)。
+证据边界:全部 loopback 单机组网;真实跨节点 QUIC smoke 属二期第 5 项;WorkerRuntime/coordinator 命令面与 frozen plan 分发未涉及(二期第 2/3 项)。
+
+_updated: 2026-08-09 05:00:20_
+### 二期首项:复用既有 shape-generic codec,补 m>1 QUIC 验证与 smoke transport 选项
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
+
+【动机六问】
+1. 问题:一期证明数学与 ring 拓扑,但 packet 上线只经实验 TCP harness;二期要把 continuation stationary 做成工程能力,数据面第一项是 m>1 stationary packet 的 TCP/QUIC wire codec。
+2. 现状:SelfDrivingPacket codec 在 QUIC(quic.rs serialize_self_driving_packet, 58dccc5)与 TCP(tcp.rs)均已存在且 shape-generic(shape 写入 JSON meta,不假设 m=1);m=1 有 self_driving_quic_smoke 双进程回环;m>1+position 子集只走过 TCP(246aa8c 三节点)与单进程测试;QUIC 上 m>1 未验证;route_b_cross_node_smoke 只支持 TCP。
+3. 终态:m>1 packet 在 TCP/QUIC 双进程回环逐位一致(回归测试固化);smoke node 模式可选 tcp|quic;N=3 QUIC loopback 与 golden 对齐。
+4. 他者:vLLM/SGLang 的分布式 wire 依赖 NCCL/RDMA collective 与自定义序列化;HCP 复用既有 [4B meta_len][JSON meta][raw bytes] 帧格式,不引入新格式。
+5. 本方案：先写 m>1 TCP/QUIC 回环测试(预期 codec 已通用,测试作 RED 探测、过则固化回归);再给 smoke 加 --transport quic(QuicKvTransport 需 tokio runtime 与 quinn endpoint 建连,bin 内最小化引入);loopback N=3 验证。
+6. 为什么:零新格式、最小改动;QUIC 是生产数据面(与 TCP 拥塞/丢包语义不同),二期第 5 项真实 smoke 必须以 QUIC 为准。
+VERDICT: IMPLEMENT。二期开工经用户于 2026-08-09 确认。
+
+_updated: 2026-08-09 03:52:42_
 ### 路线 B 一期：核心方案可行性（大）
 
 type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
@@ -144,19 +189,6 @@ type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · sour
 5. 本方案：graph 建决策 + 三个 phase 任务节点并以 DEPENDS_ON 串联；同步把里程碑门禁写入 route-experimentation skill 作为跨项目通用机制。
 6. 为什么：比直接合并保住对比公平性，比永不合并给出产品化路径；skill 化使机制可复用而非项目一次性规则。
 VERDICT: IMPLEMENT。用户于 2026-08-09 确认这是对 branch-per-route 的正规产品设计化提升。
-
-_updated: 2026-08-08 17:45:36_
-### 路线 B 二期：工程性能力（中）
-
-type: `task` · status: `planning` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
-
-出口标准（真实跨节点 E2E 通过才考虑工程层合 main）：
-1. [pending] m>1 stationary packet 的 TCP/QUIC wire codec
-2. [pending] WorkerRuntime/coordinator 一等命令（continuation stationary 主路径，不调 legacy Decode）
-3. [pending] frozen request plan 的分发/重建机制
-4. [pending] capacity/placement byte-level admission（重启 decision-defer-placement-ledger-wip-20260809 的 WIP）
-5. [pending] Mac + white 双 worker stationary continuation 真实 QUIC smoke
-依赖一期完成；每项独立小节点 RED/GREEN。
 
 _updated: 2026-08-08 17:45:36_
 ### 路线 B 三期：生态能力完善（小）
