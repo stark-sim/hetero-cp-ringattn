@@ -2,6 +2,27 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 4b 三机 production QUIC byte admission 复验
+
+type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-10`
+
+4b 的独立跨硬件验证节点：在当前 inventory endpoint 上重跑 Mac coordinator+domain0 MPS、white domain1 CUDA、pearl domain2 HIP 的 24 层 production QUIC continuation 场景。所有源码经 Git commit/remote 同步，不远端直接编辑。验收新增 coordinator admission required/budget 日志且三端 capacity 均不是 unknown；同时保持四进程 exit=0、generated IDs、分阶段 logits 守护与全局 48/48 neighbor-only hops。边界：单请求 correctness，不测性能、多请求、N>3 或完整 allocator OOM 充分条件。
+
+_updated: 2026-08-10 14:24:15_
+### 复用已知 N=3 场景验证真实 handshake byte admission
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-10`
+
+动机剖析六问：
+1. 问题：795d7ce 的本地回归证明了 byte admission 代码与合同，但没有证明真实 white CUDA / pearl HIP handshake 能提供非 unknown 预算，也没有证明 gate 接入后 production QUIC continuation 数据流仍闭环。
+2. 现状：旧 ccc838c 三机 run 已证明 Mac MPS+white CUDA+pearl HIP、24 层、N=3、48/48 hops 与阶段数值门，但当时 coordinator 尚未执行 byte admission。当前分支只有 Mac 本地单元/synthetic 证据。
+3. 终态：三机均由 inventory 当前 endpoint 运行同一 Qwen2-0.5B request；coordinator 在 Prefill 前打印逐 domain required/budget accepted；四进程 exit=0，三个 worker 合计 send/recv=48/48，generated 与阶段数值门保持已知结果。失败则保留日志并进入系统化诊断，不放宽门。
+4. 他者：分布式 serving 系统会在实际 executor/resource telemetry 上做 admission，并用真实部署拓扑的 smoke/golden 验证 dispatch 后行为。可复用“真实资源上报 + pre-dispatch gate + end-to-end trace”的验证原则，不需要引入其生产监控或资源调度框架。
+5. 本方案：复用已通过的 N=3 production QUIC 场景与 phase-specific acceptance；从 inventory 解析 host/user，先 push 当前分支、远端 git pull/build，再按 Mac->white->pearl->Mac neighbor ring 运行。报告只保存在 ignored reports，Graph 记录摘要。
+6. 为什么：单机 loopback 不能覆盖远端 capacity probe 和异构库环境；设计新 benchmark 又会扩大范围。对同一 golden 场景做一次受控重跑，变量仅为 admission 接线，是最小且可归因的验证。
+VERDICT: IMPLEMENT。该节点不改变算法和服务接口，仅补足 4b 已约定的跨硬件出口证据。
+
+_updated: 2026-08-10 14:24:15_
 ### 二期 4b：coordinator Prefill 前执行 KV byte admission
 
 type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@795d7ce`
