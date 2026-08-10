@@ -2,6 +2,33 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 二期 4b：coordinator Prefill 前执行 KV byte admission
+
+type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@795d7ce`
+
+二期第 4 项的 4b 小节点：把 4a 的冻结 KV payload byte validator 接入实验 route-B continuation coordinator。schedule tickets 只决定 layer-striped KV assignment；worker handshake capacity_mb 单独作为真实预算输入。coordinator 在发送任何本请求 Prefill 前，按 ModelConfig 的 KV geometry 与实际 dtype bytes 完成 admission。u64::MAX 表示容量查询未知，必须 fail-closed。验收：unknown capacity 与少 1 byte 在发送前拒绝；合法预算打印逐 domain required/budget bytes 并保持现有 prefill -> decode -> stationary continuation -> decode 数值与 hop 结果。边界：只改实验 continuation E2E，不改普通 legacy prefill，不引入多请求 ledger、workspace、动态 repair planner 或生产级 allocator。
+
+_updated: 2026-08-10 13:18:32_
+### route-B 在 Prefill dispatch 前 fail-closed 校验冻结 KV 字节
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-10`
+
+动机剖析六问：
+1. 问题：4a 只有纯 byte validator；当前 route-B coordinator 即使预算未知或不足，仍会先发送 Prefill，让 worker 分配 request KV shard 后才可能失败，因而 admission 尚未约束真实执行。
+2. 现状：reserved_layer_capacities 已冻结每 domain×layer 的 token capacity；ModelConfig 提供 num_kv_heads/head_dim/torch_dtype；worker handshake 提供 capacity_mb。现有 run_continuation_e2e 却把 continuation_capacity_tickets override 与 handshake capacity 混成同一参数，既用于 schedule 又会被误当真实预算。
+3. 终态：schedule tickets 与 worker capacity_mb 分开传递；capacity_mb checked 转 bytes；u64::MAX 返回结构化 UnknownCapacity；coordinator 在任何 Prefill command 发送前调用 4a validator。单测证明未知/溢出/不足稳定拒绝，合法路径给出 required/budget 日志；本地完整回归与后续三机 production QUIC 证明既有数据流未变。
+4. 他者：vLLM 等 serving runtime 在 scheduler/block allocator admission 成功后才 dispatch worker execution。可复用“先冻结 placement、再 admission、后执行”的顺序；paged blocks、eviction、request ledger 与 workspace planner 不适合直接搬入当前 positioned-slab 实验。
+5. 本方案：在 capacity.rs 增加 MB→bytes 的纯 checked conversion；ModelConfig 暴露与模型实际加载一致的 element-size helper；run_continuation_e2e 同时接收 capacity_tickets 与真实 worker_capacity_mb，并在 Prefill loop 之前完成一次 admission。
+6. 为什么：这是让已有 4a 合同真正生效的最小接线，也保留 CLI ticket override 复现实验 schedule 的能力；引入 main 的完整 placement/ledger WIP 会提前扩大到多请求和生产治理，与当前核心优先、小步实验边界冲突。
+必要性审计：若 admission 声称证明 frozen KV payload 不超过 worker budget，那么 unknown capacity 不能被解释为无限预算；否则“通过”不含任何可证上界。该结论只对 route-B hard admission 成立，不要求 legacy heuristic scheduling 改变。
+牺牲审计：
+1. 默认 fail-open 的原因：容量探测失败时仍可用均分/启发式 schedule 启动实验，避免设备查询工具缺失阻断旧路径。
+2. 牺牲：route-B continuation 在 handshake 返回 u64::MAX 时不再尝试 Prefill。
+3. 被牺牲能力的用途：在没有可靠显存探测的环境中允许 best-effort 运行。
+4. 对本项目的意义：4b 的目标正是验证 hard byte admission；把未知当无限会制造虚假的安全结论。普通 legacy path 不变，因此牺牲局部且可控。
+VERDICT: IMPLEMENT。用户已明确确认 unknown capacity 必须 fail-closed，并要求继续。
+
+_updated: 2026-08-10 12:33:19_
 ### 路线 B 二期：工程性能力（中）
 
 type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@e610d2a`

@@ -2,6 +2,20 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### 4b coordinator KV byte admission 本地 RED/GREEN 与完整回归通过
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@795d7ce`
+
+提交 795d7ce 完成 route-B coordinator 的本地 byte admission 接线：
+1. capacity_mb_to_bytes 以 1 MiB=1024*1024 bytes checked 转换；u64::MAX 返回 UnknownCapacity，其他乘法溢出返回 CapacityUnitOverflow。
+2. ModelConfig::kv_element_size_bytes 与 LlamaModel 当前 dtype 选择一致：float16/bfloat16=2 bytes，缺失/其他=4 bytes。
+3. run_continuation_e2e 拆分 capacity_tickets 与 worker_capacity_mb；前者只冻结 assignee schedule，后者只作为真实预算。admission 位于首个 WorkerCommand::Prefill 发送循环之前，并输出 required/budget/bytes_per_token_per_layer。
+4. TDD RED：新增测试首次编译失败，明确缺少 conversion、UnknownCapacity/CapacityUnitOverflow 与 dtype helper；GREEN：capacity_mb_to_bytes 聚焦 2/2、kv_element_size 聚焦 1/1。
+5. 完整验证：LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib:/opt/homebrew/opt/libomp/lib HCP_ENABLE_TORCH=1 cargo test --manifest-path rust/Cargo.toml --features tch-backend -> 124 passed, 0 failed, 5 ignored；doc tests 0 failed, 3 ignored。
+6. 静态验证：同环境 cargo clippy --manifest-path rust/Cargo.toml --features tch-backend --all-targets --message-format short -> exit 0，仅既有 warnings；rustfmt --edition 2021 --check 三个改动文件与 git diff --check 均 exit 0。
+证据边界：这是 Mac 本地编译、单元与 synthetic 回归；未运行真实 Qwen production continuation，未证明 Mac MPS + white CUDA + pearl HIP 三机 handshake 均非 unknown，也未重新证明 48/48 hops 与跨硬件 logits 门。4b task 因此保持 active，下一节点是三机 production QUIC 复验。
+
+_updated: 2026-08-10 13:18:32_
 ### 4a 冻结 KV placement 纯 byte admission 合同通过
 
 type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@e610d2a`
