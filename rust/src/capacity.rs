@@ -70,7 +70,8 @@ pub fn allocate_by_capacity(prompt_len: usize, capacities: &[u64]) -> Vec<usize>
     assert!(
         prompt_len >= n,
         "prompt_len ({}) must be >= num_domains ({}) to give each domain at least 1 token",
-        prompt_len, n
+        prompt_len,
+        n
     );
 
     let total: u128 = capacities.iter().map(|&c| c as u128).sum();
@@ -150,6 +151,112 @@ pub fn allocate_by_capacity(prompt_len: usize, capacities: &[u64]) -> Vec<usize>
     );
 
     chunks
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum KvByteAdmissionError {
+    #[error("KV byte admission requires at least one domain")]
+    NoDomains,
+    #[error("KV byte admission has {domains} domains but {budgets} byte budgets")]
+    BudgetCountMismatch { domains: usize, budgets: usize },
+    #[error("KV byte admission requires at least one layer")]
+    NoLayers,
+    #[error("KV byte admission domain {domain} has {actual} layers, expected {expected}")]
+    LayerCountMismatch {
+        domain: usize,
+        expected: usize,
+        actual: usize,
+    },
+    #[error("KV byte admission requires non-zero KV heads, head dimension, and element bytes")]
+    ZeroKvGeometry,
+    #[error("KV byte admission arithmetic overflow")]
+    ArithmeticOverflow,
+    #[error(
+        "KV byte admission domain {domain} requires {required_bytes} bytes, budget is {budget_bytes} bytes"
+    )]
+    CapacityExceeded {
+        domain: usize,
+        required_bytes: u64,
+        budget_bytes: u64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KvByteAdmission {
+    pub(crate) bytes_per_token_per_layer: u64,
+    pub(crate) required_bytes_per_domain: Vec<u64>,
+}
+
+/// Validate the persistent K/V tensor payload for a frozen placement.
+///
+/// Each reserved token in one layer owns one K row and one V row, each with
+/// `num_kv_heads * head_dim` elements. This intentionally excludes allocator
+/// rounding, host-side position metadata, activations, and workspaces.
+pub(crate) fn admit_reserved_kv_bytes(
+    layer_capacities_by_domain: &[Vec<usize>],
+    budget_bytes_by_domain: &[u64],
+    num_kv_heads: usize,
+    head_dim: usize,
+    element_size_bytes: usize,
+) -> Result<KvByteAdmission, KvByteAdmissionError> {
+    let domains = layer_capacities_by_domain.len();
+    if domains == 0 {
+        return Err(KvByteAdmissionError::NoDomains);
+    }
+    if budget_bytes_by_domain.len() != domains {
+        return Err(KvByteAdmissionError::BudgetCountMismatch {
+            domains,
+            budgets: budget_bytes_by_domain.len(),
+        });
+    }
+    let layers = layer_capacities_by_domain[0].len();
+    if layers == 0 {
+        return Err(KvByteAdmissionError::NoLayers);
+    }
+    for (domain, capacities) in layer_capacities_by_domain.iter().enumerate() {
+        if capacities.len() != layers {
+            return Err(KvByteAdmissionError::LayerCountMismatch {
+                domain,
+                expected: layers,
+                actual: capacities.len(),
+            });
+        }
+    }
+    if num_kv_heads == 0 || head_dim == 0 || element_size_bytes == 0 {
+        return Err(KvByteAdmissionError::ZeroKvGeometry);
+    }
+
+    let bytes_per_token_per_layer = 2_u128
+        .checked_mul(num_kv_heads as u128)
+        .and_then(|bytes| bytes.checked_mul(head_dim as u128))
+        .and_then(|bytes| bytes.checked_mul(element_size_bytes as u128))
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or(KvByteAdmissionError::ArithmeticOverflow)?;
+
+    let mut required_bytes_per_domain = Vec::with_capacity(domains);
+    for (domain, capacities) in layer_capacities_by_domain.iter().enumerate() {
+        let token_layer_units = capacities
+            .iter()
+            .try_fold(0_u128, |sum, &capacity| sum.checked_add(capacity as u128));
+        let required_bytes = token_layer_units
+            .and_then(|units| units.checked_mul(bytes_per_token_per_layer as u128))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or(KvByteAdmissionError::ArithmeticOverflow)?;
+        let budget_bytes = budget_bytes_by_domain[domain];
+        if required_bytes > budget_bytes {
+            return Err(KvByteAdmissionError::CapacityExceeded {
+                domain,
+                required_bytes,
+                budget_bytes,
+            });
+        }
+        required_bytes_per_domain.push(required_bytes);
+    }
+
+    Ok(KvByteAdmission {
+        bytes_per_token_per_layer,
+        required_bytes_per_domain,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -249,9 +356,7 @@ fn query_total_ram_bytes() -> Result<u64, String> {
         .output()
         .map_err(|e| format!("sysctl failed: {e}"))?;
     let s = String::from_utf8(output.stdout).map_err(|e| format!("utf8: {e}"))?;
-    s.trim()
-        .parse::<u64>()
-        .map_err(|e| format!("parse: {e}"))
+    s.trim().parse::<u64>().map_err(|e| format!("parse: {e}"))
 }
 
 #[cfg(target_os = "linux")]
@@ -283,6 +388,121 @@ fn query_total_ram_bytes() -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const QWEN_LAYERS: usize = 24;
+    const QWEN_KV_HEADS: usize = 2;
+    const QWEN_HEAD_DIM: usize = 64;
+    const BF16_BYTES: usize = 2;
+    const UNEVEN_TOKENS_PER_LAYER: [usize; 3] = [1, 3, 2];
+
+    fn uneven_24_layer_capacities() -> Vec<Vec<usize>> {
+        UNEVEN_TOKENS_PER_LAYER
+            .iter()
+            .map(|&capacity| vec![capacity; QWEN_LAYERS])
+            .collect()
+    }
+
+    fn uneven_24_layer_required_bytes() -> Vec<u64> {
+        let bytes_per_token_per_layer = 2 * QWEN_KV_HEADS * QWEN_HEAD_DIM * BF16_BYTES;
+        UNEVEN_TOKENS_PER_LAYER
+            .iter()
+            .map(|&tokens| (tokens * QWEN_LAYERS * bytes_per_token_per_layer) as u64)
+            .collect()
+    }
+
+    #[test]
+    fn kv_byte_admission_accepts_exact_24_layer_uneven_reservations() {
+        let layer_capacities = uneven_24_layer_capacities();
+        let exact_budgets = uneven_24_layer_required_bytes();
+
+        let admission = admit_reserved_kv_bytes(
+            &layer_capacities,
+            &exact_budgets,
+            QWEN_KV_HEADS,
+            QWEN_HEAD_DIM,
+            BF16_BYTES,
+        )
+        .unwrap();
+
+        assert_eq!(
+            admission.bytes_per_token_per_layer,
+            (2 * QWEN_KV_HEADS * QWEN_HEAD_DIM * BF16_BYTES) as u64
+        );
+        assert_eq!(admission.required_bytes_per_domain, exact_budgets);
+    }
+
+    #[test]
+    fn kv_byte_admission_rejects_one_byte_short_without_rebalancing() {
+        let layer_capacities = uneven_24_layer_capacities();
+        let required_bytes = uneven_24_layer_required_bytes();
+        let constrained_domain = 1;
+        let mut budgets = required_bytes.clone();
+        budgets[constrained_domain] -= 1;
+
+        let error = admit_reserved_kv_bytes(
+            &layer_capacities,
+            &budgets,
+            QWEN_KV_HEADS,
+            QWEN_HEAD_DIM,
+            BF16_BYTES,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            KvByteAdmissionError::CapacityExceeded {
+                domain: constrained_domain,
+                required_bytes: required_bytes[constrained_domain],
+                budget_bytes: required_bytes[constrained_domain] - 1,
+            }
+        );
+    }
+
+    #[test]
+    fn kv_byte_admission_rejects_inconsistent_layout() {
+        let mut layer_capacities = uneven_24_layer_capacities();
+        layer_capacities[1].pop();
+
+        assert_eq!(
+            admit_reserved_kv_bytes(
+                &layer_capacities,
+                &uneven_24_layer_required_bytes(),
+                QWEN_KV_HEADS,
+                QWEN_HEAD_DIM,
+                BF16_BYTES,
+            ),
+            Err(KvByteAdmissionError::LayerCountMismatch {
+                domain: 1,
+                expected: QWEN_LAYERS,
+                actual: QWEN_LAYERS - 1,
+            })
+        );
+        assert_eq!(
+            admit_reserved_kv_bytes(
+                &uneven_24_layer_capacities(),
+                &uneven_24_layer_required_bytes()[..2],
+                QWEN_KV_HEADS,
+                QWEN_HEAD_DIM,
+                BF16_BYTES,
+            ),
+            Err(KvByteAdmissionError::BudgetCountMismatch {
+                domains: UNEVEN_TOKENS_PER_LAYER.len(),
+                budgets: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn kv_byte_admission_rejects_zero_geometry_and_overflow() {
+        assert_eq!(
+            admit_reserved_kv_bytes(&[vec![1]], &[1], 0, 64, 2),
+            Err(KvByteAdmissionError::ZeroKvGeometry)
+        );
+        assert_eq!(
+            admit_reserved_kv_bytes(&[vec![usize::MAX]], &[u64::MAX], 2, 64, 2),
+            Err(KvByteAdmissionError::ArithmeticOverflow)
+        );
+    }
 
     #[test]
     fn test_allocate_equal_capacity() {
