@@ -2,6 +2,33 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### 4a 冻结 KV placement 纯 byte admission 合同通过
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@e610d2a`
+
+实现提交 e610d2a 仅修改 rust/src/capacity.rs，新增冻结 KV placement 的纯 byte admission 合同。
+1. 数学合同：每个 layer-token 的 persistent payload = 2(K/V)*num_kv_heads*head_dim*element_size_bytes；逐 domain required bytes 为该 domain 所有 layer capacities 之和乘上述单位字节。所有乘加与 u64 转换均 checked。
+2. 24 层 1:3:2、Qwen2-0.5B 几何（2 KV heads、head_dim=64、BF16=2 bytes）不写死派生总数：exact-fit 通过；domain 1 少 1 byte 稳定返回 CapacityExceeded，且 validator 不擅自重平衡冻结 placement。
+3. 结构守护：domain/budget 数不一致、layer layout 不一致、零 KV 几何与算术溢出均返回结构化错误。
+4. TDD RED：正确的 tch-backend 构建中，focused test 因 admit_reserved_kv_bytes/KvByteAdmissionError 不存在而编译失败；GREEN 后 focused 4 passed、0 failed。
+5. 新鲜完整验证：LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib:/opt/homebrew/opt/libomp/lib HCP_ENABLE_TORCH=1 cargo test --manifest-path rust/Cargo.toml --features tch-backend -> library 121 passed、0 failed、5 ignored；所有 bin tests 0 failed；doc tests 0 failed、3 ignored。cargo clippy --features tch-backend --all-targets --message-format short exit 0，只有既有 warnings，capacity.rs 无诊断。rustfmt --check capacity.rs 与 git diff --check exit 0。
+边界：这是本地 Mac 上的纯整数 payload admission 与 crate 回归，不接 coordinator/runtime/wire，不读取真实 worker budget，不分配 tensor，不证明 allocator rounding、positions metadata、activation/workspace、多请求占用或物理 OOM 安全，也不是三机运行证据。
+
+_updated: 2026-08-10 08:52:49_
+### 当前完整 crate 测试必须显式启用 tch-backend
+
+type: `lesson` · status: `held` · confidence: 1.0 · importance: 0.8 · source: `hetero-cp-ringattn@e610d2a`
+
+症状：尝试用 cargo test --no-default-features 运行纯 capacity 测试时，编译在 distributed/coordinator.rs 失败，报 attention/self_driving 模块不存在。影响：测试未到达新 admission RED，容易被误判成新代码回归。根因：当前 coordinator 无条件引用 model::attention::strategy 和 model::self_driving，而这两个模块在 model/mod.rs 受 tch-backend feature gate；因此仓库当前不支持 no-default-features 的完整 crate test。最小对照：同一工作树改用项目规定的 LIBTORCH+HCP_ENABLE_TORCH=1、--features tch-backend 后，测试到达预期 missing-symbol RED，GREEN 后 focused/full 均通过。处理：本节点不顺手修 feature gating；当前 Rust 验证命令显式启用 tch-backend。预防：在 feature-gating 被单独修复前，不以 --no-default-features 作为 capacity-only 测试捷径。边界：这是当前 crate 构建图事实，不说明 admission 依赖 libtorch，也不拒绝未来增加真正的 pure-core test target。
+
+_updated: 2026-08-10 08:52:49_
+### 二期 4a：冻结 KV placement 的纯 byte admission 合同
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@e610d2a`
+
+二期第 4 项拆分的 4a 小节点：只建立冻结 KV placement 的纯字节 admission 合同。输入每 domain×layer 的 reserved token capacities、KV heads、head dim、element bytes 与逐 domain KV byte budget；输出精确 K/V tensor payload required bytes。拒绝 domain/budget 数不一致、layer layout 不一致、零几何、算术溢出和任一 domain required>budget。验收使用 24 层、1:3:2 不均等 capacities 验证 exact-fit 和 one-byte-short rejection，并覆盖结构错误与溢出。边界：本节点不接 coordinator/runtime/wire，不导入 main 的 placement/ledger WIP，不新增多请求 ledger、workspace、速率 planner，也不声称 payload bytes 足以证明物理 allocator 永不 OOM。
+
+_updated: 2026-08-10 08:52:49_
 ### phase-2 分阶段门禁确认 N=3 production QUIC 出口
 
 type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@ccc838c+run-20260809-222750`

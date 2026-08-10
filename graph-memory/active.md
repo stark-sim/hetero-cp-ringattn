@@ -4,17 +4,32 @@
 
 ### 路线 B 二期：工程性能力（中）
 
-type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@ccc838c+run-20260809-222750`
+type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@e610d2a`
 
 出口标准（真实跨节点 E2E 通过才考虑工程层合 main）：
 1. [done] m>1 stationary packet 的 TCP/QUIC wire codec（129de9b；codec shape-generic，m>1 回环测试与 N=3 QUIC loopback 已固化）
 2. [done] WorkerRuntime/coordinator 一等命令（StationaryContinuation 主路径；2592795/a4ab7f4/1aee8e6）
 3. [done] frozen request plan 的分发/重建机制（plan 随 StationaryContinuation 命令广播，worker 无状态推导；1aee8e6）
-4. [pending] capacity/placement byte-level admission（重启 decision-defer-placement-ledger-wip-20260809 的必要子集，不引入三期多请求能力）
+4. [partial] capacity/placement byte-level admission：4a 冻结 per-layer capacities 的纯 KV payload byte validator 已由 e610d2a 完成；4b 尚需把 model dtype/geometry 与 handshake budget 接入 coordinator，在任何 Prefill command 发送前执行门禁，并做 Mac+white+pearl 三机验证。main 的完整 placement/ledger WIP 继续保持只读，不引入多请求能力。
 5. [done] production-path QUIC E2E：Mac MPS + white CUDA + pearl HIP 三个 worker 经 coordinator/WorkerRuntime/StationaryContinuation 在 N=3 neighbor-only QUIC ring 上通过；三 worker 全局 send/recv=48/48=24*(3-1)，目标 prefill/continuation 通过严格阶段门，legacy decode 通过 argmax/top-5/max 守护。
-依赖一期完成；当前只剩第 4 项 byte-level admission，保持为独立小节点。
+依赖一期完成；当前只剩第 4 项的 4b coordinator admission 接线与三机证据。
 
-_updated: 2026-08-10 03:30:34_
+_updated: 2026-08-10 08:52:49_
+### byte admission 先做 post-plan 纯校验，不导入完整 ledger
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-continue-2026-08-10`
+
+动机剖析六问：
+1. 问题：路线 B 已冻结每 domain、每 layer 的 KV token reservation，但尚未把 reservation 换算为 K/V tensor 字节并与节点预算比较；超限目前只能在 shard 分配或设备 OOM 时暴露。
+2. 现状：coordinator 的 reserved_layer_capacities 已覆盖 initial prefill、legacy decode growth 与 stationary continuation；ReservedPositionedKvShard 按 [1,num_kv_heads,capacity,head_dim] 分别分配 K/V。capacity tickets 只决定比例，reserved_capacity 只限制 token 数，都不是 byte admission。main 工作区另有 1079 行 placement/ledger WIP，包含多请求 reservation ledger、workspace、attention rate 和 repair planner，按旧决策保持只读。
+3. 终态：先完成独立纯函数合同：根据冻结 capacities 和 KV 几何计算每 domain required bytes；结构非法、溢出或 required>budget 时返回可检查错误。24 层 1:3:2 exact-fit 通过，任一节点少 1 byte 稳定拒绝。
+4. 他者：vLLM 等 serving runtime 在 scheduler/block allocator 层先按 KV blocks 做 admission，再进入 worker 执行。可复用“placement 先冻结、容量门后执行”的分层；其 paged block manager 和多请求 eviction/ledger 不适合直接搬入当前 positioned slab 实验。
+5. 本方案：把 4a 限定为 capacity.rs 中的 post-plan pure validator；不生成 placement、不重算 FrozenKvAssigneeSchedule。后续 4b 才决定 coordinator 接线、MB 到 bytes 和 unknown-capacity 策略。
+6. 为什么：导入完整 WIP 会把多请求和动态 planner 提前带入，worker 分配时才自检又太晚；前置纯校验是能独立 RED/GREEN、且不碰已验证 ring 数学的最小缺口。
+必要性审计：给定 ReservedPositionedKvShard 的两个连续 tensor shape，persistent payload = sum(layer_capacity)*2*num_kv_heads*head_dim*element_bytes 是数学确定的 payload 字节；它不包含 allocator rounding、positions Vec、activation/workspace 或其他请求，因此是本阶段可验证的 KV payload bound，不是完整 OOM 充分条件。
+VERDICT: IMPLEMENT。用户在上一 checkpoint 接受“纯计算与拒绝边界”，并于 2026-08-10 要求继续。
+
+_updated: 2026-08-10 06:50:35_
 ### 用 test-only 导出与 backend 汇总完成 N=3 直接证据
 
 type: `decision` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
