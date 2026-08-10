@@ -11,6 +11,7 @@
 
 use crate::api::types::{InferenceJob, InferenceResult, StreamChunk};
 use crate::api::{build_router, ApiState};
+use crate::capacity::{admit_reserved_kv_bytes, capacity_mb_to_bytes};
 use crate::distributed::protocol::{
     recv_response_quic, send_command_quic, validate_stationary_continuation, WorkerCommand,
     WorkerResponse,
@@ -938,7 +939,8 @@ fn run_continuation_e2e(
     max_tokens: usize,
     chunk_sizes_override: &Option<Vec<usize>>,
     config: &ModelConfig,
-    worker_capacities: &[u64],
+    capacity_tickets: &[u64],
+    worker_capacity_mb: &[u64],
     worker_streams: &mut [(quinn::SendStream, quinn::RecvStream)],
     rt: &tokio::runtime::Runtime,
     export_logits_dir: Option<&str>,
@@ -979,9 +981,9 @@ fn run_continuation_e2e(
     let domain_inputs =
         apply_ring_strategy(prompt_ids, &chunk_sizes, RingSchedulingStrategy::Vanilla);
 
-    // Tickets come straight from the worker handshakes (capacity_mb); the
-    // frozen schedule largest-remainder quantization maps them to offsets.
-    let capacity_tickets = worker_capacities.to_vec();
+    // Tickets only select the frozen assignment. They may be overridden to
+    // reproduce an experiment and are intentionally separate from budgets.
+    let capacity_tickets = capacity_tickets.to_vec();
     let cont_schedule = FrozenKvAssigneeSchedule::new(&capacity_tickets, request_id, m)?;
     let mut continuation_offsets = vec![Vec::new(); domains];
     for offset in 0..m {
@@ -1003,8 +1005,22 @@ fn run_continuation_e2e(
         layers,
         domains,
     );
+    let budget_bytes = capacity_mb_to_bytes(worker_capacity_mb)
+        .map_err(|error| format!("continuation KV byte admission failed: {error}"))?;
+    let admission = admit_reserved_kv_bytes(
+        &capacities,
+        &budget_bytes,
+        config.num_kv_heads(),
+        config.head_dim(),
+        config.kv_element_size_bytes(),
+    )
+    .map_err(|error| format!("continuation KV byte admission failed: {error}"))?;
     println!(
         "[coordinator] experimental continuation E2E: tickets={capacity_tickets:?} splits={chunk_sizes:?} starter={starter_domain} offsets={continuation_offsets:?} capacities={capacities:?}"
+    );
+    println!(
+        "[coordinator] continuation KV byte admission: required={:?} budget={budget_bytes:?} bytes_per_token_per_layer={} status=accepted",
+        admission.required_bytes_per_domain, admission.bytes_per_token_per_layer
     );
 
     // Prefill with per-domain reservations.
@@ -1327,6 +1343,7 @@ pub fn run() {
                 &args.chunk_sizes,
                 &config,
                 capacity_tickets,
+                &worker_capacities,
                 &mut guard,
                 &rt,
                 args.export_logits_dir.as_deref(),

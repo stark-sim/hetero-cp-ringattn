@@ -171,6 +171,12 @@ pub(crate) enum KvByteAdmissionError {
     ZeroKvGeometry,
     #[error("KV byte admission arithmetic overflow")]
     ArithmeticOverflow,
+    #[error("KV byte admission domain {domain} reported unknown capacity")]
+    UnknownCapacity { domain: usize },
+    #[error(
+        "KV byte admission domain {domain} capacity {capacity_mb} MB cannot be represented in bytes"
+    )]
+    CapacityUnitOverflow { domain: usize, capacity_mb: u64 },
     #[error(
         "KV byte admission domain {domain} requires {required_bytes} bytes, budget is {budget_bytes} bytes"
     )]
@@ -185,6 +191,32 @@ pub(crate) enum KvByteAdmissionError {
 pub(crate) struct KvByteAdmission {
     pub(crate) bytes_per_token_per_layer: u64,
     pub(crate) required_bytes_per_domain: Vec<u64>,
+}
+
+/// Convert worker handshake capacities from MiB to bytes for hard admission.
+///
+/// `u64::MAX` is the legacy query-failure sentinel. A hard admission cannot
+/// prove a bound from that value, so this conversion rejects it explicitly.
+pub(crate) fn capacity_mb_to_bytes(
+    capacity_mb_by_domain: &[u64],
+) -> Result<Vec<u64>, KvByteAdmissionError> {
+    const BYTES_PER_MIB: u64 = 1024 * 1024;
+
+    capacity_mb_by_domain
+        .iter()
+        .enumerate()
+        .map(|(domain, &capacity_mb)| {
+            if capacity_mb == u64::MAX {
+                return Err(KvByteAdmissionError::UnknownCapacity { domain });
+            }
+            capacity_mb.checked_mul(BYTES_PER_MIB).ok_or(
+                KvByteAdmissionError::CapacityUnitOverflow {
+                    domain,
+                    capacity_mb,
+                },
+            )
+        })
+        .collect()
 }
 
 /// Validate the persistent K/V tensor payload for a frozen placement.
@@ -501,6 +533,29 @@ mod tests {
         assert_eq!(
             admit_reserved_kv_bytes(&[vec![usize::MAX]], &[u64::MAX], 2, 64, 2),
             Err(KvByteAdmissionError::ArithmeticOverflow)
+        );
+    }
+
+    #[test]
+    fn capacity_mb_to_bytes_rejects_unknown_and_overflow() {
+        assert_eq!(
+            capacity_mb_to_bytes(&[4096, u64::MAX, 8192]),
+            Err(KvByteAdmissionError::UnknownCapacity { domain: 1 })
+        );
+        assert_eq!(
+            capacity_mb_to_bytes(&[u64::MAX - 1]),
+            Err(KvByteAdmissionError::CapacityUnitOverflow {
+                domain: 0,
+                capacity_mb: u64::MAX - 1,
+            })
+        );
+    }
+
+    #[test]
+    fn capacity_mb_to_bytes_uses_binary_megabytes() {
+        assert_eq!(
+            capacity_mb_to_bytes(&[1, 4096]).unwrap(),
+            vec![1024 * 1024, 4096 * 1024 * 1024]
         );
     }
 

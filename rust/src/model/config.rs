@@ -168,6 +168,17 @@ impl ModelConfig {
         self.hidden_size / self.num_heads
     }
 
+    /// Bytes per KV cache element used by the model runtime.
+    ///
+    /// This mirrors `LlamaModel::new`: float16 and bfloat16 remain 2-byte
+    /// tensors, while missing or unsupported dtype declarations use float32.
+    pub fn kv_element_size_bytes(&self) -> usize {
+        match self.torch_dtype.as_deref() {
+            Some("float16" | "bfloat16") => 2,
+            _ => 4,
+        }
+    }
+
     /// 【判断是否使用 GQA】
     /// 如果 num_kv_heads < num_heads，说明多个 query head 共享 KV head，是 GQA。
     #[allow(dead_code)]
@@ -190,7 +201,7 @@ impl ModelConfig {
 
 /// 【默认值函数】serde 在字段缺失时会调用这些函数获取默认值。
 fn default_rope_theta() -> f64 {
-    10000.0  // 经典 Llama-2 的默认值
+    10000.0 // 经典 Llama-2 的默认值
 }
 
 fn default_rms_norm_eps() -> f64 {
@@ -198,7 +209,7 @@ fn default_rms_norm_eps() -> f64 {
 }
 
 fn default_hidden_act() -> String {
-    "silu".to_string()  // SwiGLU 默认使用 silu
+    "silu".to_string() // SwiGLU 默认使用 silu
 }
 
 fn default_true() -> bool {
@@ -243,6 +254,7 @@ mod tests {
         assert!(cfg.is_swiglu());
         assert!(cfg.tie_word_embeddings);
         assert_eq!(cfg.eos_token_id(), Some(151643));
+        assert_eq!(cfg.kv_element_size_bytes(), 2);
     }
 
     #[test]
@@ -258,5 +270,31 @@ mod tests {
         let cfg: ModelConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.num_kv_heads(), 32); // falls back to num_heads
         assert!(!cfg.uses_gqa());
+        assert_eq!(cfg.kv_element_size_bytes(), 4);
+    }
+
+    #[test]
+    fn kv_element_size_matches_model_dtype_selection() {
+        let mut cfg: ModelConfig = serde_json::from_str(
+            r#"{
+                "hidden_size": 16,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "intermediate_size": 32,
+                "vocab_size": 64
+            }"#,
+        )
+        .unwrap();
+
+        for (dtype, expected_bytes) in [
+            (Some("float16"), 2),
+            (Some("bfloat16"), 2),
+            (Some("float32"), 4),
+            (Some("unsupported"), 4),
+            (None, 4),
+        ] {
+            cfg.torch_dtype = dtype.map(str::to_string);
+            assert_eq!(cfg.kv_element_size_bytes(), expected_bytes);
+        }
     }
 }
