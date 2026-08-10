@@ -2,6 +2,33 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### phase-2 分阶段门禁确认 N=3 production QUIC 出口
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@ccc838c+run-20260809-222750`
+
+在 reports/routeb-production-n3-ccc838c-20260809-222750 的原始 f32 logits、meta、exit 文件和 worker 日志上执行新鲜阶段化验收，结果 PHASE2_STAGE_ACCEPTANCE: PASS。
+1. golden 与 production meta 完全一致：request_id=75、domains=3、layers=24、capacity_tickets=[8192,21913,14525]、prefix_splits=[1,1,2]、continuation offsets=[[2],[0,1],[3]]、starter=2、generated=[198,15,15]。
+2. prefill：argmax 198/198，mean=0.035258，max=0.187500，通过 tie-aware+mean<0.1+max<0.75。
+3. stationary continuation：argmax 15/15，mean=0.030063，max=0.203125，通过同一严格门。
+4. 未改动的 legacy decode：argmax 6667/6667、top-5 overlap=5/5、max=0.648438<0.75，mean=0.107887 仅作诊断，符合用户选择的路线 B。
+5. mixed 三机与 local golden 共 8 个 exit 文件全部为 0；三个 production worker 日志各有且仅有一条 stationary stats。验证从 meta 的 layers/domains 推导 expected_hops=layers*(domains-1)=48，全局 starter/middle/finisher=24/24/24、send/recv=48/48。
+验证边界：单请求、N=3、24 层、m=4、Qwen2-0.5B BF16、Mac MPS+white CUDA+pearl HIP、Tailscale QUIC correctness；不证明性能、多请求、N>3、故障恢复或 byte-level admission。新鲜命令是对既有正式 run artifact 的重新验收，不是一次新的跨机推理运行。
+
+_updated: 2026-08-10 03:30:34_
+### zsh wrapper 不得用只读 status 参数保存退出码
+
+type: `lesson` · status: `held` · confidence: 1.0 · importance: 0.85 · source: `local-zsh+run-20260809-222750`
+
+症状：第一次正式报告 reports/routeb-production-n3-ccc838c-20260809-220748 已产生推理输出，但本地 zsh wrapper 在保存退出码时使用变量名 status，导致 zsh: read-only variable: status，报告缺少可信 exit 文件。影响：推理结果本身可观察，但进程级成功条件无法作为正式证据，必须重跑为 222750 报告。根因：status 是 zsh 的只读特殊参数，wrapper 把常见 shell 变量名误当成普通可写变量。最小复现：zsh -c 'status=0' 稳定 exit 1；替换为 command_status 后相同检查 exit 0。解决：正式 222750 wrapper 使用非保留变量并持久保存 coordinator/Mac/white/pearl 精确退出码，四端均为 0。预防：zsh 实验 wrapper 禁止用 status 保存退出码，优先使用 command_status/exit_code；缺少 exit 文件的 run 不能作为正式 evidence。边界：这是 shell wrapper 证据完整性规则，不涉及 Rust runtime 或 QUIC 数据面正确性。
+
+_updated: 2026-08-10 03:30:34_
+### 统一三阶段 mean 门修订为 phase-2 分阶段验收
+
+type: `revision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-10`
+
+用户选择路线 B，修订 phase-2 stationary continuation 的数值出口：旧决策要求 prefill/decode/continuation 三阶段统一通过 mean<0.1；新决策改为按阶段判定，目标 prefill/continuation 保持原严格门，未改动的 legacy decode 用 argmax/top-k/max 守护且 mean 仅诊断。该修订只作用于 phase-2 出口，不覆盖 phase-1 通用合同或 compare_route_b_dumps.py。
+
+_updated: 2026-08-10 03:30:34_
 ### N=3 production QUIC observability 通过，legacy decode mean guard 边界暴露
 
 type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@ccc838c+run-20260809-222750`
@@ -13,6 +40,21 @@ type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · 
 边界：这是单请求、N=3、24 层、m=4、Qwen2-0.5B BF16、Tailscale QUIC correctness 证据，不含性能、多请求、N>3、故障恢复或 byte-level admission。stationary continuation 的目标阶段已通过原数值门；legacy decode mean guard 是否作为本任务阻塞项需要显式决策，不能由该证据自动放宽。
 
 _updated: 2026-08-09 18:23:35_
+### legacy decode mean guard 不再阻塞 phase-2 stationary continuation
+
+type: `risk` · status: `resolved` · confidence: 1.0 · importance: 0.95 · source: `user-confirmed-2026-08-10`
+
+正式 N=3 production mixed-hardware run 的 legacy decode 与同 production-path 三 MPS golden 稳定得到 mean=0.107887，高于通用 0.1 guard；argmax exact、max=0.648438<0.75、top-5=5/5，且两侧各自重复运行逐位确定。目标 stationary continuation 自身 mean=0.030063/max=0.203125 严格通过。
+用户于 2026-08-10 选择路线 B 后，本风险对 phase-2 stationary continuation 出口已解除：legacy decode mean 保留为诊断，tie-aware argmax、top-5 和 max 继续作为守护；不新增 decode 数值修复任务。边界：这不是对通用 mean 门的全局放宽。
+
+_updated: 2026-08-10 03:30:34_
+### 三机 production QUIC 可观测性与同配置 golden 门禁
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@ccc838c`
+
+为三机 production QUIC stationary continuation E2E 补最小 test-only 可观测性并执行分阶段数值门禁。验收：1) coordinator 导出 prefill last、第一次 legacy decode、stationary continuation last 三份 f32 logits 和场景 meta；2) 每个 worker 汇总 starter/middle/finisher 角色数与 send/recv 数，三机总发送与总接收均为 24*(3-1)=48；3) Mac/white/pearl/coordinator 持久保存精确 exit code 且全部为 0；4) 同 request_id、capacity tickets、prefix splits 的 local golden 下，prefill 与 stationary continuation 保持 tie-aware + mean<0.1 + max<0.75；5) 未改动的 legacy decode baseline 以 tie-aware argmax、top-5 overlap=5/5、max<0.75 守护，mean 只记录为诊断。边界：这是 phase-2 stationary continuation 出口的阶段化验收，不改 phase-1 通用数值合同、compare_route_b_dumps.py、wire、packet、schedule、KV 归属、数值流程或 byte-level admission。
+
+_updated: 2026-08-10 03:30:34_
 ### N=2 production QUIC 足以完成二期拓扑出口
 
 type: `belief` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@45f2f54`
@@ -20,6 +62,14 @@ type: `belief` · status: `superseded` · confidence: 1.0 · importance: 1.0 · 
 二期第 5 项曾因 Mac MPS + white CUDA 的 N=2 production-path QUIC E2E 通过而被标记完成。该证据确实证明跨机 QUIC、runtime/coordinator 命令和异构双 worker 数值正确，但 N=2 时 predecessor 与 successor 是同一 peer，无法区分 neighbor-only ring 与普通点对点直连，因此不足以完成拓扑出口。
 
 _updated: 2026-08-09 09:43:14_
+### 二期第 5 项：三机 production QUIC neighbor-only E2E
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@ccc838c+run-20260809-222750`
+
+把二期 production path 的跨机验证从 N=2 扩展为 N=3：Mac 运行 coordinator + domain0 worker(MPS)，white 运行 domain1 worker(CUDA)，pearl 运行 domain2 worker(HIP/ROCm)。三个 worker 的数据面只能连接 predecessor/successor，StationaryContinuation packet 必须经过 middle worker 逐跳到 finisher；coordinator 仅广播命令与收集唯一 logits，不参与模型计算或 worker 间数据转发。
+验收：真实 Qwen2-0.5B 请求完成 prefill -> decode -> stationary continuation -> 后续 decode；三端正常退出；generated tokens 与同场景 golden/tie-aware 数值判据一致；日志证明每个 worker 只有 neighbor data-plane 连接且 packet 为 N-1=2 hops；记录 capacity tickets、prefix splits、offsets、finisher 与 KV totals。边界：单请求 correctness，不含性能、多请求、故障恢复或 byte-level admission。
+
+_updated: 2026-08-10 03:30:34_
 ### m>1 stationary LayerPacket 单层合同验证完成
 
 type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@5777d51`
