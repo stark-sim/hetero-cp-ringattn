@@ -2,6 +2,25 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### 6b.0 Rust completions/SSE 内部合同验证通过
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@4784acf`
+
+实现提交：4784acf，仅在 rust/src/api/server.rs 增加四个 Axum Router::oneshot 合同测试，生产 handler 无行为修改。
+
+验证：
+1. LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib:/opt/homebrew/opt/libomp/lib cargo test --manifest-path rust/Cargo.toml --features tch-backend --lib
+   结果：129 passed；0 failed；5 ignored；包含 4 个 api::server::tests。
+2. LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib:/opt/homebrew/opt/libomp/lib cargo clippy --manifest-path rust/Cargo.toml --features tch-backend --all-targets --message-format short
+   结果：exit 0；warning 均来自本节点未修改的既有文件。
+3. rustfmt --edition 2021 --check rust/src/api/server.rs；git diff --check
+   结果：exit 0。
+
+覆盖：request_id/prompt/max_tokens/temperature/top_p 到 InferenceJob 的映射；非流式 id/object/model/choices/usage/finish_reason；流式 JSON token events、稳定 completion id、finish_reason 与 [DONE]；coordinator queue 关闭返回 503；缺失 prompt 在 enqueue 前返回 422。
+
+证据边界：这是进程内 Axum router + 模拟 coordinator channel 的合同测试，不启动真实 TCP socket，不经 curl 或 vLLM CLI，不加载模型，不运行 worker/GPU/QUIC/三机，不验证并发、容量 admission、request release 或性能。因为现有 handler 已满足合同，本节点没有生产缺陷修复，也没有预期的 RED 行为改动；价值是把既有 wire semantics 固化为回归。
+
+_updated: 2026-08-11 19:31:56_
 ### vLLM bench serve 可将 HCP 当作 OpenAI-compatible 黑盒服务
 
 type: `belief` · status: `held` · confidence: 0.95 · importance: 0.9 · source: `https://docs.vllm.ai/en/latest/cli/bench/serve/`

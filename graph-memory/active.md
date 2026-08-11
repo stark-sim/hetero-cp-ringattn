@@ -2,6 +2,24 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 6b.0：Rust 内部固化 benchmark-ready completions 合同
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@4784acf`
+
+【当前下一节点】
+问题：现有 API 有实现但缺少针对 benchmark-ready contract 的内部 regression，不能在不依赖外部 client 的情况下守住 wire semantics。
+动作：对 Axum router/handler 建最小测试，覆盖 non-streaming JSON、streaming SSE token chunk、最终 finish_reason 与 `[DONE]`、usage/request id、malformed request/error；只验证当前支持的 completions 子集。
+验收：focused Rust tests RED/GREEN；现有 API/runtime tests 回归；不启动 vLLM CLI。
+边界：不新增 chat、鉴权、beam search、复杂 sampling 或完整 OpenAI 兼容层。
+
+_updated: 2026-08-11 19:31:56_
+### 二期下一检查点：6b.2a service prefill reservation/admission
+
+type: `session` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@4784acf`
+
+6b.0 已由 4784acf 完成并验证。下一候选节点保持 pending：审计普通 HTTP service prefill 与 route-B frozen reservation/byte gate 的实际接缝，先独立完成动机剖析，再决定最小接入范围。不得扩成并发总预算、eviction、repair、动态迁移或 vLLM benchmark。
+
+_updated: 2026-08-11 19:31:56_
 ### 二期 benchmark 分层：HCP oracle + vLLM serving，AIPerf/RULER 后置
 
 type: `decision` · status: `superseded` · confidence: 0.95 · importance: 1.0 · source: `official-source-and-code-audit-2026-08-11`
@@ -117,32 +135,11 @@ type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source
 二期不运行 vLLM benchmark，不改 vLLM engine/plugin。
 
 _updated: 2026-08-11 19:10:38_
-### 6b.0：Rust 内部固化 benchmark-ready completions 合同
-
-type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-correction-20260812`
-
-【当前下一节点】
-问题：现有 API 有实现但缺少针对 benchmark-ready contract 的内部 regression，不能在不依赖外部 client 的情况下守住 wire semantics。
-动作：对 Axum router/handler 建最小测试，覆盖 non-streaming JSON、streaming SSE token chunk、最终 finish_reason 与 `[DONE]`、usage/request id、malformed request/error；只验证当前支持的 completions 子集。
-验收：focused Rust tests RED/GREEN；现有 API/runtime tests 回归；不启动 vLLM CLI。
-边界：不新增 chat、鉴权、beam search、复杂 sampling 或完整 OpenAI 兼容层。
-
-_updated: 2026-08-11 19:10:38_
 ### 6d：N=3 异构 Rust 服务真实 Qwen readiness
 
 type: `task` · status: `pending` · confidence: 1.0 · importance: 1.0 · source: `user-correction-20260812`
 
 Mac MPS + white CUDA + pearl HIP 各运行一个 worker，经 coordinator/QUIC 处理真实多请求；使用 native client 验证 token/reference、admission、FIFO、release、telemetry 和 neighbor-only hops。二期到此证明 Rust 服务已具备接受外部 benchmark 的基础，不在本节点调用 vLLM CLI。
-
-_updated: 2026-08-11 19:10:38_
-### 新对话/当前恢复点：二期 Rust API contract，不运行 vLLM benchmark
-
-type: `session` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-correction-20260812`
-
-当前 worktree `/Users/stark_sim/.config/superpowers/worktrees/hetero-cp-ringattn/route-b-continuation-stationary-packet`，branch `codex/route-b-continuation-stationary-packet`。
-用户明确：二期是 Rust 工程性 readiness；vLLM benchmark 与 vLLM 接入属于三期。
-下一任务：`task-phase2-rust-6b0-api-contract-20260812`。先做每节点动机剖析和 Axum internal contract RED/GREEN。
-保留未跟踪 `models`、`reports/**`。
 
 _updated: 2026-08-11 19:10:38_
 ### 6a.2 N=2 synthetic Q-ring 多请求隔离 oracle
