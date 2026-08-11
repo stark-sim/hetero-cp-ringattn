@@ -2,6 +2,62 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 二期 benchmark 分层：HCP oracle + vLLM serving，AIPerf/RULER 后置
+
+type: `decision` · status: `held` · confidence: 0.95 · importance: 1.0 · source: `official-source-and-code-audit-2026-08-11`
+
+动机剖析六问：
+1. 问题：单元测试和单次三机 smoke 不能衡量基础推理服务在并发到达、流式输出、长短请求混合时的正确性与时延，也不能形成可与主流引擎对照的标准指标。
+2. 现状：HCP 已有 OpenAI-compatible /v1/completions、SSE、BatchScheduler、request_id KV map 与三机 QUIC 证据，但没有外部 workload benchmark；现有 HTTP 每次调用生成新 request_id，完成即 ReleaseRequest。
+3. 终态：第一层用 HCP deterministic oracle 验证精确 token、request 隔离、continuation、释放、ring hop/bytes 与 capacity-weighted KV；第二层用标准客户端报告成功率、request throughput、TTFT、TPOT/ITL、E2E latency/goodput；每项证据注明不覆盖的硬件、规模和性能轴。
+4. 他者：vLLM bench serve 支持 OpenAI completions、自定义 endpoint、request-rate/max-concurrency、TTFT/TPOT/ITL/E2EL/goodput、random/ShareGPT/timed trace/prefix repetition；AIPerf 支持 completions、并发/请求率、trace replay、prefill concurrency、multi-turn 与更完整 telemetry；MLPerf 是模型/数据集/LoadGen 标准提交；RULER/LongBench 测长上下文任务能力而非 HCP 数据流 correctness。
+5. 本方案：当前先做真正独立参考的 HCP correctness oracle，再用 vLLM bench serve 做最小 streaming serving smoke 与小并发基线；确认 API/session 边界后再考虑 AIPerf。RULER 在更长模型/上下文就绪后使用，MLPerf 与 LongBench v2 暂不作为二期门槛。
+6. 为什么：vLLM 客户端最轻且与现有 completions/SSE 最接近；AIPerf 的全面能力现在会引入较重运行栈，而且其 multi-turn 默认每轮重发完整历史，不能证明 HCP 原地 continuation KV；模型质量 benchmark 也会把 Qwen 能力与系统正确性混在一起。
+必要性审计：标准 serving benchmark 可以比较客户端可见时延与吞吐，但 HCP 的 capacity-weighted KV、neighbor-only hops、历史 KV 是否重传、同 request KV continuation 都不可由通用 OpenAI API 指标推导，必须保留 HCP-specific oracle/telemetry。
+临时验收矩阵：
+A. correctness：greedy token 与独立参考一致；不同长度请求交错；release 后无 request cache。
+B. serving：0 请求错误；TTFT/TPOT/ITL/E2EL 与 request throughput 可导出；并发 1/2/4 分级，不预设生产 SLO。
+C. HCP：每 worker KV bytes 不越 budget；placement 与 capacity weight 一致；只走 predecessor/successor；记录 prefill/decode/continuation hops 与 bytes。
+D. continuation：必须由同一 HCP request/session 复用原 KV 的专用测试证明，不能由 AIPerf full-history multi-turn 替代。
+状态：待用户审查后进入实现。
+VERDICT: IMPLEMENT（若用户确认）。
+
+_updated: 2026-08-11 18:57:00_
+### 6b.0：vLLM bench serve 单请求线级兼容探测
+
+type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-20260812`
+
+【下一节点，仅做探测，不改行为】
+问题：静态审计只能说明 HCP API 接近 OpenAI completions，不能证明实际 `vllm bench serve` parser 能消费 request/SSE/[DONE]。
+动作：新会话先读取 infrastructure inventory，选择已有或最小可用的 vLLM CLI 环境；启动现有 HCP service；以 `/v1/completions`、streaming、单 prompt、concurrency=1 发起一次真实 client 请求。
+验收：A) client 成功并产生可解析 serving 指标，则直接关闭本节点并跳过 6b.1；或 B) 保存精确 request/response/parser 错误并据此激活 6b.1。
+边界：不声明性能，不修改 vLLM engine，不新增 API 字段，不运行并发或三机。
+
+_updated: 2026-08-11 18:57:00_
+### 6d：Mac MPS + white CUDA + pearl HIP 三机真实 Qwen benchmark
+
+type: `task` · status: `pending` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-20260812`
+
+问题：本地/synthetic serving baseline 不能证明异构 N=3 neighbor-only ring 在真实模型和并发请求下成立。
+动作：按 inventory 当前 endpoint，经本地 commit/push 和远端 git pull 同步；Mac、white、pearl 各运行至少一个 worker；先跑 HCP correctness oracle，再运行低并发 vLLM serving client。
+验收：三平台都执行模型 forward；N=3 predecessor/successor QUIC ring；真实 Qwen 请求 0 错误；token/reference 与 release/admission 守护通过；报告 client 与 HCP 双平面数据。
+边界：先 concurrency 1/2，是否扩到 4 由资源证据决定；不声明生产级容错或跨硬件绝对公平性能。
+
+_updated: 2026-08-11 18:57:00_
+### 新对话恢复点：从 6b.0 vLLM client 线级探测开始
+
+type: `session` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-20260812`
+
+恢复信息：
+- worktree: `/Users/stark_sim/.config/superpowers/worktrees/hetero-cp-ringattn/route-b-continuation-stationary-packet`
+- branch: `codex/route-b-continuation-stationary-packet`
+- 已确认架构：vLLM bench serve 作为 black-box client；DEFER vLLM engine integration。
+- 当前下一任务：`task-phase2-benchmark-6b0-wire-probe-20260812`，只做单请求真实 client probe，不先改 API。
+- 6a.2 已证明 N=2、同序 FIFO 下两个不等长 request 的 Q-ring isolation；真实 runtime FIFO 合同仍由 6b.3 验证。
+- 保留未跟踪 `models` 与 `reports/**`，不得提交或删除。
+- 每个子节点实施前仍需独立动机剖析、验证、代码 commit、Graph Memory evidence commit。
+
+_updated: 2026-08-11 18:57:00_
 ### 二期 benchmark：HCP serving contract 与 vLLM bench serve 黑盒接入
 
 type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-12`
@@ -50,27 +106,6 @@ type: `decision` · status: `held` · confidence: 0.98 · importance: 1.0 · sou
 VERDICT: IMPLEMENT。
 
 _updated: 2026-08-11 15:17:50_
-### 二期 benchmark 分层：HCP oracle + vLLM serving，AIPerf/RULER 后置
-
-type: `decision` · status: `planning` · confidence: 0.95 · importance: 1.0 · source: `official-source-and-code-audit-2026-08-11`
-
-动机剖析六问：
-1. 问题：单元测试和单次三机 smoke 不能衡量基础推理服务在并发到达、流式输出、长短请求混合时的正确性与时延，也不能形成可与主流引擎对照的标准指标。
-2. 现状：HCP 已有 OpenAI-compatible /v1/completions、SSE、BatchScheduler、request_id KV map 与三机 QUIC 证据，但没有外部 workload benchmark；现有 HTTP 每次调用生成新 request_id，完成即 ReleaseRequest。
-3. 终态：第一层用 HCP deterministic oracle 验证精确 token、request 隔离、continuation、释放、ring hop/bytes 与 capacity-weighted KV；第二层用标准客户端报告成功率、request throughput、TTFT、TPOT/ITL、E2E latency/goodput；每项证据注明不覆盖的硬件、规模和性能轴。
-4. 他者：vLLM bench serve 支持 OpenAI completions、自定义 endpoint、request-rate/max-concurrency、TTFT/TPOT/ITL/E2EL/goodput、random/ShareGPT/timed trace/prefix repetition；AIPerf 支持 completions、并发/请求率、trace replay、prefill concurrency、multi-turn 与更完整 telemetry；MLPerf 是模型/数据集/LoadGen 标准提交；RULER/LongBench 测长上下文任务能力而非 HCP 数据流 correctness。
-5. 本方案：当前先做真正独立参考的 HCP correctness oracle，再用 vLLM bench serve 做最小 streaming serving smoke 与小并发基线；确认 API/session 边界后再考虑 AIPerf。RULER 在更长模型/上下文就绪后使用，MLPerf 与 LongBench v2 暂不作为二期门槛。
-6. 为什么：vLLM 客户端最轻且与现有 completions/SSE 最接近；AIPerf 的全面能力现在会引入较重运行栈，而且其 multi-turn 默认每轮重发完整历史，不能证明 HCP 原地 continuation KV；模型质量 benchmark 也会把 Qwen 能力与系统正确性混在一起。
-必要性审计：标准 serving benchmark 可以比较客户端可见时延与吞吐，但 HCP 的 capacity-weighted KV、neighbor-only hops、历史 KV 是否重传、同 request KV continuation 都不可由通用 OpenAI API 指标推导，必须保留 HCP-specific oracle/telemetry。
-临时验收矩阵：
-A. correctness：greedy token 与独立参考一致；不同长度请求交错；release 后无 request cache。
-B. serving：0 请求错误；TTFT/TPOT/ITL/E2EL 与 request throughput 可导出；并发 1/2/4 分级，不预设生产 SLO。
-C. HCP：每 worker KV bytes 不越 budget；placement 与 capacity weight 一致；只走 predecessor/successor；记录 prefill/decode/continuation hops 与 bytes。
-D. continuation：必须由同一 HCP request/session 复用原 KV 的专用测试证明，不能由 AIPerf full-history multi-turn 替代。
-状态：待用户审查后进入实现。
-VERDICT: IMPLEMENT（若用户确认）。
-
-_updated: 2026-08-11 13:19:55_
 ### 通用 multi-turn benchmark 不证明 HCP 原地 KV continuation
 
 type: `belief` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `official-aiperf-docs-and-hetero-cp-ringattn@7ecbeda`
@@ -1282,7 +1317,7 @@ C. Rust decode 移植 Q+LSE 累积器环+增长分片(修 007+008)。
 _updated: 2026-07-27 15:10:25_
 ### vLLM bench serve 作为黑盒客户端，不接入 vLLM engine
 
-type: `decision` · status: `planning` · confidence: 0.96 · importance: 0.98 · source: `motivation-analysis-and-official-vllm-bench-audit-2026-08-12`
+type: `decision` · status: `held` · confidence: 0.96 · importance: 0.98 · source: `motivation-analysis-and-official-vllm-bench-audit-2026-08-12`
 
 动机剖析六问：
 1. 问题：HCP 需要面对公开 serving benchmark，但当前“有 HTTP endpoint”尚未被标准 client 逐项验证，也缺普通 service prefill 的 capacity admission 与 HCP-specific telemetry。
@@ -1300,7 +1335,27 @@ type: `decision` · status: `planning` · confidence: 0.96 · importance: 0.98 �
 
 VERDICT: IMPLEMENT serving-contract path; DEFER vLLM-engine integration.
 
-_updated: 2026-08-11 17:49:40_
+_updated: 2026-08-11 18:57:00_
+### 6b.2a：普通 service prefill 接入冻结 reservation 与 byte admission
+
+type: `task` · status: `pending` · confidence: 1.0 · importance: 0.98 · source: `user-confirmed-20260812`
+
+问题：route-B 实验路径已有 frozen per-layer capacities 与 byte gate，但普通 HTTP service prefill 仍可能在未证明预算的情况下 dispatch。
+动作：对每个 service request，根据 prompt/max_tokens、capacity tickets、模型 KV geometry 冻结本次 per-domain/per-layer reservation；在任何 Prefill command 前执行 exact KV payload byte admission，并把 capacities 随命令下发。
+验收：合法请求在 prefill 前打印/返回 required<=budget；unknown、overflow、one-byte-short 在任何 worker prefill 前拒绝；既有单请求 token correctness 不变。
+边界：本节点只做单请求 post-plan admission，不做并发总量、eviction、repair 或动态迁移。
+
+_updated: 2026-08-11 18:57:00_
+### 6b.3：真实 runtime 固化跨 worker DecodeBatch FIFO 合同
+
+type: `task` · status: `pending` · confidence: 1.0 · importance: 0.98 · source: `user-confirmed-20260812`
+
+问题：RingPacket 无 wire request_id，当前正确性依赖所有 worker 按 coordinator 的同一 request vector 顺序进入每层 Q-ring。
+动作：在 coordinator/runtime 命令路径验证 request_tokens 只生成一次并原样广播；两个不等长请求跨 worker 交错 decode，记录 command 顺序、request horizon、token/reference 和 release。
+验收：所有 worker 每轮观测相同 request_id 序列；无错包/死锁；两请求 token 与独立 reference 一致；完成后 cache 释放。
+边界：不增加 RingPacket request_id/decode_step；若真实 runtime 证明会重排，再单独做协议修订动机剖析。
+
+_updated: 2026-08-11 18:57:00_
 ### 现有多请求 context 未隔离每层 ring phase state
 
 type: `risk` · status: `blocker` · confidence: 1.0 · importance: 0.98 · source: `hetero-cp-ringattn@d1e536a-code-audit`
@@ -1354,6 +1409,16 @@ type: `task` · status: `planning` · confidence: 0.92 · importance: 0.97 · so
 使用同一模型、history T、segment m、capacity-weighted KV placement 与 neighbor-only P2P 约束，对三条路线做 correctness 与成本对照。至少记录总 payload bytes、每 link bytes、hop 数、峰值 peer 暂存、每 worker attention/MLP/norm 计算量；混合路线先形成可检验的选择条件，不在证据前实现生产级 planner。
 
 _updated: 2026-08-03 15:01:43_
+### 6b.2b：最小 active-request KV byte reserve/release 计数
+
+type: `task` · status: `pending` · confidence: 1.0 · importance: 0.96 · source: `user-confirmed-20260812`
+
+问题：并发 benchmark 中每个请求单独 fit 不代表所有 active requests 的 reservation 总和 fit。
+动作：coordinator 维护最小 request_id -> per-domain reserved bytes 映射；admission 原子检查 active sum + new request；完成、拒绝或失败路径只释放一次。
+验收：两个 individually-fit 但 jointly-over-budget 的请求中第二个在 dispatch 前拒绝/排队；完成第一个后预算恢复，后续请求可进入；重复 release 不产生负数或双重返还。
+边界：这是 correctness 所需的确定性占用计数，不引入 paged allocator、preemption、priority、eviction、repair planner 或无限队列治理。
+
+_updated: 2026-08-11 18:57:00_
 ### Multi-query accumulator continuation ring 延后为独立路线
 
 type: `decision` · status: `held` · confidence: 0.95 · importance: 0.96 · source: `analysis-2026-08-03`
@@ -1553,6 +1618,26 @@ type: `belief` · status: `held` · confidence: 0.85 · importance: 0.95 · sour
 基于 white-pearl 限速矩阵：\n- 2.35 Gbps 基线 20.5 s\n- 1 Gbps 29.5 s（1.44x）\n- 500 Mbps 50 s（2.44x）\n- 100 Mbps 445 s（21.7x）\n\n在 Qwen2-0.5B-1M、seq=4096、max_tokens=5 的异构推理任务中，端到端 latency 随跨节点带宽下降呈非线性增长。低于 1 Gbps 时，P2P KV ring 的通信时间显著超过计算时间；100 Mbps 时通信完全主导总时间。\n\n推论：若要在生产环境中部署异构 CP 推理，需要 CXL / RDMA / 高速 NVLink 等级别的互联带宽，否则网络将把多卡聚合的显存优势抵消为极高的延迟惩罚。
 
 _updated: 2026-06-29 14:32:15_
+### 6c.1：vLLM bench serve 分级 serving baseline
+
+type: `task` · status: `pending` · confidence: 1.0 · importance: 0.94 · source: `user-confirmed-20260812`
+
+问题：需要可信的客户端服务曲线，而不是单次 smoke 或未经 admission 的吞吐数字。
+动作：固定模型、tokenizer、dataset/sampling/client location 后，依次运行 concurrency=1、2、4，再做小范围 request-rate sweep；每次同时保留 HCP oracle/telemetry。
+验收：报告请求数、错误率、throughput、TTFT/TPOT/ITL/E2EL、goodput（若配置）；并记录每档 active reservation、ring hops/bytes、释放闭环。先要求 0 请求错误，不预设生产 SLO 或胜过 vLLM。
+边界：这里测 HCP service，不把不同硬件总量的结果误称为算法公平 speedup；vLLM engine baseline 属后续受控对照。
+
+_updated: 2026-08-11 18:57:00_
+### 6c.0：建立 benchmark 最小双平面观测
+
+type: `task` · status: `pending` · confidence: 1.0 · importance: 0.9 · source: `user-confirmed-20260812`
+
+问题：vLLM client 只能看到 HTTP 时延，不能证明 HCP capacity placement、neighbor-only ring 和 KV 通信性质。
+动作：保留 client TTFT/TPOT/ITL/E2EL；HCP 侧按 request_id 输出结构化 queue/prefill/first-token/decode 时间、reserved/released bytes、phase hops/bytes、completion/error/release。
+验收：一个请求可以通过 request_id 关联 client 结果与 HCP 记录；计数与已知 N/L 公式一致；disabled 时不改变推理结果。
+边界：JSONL/现有 metrics 即可，不引入 Prometheus、trace backend、dashboard 或生产告警。
+
+_updated: 2026-08-11 18:57:00_
 ### 跨设备 BF16 验证的 argmax 判据必须容忍精确平局翻转
 
 type: `belief` · status: `held` · confidence: 0.98 · importance: 0.9 · source: `hetero-cp-ringattn@9ab909b`
@@ -1772,6 +1857,17 @@ type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.9 · sou
 与 HCP 相关性：直接相关，可能缓解 pearl 等小/慢 domain 在 Phase 2 成为瓶颈的问题。
 
 _updated: 2026-06-29 06:06:09_
+### 6b.1：按真实 client 错误补最小 completions 合同
+
+type: `task` · status: `conditional` · confidence: 1.0 · importance: 0.85 · source: `user-confirmed-20260812`
+
+【条件节点，仅在 6b.0 RED 时激活】
+问题：实际 vLLM client 若不能解析当前 request/response/SSE，需要线级兼容修补。
+动作：先把 6b.0 的原始失败固化为 API regression，再只修改 benchmark 实际需要的 CompletionRequest/Response/SSE 字段或 endpoint 行为。
+验收：focused contract test RED/GREEN；同一个 vLLM 单请求 probe 转绿；现有 API tests 回归通过。
+边界：不实现 chat endpoint、鉴权、beam search、复杂 sampling 或完整 OpenAI API。若 6b.0 GREEN，本节点标记 skipped。
+
+_updated: 2026-08-11 18:57:00_
 ### 任务E:plugin 线 successor-seeded 优化(owner 最后归并,每层 N 跳→N-1 跳)
 
 type: `task` · status: `rejected` · confidence: 0.99 · importance: 0.85 · source: `user-direction`
@@ -1959,6 +2055,13 @@ type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.85 · sou
 HCP 的数学基础即来源于此。
 
 _updated: 2026-06-29 06:06:09_
+### HCP continuation benchmark 继续由专用 oracle 证明
+
+type: `task` · status: `deferred` · confidence: 1.0 · importance: 0.8 · source: `user-confirmed-20260812`
+
+vLLM bench serve 的普通 OpenAI requests 每次创建新 HCP request_id，不能证明同一会话原地复用历史 KV。continuation 正确性、历史 KV 零重传和第二轮 prefill+decode 继续由 HCP internal/session oracle 单独验收；在 stateful HTTP session API 被明确立项前，不把它塞进 6c serving baseline。
+
+_updated: 2026-08-11 18:57:00_
 ### KVConnectorBase_V1 是 experimental API，插件边界收敛才能跟进 vLLM 升级
 
 type: `belief` · status: `held` · confidence: 0.9 · importance: 0.8 · source: `experiment`
