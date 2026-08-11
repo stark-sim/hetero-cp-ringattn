@@ -2,6 +2,28 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 6b.2a：普通 service prefill 接入冻结 reservation 与 byte admission
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6b2a`
+
+[2026-08-12 完成] 6b.2a 普通 HTTP service prefill 接入 frozen reservation 与 byte admission。
+接入点 rust/src/distributed/coordinator.rs prefill_single_request：任何 Prefill command 发出前，按 prompt/max_tokens、capacity tickets(chunk_sizes)、模型 KV geometry 冻结本请求 per-domain per-layer reservation（service_layer_capacities：prefix split + 全量 decode horizon [prompt_len, prompt_len+max_tokens)，每个 decode position 由 position%domains owner 持有，与 ring.rs keep 规则一致），随后 capacity_mb_to_bytes + admit_reserved_kv_bytes 做 exact KV payload byte admission；通过后把 capacities 随 Prefill 命令下发（layer_kv_capacities: Some(...)）。
+验收：1) 合法请求在 prefill 前打印 required<=budget（新增 coordinator 日志）；2) unknown/overflow/one-byte-short 在任意 worker prefill 前拒绝（fail-closed，错误经 job.tx 返回）；3) 既有 token correctness 不变（132 passed，含 6a decode_batch/request isolation oracle）。新增 3 个 service_layer_capacities 单测（full horizon/zero max_tokens/N=3）。边界：单请求 post-plan admission；batch mode(process_single_request) 保持 layer_kv_capacities: None 未接入；不涉并发总量(6b.2b)、eviction、repair、迁移。worker 端 ReservedPositioned decode 数值语义已由 6a 证明与独立参考一致。
+
+_updated: 2026-08-11 20:47:51_
+### 6b.2a service prefill frozen reservation + byte admission 通过
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6b2a`
+
+实现提交 d57b9ca（rust: gate HTTP service prefill with KV byte admission）。
+TDD 与验证：
+1. 纯 helper 单测：service_layer_capacities 新增 3 个测试覆盖 (a) 2-domain prompt4 max_tokens3 -> capacities [3,4]（domain0 前缀1+{4,6}，domain1 前缀3+{5}）；(b) max_tokens=0 只留前缀 [1,3]；(c) N=3 prompt6 [2,2,2] max_tokens4 -> [4,3,3]。
+2. focused test：service_layer_capacities 3 passed。
+3. 完整回归：cargo test --features tch-backend --lib = 132 passed、0 failed、5 ignored（基线 129 + 3 新增）；含 6a 的 decode_batch isolation 与 decode_qring request isolation oracle。
+4. rustfmt --edition 2021 <file> 与 git diff --check 均 exit 0；改动仅限 coordinator.rs 一个文件。
+证据边界：coordinator 本地单元 + 既有 in-process worker oracle；未在真实 HTTP 服务 + 多 worker 上复跑（跨机 HTTP E2E 属 6d）；不证明并发 admission(6b.2b)、吞吐、eviction 或 batch mode 路径。
+
+_updated: 2026-08-11 20:47:51_
 ### 6b.0：Rust 内部固化 benchmark-ready completions 合同
 
 type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@4784acf`
@@ -11,13 +33,6 @@ type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · sou
 动作：对 Axum router/handler 建最小测试，覆盖 non-streaming JSON、streaming SSE token chunk、最终 finish_reason 与 `[DONE]`、usage/request id、malformed request/error；只验证当前支持的 completions 子集。
 验收：focused Rust tests RED/GREEN；现有 API/runtime tests 回归；不启动 vLLM CLI。
 边界：不新增 chat、鉴权、beam search、复杂 sampling 或完整 OpenAI 兼容层。
-
-_updated: 2026-08-11 19:31:56_
-### 二期下一检查点：6b.2a service prefill reservation/admission
-
-type: `session` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@4784acf`
-
-6b.0 已由 4784acf 完成并验证。下一候选节点保持 pending：审计普通 HTTP service prefill 与 route-B frozen reservation/byte gate 的实际接缝，先独立完成动机剖析，再决定最小接入范围。不得扩成并发总预算、eviction、repair、动态迁移或 vLLM benchmark。
 
 _updated: 2026-08-11 19:31:56_
 ### 二期 benchmark 分层：HCP oracle + vLLM serving，AIPerf/RULER 后置
@@ -1405,16 +1420,6 @@ type: `decision` · status: `superseded` · confidence: 0.96 · importance: 0.98
 VERDICT: IMPLEMENT serving-contract path; DEFER vLLM-engine integration.
 
 _updated: 2026-08-11 19:10:38_
-### 6b.2a：普通 service prefill 接入冻结 reservation 与 byte admission
-
-type: `task` · status: `pending` · confidence: 1.0 · importance: 0.98 · source: `user-confirmed-20260812`
-
-问题：route-B 实验路径已有 frozen per-layer capacities 与 byte gate，但普通 HTTP service prefill 仍可能在未证明预算的情况下 dispatch。
-动作：对每个 service request，根据 prompt/max_tokens、capacity tickets、模型 KV geometry 冻结本次 per-domain/per-layer reservation；在任何 Prefill command 前执行 exact KV payload byte admission，并把 capacities 随命令下发。
-验收：合法请求在 prefill 前打印/返回 required<=budget；unknown、overflow、one-byte-short 在任何 worker prefill 前拒绝；既有单请求 token correctness 不变。
-边界：本节点只做单请求 post-plan admission，不做并发总量、eviction、repair 或动态迁移。
-
-_updated: 2026-08-11 18:57:00_
 ### 6b.3：真实 runtime 固化跨 worker DecodeBatch FIFO 合同
 
 type: `task` · status: `pending` · confidence: 1.0 · importance: 0.98 · source: `user-confirmed-20260812`
@@ -1736,6 +1741,13 @@ type: `task` · status: `superseded` · confidence: 1.0 · importance: 0.94 · s
 边界：这里测 HCP service，不把不同硬件总量的结果误称为算法公平 speedup；vLLM engine baseline 属后续受控对照。
 
 _updated: 2026-08-11 19:10:38_
+### 二期下一检查点：6b.2b active-request reserve/release 计数
+
+type: `session` · status: `active` · confidence: 1.0 · importance: 0.9 · source: `hetero-cp-ringattn@6b2a`
+
+6b.2a 已完成并验证：service prefill 在任何 Prefill 前做 exact byte admission，capacities 随命令下发。下一候选节点保持 pending：coordinator 维护 request_id -> per-domain reserved bytes 映射；admission 原子检查 active sum + new request；完成/拒绝/失败路径只释放一次。不得扩成 paged allocator、preemption、priority、eviction、repair planner 或无限队列治理。
+
+_updated: 2026-08-11 20:47:51_
 ### 三期：vLLM bench serve 实测与 vLLM 生态接入
 
 type: `task` · status: `deferred` · confidence: 1.0 · importance: 0.9 · source: `user-correction-20260812`
