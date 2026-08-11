@@ -26,6 +26,7 @@ use crate::model::sampling::sample_token;
 use crate::model::sampling::sample_token_slice;
 use crate::model::self_driving::{stationary_layer_starters, FrozenKvAssigneeSchedule};
 use crate::model::ModelConfig;
+use std::collections::HashMap;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -485,6 +486,98 @@ fn process_single_request(
     })
 }
 
+/// Per-request KV byte occupancy ledger for the HTTP service loop.
+///
+/// Tracks how many bytes each worker's KV budget is currently reserved by
+/// active requests. A request is admitted only if, on every domain, the active
+/// sum plus its own reservation stays within the worker budget. This is
+/// correctness accounting only — no paging, preemption, priority, eviction,
+/// or repair planning.
+struct ActiveKvReservation {
+    budgets: Vec<u64>,
+    per_domain_used: Vec<u64>,
+    by_request: HashMap<u64, Vec<u64>>,
+}
+
+impl ActiveKvReservation {
+    fn new(budgets: Vec<u64>) -> Self {
+        let domains = budgets.len();
+        Self {
+            budgets,
+            per_domain_used: vec![0; domains],
+            by_request: HashMap::new(),
+        }
+    }
+
+    /// Atomically reserve `required` bytes across all domains for `request_id`.
+    /// Succeeds only if every domain stays within budget; on failure nothing is
+    /// recorded. A live request cannot reserve twice.
+    fn try_reserve(&mut self, request_id: u64, required: &[u64]) -> Result<(), String> {
+        if self.by_request.contains_key(&request_id) {
+            return Err(format!("request {request_id} already has a KV reservation"));
+        }
+        if required.len() != self.budgets.len() {
+            return Err(format!(
+                "request {request_id} reservation has {} domains, ledger has {}",
+                required.len(),
+                self.budgets.len()
+            ));
+        }
+        let mut used = self.per_domain_used.clone();
+        for (domain, &bytes) in required.iter().enumerate() {
+            used[domain] = used[domain].checked_add(bytes).ok_or_else(|| {
+                format!("request {request_id} KV reservation overflow on domain {domain}")
+            })?;
+            if used[domain] > self.budgets[domain] {
+                return Err(format!(
+                    "request {request_id} KV reservation exceeds budget on domain {domain}: active+new={} budget={}",
+                    used[domain], self.budgets[domain]
+                ));
+            }
+        }
+        self.per_domain_used = used;
+        self.by_request.insert(request_id, required.to_vec());
+        Ok(())
+    }
+
+    /// Release one request's reservation exactly once. Repeated release of the
+    /// same id is a no-op; unknown ids are ignored, so accounting never goes
+    /// negative.
+    fn release(&mut self, request_id: u64) {
+        let Some(required) = self.by_request.remove(&request_id) else {
+            return;
+        };
+        for (domain, &bytes) in required.iter().enumerate() {
+            self.per_domain_used[domain] = self.per_domain_used[domain].saturating_sub(bytes);
+        }
+    }
+
+    fn reserved_bytes(&self, request_id: u64) -> Option<&[u64]> {
+        self.by_request.get(&request_id).map(Vec::as_slice)
+    }
+
+    fn used_bytes(&self) -> &[u64] {
+        &self.per_domain_used
+    }
+}
+
+/// RAII guard: releases the reservation if prefill fails after reserving, and
+/// keeps it once the request is admitted. Guarantees exactly-once release on
+/// every error path without scattering manual cleanup.
+struct ReservationGuard<'a> {
+    ledger: &'a mut ActiveKvReservation,
+    request_id: u64,
+    committed: bool,
+}
+
+impl Drop for ReservationGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.ledger.release(self.request_id);
+        }
+    }
+}
+
 /// Prefill a single request and return an `ActiveRequest` ready for decode batch.
 ///
 /// On prefill failure, sends an error result via `job.tx` and returns `Err`.
@@ -497,6 +590,7 @@ fn prefill_single_request(
     chunk_sizes_override: &Option<Vec<usize>>,
     capacity_aware: bool,
     worker_capacities: &[u64],
+    kv_ledger: &mut ActiveKvReservation,
     rt: &tokio::runtime::Runtime,
     strategy: RingSchedulingStrategy,
 ) -> Result<ActiveRequest, String> {
@@ -620,6 +714,25 @@ fn prefill_single_request(
         "[coordinator] service request {} KV byte admission: required={:?} budget={budget_bytes:?} bytes_per_token_per_layer={} status=accepted",
         job.request_id, admission.required_bytes_per_domain, admission.bytes_per_token_per_layer
     );
+
+    // Active-request accounting: atomically check active sum + this request
+    // against every worker budget before dispatch. A guard releases the
+    // reservation on any later prefill error; the caller commits it on success.
+    if let Err(error) = kv_ledger.try_reserve(job.request_id, &admission.required_bytes_per_domain)
+    {
+        let _ = job.tx.send(InferenceResult {
+            text: format!("[error: {error}]"),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            finish_reason: Some("error".to_string()),
+        });
+        return Err(error);
+    }
+    let mut reservation_guard = ReservationGuard {
+        ledger: kv_ledger,
+        request_id: job.request_id,
+        committed: false,
+    };
 
     // Legacy chunk boundaries (only meaningful for vanilla; kept for ActiveRequest compatibility).
     let mut chunk_boundaries = vec![0usize];
@@ -749,6 +862,10 @@ fn prefill_single_request(
     if Some(token) == eos_token {
         finish_reason = Some("stop".to_string());
     }
+
+    // Prefill succeeded and the request is entering the active set: keep the
+    // reservation. Drop of the guard then releases nothing.
+    reservation_guard.committed = true;
 
     Ok(ActiveRequest {
         request_id: job.request_id,
@@ -1531,6 +1648,11 @@ pub fn run() {
     let mut scheduler = BatchScheduler::new(max_batch_size);
     println!("[coordinator] entering HTTP iterative scheduling mode (max_batch_size={max_batch_size}). Press Ctrl+C to exit.");
 
+    // Active-request KV byte ledger for the whole HTTP service lifetime.
+    let kv_budgets = capacity_mb_to_bytes(&worker_capacities)
+        .expect("worker capacities must be convertible to byte budgets");
+    let mut kv_ledger = ActiveKvReservation::new(kv_budgets);
+
     // Iterative scheduling loop: each iteration may prefill new requests and/or
     // decode all active requests.  This replaces the request-level spawn_blocking
     // model with an iteration-level scheduler.
@@ -1569,6 +1691,7 @@ pub fn run() {
                         &args.chunk_sizes,
                         args.capacity_aware,
                         &worker_capacities,
+                        &mut kv_ledger,
                         &rt,
                         args.ring_strategy,
                     ) {
@@ -1618,6 +1741,8 @@ pub fn run() {
                         for request_id in completed {
                             if let Some(req) = scheduler.remove_active(request_id) {
                                 active_counter.fetch_sub(1, Ordering::SeqCst);
+                                // Free this request's KV byte reservation.
+                                kv_ledger.release(request_id);
 
                                 if let Some(ref chunk_tx) = req.stream_tx {
                                     // Streaming: send final chunk with finish_reason.
@@ -1650,6 +1775,8 @@ pub fn run() {
                         for request_id in scheduler.active_request_ids() {
                             if let Some(req) = scheduler.remove_active(request_id) {
                                 active_counter.fetch_sub(1, Ordering::SeqCst);
+                                // Free each failed request's KV byte reservation.
+                                kv_ledger.release(request_id);
                                 let _ = req.result_tx.send(InferenceResult {
                                     text: format!("[error: decode batch failed: {e}]"),
                                     prompt_tokens: req.prompt_tokens,
@@ -1774,6 +1901,71 @@ mod tests {
         // Single layer: finisher is one hop before the starter.
         assert_eq!(continuation_final_finisher(0, 1, 3).unwrap(), 2);
         assert!(continuation_final_finisher(3, 24, 3).is_err());
+    }
+
+    #[test]
+    fn kv_ledger_accepts_two_individually_fitting_requests() {
+        let budgets = vec![100, 100];
+        let mut ledger = ActiveKvReservation::new(budgets);
+        ledger.try_reserve(1, &[40, 40]).unwrap();
+        ledger.try_reserve(2, &[40, 40]).unwrap();
+        assert_eq!(ledger.used_bytes(), &[80, 80]);
+        assert_eq!(ledger.reserved_bytes(1), Some(&[40, 40][..]));
+        assert_eq!(ledger.reserved_bytes(2), Some(&[40, 40][..]));
+    }
+
+    #[test]
+    fn kv_ledger_rejects_second_request_over_joint_budget() {
+        let budgets = vec![100, 100];
+        let mut ledger = ActiveKvReservation::new(budgets);
+        ledger.try_reserve(1, &[80, 80]).unwrap();
+        // Second request fits alone but not jointly: must fail atomically and
+        // leave the ledger untouched so the first request's reservation stands.
+        let error = ledger.try_reserve(2, &[60, 60]).unwrap_err();
+        assert!(error.contains("exceeds budget on domain 0"));
+        assert!(ledger.reserved_bytes(2).is_none());
+        assert_eq!(ledger.used_bytes(), &[80, 80]);
+        // Budget restores after the first request completes.
+        ledger.release(1);
+        assert_eq!(ledger.used_bytes(), &[0, 0]);
+        ledger.try_reserve(2, &[60, 60]).unwrap();
+        assert_eq!(ledger.reserved_bytes(2), Some(&[60, 60][..]));
+    }
+
+    #[test]
+    fn kv_ledger_duplicate_reserve_and_repeated_release_are_safe() {
+        let budgets = vec![100];
+        let mut ledger = ActiveKvReservation::new(budgets);
+        ledger.try_reserve(1, &[30]).unwrap();
+        assert!(ledger.try_reserve(1, &[30]).is_err());
+        // Repeated release is a no-op, never double-refund or negative.
+        ledger.release(1);
+        ledger.release(1);
+        ledger.release(999);
+        assert_eq!(ledger.used_bytes(), &[0]);
+        // A new request can take the freed budget.
+        ledger.try_reserve(2, &[30]).unwrap();
+        assert_eq!(ledger.used_bytes(), &[30]);
+    }
+
+    #[test]
+    fn kv_ledger_rejects_overflow_and_shape_mismatch() {
+        let budgets = vec![100];
+        let mut ledger = ActiveKvReservation::new(budgets);
+        // Overflow only triggers when the domain already has a live reservation.
+        ledger.try_reserve(1, &[50]).unwrap();
+        assert!(ledger
+            .try_reserve(2, &[u64::MAX])
+            .unwrap_err()
+            .contains("overflow"));
+        assert!(ledger
+            .try_reserve(3, &[10, 10])
+            .unwrap_err()
+            .contains("domains"));
+        // Failed attempts leave no accounting behind.
+        assert_eq!(ledger.used_bytes(), &[50]);
+        assert!(ledger.reserved_bytes(2).is_none());
+        assert!(ledger.reserved_bytes(3).is_none());
     }
 
     #[test]
