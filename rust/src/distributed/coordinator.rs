@@ -884,6 +884,23 @@ fn prefill_single_request(
     })
 }
 
+/// Deterministic decode batch for all active requests.
+///
+/// Orders by `request_id` so the vector is stable across iterations and
+/// platforms. The coordinator builds this exactly once per iteration and
+/// broadcasts the same vector verbatim to every worker — that is the FIFO
+/// contract the multi-request Q-ring relies on, because `RingPacket` carries
+/// no request identifier and workers must decode in the same per-layer order.
+fn batch_request_tokens(scheduler: &BatchScheduler) -> Vec<(u64, i64)> {
+    let mut request_tokens: Vec<(u64, i64)> = scheduler
+        .active_requests()
+        .values()
+        .map(|req| (req.request_id, req.next_token))
+        .collect();
+    request_tokens.sort_unstable_by_key(|&(request_id, _)| request_id);
+    request_tokens
+}
+
 /// Execute one decode iteration for all active requests in the scheduler.
 ///
 /// Returns the list of request IDs that have completed (EOS or max_tokens).
@@ -896,12 +913,9 @@ fn decode_iteration(
 ) -> Result<Vec<u64>, String> {
     let _num_domains = worker_streams.len();
 
-    // Collect next tokens from all active requests
-    let request_tokens: Vec<(u64, i64)> = scheduler
-        .active_requests()
-        .values()
-        .map(|req| (req.request_id, req.next_token))
-        .collect();
+    // Collect next tokens from all active requests, exactly once. The same
+    // vector is broadcast verbatim to every worker (FIFO decode contract).
+    let request_tokens = batch_request_tokens(scheduler);
 
     if request_tokens.is_empty() {
         return Ok(Vec::new());
@@ -1901,6 +1915,49 @@ mod tests {
         // Single layer: finisher is one hop before the starter.
         assert_eq!(continuation_final_finisher(0, 1, 3).unwrap(), 2);
         assert!(continuation_final_finisher(3, 24, 3).is_err());
+    }
+
+    fn active_request_for_test(
+        scheduler: &mut BatchScheduler,
+        request_id: u64,
+        next_token: i64,
+        max_tokens: usize,
+    ) {
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        scheduler.add_active(ActiveRequest {
+            request_id,
+            prompt: format!("prompt-{request_id}"),
+            max_tokens,
+            temperature: 0.0,
+            top_p: 1.0,
+            prompt_ids: vec![1],
+            prompt_tokens: 1,
+            chunk_boundaries: vec![0, 1],
+            generated_ids: vec![10],
+            next_token,
+            finish_reason: None,
+            result_tx: tx,
+            stream_tx: None,
+        });
+    }
+
+    #[test]
+    fn batch_request_tokens_is_sorted_by_request_id() {
+        // Insert active requests in an order that would be non-deterministic if
+        // taken from the backing HashMap; the batch contract must be sorted.
+        let mut scheduler = BatchScheduler::new(4);
+        active_request_for_test(&mut scheduler, 30, 7, 3);
+        active_request_for_test(&mut scheduler, 10, 5, 3);
+        active_request_for_test(&mut scheduler, 20, 6, 3);
+
+        let tokens = batch_request_tokens(&scheduler);
+        assert_eq!(tokens, vec![(10, 5), (20, 6), (30, 7)]);
+    }
+
+    #[test]
+    fn batch_request_tokens_empty_when_no_active_requests() {
+        let scheduler = BatchScheduler::new(4);
+        assert!(batch_request_tokens(&scheduler).is_empty());
     }
 
     #[test]

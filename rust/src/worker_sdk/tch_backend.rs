@@ -1381,6 +1381,50 @@ mod tests {
     }
 
     #[test]
+    fn release_request_frees_context_and_further_decode_fails() {
+        let device = Device::Cpu;
+        let config = ModelConfig {
+            architectures: Some(vec!["LlamaForCausalLM".to_string()]),
+            hidden_size: 32,
+            num_layers: 2,
+            num_heads: 4,
+            num_kv_heads: Some(1),
+            intermediate_size: 64,
+            vocab_size: 100,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-6,
+            tie_word_embeddings: false,
+            torch_dtype: Some("float32".to_string()),
+            hidden_act: "silu".to_string(),
+            max_position_embeddings: Some(128),
+            attention_dropout: 0.0,
+            bos_token_id: None,
+            eos_token_id: None,
+            use_cache: true,
+            sliding_window: None,
+            use_sliding_window: None,
+            partial_rotary_factor: 1.0,
+        };
+        let weights = create_synthetic_weights(&config, device);
+        let model = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+        let mut backend = TchWorkerBackend::from_model(model, device, 0);
+
+        backend.prefill_request(1, &[3, 5], 0, None).unwrap();
+        assert!(backend.request_contexts.contains_key(&1));
+        let logits = backend.decode_request(1, 7).unwrap();
+        assert_eq!(logits.len(), config.vocab_size);
+
+        // Release must free the per-request KV cache exactly like the
+        // coordinator's ReleaseRequest command after completion.
+        backend.release_request(1);
+        assert!(!backend.request_contexts.contains_key(&1));
+        // Idempotent release is a no-op, not an error.
+        backend.release_request(1);
+        // Decoding a released request must fail, not reuse stale state.
+        assert!(backend.decode_request(1, 7).is_err());
+    }
+
+    #[test]
     fn single_local_token_prefill_remains_causal_with_future_peer_kv() {
         let device = Device::Cpu;
         let config = ModelConfig {
