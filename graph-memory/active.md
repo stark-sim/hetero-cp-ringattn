@@ -4,7 +4,7 @@
 
 ### 路线 B 二期：工程性能力（中）
 
-type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@795d7ce`
+type: `task` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@795d7ce`
 
 出口标准（真实跨节点 E2E 通过才考虑工程层合 main）：
 1. [done] m>1 stationary packet 的 TCP/QUIC wire codec（129de9b；codec shape-generic，m>1 回环测试与 N=3 QUIC loopback 已固化）
@@ -14,7 +14,44 @@ type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · sou
 5. [done] production-path QUIC E2E：Mac MPS + white CUDA + pearl HIP 三个 worker 经 coordinator/WorkerRuntime/StationaryContinuation 在 N=3 neighbor-only QUIC ring 上通过；三 worker 全局 send/recv=48/48=24*(3-1)，目标 prefill/continuation 通过严格阶段门，legacy decode 通过 argmax/top-5/max 守护。
 二期五项出口均完成。边界仍是单请求 correctness；main 的完整 placement/ledger WIP、多请求、workspace、性能和故障恢复未被引入或证明。
 
-_updated: 2026-08-11 10:21:36_
+_updated: 2026-08-11 12:00:12_
+### 路线 B 二期扩展：基础多请求推理服务
+
+type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-11`
+
+用户于 2026-08-11 扩展路线 B 二期的工程出口：旧五项只完成了单请求 production QUIC 与 byte admission，不足以称为基础推理引擎服务。二期继续完成最小多请求服务闭环。
+建议分小节点：
+6a. 修复并验证 request-local transformer/ring phase state；两个 prompt 长度不同的 request 交错 prefill/decode 必须与各自单请求参考一致。
+6b. 把 frozen reservation 与 byte admission 接入普通 service prefill；每个 request 在 dispatch 前独立门禁并在完成后释放。
+6c. HTTP 并发基线：至少两个同时到达的非 streaming 请求可排队、交错 decode、独立完成；指标与 request lifecycle 一致。
+6d. Mac MPS + white CUDA + pearl HIP N=3 production QUIC 复验真实 Qwen 多请求，保留 neighbor-only ring。
+边界：先做 correctness-first 基础能力；DecodeBatch 可以在 backend 内按确定顺序逐请求执行，不声称 kernel-level batching、吞吐提升、生产级 eviction/ledger、故障恢复或无限队列治理。
+
+_updated: 2026-08-11 12:00:12_
+### 二期从单请求工程闭环扩展到基础推理服务
+
+type: `revision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-11`
+
+[2026-08-11] 用户修订路线 B 二期出口。旧 task-route-b-phase2-engineering-20260809 的“completed”只证明五项单请求工程能力：wire/runtime/frozen plan/byte admission/N=3 production QUIC；证据本身仍成立，但“二期整体完成”的范围判断被取代。新的二期任务必须加入基础推理引擎服务能力，至少覆盖多 request_id 的隔离、调度、释放与真实三机 E2E。旧任务保留为已完成历史范围并由本 revision SUPERSEDES，不删除其 evidence。
+同时，原路线 B 三期 planning 曾把“多请求并发与调度行为”列为生态能力；用户现将其提升为二期工程出口。三期计划因此需在后续审查时删除或重写该重复项。
+VERDICT: REVISE AND CONTINUE PHASE 2。
+
+_updated: 2026-08-11 12:00:12_
+### 复用现有 scheduler，先修多请求 correctness 再接 service admission
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-11`
+
+动机剖析六问：
+1. 问题：HCP 已有单请求 prefill/decode/continuation 与 N=3 production QUIC 证据，但推理引擎需要在同一 worker 集合中持续接收多个请求、隔离 KV/phase state、交错推进并释放；单请求 CLI E2E 不能证明这些能力。
+2. 现状：HTTP API、BatchScheduler、DecodeBatch、request_id KV map 和 ReleaseRequest 已存在；普通 service prefill 仍用 layer_kv_capacities=None、无 byte admission，Tch RequestContext 未保存每层 attention 的 request-sensitive state。旧 decode_batch test 使用等长 prompt 和单 domain，旧三机 concurrent script只检查两份非空文本。
+3. 终态：两个不同长度/内容的 request 可交错 prefill 与多步 decode，各自 logits/token 与单请求参考一致；完成一个请求不影响另一个；request cache 被释放；随后普通 HTTP path 在 N=3 异构 ring 上通过。验证必须覆盖状态隔离而非仅“两个 HTTP 200”。
+4. 他者：vLLM 等 serving engine 用 request state、scheduler、paged KV/block table 与 continuous batching组织生命周期。可复用 request-local state、admission-before-dispatch、iteration scheduling 和 release 合同；现阶段不直接引入 paged allocator、preemption、eviction 或 kernel batching。
+5. 本方案：保留现有 scheduler/wire 作为 baseline，先补齐 request-local layer state correctness，再把已经验证的 reservation/admission接进 service prefill，最后做 HTTP 与三机 E2E。每一步独立 RED/GREEN 和 commit。
+6. 为什么：直接重写为成熟 engine 会把 allocator/吞吐/容错一起带入；只重跑旧 concurrent script又可能在共享 phase state错误下假通过。修复最小 correctness blocker并逐步接线，最符合当前“小步、核心与必要能力”的约束。
+必要性审计：不同请求若拥有不同 prompt length/position，则影响 attention position、prefill_kv_len 或 phase 的可变状态必须按 request restore，或由本轮输入纯推导；共享上一请求的状态会改变当前请求的数学输入。这是 request isolation 的 correctness 必要条件，不是 vLLM 的实现习惯。具体存储位置仍可选择 context snapshot、纯函数参数或重构无状态层。
+VERDICT: IMPLEMENT。
+
+_updated: 2026-08-11 12:00:12_
 ### 二期 4b：coordinator Prefill 前执行 KV byte admission
 
 type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `reports/routeb-byte-admission-n3-20260811-180836@hetero-cp-ringattn-795d7ce`
@@ -1162,6 +1199,13 @@ B. vLLM decode ≥2 并发+增长分片保持(修 004,PoC 最小要求);
 C. Rust decode 移植 Q+LSE 累积器环+增长分片(修 007+008)。
 
 _updated: 2026-07-27 15:10:25_
+### 现有多请求 context 未隔离每层 ring phase state
+
+type: `risk` · status: `blocker` · confidence: 1.0 · importance: 0.98 · source: `hetero-cp-ringattn@d1e536a-code-audit`
+
+TchWorkerBackend::RequestContext 只保存 KvCaches/global_seq_len/is_prefill_done；每层 HcpRingAttentionBackend 还持有 request-sensitive prefill_kv_len、is_prefill_done 和 seq_offset。单请求不受影响，但分布式多请求交错可能共享错误 phase。按用户路线先继续单请求完整流程；在多请求节点前必须把这些字段纳入 request-local state，否则属于 correctness blocker。
+
+_updated: 2026-08-11 12:00:12_
 ### Baseline 后实验 batched Q/O/LSE continuation ring
 
 type: `task` · status: `planning` · confidence: 0.95 · importance: 0.98 · source: `user-confirmed-2026-08-03`
@@ -1183,13 +1227,6 @@ type: `decision` · status: `held` · confidence: 1.0 · importance: 0.98 · sou
 VERDICT: IMPLEMENT
 
 _updated: 2026-08-03 05:09:31_
-### 现有多请求 context 未隔离每层 ring phase state
-
-type: `risk` · status: `open` · confidence: 1.0 · importance: 0.98 · source: `code-audit-2026-08-02`
-
-TchWorkerBackend::RequestContext 只保存 KvCaches/global_seq_len/is_prefill_done；每层 HcpRingAttentionBackend 还持有 request-sensitive prefill_kv_len、is_prefill_done 和 seq_offset。单请求不受影响，但分布式多请求交错可能共享错误 phase。按用户路线先继续单请求完整流程；在多请求节点前必须把这些字段纳入 request-local state，否则属于 correctness blocker。
-
-_updated: 2026-08-01 20:42:55_
 ### 真实模型 KV dtype 与 reserved slab 固定 Float 不兼容
 
 type: `risk` · status: `resolved` · confidence: 1.0 · importance: 0.98 · source: `hetero-cp-ringattn@b6902ba`

@@ -2,6 +2,19 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### 多请求 service 仍共享 request-sensitive layer state
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@d1e536a-code-audit`
+
+2026-08-11 多请求 service 代码审计确认旧 risk 仍成立：
+1. rust/src/worker_sdk/tch_backend.rs 的 RequestContext 只含 kv_caches/global_seq_len/is_prefill_done；decode_request 只 restore/save 后两者。
+2. do_prefill 会按本请求 seq_offset 调用每层 attention.set_distributed，并在 ring backend 中维护 prefill_kv_len/is_prefill_done/seq_offset 等字段；下一请求 prefill 可覆盖这些共享字段。
+3. rust/src/distributed/coordinator.rs 已将 active HashMap 中的 request_tokens 复制为同一 DecodeBatch 顺序广播给所有 worker；WorkerBackend 默认 decode_batch 按该顺序逐个 decode_request，因此 wire 顺序一致，但不自动隔离层内状态。
+4. 现有 tch_backend::test_decode_batch_isolation 只使用两个相同 seq_len=12 的 prompt、num_domains=1；它证明 KV map 不串扰，却不能暴露不同 prefix length/offset 的 layer-state 串扰。
+5. 旧 scripts/test_http_api_concurrent_3domain_cross_node.sh 只断言两个响应文本非空，无单请求 reference、token equality、cache release 或 per-request phase evidence。
+边界：这是静态代码与既有测试覆盖审计，尚未新增不等长 RED 测试，也未测量实际错误幅度；因此风险升级为下一 correctness 节点的 blocker，而不是声称已经观察到跨机错误输出。
+
+_updated: 2026-08-11 12:00:12_
 ### 4b byte admission 经 N=3 Mac+CUDA+HIP production QUIC 验证通过
 
 type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `reports/routeb-byte-admission-n3-20260811-180836@hetero-cp-ringattn-795d7ce`
