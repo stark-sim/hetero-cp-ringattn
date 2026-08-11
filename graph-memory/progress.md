@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### vLLM bench serve 可将 HCP 当作 OpenAI-compatible 黑盒服务
+
+type: `belief` · status: `held` · confidence: 0.95 · importance: 0.9 · source: `https://docs.vllm.ai/en/latest/cli/bench/serve/`
+
+官方 bench 文档将目标抽象为 serving endpoint/client protocol，并提供 request-rate、max-concurrency、streaming 与 TTFT/TPOT/ITL/E2EL/goodput 等测量；它不要求被测 endpoint 内部运行 vLLM engine。HCP 当前 API 已接近该合同，但需用实际 client 做线级验证。
+
+_updated: 2026-08-11 17:49:40_
 ### 一期 request_id 的 phase/control 语义与 Q-ring wire packet 语义分离
 
 type: `lesson` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `git-history-and-6a2-audit-20260812`

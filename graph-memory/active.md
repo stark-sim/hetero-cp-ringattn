@@ -2,6 +2,21 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 二期 benchmark：HCP serving contract 与 vLLM bench serve 黑盒接入
+
+type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-12`
+
+目标：让现有 Rust HCP 服务作为 OpenAI-compatible black-box 被 `vllm bench serve` 驱动，并在不嵌入 vLLM engine 的前提下，完成 correctness、request lifecycle、capacity admission、HCP ring telemetry 与小并发 serving baseline。
+
+分层出口：
+1. API contract：非 streaming/streaming completions、`[DONE]`、错误与 usage 可被标准 client 解析。
+2. HCP correctness：不同长度请求交错时 token/reference、request cache release、horizon sync 和 FIFO batch contract 可验证。
+3. Admission：普通 service prefill 在 dispatch 前使用 frozen capacity-weighted reservation/byte gate。
+4. Benchmark：先 request-rate=1/concurrency=1，再 max-concurrency=2/4；记录 TTFT/TPOT/ITL/E2EL 与 HCP request/hop/byte 证据。
+
+边界：不把 vLLM scheduler/paged KV/NCCL backend 搬入 Rust；不把通用 benchmark 的 multi-turn 当作 HCP 原地 continuation 证据。
+
+_updated: 2026-08-11 17:49:40_
 ### 6a.2 N=2 synthetic Q-ring 多请求隔离 oracle
 
 type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-11`
@@ -1265,6 +1280,27 @@ B. vLLM decode ≥2 并发+增长分片保持(修 004,PoC 最小要求);
 C. Rust decode 移植 Q+LSE 累积器环+增长分片(修 007+008)。
 
 _updated: 2026-07-27 15:10:25_
+### vLLM bench serve 作为黑盒客户端，不接入 vLLM engine
+
+type: `decision` · status: `planning` · confidence: 0.96 · importance: 0.98 · source: `motivation-analysis-and-official-vllm-bench-audit-2026-08-12`
+
+动机剖析六问：
+1. 问题：HCP 需要面对公开 serving benchmark，但当前“有 HTTP endpoint”尚未被标准 client 逐项验证，也缺普通 service prefill 的 capacity admission 与 HCP-specific telemetry。
+2. 当前状态：Rust 服务已有 `/v1/completions`、SSE、`[DONE]`、usage、request_id KV context、BatchScheduler 和同序 DecodeBatch；普通 HTTP prefill 仍未完成冻结 reservation/byte admission 的服务接线。
+3. 终态：不修改 HCP ring 数学和 worker backend 边界；`vllm bench serve` 能以 `/v1/completions` 驱动 HCP，concurrency 1/2/4 无错误并可报告 TTFT/TPOT/ITL/E2EL；HCP 自身另有 request release、capacity placement、neighbor hop/byte 证据。
+4. 他者：vLLM 官方 `bench serve` 是面向 OpenAI-compatible endpoint 的 workload/latency client；vLLM engine 内部则使用 scheduler、paged KV、同构 CUDA/collective 执行。前者可直接复用，后者不是 benchmark 的必要依赖。
+5. 本方案：先锁定 HCP API contract；再补普通 prefill 的 per-request frozen reservation + byte admission；再加最小 request timing/ring hop-byte telemetry；最后用 vLLM bench serve 做单并发到小并发基线，并把 continuation 保留为 HCP 专用 oracle。
+6. 为什么：benchmark 测量对象是 HTTP serving contract，不是 vLLM 内部实现。嵌入 vLLM 会把 paged allocator、CUDA kernel、NCCL/collective 和 HCP Rust P2P ring 耦合，无法自然覆盖 MPS/CUDA/HIP 异构目标，且会改变被测系统。
+
+必要性审计：
+- “必须接入 vLLM engine 才能运行 vLLM bench serve”是错误命题；bench client 只要求 endpoint contract。
+- “必须有 request_id wire packet 才能做当前 benchmark”也不是当前必要条件；coordinator 已向所有 worker 广播同一 request order，先验证 FIFO contract。
+
+取舍：不获得 vLLM paged-KV/continuous-batching 的成熟性能，但保留 HCP 的 Rust backend、capacity-weighted KV 和 neighbor-only P2P 数据面，避免把工程目标替换成 vLLM 适配工程。
+
+VERDICT: IMPLEMENT serving-contract path; DEFER vLLM-engine integration.
+
+_updated: 2026-08-11 17:49:40_
 ### 现有多请求 context 未隔离每层 ring phase state
 
 type: `risk` · status: `blocker` · confidence: 1.0 · importance: 0.98 · source: `hetero-cp-ringattn@d1e536a-code-audit`
