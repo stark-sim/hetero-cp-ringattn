@@ -2,6 +2,29 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 6b.2b：最小 active-request KV byte reserve/release 计数
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6b2b`
+
+[2026-08-12 完成] 6b.2b 最小 active-request KV byte reserve/release 计数。
+coordinator 新增 ActiveKvReservation ledger：request_id -> per-domain reserved bytes 映射 + per-domain used sum；prefill 在 dispatch 前原子检查 active sum + new request 是否都 <= 各 worker byte budget（try_reserve），成功才下 Prefill；完成、decode 失败、prefill 失败三种路径各自恰好释放一次（RAII ReservationGuard 保证 prefill 中间失败也释放，成功时 committed 保留）。
+验收：1) 两个 individually-fit 但 jointly-over-budget 的请求中第二个在 dispatch 前被拒绝（try_reserve 返回错误并经 job.tx 返回）；2) 完成第一个后预算恢复，后续请求可进入（release 后 used 归零）；3) 重复 release 不产生负数或双重返还（release 幂等、saturating_sub）。
+边界：correctness 确定性占用计数，无 paged allocator、preemption、priority、eviction、repair planner、无限队列治理；不含真实 HTTP 并发 E2E（6d）；batch mode 不接入。
+
+_updated: 2026-08-11 20:59:37_
+### 6b.2b active-request KV byte reserve/release 计数通过
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6b2b`
+
+实现提交 9ec8f96（rust: track active-request KV byte reservations in HTTP service）。
+TDD 与验证：
+1. 新增 4 个 ActiveKvReservation 单测：(a) 两个 individually-fit 请求同时容纳；(b) 第二个请求 joint 超预算时原子拒绝、账本不变、释放后恢复；(c) duplicate reserve 报错、重复/未知 release 幂等且不产生负数；(d) checked_add overflow 与 domain 数不匹配拒绝且不留账本。
+2. RED/GREEN：首轮运行 1 个测试因 overflow 断言触发条件错误而失败（used=0 时 u64::MAX 不溢出），修正测试为已有 live reservation 后 4 passed。
+3. 完整回归：cargo test --features tch-backend --lib = 136 passed、0 failed、5 ignored（129 基线 + 3 service_layer_capacities + 4 kv_ledger）。
+4. rustfmt --edition 2021 <file> 与 git diff --check 均 exit 0；改动仅限 coordinator.rs。
+证据边界：ledger 单测证明确定性计数语义（原子拒绝、一次释放、幂等）；未在真实 HTTP 并发 + 多 worker 上复跑（6d 完成）；不证明吞吐、eviction 或 queue 治理。
+
+_updated: 2026-08-11 20:59:37_
 ### 6b.2a：普通 service prefill 接入冻结 reservation 与 byte admission
 
 type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6b2a`
@@ -1483,16 +1506,6 @@ type: `task` · status: `planning` · confidence: 0.92 · importance: 0.97 · so
 使用同一模型、history T、segment m、capacity-weighted KV placement 与 neighbor-only P2P 约束，对三条路线做 correctness 与成本对照。至少记录总 payload bytes、每 link bytes、hop 数、峰值 peer 暂存、每 worker attention/MLP/norm 计算量；混合路线先形成可检验的选择条件，不在证据前实现生产级 planner。
 
 _updated: 2026-08-03 15:01:43_
-### 6b.2b：最小 active-request KV byte reserve/release 计数
-
-type: `task` · status: `pending` · confidence: 1.0 · importance: 0.96 · source: `user-confirmed-20260812`
-
-问题：并发 benchmark 中每个请求单独 fit 不代表所有 active requests 的 reservation 总和 fit。
-动作：coordinator 维护最小 request_id -> per-domain reserved bytes 映射；admission 原子检查 active sum + new request；完成、拒绝或失败路径只释放一次。
-验收：两个 individually-fit 但 jointly-over-budget 的请求中第二个在 dispatch 前拒绝/排队；完成第一个后预算恢复，后续请求可进入；重复 release 不产生负数或双重返还。
-边界：这是 correctness 所需的确定性占用计数，不引入 paged allocator、preemption、priority、eviction、repair planner 或无限队列治理。
-
-_updated: 2026-08-11 18:57:00_
 ### Multi-query accumulator continuation ring 延后为独立路线
 
 type: `decision` · status: `held` · confidence: 0.95 · importance: 0.96 · source: `analysis-2026-08-03`
@@ -1741,13 +1754,13 @@ type: `task` · status: `superseded` · confidence: 1.0 · importance: 0.94 · s
 边界：这里测 HCP service，不把不同硬件总量的结果误称为算法公平 speedup；vLLM engine baseline 属后续受控对照。
 
 _updated: 2026-08-11 19:10:38_
-### 二期下一检查点：6b.2b active-request reserve/release 计数
+### 二期下一检查点：6b.3 DecodeBatch FIFO runtime 合同
 
-type: `session` · status: `active` · confidence: 1.0 · importance: 0.9 · source: `hetero-cp-ringattn@6b2a`
+type: `session` · status: `active` · confidence: 1.0 · importance: 0.9 · source: `hetero-cp-ringattn@6b2b`
 
-6b.2a 已完成并验证：service prefill 在任何 Prefill 前做 exact byte admission，capacities 随命令下发。下一候选节点保持 pending：coordinator 维护 request_id -> per-domain reserved bytes 映射；admission 原子检查 active sum + new request；完成/拒绝/失败路径只释放一次。不得扩成 paged allocator、preemption、priority、eviction、repair planner 或无限队列治理。
+6b.2b 已完成并验证：coordinator 维护 request_id -> per-domain reserved bytes 映射，active sum 原子 admission，三种完成/失败路径恰好释放一次。下一候选节点保持 pending：在 coordinator/runtime 命令路径验证 request_tokens 只生成一次并原样广播；两个不等长请求跨 worker 交错 decode，记录 command 顺序、request horizon、token/reference 和 release。不得增加 RingPacket request_id/decode_step；若真实 runtime 证明会重排，再单独做协议修订动机剖析。
 
-_updated: 2026-08-11 20:47:51_
+_updated: 2026-08-11 20:59:37_
 ### 三期：vLLM bench serve 实测与 vLLM 生态接入
 
 type: `task` · status: `deferred` · confidence: 1.0 · importance: 0.9 · source: `user-correction-20260812`
