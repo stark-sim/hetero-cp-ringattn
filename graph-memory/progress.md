@@ -2,6 +2,19 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### 6a.1 不等长 prompt 独立参考 oracle 通过
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@fe3aedc`
+
+[2026-08-11] 实现提交 fe3aedc 将原有 decode_batch isolation 测试改为真正独立参考：
+- mixed backend 先后 prefill request A/B，prompt 长度分别为 8/12；
+- ref-A、ref-B 使用两个完全独立的相同权重 backend；
+- prefill global length、初始 logits、首步与后续 4 轮 decode logits 均逐 request 对比；
+- greedy argmax token 每轮与独立参考一致，定向测试 1 passed, 0 failed；
+- rustfmt --edition 2021 --check rust/src/worker_sdk/tch_backend.rs 与 git diff --check 均 exit 0。
+边界：这是 CPU、float32、num_domains=1、2 layers、synthetic weights 的请求隔离证据；不证明 N=2/N=3 Q-ring、MPS/CUDA/HIP、QUIC、HTTP、吞吐、capacity admission 或共享 layer state 在 ring path 下安全。N=2 Q-ring 仍是下一节点。
+
+_updated: 2026-08-11 15:38:57_
 ### 二期基础推理服务 benchmark 选型研究
 
 type: `task` · status: `completed` · confidence: 1.0 · importance: 0.95 · source: `official-source-and-code-audit-2026-08-11`

@@ -2,6 +2,28 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 6a.1 不等长多请求独立参考 correctness oracle
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@fe3aedc`
+
+二期 6a 的首个垂直切片：只增强多请求 correctness 证据。两个不同长度 prompt 在同一 backend 中先后 prefill，再用 DecodeBatch 交错 decode；每个 request 的 logits/token 必须与完全独立 backend 的单请求参考一致。首节点先覆盖 num_domains=1 synthetic tch backend；N=2 Q-ring 作为后续独立节点。边界：不改请求状态实现、不接 HTTP、不声称并发性能。
+
+_updated: 2026-08-11 15:38:57_
+### 6a.1 先强化独立参考 oracle，再决定是否修 layer state
+
+type: `decision` · status: `held` · confidence: 0.98 · importance: 1.0 · source: `user-confirmed-2026-08-11`
+
+动机剖析六问：
+1. 问题：现有 test_decode_batch_isolation 使用两个等长 prompt，并让同一个 reference backend 按相同交错顺序运行；共享 layer state 即使错误也可能在 batch/reference 两侧同步，不能证明 request isolation。
+2. 现状：TchWorkerBackend 已有 request_id KV map、prefill_request、decode_request 和 decode_batch；N=1 synthetic path 可快速构造独立参考，但当前测试没有覆盖不同 prefix length。静态审计发现 layer 的 seq_offset/prefill_kv_len/is_prefill_done 可能共享，不过生产 Q-ring 是否实际读取全部字段尚未由行为测试证伪。
+3. 终态：prompt A/B 长度不同；batch backend 的 prefill/decode 结果分别与 ref-A/ref-B 独立 backend 对齐；至少多步 greedy token exact，logits 差值在既有 float32 容差内；测试只走公开 WorkerBackend 接口。
+4. 他者：vLLM 等 serving runtime 依靠 request-local state 与独立 block tables；其正确性测试也需要请求级 reference，而不是只检查响应非空。该原则可复用，但本节点不引入 paged allocator。
+5. 本方案：先只新增一个垂直测试，构造三个相同权重的 backend：混合 backend、request A reference、request B reference；A/B 使用不同 prompt 长度，交错执行若干 decode_batch 轮次。测试先跑 N=1；若后续 N=2 Q-ring 出现 RED，再对根因选择最小状态修复。
+6. 为什么：这是最低成本、最可证伪的 oracle 增强；立即加入 layer snapshot 会把静态风险误当成已证实 bug，显式参数化则扩大到模型/attention API 重构。先有行为证据再选修法，符合 correctness-first 和小步策略。
+必要性审计：若不同 request 的 prefix length 会改变模型数学输入，则 reference 必须独立；这是 correctness 必要性。至于“必须保存每层 snapshot”不是数学必要性，可能由 Q-ring 路径的输入或 cache 元数据推导，需等待 RED 证据。
+VERDICT: IMPLEMENT。
+
+_updated: 2026-08-11 15:17:50_
 ### 二期 benchmark 分层：HCP oracle + vLLM serving，AIPerf/RULER 后置
 
 type: `decision` · status: `planning` · confidence: 0.95 · importance: 1.0 · source: `official-source-and-code-audit-2026-08-11`
