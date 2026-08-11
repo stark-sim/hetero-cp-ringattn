@@ -2,6 +2,19 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### 一期 request_id 的 phase/control 语义与 Q-ring wire packet 语义分离
+
+type: `lesson` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `git-history-and-6a2-audit-20260812`
+
+[2026-08-12] `request_id` 在 HCP 一期不同层次的语义不能混用：
+
+1. `FrozenKvAssigneeSchedule::new(capacity_tickets, request_id, ...)` 使用 `request_id` 计算稳定 phase，目的是让不同 request 的 KV assignee 初始相位分散；这是 request-aware placement/scheduling metadata。
+2. coordinator 的 `WorkerCommand::DecodeBatch` 携带 `(request_id, token)` 列表，worker 的 `RequestContext` 也按 request_id 隔离 KV 与 global horizon；这是控制面和 backend state。
+3. decode `RingPacket` 从引入 Q-ring 的 commit `c4a3e7f` 起就只有 `layer_idx, q, o, lse, scale`；self-driving `SelfDrivingPacket` 也只有 layer/activation/route fields。单请求设计中，packet 身份由 per-layer transport FIFO、ring round 和 layer route 隐式确定。
+
+因此当前缺口不是一期实现被回退或删除，而是“无 wire request_id 的单请求数据面”被扩展到多请求 DecodeBatch 后暴露了调度顺序依赖。6a.2 只证明同一 request 顺序下正确；后续若需要 worker 独立重排，才应单独评估为 RingPacket 增加 request_id/step metadata，或继续把全局 FIFO 作为明确合同。
+
+_updated: 2026-08-11 17:25:35_
 ### [2026-08-12] 6a.2 N=2 Q-ring unequal-prefix request isolation oracle 通过
 
 type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@3b9d912`
