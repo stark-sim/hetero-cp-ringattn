@@ -2,6 +2,39 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 二期 benchmark 分层：HCP oracle + vLLM serving，AIPerf/RULER 后置
+
+type: `decision` · status: `planning` · confidence: 0.95 · importance: 1.0 · source: `official-source-and-code-audit-2026-08-11`
+
+动机剖析六问：
+1. 问题：单元测试和单次三机 smoke 不能衡量基础推理服务在并发到达、流式输出、长短请求混合时的正确性与时延，也不能形成可与主流引擎对照的标准指标。
+2. 现状：HCP 已有 OpenAI-compatible /v1/completions、SSE、BatchScheduler、request_id KV map 与三机 QUIC 证据，但没有外部 workload benchmark；现有 HTTP 每次调用生成新 request_id，完成即 ReleaseRequest。
+3. 终态：第一层用 HCP deterministic oracle 验证精确 token、request 隔离、continuation、释放、ring hop/bytes 与 capacity-weighted KV；第二层用标准客户端报告成功率、request throughput、TTFT、TPOT/ITL、E2E latency/goodput；每项证据注明不覆盖的硬件、规模和性能轴。
+4. 他者：vLLM bench serve 支持 OpenAI completions、自定义 endpoint、request-rate/max-concurrency、TTFT/TPOT/ITL/E2EL/goodput、random/ShareGPT/timed trace/prefix repetition；AIPerf 支持 completions、并发/请求率、trace replay、prefill concurrency、multi-turn 与更完整 telemetry；MLPerf 是模型/数据集/LoadGen 标准提交；RULER/LongBench 测长上下文任务能力而非 HCP 数据流 correctness。
+5. 本方案：当前先做真正独立参考的 HCP correctness oracle，再用 vLLM bench serve 做最小 streaming serving smoke 与小并发基线；确认 API/session 边界后再考虑 AIPerf。RULER 在更长模型/上下文就绪后使用，MLPerf 与 LongBench v2 暂不作为二期门槛。
+6. 为什么：vLLM 客户端最轻且与现有 completions/SSE 最接近；AIPerf 的全面能力现在会引入较重运行栈，而且其 multi-turn 默认每轮重发完整历史，不能证明 HCP 原地 continuation KV；模型质量 benchmark 也会把 Qwen 能力与系统正确性混在一起。
+必要性审计：标准 serving benchmark 可以比较客户端可见时延与吞吐，但 HCP 的 capacity-weighted KV、neighbor-only hops、历史 KV 是否重传、同 request KV continuation 都不可由通用 OpenAI API 指标推导，必须保留 HCP-specific oracle/telemetry。
+临时验收矩阵：
+A. correctness：greedy token 与独立参考一致；不同长度请求交错；release 后无 request cache。
+B. serving：0 请求错误；TTFT/TPOT/ITL/E2EL 与 request throughput 可导出；并发 1/2/4 分级，不预设生产 SLO。
+C. HCP：每 worker KV bytes 不越 budget；placement 与 capacity weight 一致；只走 predecessor/successor；记录 prefill/decode/continuation hops 与 bytes。
+D. continuation：必须由同一 HCP request/session 复用原 KV 的专用测试证明，不能由 AIPerf full-history multi-turn 替代。
+状态：待用户审查后进入实现。
+VERDICT: IMPLEMENT（若用户确认）。
+
+_updated: 2026-08-11 13:19:55_
+### 通用 multi-turn benchmark 不证明 HCP 原地 KV continuation
+
+type: `belief` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `official-aiperf-docs-and-hetero-cp-ringattn@7ecbeda`
+
+AIPerf 官方 multi-turn 文档说明后续 turn 会携带完整 conversation history；deltas_without_responses 模式也由客户端累积历史和实时响应后构造下一请求。HCP 当前 /v1/completions 每次 HTTP 调用生成新的 request_id，coordinator 完成后向 worker 发送 ReleaseRequest。因此直接运行 AIPerf multi-turn 只能测多轮负载和增长 prompt，不会证明同一 request 的历史 KV 原地保留与 continuation append。若要测后者，需要 HCP 内部 trace oracle，或以后明确增加 stateful session continuation API。
+来源：
+- https://github.com/ai-dynamo/aiperf/blob/main/docs/tutorials/multi-turn.md
+- https://github.com/ai-dynamo/aiperf/blob/main/docs/reference/conversation-context-mode.md
+- rust/src/api/server.rs
+- rust/src/distributed/coordinator.rs
+
+_updated: 2026-08-11 13:19:55_
 ### 路线 B 二期：工程性能力（中）
 
 type: `task` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@795d7ce`

@@ -2,6 +2,35 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### 二期基础推理服务 benchmark 选型研究
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 0.95 · source: `official-source-and-code-audit-2026-08-11`
+
+[2026-08-11] 调研可用于 HCP 整体推理服务的公开 benchmark，并按系统 correctness、在线 serving、多轮会话和长上下文能力分层评估。结论：当前最小接入候选是 vLLM bench serve；AIPerf 更全面但适合后续 trace/multi-turn 阶段；RULER 用于长期长上下文能力评估；MLPerf/LongBench v2 不作为当前二期门槛。边界：本节点只完成官方资料与现有 API 合同审计，尚未运行任何外部 benchmark，也不证明 HCP 与这些客户端已经线级兼容。
+
+_updated: 2026-08-11 13:19:55_
+### 公开推理 benchmark 官方资料与 HCP API 合同审计
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `official-source-and-code-audit-2026-08-11`
+
+[2026-08-11] 官方来源审计：
+1. vLLM bench serve 支持 /v1/completions、request-rate、max-concurrency、random/ShareGPT/timed_trace/prefix_repetition，以及 TTFT/TPOT/ITL/E2EL percentiles 和 goodput。
+2. NVIDIA GenAI-Perf 已公告逐步停止开发并推荐 AIPerf；AIPerf 支持 OpenAI completions、streaming、concurrency/request-rate/trace replay、multi-turn、prefill concurrency 与 telemetry。
+3. AIPerf multi-turn 每轮发送客户端累积的完整 history；它不等价于服务端 request-local KV continuation。
+4. MLPerf Inference 提供模型/数据集/LoadGen 标准，当前 LLM 项包括 Llama、DeepSeek 等，接入成本和模型约束远大于二期最小服务验证。
+5. RULER 是可配置的合成长上下文能力测试；LongBench v2 是 503 道、8K 到 2M words 的现实多任务质量评估。二者主要测模型有效上下文能力，不单独证明分布式 runtime correctness。
+6. HCP 代码已有 completions SSE 和 [DONE]，但每次 HTTP 自动分配 request_id 且完成即释放，因此可先尝试 vLLM serving 客户端，stateful continuation 仍需独立验收。
+来源：
+- https://docs.vllm.ai/en/latest/cli/bench/serve/
+- https://github.com/ai-dynamo/aiperf
+- https://github.com/ai-dynamo/aiperf/blob/main/docs/tutorials/openai-text-endpoints.md
+- https://github.com/ai-dynamo/aiperf/blob/main/docs/tutorials/multi-turn.md
+- https://github.com/mlcommons/inference
+- https://github.com/NVIDIA/RULER
+- https://github.com/THUDM/LongBench
+边界：这是文档与静态代码审计，未安装或运行 vLLM/AIPerf/MLPerf/RULER，未验证线级兼容、真实三机性能或任何吞吐优势。
+
+_updated: 2026-08-11 13:19:55_
 ### 多请求 service 仍共享 request-sensitive layer state
 
 type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@d1e536a-code-audit`
