@@ -2,6 +2,29 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 6c.0：建立 benchmark 最小双平面观测
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6c0`
+
+[2026-08-12 完成] 6c.0 benchmark 最小双平面观测。
+coordinator 新增 --trace-jsonl <path>：每个完成的请求输出一条 JSONL 记录（keyed by request_id），包含 enqueue/prefill-accepted/first-token/completed elapsed ms、reserved/released bytes、prompt/max tokens、finish_reason 或 error、prefill/decode hops。hop 数按已知 N/L 公式派生（prefill = L*(N-1)，每个 decode step 同样），无需逐 hop 埋点。默认关闭；开启仅追加 JSONL，不改推理结果。
+验收：1) 一个请求可通过 request_id 关联 client 结果与 HCP 记录（request_id 从 1 递增，trace 含同 id）；2) 计数与已知 N/L 公式一致（测试断言 prefill_hops=L*(N-1)、decode_hops=steps*L*(N-1)）；3) disabled 不改变推理结果（TraceSink::new(None) writer=None，lifecycle 调用 no-op）。
+边界：JSONL/现有 /metrics 计数，不引入 Prometheus、trace backend、dashboard、生产告警。
+
+_updated: 2026-08-11 21:37:12_
+### 6c.0 per-request JSONL trace 双平面通过
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6c0`
+
+实现提交 78be1d0（rust: add per-request JSONL trace plane to HTTP service）。
+TDD 与验证：
+1. 新增 2 个 trace_sink 单测：(a) disabled（None 路径）writer 为 None、lifecycle 调用 no-op 且不 panic；(b) N=3 L=24 trace 记录含 enqueue->accepted->2 decode->complete，断言 prefill_hops=48、decode_hops=96、reserved/released 字节、finish_reason 与时间戳字段。
+2. RED/GREEN：首轮 2 个编译错误（elapsed_ms 与 in_flight 的 borrow 冲突；InferenceJob 在 prefill 失败路径被 move 后引用）已修复，随后 2 passed。
+3. 完整回归：cargo test --features tch-backend --lib = 141 passed、0 failed、5 ignored（129 基线 + 3 service_layer_capacities + 4 kv_ledger + 2 batch_request_tokens + 1 release_request + 2 trace_sink）。
+4. rustfmt --edition 2021 与 git diff --check 均 exit 0；改动仅限 coordinator.rs。
+证据边界：trace 平面单测证明字段与 hop 公式；真实 HTTP 服务端到端 trace 由 6c.1 native baseline 完成（证据 evidence-phase2-rust-6c1-native-baseline-20260812）。
+
+_updated: 2026-08-11 21:37:12_
 ### 6b.3：真实 runtime 固化跨 worker DecodeBatch FIFO 合同
 
 type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6b3`
@@ -1767,13 +1790,13 @@ type: `task` · status: `superseded` · confidence: 1.0 · importance: 0.94 · s
 边界：这里测 HCP service，不把不同硬件总量的结果误称为算法公平 speedup；vLLM engine baseline 属后续受控对照。
 
 _updated: 2026-08-11 19:10:38_
-### 二期下一检查点：6c.0 benchmark 双平面观测
+### 二期下一检查点：6c.1 native 服务稳定性基线
 
-type: `session` · status: `active` · confidence: 1.0 · importance: 0.9 · source: `hetero-cp-ringattn@6b3`
+type: `session` · status: `active` · confidence: 1.0 · importance: 0.9 · source: `hetero-cp-ringattn@6c0`
 
-6b.3 已完成并验证：DecodeBatch FIFO 合同（按 request_id 排序 + 原样广播）与 request release 均以单测锁定。下一候选节点保持 pending：建立 benchmark 最小双平面观测——request queue/prefill/first-token/decode/release 与 ring hops/bytes/reserved bytes 可关联。
+6c.0 已完成并验证：--trace-jsonl 输出 per-request 双平面记录。下一候选节点保持 pending：用仓库原生 HTTP smoke/测试客户端运行 concurrency 1、2、4 与不等长请求，验证 0 错误、token/reference、queue/active/release、reserved bytes 与 ring hops/bytes。结果是二期内部稳定性基线，不是 vLLM benchmark 性能结论。
 
-_updated: 2026-08-11 21:10:32_
+_updated: 2026-08-11 21:37:12_
 ### 三期：vLLM bench serve 实测与 vLLM 生态接入
 
 type: `task` · status: `deferred` · confidence: 1.0 · importance: 0.9 · source: `user-correction-20260812`
@@ -1785,16 +1808,6 @@ type: `task` · status: `deferred` · confidence: 1.0 · importance: 0.9 · sour
 该阶段不得反向改写已验证的 HCP core 数学，生态接入与 benchmark 对照分别独立节点。
 
 _updated: 2026-08-11 19:10:38_
-### 6c.0：建立 benchmark 最小双平面观测
-
-type: `task` · status: `pending` · confidence: 1.0 · importance: 0.9 · source: `user-confirmed-20260812`
-
-问题：vLLM client 只能看到 HTTP 时延，不能证明 HCP capacity placement、neighbor-only ring 和 KV 通信性质。
-动作：保留 client TTFT/TPOT/ITL/E2EL；HCP 侧按 request_id 输出结构化 queue/prefill/first-token/decode 时间、reserved/released bytes、phase hops/bytes、completion/error/release。
-验收：一个请求可以通过 request_id 关联 client 结果与 HCP 记录；计数与已知 N/L 公式一致；disabled 时不改变推理结果。
-边界：JSONL/现有 metrics 即可，不引入 Prometheus、trace backend、dashboard 或生产告警。
-
-_updated: 2026-08-11 18:57:00_
 ### 跨设备 BF16 验证的 argmax 判据必须容忍精确平局翻转
 
 type: `belief` · status: `held` · confidence: 0.98 · importance: 0.9 · source: `hetero-cp-ringattn@9ab909b`
