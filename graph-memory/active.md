@@ -2,6 +2,17 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 6a.2 N=2 synthetic Q-ring 多请求隔离 oracle
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-11`
+
+二期 6a.2：N=2 synthetic Q-ring 多请求隔离 oracle。
+
+范围：两个不同长度 request 在两个同步 Q-ring worker backend 上交错执行分片 prefill 与多轮 decode；每个 request 的 prefill/首轮及后续 decode logits、greedy token 必须分别匹配完全独立的单域 reference backend。
+
+验收：focused test 通过；不改变生产 runtime、HTTP、QUIC、三机或性能路径；不得把现有 legacy fallback 风险误标为已关闭。
+
+_updated: 2026-08-11 16:58:49_
 ### 6a.1 不等长多请求独立参考 correctness oracle
 
 type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@fe3aedc`
@@ -1319,6 +1330,30 @@ type: `decision` · status: `held` · confidence: 0.95 · importance: 0.96 · so
 结论：Node 4b DEFER multi-query continuation ring，只实现有证据的 KV-ring correctness；把 Q-ring 作为独立路线选择记忆，待 baseline 可运行后按 payload bytes 与实测带宽决定。VERDICT: DEFER。
 
 _updated: 2026-08-03 09:14:32_
+### Q-ring 多请求依赖跨 worker request FIFO 顺序
+
+type: `risk` · status: `open` · confidence: 0.95 · importance: 0.95 · source: `evidence-route-b-6a2-qring-unequal-isolation-20260812`
+
+当前 Q-ring packet 只含 layer/Q/O/LSE/scale，没有 request_id。6a.2 证明相同 request 顺序下的 isolation，但若不同 worker 的 batch scheduler 重排 request，FIFO packet 可能错配或阻塞。后续 6b/6c 接入真实 service scheduler 前，需要选择并验证：中心调度器保证全 worker 顺序一致，或为 packet 增加 request route metadata。
+
+_updated: 2026-08-11 16:58:49_
+### 6a.2 使用 N=2 Q-ring request isolation oracle
+
+type: `decision` · status: `held` · confidence: 0.95 · importance: 0.95 · source: `motivation-analysis-2026-08-11`
+
+动机剖析六问：
+1. 问题：6a.1 的 N=1 unequal-prefix isolation oracle 没有经过 Q-ring rendezvous，无法发现多个 request 共用 ring phase、packet route、seq offset 或 prefill_done 状态时的串扰。
+2. 当前状态：HcpRingAttentionBackend 已有支持 Q-ring packet 的 transport 合同与单 request/多 worker correctness 测试；LinkedMockKvTransport 是顺序驱动且 supports_ring_packets=false，会走 legacy KV resend，不能作为本节点证据。
+3. 终态：两个 worker 同步运行 N=2 Q-ring；request A/B 使用不同 prefix 长度并交错推进；各自 prefill logits、首个 decode 和固定后续 horizon 的 logits/token 与独立 reference 对齐。RED 时只定位 request-local snapshot/phase bug，GREEN 时仅关闭 Q-ring correctness 这一风险子集。
+4. 他者：Ring Attention 与主流 CP 实现都要求每个 step 的 query/softmax state 与 KV packet 按 ring step rendezvous；服务引擎通常把 request metadata 隔离在 scheduler/block table 中。其 collective、paged allocator 和中心 scheduler 不直接适用 HCP 的 neighbor-only P2P ring，但 request-local metadata 隔离原则可复用。
+5. 本方案：复用 ring.rs 已有支持 Q-ring 的 test transport；为两个 worker backend 配置 per-layer Q-ring transports；用不同长度 prompt 做 capacity-weighted 分片 prefill；两个 request 交错调用 decode，所有 worker 同步参与，分别以独立单域 reference 比较 logits/argmax。若失败，再最小化检查 seq_offset、prefill_kv_len、is_prefill_done 是否需要 request-local snapshot，不预先扩大接口。
+6. 为什么：这是验证核心 HCP decode ring 在多请求场景下的最小闭环，直接覆盖当前 blocker，而不引入 planner/ledger/HTTP 等尚未必要的工程复杂度；独立 reference 能避免共享错误导致假通过。
+
+牺牲审查：本节点不测 QUIC/真实硬件/吞吐和 failure recovery；这些能力的证明被延后，不影响当前 correctness 结论。
+
+VERDICT: IMPLEMENT。
+
+_updated: 2026-08-11 15:58:27_
 ### KV-ring continuation 正确但会重传完整历史 shard
 
 type: `risk` · status: `open` · confidence: 1.0 · importance: 0.95 · source: `analysis-2026-08-03`

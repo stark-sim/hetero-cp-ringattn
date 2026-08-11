@@ -2,6 +2,33 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### [2026-08-12] 6a.2 N=2 Q-ring unequal-prefix request isolation oracle 通过
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@3b9d912`
+
+实现提交 `3b9d912`。focused test `test_decode_qring_request_isolation_with_unequal_prefixes` 通过：
+
+1. 两个 request A/B 使用长度 4/6 的不同 prompt；两个 worker 各自保留不均等 prefix shard（A 为 1:3，B 为 2:4），每层使用 ReservedPositioned KV。
+2. prefill 通过真实双向 TCP KV transport；同一复合 transport 同时提供 mpsc Q-ring packet rendezvous，避免替换 transport 时重置 attention phase。
+3. prefill 后显式同步两个 worker 的 request global horizon；两个 worker 以相同 `[A,B]` 顺序交错执行 3 轮 `decode_batch`。
+4. 两个 request 的 prefill tail logits、每轮 decode logits 与完全独立 reference 的 max diff < 1e-3，greedy argmax token 逐轮一致。
+5. 每层 KV position 精确匹配 prefix + `global_position % 2` growth 归属；最终 request horizon 分别为 7/9。
+
+验证：`LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib:/opt/homebrew/opt/libomp/lib cargo test --manifest-path rust/Cargo.toml --features tch-backend --lib` -> 125 passed, 0 failed, 5 ignored；focused test 通过；`cargo clippy --features tch-backend --all-targets --message-format short` exit 0；rustfmt 与 `git diff --check` 通过。
+
+边界：CPU float32 synthetic 2-layer/2-domain；Q-ring packet 当前没有 request_id，因此证据只覆盖所有 worker 遵守相同 request FIFO 顺序的调度合同；不证明不同 worker request 顺序、QUIC、MPS/CUDA/HIP、HTTP、吞吐或故障恢复。
+
+_updated: 2026-08-11 16:58:49_
+### [2026-08-12] 多请求 Q-ring 前必须同步 request horizon，且 packet FIFO 顺序是当前合同
+
+type: `lesson` · status: `held` · confidence: 1.0 · importance: 0.9 · source: `hetero-cp-ringattn@3b9d912`
+
+6a.2 的两次诊断形成可复用约束：
+1. 分片 prefill 后各 worker 的 `global_seq_len` 可能只是本地 chunk 末端；decode 前必须由 coordinator 对每个 request 广播全局 horizon，否则不同 worker 为同一 token 生成不同 position_ids/Q。
+2. `RingPacket` 当前不携带 request_id；在不改 wire contract 的前提下，所有 worker 必须按同一 request 顺序进入每层 Q-ring，per-layer FIFO 才能保持 packet 与 request 对齐。
+3. `setup_kv_transports()` 会通过 `set_distributed()` 重置 attention phase；测试或 runtime 不能在 prefill 后直接替换 transport 并假设 Q-ring gate 仍打开。
+
+_updated: 2026-08-11 16:58:49_
 ### 6a.1 不等长 prompt 独立参考 oracle 通过
 
 type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@fe3aedc`
