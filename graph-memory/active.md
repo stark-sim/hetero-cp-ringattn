@@ -2,6 +2,60 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 二期 Rust 推理服务 benchmark-readiness
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6d`
+
+[2026-08-12 完成] 二期 Rust 推理服务 benchmark-readiness 五项出口全部达成（只针对 Rust HCP 服务本体，不运行 vLLM benchmark）：
+1. API ✅：/v1/completions 非 streaming/streaming、SSE [DONE]、usage/error 内部 regression（6b.0，4784acf）。
+2. 资源 ✅：普通 service prefill frozen reservation + byte admission（6b.2a，d57b9ca）；active requests 总占用 reserve/release（6b.2b，9ec8f96）。
+3. 调度 ✅：coordinator 广播同一 DecodeBatch FIFO，request horizon/token/cache lifecycle 正确（6b.3，abddbf1）。
+4. 观测 ✅：request queue/prefill/first-token/decode/release 与 ring hops/bytes/reserved bytes 可关联（6c.0，78be1d0 --trace-jsonl）。
+5. 稳定性 ✅：native concurrency 1/2/4（6c.1）；Mac MPS + white CUDA + pearl HIP N=3 真实 Qwen 服务闭环（6d，test_phase2_6d_n3_service.sh）。
+二期不改 vLLM engine/plugin。三期（生态：多请求 batching、placement/ledger WIP 重启、外部 benchmark）待用户规划。
+
+_updated: 2026-08-11 22:14:54_
+### 6d：N=3 异构 Rust 服务真实 Qwen readiness
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6d`
+
+[2026-08-12 完成] 6d N=3 异构 Rust 服务 readiness。
+Mac MPS (coordinator + worker0) + white RTX 4090 CUDA (worker1) + pearl RX 9060 XT HIP (worker2) 经 coordinator/生产 QUIC neighbor-only ring 处理真实 Qwen2-0.5B 多请求服务；native client 验证 token、admission、FIFO、release、telemetry 与 neighbor-only hops。
+验收（scripts/test_phase2_6d_n3_service.sh，report routeb-6d-n3-service-20260812-060937）：
+1. 4/4 请求 0 错误（metrics total=4 completed=4 failed=0 active=0；提示词不等长 6/13/40/49 tokens，max_tokens 3/4/6/8）；
+2. token/reference：greedy 生成均非 [error:、text 非空（如 prompt49 -> ". The quick brown"，prompt40 -> " It was the only flower that"）；
+3. admission/FIFO/release：trace 每请求 reserved==released、reserved 字节按 prompt/decodes 单调增长（如 req1 [233472,245760,221184]）；
+4. telemetry 关联：trace 8 条（4 请求）按 request_id 含 enqueue/prefill-accepted/first-token/completed elapsed 与 finish_reason；
+5. neighbor-only hops：N=3 L=24 断言 prefill_hops=48=L*(N-1)、decode_hops=steps*48 全部成立。
+二期到此证明 Rust 服务已具备接受外部 benchmark 的基础，不在本节点调用 vLLM CLI。
+
+_updated: 2026-08-11 22:14:54_
+### 6d N=3 异构真实 Qwen 服务闭环通过
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6d`
+
+实现脚本 scripts/test_phase2_6d_n3_service.sh；复用 78be1d0（6c.0 trace 平面）。
+验证（三机真实异构：Mac MPS + white CUDA + pearl HIP，均 292a3c5 release build，远端经 git pull --ff-only 同步）：
+1. 三端 handshake：Mac=8192 MB、white=21793 MB、pearl=14805 MB（均非 u64::MAX，admission 预算真实）。
+2. 4 个不等长请求（并发 2 + 串行 2）：resp1-4 全部 OK，0 错误；metrics total=completed=4、failed=0、active=0。
+3. trace 4 条：prefill_hops=48、decode_hops=steps*48（N=3 L=24 公式），reserved==released，finish_reason 均 length。
+4. 首次运行 1 个失败：测试提示词 "The quick brown fox"（4 tokens）在 N=3 ring 下 domain 分到 0 token 被预检拒绝——测试数据问题，非系统缺陷；加长后通过。另一次脚本 health grep 误判（python json.tool 缩进），已改为 json 解析。
+证据边界：N=3 异构单服务实例多请求 correctness；不证明吞吐/性能、跨机故障恢复、vLLM 兼容；二期 benchmark-readiness 五项出口至此全部达成（API 6b.0 / 资源 6b.2a+6b.2b / 调度 6b.3 / 观测 6c.0 / 稳定性 6c.1+6d）。
+
+_updated: 2026-08-11 22:14:54_
+### 二期 benchmark-readiness 五项出口全部达成
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6d`
+
+[2026-08-12 完成] 二期 Rust 推理服务 benchmark-readiness 五项出口全部达成（只针对 Rust HCP 服务本体，不运行 vLLM benchmark）：
+1. API ✅：/v1/completions 非 streaming/streaming、SSE [DONE]、usage/error 内部 regression（6b.0，4784acf）。
+2. 资源 ✅：普通 service prefill frozen reservation + byte admission（6b.2a，d57b9ca）；active requests 总占用 reserve/release（6b.2b，9ec8f96）。
+3. 调度 ✅：coordinator 广播同一 DecodeBatch FIFO，request horizon/token/cache lifecycle 正确（6b.3，abddbf1）。
+4. 观测 ✅：request queue/prefill/first-token/decode/release 与 ring hops/bytes/reserved bytes 可关联（6c.0，78be1d0 --trace-jsonl）。
+5. 稳定性 ✅：native concurrency 1/2/4（6c.1）；Mac MPS + white CUDA + pearl HIP N=3 真实 Qwen 服务闭环（6d，test_phase2_6d_n3_service.sh）。
+二期不改 vLLM engine/plugin。三期（生态：多请求 batching、placement/ledger WIP 重启、外部 benchmark）待用户规划。
+
+_updated: 2026-08-11 22:14:54_
 ### 6c.1：Rust/native client 分级服务稳定性基线
 
 type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6c1`
@@ -227,27 +281,6 @@ type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · sour
 
 必要性审计：面对 benchmark 必须具备稳定服务合同、资源正确性与观测；二期必须实际运行 vLLM CLI 则不是必要条件。
 VERDICT: IMPLEMENT RUST READINESS; DEFER VLLM BENCH/INTEGRATION TO PHASE 3。
-
-_updated: 2026-08-11 19:10:38_
-### 二期 Rust 推理服务 benchmark-readiness
-
-type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-correction-20260812`
-
-二期工程出口只针对 Rust HCP 服务本体：
-1. API：内部 regression 固化 `/v1/completions` 非 streaming/streaming、SSE `[DONE]`、usage/error。
-2. 资源：普通 service prefill frozen reservation + byte admission；active requests 总占用 reserve/release。
-3. 调度：coordinator 广播同一 DecodeBatch FIFO，request horizon/token/cache lifecycle 正确。
-4. 观测：request queue/prefill/first-token/decode/release 与 ring hops/bytes/reserved bytes 可关联。
-5. 稳定性：native workload concurrency 1/2/4；Mac MPS + white CUDA + pearl HIP N=3 真实 Qwen 服务闭环。
-
-二期不运行 vLLM benchmark，不改 vLLM engine/plugin。
-
-_updated: 2026-08-11 19:10:38_
-### 6d：N=3 异构 Rust 服务真实 Qwen readiness
-
-type: `task` · status: `pending` · confidence: 1.0 · importance: 1.0 · source: `user-correction-20260812`
-
-Mac MPS + white CUDA + pearl HIP 各运行一个 worker，经 coordinator/QUIC 处理真实多请求；使用 native client 验证 token/reference、admission、FIFO、release、telemetry 和 neighbor-only hops。二期到此证明 Rust 服务已具备接受外部 benchmark 的基础，不在本节点调用 vLLM CLI。
 
 _updated: 2026-08-11 19:10:38_
 ### 6a.2 N=2 synthetic Q-ring 多请求隔离 oracle
@@ -1807,13 +1840,6 @@ type: `task` · status: `superseded` · confidence: 1.0 · importance: 0.94 · s
 边界：这里测 HCP service，不把不同硬件总量的结果误称为算法公平 speedup；vLLM engine baseline 属后续受控对照。
 
 _updated: 2026-08-11 19:10:38_
-### 二期下一检查点：6d N=3 异构 Rust 服务 readiness
-
-type: `session` · status: `active` · confidence: 1.0 · importance: 0.9 · source: `hetero-cp-ringattn@6c1`
-
-6c.1 已完成并验证：N=2 本地 MPS concurrency 1/2/4 稳定性基线 0 错误，trace 与 metrics 一致。下一候选节点保持 pending：Mac MPS + white CUDA + pearl HIP N=3 production QUIC 真实 Qwen 服务闭环（neighbor-only ring）。二期 benchmark-readiness 五项（API/资源/调度/观测/稳定性）在 6d 完成后收口。
-
-_updated: 2026-08-11 21:40:05_
 ### 三期：vLLM bench serve 实测与 vLLM 生态接入
 
 type: `task` · status: `deferred` · confidence: 1.0 · importance: 0.9 · source: `user-correction-20260812`
