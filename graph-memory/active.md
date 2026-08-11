@@ -4,7 +4,7 @@
 
 ### 二期 benchmark 分层：HCP oracle + vLLM serving，AIPerf/RULER 后置
 
-type: `decision` · status: `held` · confidence: 0.95 · importance: 1.0 · source: `official-source-and-code-audit-2026-08-11`
+type: `decision` · status: `superseded` · confidence: 0.95 · importance: 1.0 · source: `official-source-and-code-audit-2026-08-11`
 
 动机剖析六问：
 1. 问题：单元测试和单次三机 smoke 不能衡量基础推理服务在并发到达、流式输出、长短请求混合时的正确性与时延，也不能形成可与主流引擎对照的标准指标。
@@ -22,45 +22,10 @@ D. continuation：必须由同一 HCP request/session 复用原 KV 的专用测�
 状态：待用户审查后进入实现。
 VERDICT: IMPLEMENT（若用户确认）。
 
-_updated: 2026-08-11 18:57:00_
-### 6b.0：vLLM bench serve 单请求线级兼容探测
-
-type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-20260812`
-
-【下一节点，仅做探测，不改行为】
-问题：静态审计只能说明 HCP API 接近 OpenAI completions，不能证明实际 `vllm bench serve` parser 能消费 request/SSE/[DONE]。
-动作：新会话先读取 infrastructure inventory，选择已有或最小可用的 vLLM CLI 环境；启动现有 HCP service；以 `/v1/completions`、streaming、单 prompt、concurrency=1 发起一次真实 client 请求。
-验收：A) client 成功并产生可解析 serving 指标，则直接关闭本节点并跳过 6b.1；或 B) 保存精确 request/response/parser 错误并据此激活 6b.1。
-边界：不声明性能，不修改 vLLM engine，不新增 API 字段，不运行并发或三机。
-
-_updated: 2026-08-11 18:57:00_
-### 6d：Mac MPS + white CUDA + pearl HIP 三机真实 Qwen benchmark
-
-type: `task` · status: `pending` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-20260812`
-
-问题：本地/synthetic serving baseline 不能证明异构 N=3 neighbor-only ring 在真实模型和并发请求下成立。
-动作：按 inventory 当前 endpoint，经本地 commit/push 和远端 git pull 同步；Mac、white、pearl 各运行至少一个 worker；先跑 HCP correctness oracle，再运行低并发 vLLM serving client。
-验收：三平台都执行模型 forward；N=3 predecessor/successor QUIC ring；真实 Qwen 请求 0 错误；token/reference 与 release/admission 守护通过；报告 client 与 HCP 双平面数据。
-边界：先 concurrency 1/2，是否扩到 4 由资源证据决定；不声明生产级容错或跨硬件绝对公平性能。
-
-_updated: 2026-08-11 18:57:00_
-### 新对话恢复点：从 6b.0 vLLM client 线级探测开始
-
-type: `session` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-20260812`
-
-恢复信息：
-- worktree: `/Users/stark_sim/.config/superpowers/worktrees/hetero-cp-ringattn/route-b-continuation-stationary-packet`
-- branch: `codex/route-b-continuation-stationary-packet`
-- 已确认架构：vLLM bench serve 作为 black-box client；DEFER vLLM engine integration。
-- 当前下一任务：`task-phase2-benchmark-6b0-wire-probe-20260812`，只做单请求真实 client probe，不先改 API。
-- 6a.2 已证明 N=2、同序 FIFO 下两个不等长 request 的 Q-ring isolation；真实 runtime FIFO 合同仍由 6b.3 验证。
-- 保留未跟踪 `models` 与 `reports/**`，不得提交或删除。
-- 每个子节点实施前仍需独立动机剖析、验证、代码 commit、Graph Memory evidence commit。
-
-_updated: 2026-08-11 18:57:00_
+_updated: 2026-08-11 19:10:38_
 ### 二期 benchmark：HCP serving contract 与 vLLM bench serve 黑盒接入
 
-type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-12`
+type: `task` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-12`
 
 目标：让现有 Rust HCP 服务作为 OpenAI-compatible black-box 被 `vllm bench serve` 驱动，并在不嵌入 vLLM engine 的前提下，完成 correctness、request lifecycle、capacity admission、HCP ring telemetry 与小并发 serving baseline。
 
@@ -72,7 +37,114 @@ type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source
 
 边界：不把 vLLM scheduler/paged KV/NCCL backend 搬入 Rust；不把通用 benchmark 的 multi-turn 当作 HCP 原地 continuation 证据。
 
-_updated: 2026-08-11 17:49:40_
+_updated: 2026-08-11 19:10:38_
+### 6b.0：vLLM bench serve 单请求线级兼容探测
+
+type: `task` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-20260812`
+
+【下一节点，仅做探测，不改行为】
+问题：静态审计只能说明 HCP API 接近 OpenAI completions，不能证明实际 `vllm bench serve` parser 能消费 request/SSE/[DONE]。
+动作：新会话先读取 infrastructure inventory，选择已有或最小可用的 vLLM CLI 环境；启动现有 HCP service；以 `/v1/completions`、streaming、单 prompt、concurrency=1 发起一次真实 client 请求。
+验收：A) client 成功并产生可解析 serving 指标，则直接关闭本节点并跳过 6b.1；或 B) 保存精确 request/response/parser 错误并据此激活 6b.1。
+边界：不声明性能，不修改 vLLM engine，不新增 API 字段，不运行并发或三机。
+
+_updated: 2026-08-11 19:10:38_
+### 6d：Mac MPS + white CUDA + pearl HIP 三机真实 Qwen benchmark
+
+type: `task` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-20260812`
+
+问题：本地/synthetic serving baseline 不能证明异构 N=3 neighbor-only ring 在真实模型和并发请求下成立。
+动作：按 inventory 当前 endpoint，经本地 commit/push 和远端 git pull 同步；Mac、white、pearl 各运行至少一个 worker；先跑 HCP correctness oracle，再运行低并发 vLLM serving client。
+验收：三平台都执行模型 forward；N=3 predecessor/successor QUIC ring；真实 Qwen 请求 0 错误；token/reference 与 release/admission 守护通过；报告 client 与 HCP 双平面数据。
+边界：先 concurrency 1/2，是否扩到 4 由资源证据决定；不声明生产级容错或跨硬件绝对公平性能。
+
+_updated: 2026-08-11 19:10:38_
+### 新对话恢复点：从 6b.0 vLLM client 线级探测开始
+
+type: `session` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-20260812`
+
+恢复信息：
+- worktree: `/Users/stark_sim/.config/superpowers/worktrees/hetero-cp-ringattn/route-b-continuation-stationary-packet`
+- branch: `codex/route-b-continuation-stationary-packet`
+- 已确认架构：vLLM bench serve 作为 black-box client；DEFER vLLM engine integration。
+- 当前下一任务：`task-phase2-benchmark-6b0-wire-probe-20260812`，只做单请求真实 client probe，不先改 API。
+- 6a.2 已证明 N=2、同序 FIFO 下两个不等长 request 的 Q-ring isolation；真实 runtime FIFO 合同仍由 6b.3 验证。
+- 保留未跟踪 `models` 与 `reports/**`，不得提交或删除。
+- 每个子节点实施前仍需独立动机剖析、验证、代码 commit、Graph Memory evidence commit。
+
+_updated: 2026-08-11 19:10:38_
+### 二期只做 Rust benchmark-readiness，vLLM benchmark/接入归三期
+
+type: `revision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-correction-20260812`
+
+用户修订阶段边界：上一版把“Rust 服务具备面对 vLLM benchmark 的工程能力”误写成“二期立即运行 vLLM bench serve”。
+
+修订后：
+- 二期：只实现和验证 Rust 服务核心——OpenAI completions 合同、streaming、多请求调度、capacity-weighted reservation、active byte admission、FIFO ring 合同、request release、双平面观测、Mac+white+pearl 三机真实服务稳定性。
+- 三期：实际运行 `vllm bench serve`，根据真实客户端差异做生态兼容；vLLM backend/plugin/paged-KV 等接入也属于三期。
+
+已发生的 white/Mac vLLM CLI 检查只是只读环境盘点；未启动 HCP service、未运行 benchmark、未改 Rust/API。旧计划节点保留并用 supersession 标记。
+VERDICT: REVISE PHASE BOUNDARY。
+
+_updated: 2026-08-11 19:10:38_
+### 先完成 Rust 推理服务 benchmark-readiness，再进入 vLLM 生态阶段
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-correction-20260812`
+
+动机剖析六问：
+1. 问题：把外部 benchmark client 运行提前到二期，会让 API parser 差异和 vLLM 环境问题干扰 Rust 服务核心闭环。
+2. 当前状态：Rust 已有 completions/SSE、scheduler、request context 和 ring correctness；缺口仍是普通 service admission、并发总预算、真实 runtime FIFO、释放和可解释 telemetry。
+3. 终态：二期结束时，Rust 服务通过内部 contract 与 native load acceptance，能稳定处理 concurrency 1/2/4，并在 N=3 异构 QUIC 上保留 correctness/admission/hop-byte 证据；尚未要求实际 vLLM CLI 结果。
+4. 他者：成熟引擎通常先稳定 serving core 与协议合同，再由独立 benchmark/生态 adapter 适配外部工具；vLLM benchmark client 不是 Rust 核心能力的一部分。
+5. 本方案：内部 Axum contract test -> 普通 service reservation/admission -> active request byte accounting -> runtime FIFO oracle -> HCP telemetry -> native service baseline -> N=3 real Qwen；随后三期才运行 vLLM benchmark 和做生态接入。
+6. 为什么：保持阶段可归因、小步和 Rust 主线；避免为了某一版本 vLLM CLI 先修改核心，同时确保三期接入时被测服务已经稳定。
+
+必要性审计：面对 benchmark 必须具备稳定服务合同、资源正确性与观测；二期必须实际运行 vLLM CLI 则不是必要条件。
+VERDICT: IMPLEMENT RUST READINESS; DEFER VLLM BENCH/INTEGRATION TO PHASE 3。
+
+_updated: 2026-08-11 19:10:38_
+### 二期 Rust 推理服务 benchmark-readiness
+
+type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-correction-20260812`
+
+二期工程出口只针对 Rust HCP 服务本体：
+1. API：内部 regression 固化 `/v1/completions` 非 streaming/streaming、SSE `[DONE]`、usage/error。
+2. 资源：普通 service prefill frozen reservation + byte admission；active requests 总占用 reserve/release。
+3. 调度：coordinator 广播同一 DecodeBatch FIFO，request horizon/token/cache lifecycle 正确。
+4. 观测：request queue/prefill/first-token/decode/release 与 ring hops/bytes/reserved bytes 可关联。
+5. 稳定性：native workload concurrency 1/2/4；Mac MPS + white CUDA + pearl HIP N=3 真实 Qwen 服务闭环。
+
+二期不运行 vLLM benchmark，不改 vLLM engine/plugin。
+
+_updated: 2026-08-11 19:10:38_
+### 6b.0：Rust 内部固化 benchmark-ready completions 合同
+
+type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-correction-20260812`
+
+【当前下一节点】
+问题：现有 API 有实现但缺少针对 benchmark-ready contract 的内部 regression，不能在不依赖外部 client 的情况下守住 wire semantics。
+动作：对 Axum router/handler 建最小测试，覆盖 non-streaming JSON、streaming SSE token chunk、最终 finish_reason 与 `[DONE]`、usage/request id、malformed request/error；只验证当前支持的 completions 子集。
+验收：focused Rust tests RED/GREEN；现有 API/runtime tests 回归；不启动 vLLM CLI。
+边界：不新增 chat、鉴权、beam search、复杂 sampling 或完整 OpenAI 兼容层。
+
+_updated: 2026-08-11 19:10:38_
+### 6d：N=3 异构 Rust 服务真实 Qwen readiness
+
+type: `task` · status: `pending` · confidence: 1.0 · importance: 1.0 · source: `user-correction-20260812`
+
+Mac MPS + white CUDA + pearl HIP 各运行一个 worker，经 coordinator/QUIC 处理真实多请求；使用 native client 验证 token/reference、admission、FIFO、release、telemetry 和 neighbor-only hops。二期到此证明 Rust 服务已具备接受外部 benchmark 的基础，不在本节点调用 vLLM CLI。
+
+_updated: 2026-08-11 19:10:38_
+### 新对话/当前恢复点：二期 Rust API contract，不运行 vLLM benchmark
+
+type: `session` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-correction-20260812`
+
+当前 worktree `/Users/stark_sim/.config/superpowers/worktrees/hetero-cp-ringattn/route-b-continuation-stationary-packet`，branch `codex/route-b-continuation-stationary-packet`。
+用户明确：二期是 Rust 工程性 readiness；vLLM benchmark 与 vLLM 接入属于三期。
+下一任务：`task-phase2-rust-6b0-api-contract-20260812`。先做每节点动机剖析和 Axum internal contract RED/GREEN。
+保留未跟踪 `models`、`reports/**`。
+
+_updated: 2026-08-11 19:10:38_
 ### 6a.2 N=2 synthetic Q-ring 多请求隔离 oracle
 
 type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-11`
@@ -1317,7 +1389,7 @@ C. Rust decode 移植 Q+LSE 累积器环+增长分片(修 007+008)。
 _updated: 2026-07-27 15:10:25_
 ### vLLM bench serve 作为黑盒客户端，不接入 vLLM engine
 
-type: `decision` · status: `held` · confidence: 0.96 · importance: 0.98 · source: `motivation-analysis-and-official-vllm-bench-audit-2026-08-12`
+type: `decision` · status: `superseded` · confidence: 0.96 · importance: 0.98 · source: `motivation-analysis-and-official-vllm-bench-audit-2026-08-12`
 
 动机剖析六问：
 1. 问题：HCP 需要面对公开 serving benchmark，但当前“有 HTTP endpoint”尚未被标准 client 逐项验证，也缺普通 service prefill 的 capacity admission 与 HCP-specific telemetry。
@@ -1335,7 +1407,7 @@ type: `decision` · status: `held` · confidence: 0.96 · importance: 0.98 · so
 
 VERDICT: IMPLEMENT serving-contract path; DEFER vLLM-engine integration.
 
-_updated: 2026-08-11 18:57:00_
+_updated: 2026-08-11 19:10:38_
 ### 6b.2a：普通 service prefill 接入冻结 reservation 与 byte admission
 
 type: `task` · status: `pending` · confidence: 1.0 · importance: 0.98 · source: `user-confirmed-20260812`
@@ -1431,6 +1503,13 @@ type: `decision` · status: `held` · confidence: 0.95 · importance: 0.96 · so
 结论：Node 4b DEFER multi-query continuation ring，只实现有证据的 KV-ring correctness；把 Q-ring 作为独立路线选择记忆，待 baseline 可运行后按 payload bytes 与实测带宽决定。VERDICT: DEFER。
 
 _updated: 2026-08-03 09:14:32_
+### 6c.1：Rust/native client 分级服务稳定性基线
+
+type: `task` · status: `pending` · confidence: 1.0 · importance: 0.95 · source: `user-correction-20260812`
+
+在 admission、FIFO 和 telemetry 完成后，用仓库原生 HTTP smoke/测试客户端运行 concurrency 1、2、4 与不等长请求，验证 0 错误、token/reference、queue/active/release、reserved bytes 与 ring hops/bytes。结果是二期内部稳定性基线，不是 vLLM benchmark 性能结论。
+
+_updated: 2026-08-11 19:10:38_
 ### 6b.0 先用真实 vLLM client 探测，不预写 adapter
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `user-confirmed-continue-20260812`
@@ -1636,14 +1715,25 @@ type: `belief` · status: `held` · confidence: 0.85 · importance: 0.95 · sour
 _updated: 2026-06-29 14:32:15_
 ### 6c.1：vLLM bench serve 分级 serving baseline
 
-type: `task` · status: `pending` · confidence: 1.0 · importance: 0.94 · source: `user-confirmed-20260812`
+type: `task` · status: `superseded` · confidence: 1.0 · importance: 0.94 · source: `user-confirmed-20260812`
 
 问题：需要可信的客户端服务曲线，而不是单次 smoke 或未经 admission 的吞吐数字。
 动作：固定模型、tokenizer、dataset/sampling/client location 后，依次运行 concurrency=1、2、4，再做小范围 request-rate sweep；每次同时保留 HCP oracle/telemetry。
 验收：报告请求数、错误率、throughput、TTFT/TPOT/ITL/E2EL、goodput（若配置）；并记录每档 active reservation、ring hops/bytes、释放闭环。先要求 0 请求错误，不预设生产 SLO 或胜过 vLLM。
 边界：这里测 HCP service，不把不同硬件总量的结果误称为算法公平 speedup；vLLM engine baseline 属后续受控对照。
 
-_updated: 2026-08-11 18:57:00_
+_updated: 2026-08-11 19:10:38_
+### 三期：vLLM bench serve 实测与 vLLM 生态接入
+
+type: `task` · status: `deferred` · confidence: 1.0 · importance: 0.9 · source: `user-correction-20260812`
+
+二期 Rust readiness 完成后：
+1. 用实际 `vllm bench serve` 驱动 HCP endpoint，按真实 parser/metric 差异做最小兼容；
+2. 建立受控 vLLM baseline 对照；
+3. 再评估 vLLM backend/plugin、paged KV 或其他生态接口。
+该阶段不得反向改写已验证的 HCP core 数学，生态接入与 benchmark 对照分别独立节点。
+
+_updated: 2026-08-11 19:10:38_
 ### 6c.0：建立 benchmark 最小双平面观测
 
 type: `task` · status: `pending` · confidence: 1.0 · importance: 0.9 · source: `user-confirmed-20260812`
@@ -1875,7 +1965,7 @@ type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.9 · sou
 _updated: 2026-06-29 06:06:09_
 ### 6b.1：按真实 client 错误补最小 completions 合同
 
-type: `task` · status: `conditional` · confidence: 1.0 · importance: 0.85 · source: `user-confirmed-20260812`
+type: `task` · status: `superseded` · confidence: 1.0 · importance: 0.85 · source: `user-confirmed-20260812`
 
 【条件节点，仅在 6b.0 RED 时激活】
 问题：实际 vLLM client 若不能解析当前 request/response/SSE，需要线级兼容修补。
@@ -1883,7 +1973,7 @@ type: `task` · status: `conditional` · confidence: 1.0 · importance: 0.85 · 
 验收：focused contract test RED/GREEN；同一个 vLLM 单请求 probe 转绿；现有 API tests 回归通过。
 边界：不实现 chat endpoint、鉴权、beam search、复杂 sampling 或完整 OpenAI API。若 6b.0 GREEN，本节点标记 skipped。
 
-_updated: 2026-08-11 18:57:00_
+_updated: 2026-08-11 19:10:38_
 ### 任务E:plugin 线 successor-seeded 优化(owner 最后归并,每层 N 跳→N-1 跳)
 
 type: `task` · status: `rejected` · confidence: 0.99 · importance: 0.85 · source: `user-direction`
