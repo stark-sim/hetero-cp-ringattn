@@ -2,6 +2,30 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 6c.1：Rust/native client 分级服务稳定性基线
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6c1`
+
+[2026-08-12 完成] 6c.1 native 服务稳定性基线。
+新增 scripts/test_phase2_6c1_native_baseline.sh：本地 Mac MPS 2-domain 真实 HTTP 服务（HCP_TCH_DEVICE=mps、Qwen2-0.5B），带 --trace-jsonl 运行 concurrency 1（2 串行不等长）、2（2 同时不等长）、4（4 同时不等长），共 8 个请求。
+验收：1) 0 错误：8/8 请求完成，metrics failed=0、active=0；2) token/reference：greedy 生成均非 [error:，text 非空；3) queue/active/release：metrics total=completed=8、queued=0；4) reserved bytes 与 release 一致（trace 每请求 reserved==released，字节数随 prompt/decodes 单调增长）；5) ring hops/bytes：trace 断言 prefill_hops=24=L*(N-1)（N=2 L=24）、decode_hops=decode_steps*24。
+边界：这是二期内部稳定性基线，不是 vLLM benchmark 性能结论；仅 Mac 本机 MPS 2-domain（N=3 异构见 6d）。
+
+_updated: 2026-08-11 21:40:05_
+### 6c.1 native 服务稳定性基线通过（N=2 concurrency 1/2/4）
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6c1`
+
+实现脚本 scripts/test_phase2_6c1_native_baseline.sh；配套实现 78be1d0（6c.0 trace 平面，本基线复用）。
+验证（本地 Mac MPS、N=2、L=24、Qwen2-0.5B、release build）：
+1. concurrency 1：2 串行不等长请求（prompt 2/33 tokens，max_tokens 3/8）→ responses=2 errors=0。
+2. concurrency 2：2 同时不等长（prompt 8/3，max 6/2）→ responses=2 errors=0。
+3. concurrency 4：4 同时不等长（prompt 2/13/26/3，max 4/10/7/1）→ responses=4 errors=0。
+4. /metrics 后验：total=completed=8、failed=0、queued=0、active=0。
+5. trace 8 条记录：request_id 1..8；每请求 prefill_accepted/completed elapsed > 0、error=null、reserved==released（如 req2 prompt33 max8 reserved=[258048,245760]）；prefill_hops=24=L*(N-1)、decode_hops=steps*24；finish_reason 均 length。
+证据边界：Mac 本机 MPS 2-domain 稳定性基线；不证明 N=3 异构（white CUDA/pearl HIP）、真实网络、吞吐或 vLLM 兼容；不含性能结论。
+
+_updated: 2026-08-11 21:40:05_
 ### 6c.0：建立 benchmark 最小双平面观测
 
 type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6c0`
@@ -1570,13 +1594,6 @@ type: `decision` · status: `held` · confidence: 1.0 · importance: 0.95 · sou
 VERDICT: IMPLEMENT CONTRACT REGRESSION。
 
 _updated: 2026-08-11 19:23:51_
-### 6c.1：Rust/native client 分级服务稳定性基线
-
-type: `task` · status: `pending` · confidence: 1.0 · importance: 0.95 · source: `user-correction-20260812`
-
-在 admission、FIFO 和 telemetry 完成后，用仓库原生 HTTP smoke/测试客户端运行 concurrency 1、2、4 与不等长请求，验证 0 错误、token/reference、queue/active/release、reserved bytes 与 ring hops/bytes。结果是二期内部稳定性基线，不是 vLLM benchmark 性能结论。
-
-_updated: 2026-08-11 19:10:38_
 ### 6b.0 先用真实 vLLM client 探测，不预写 adapter
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `user-confirmed-continue-20260812`
@@ -1790,13 +1807,13 @@ type: `task` · status: `superseded` · confidence: 1.0 · importance: 0.94 · s
 边界：这里测 HCP service，不把不同硬件总量的结果误称为算法公平 speedup；vLLM engine baseline 属后续受控对照。
 
 _updated: 2026-08-11 19:10:38_
-### 二期下一检查点：6c.1 native 服务稳定性基线
+### 二期下一检查点：6d N=3 异构 Rust 服务 readiness
 
-type: `session` · status: `active` · confidence: 1.0 · importance: 0.9 · source: `hetero-cp-ringattn@6c0`
+type: `session` · status: `active` · confidence: 1.0 · importance: 0.9 · source: `hetero-cp-ringattn@6c1`
 
-6c.0 已完成并验证：--trace-jsonl 输出 per-request 双平面记录。下一候选节点保持 pending：用仓库原生 HTTP smoke/测试客户端运行 concurrency 1、2、4 与不等长请求，验证 0 错误、token/reference、queue/active/release、reserved bytes 与 ring hops/bytes。结果是二期内部稳定性基线，不是 vLLM benchmark 性能结论。
+6c.1 已完成并验证：N=2 本地 MPS concurrency 1/2/4 稳定性基线 0 错误，trace 与 metrics 一致。下一候选节点保持 pending：Mac MPS + white CUDA + pearl HIP N=3 production QUIC 真实 Qwen 服务闭环（neighbor-only ring）。二期 benchmark-readiness 五项（API/资源/调度/观测/稳定性）在 6d 完成后收口。
 
-_updated: 2026-08-11 21:37:12_
+_updated: 2026-08-11 21:40:05_
 ### 三期：vLLM bench serve 实测与 vLLM 生态接入
 
 type: `task` · status: `deferred` · confidence: 1.0 · importance: 0.9 · source: `user-correction-20260812`

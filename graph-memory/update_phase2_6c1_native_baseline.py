@@ -14,7 +14,6 @@ SESSION_NEXT = "session-next-phase2-rust-6d-n3-service-20260812"
 TASK_6D = "task-phase2-rust-6d-n3-service-readiness-20260812"
 TASK_6C0 = "task-phase2-benchmark-6c0-observability-20260812"
 EV_6C0 = "evidence-phase2-rust-6c0-observability-20260812"
-SCRIPT = "scripts/test_phase2_6c1_native_baseline.sh"
 
 
 def upsert_node(conn, node_id, node_type, layer, title, content, status, importance, confidence, source):
@@ -107,7 +106,6 @@ def main():
         (EVIDENCE, TASK, "SUPPORTS", "evidence supports task completion"),
         (EV_6C0, EVIDENCE, "SUPPORTS", "trace plane enables 6c.1 correlation"),
         (TASK_6C0, TASK, "DEPENDS_ON", "6c.1 builds on 6c.0 observability"),
-        (SCRIPT, EVIDENCE, "BASED_ON", "baseline script is the repeatable artifact"),
         (TASK_6D, SESSION_NEXT, "PART_OF", "next checkpoint targets 6d N=3 service"),
     )
     for edge in edges:
