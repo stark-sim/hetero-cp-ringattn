@@ -12,14 +12,13 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
-use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::StreamExt;
 use tower_http::cors::CorsLayer;
 
 use crate::api::types::{
     CompletionChoice, CompletionRequest, CompletionResponse, CompletionStreamChoice,
-    CompletionStreamResponse, HealthResponse, InferenceJob,
-    MetricsResponse, StreamChunk, Usage,
+    CompletionStreamResponse, HealthResponse, InferenceJob, MetricsResponse, StreamChunk, Usage,
 };
 
 /// Shared state between HTTP handlers and the coordinator.
@@ -94,9 +93,7 @@ async fn completions_handler(
                     }],
                 };
                 let data = serde_json::to_string(&resp).unwrap_or_default();
-                Ok::<_, std::convert::Infallible>(
-                    axum::response::sse::Event::default().data(data),
-                )
+                Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(data))
             })
             .chain(tokio_stream::once(Ok::<_, std::convert::Infallible>(
                 axum::response::sse::Event::default().data("[DONE]"),
@@ -179,4 +176,179 @@ async fn metrics_handler(State(state): State<ApiState>) -> Json<MetricsResponse>
         queued_requests: state.queued_counter.load(Ordering::SeqCst),
         active_requests: state.active_counter.load(Ordering::SeqCst),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::types::InferenceResult;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{header::CONTENT_TYPE, Request};
+    use serde_json::Value;
+    use tokio::sync::mpsc::UnboundedReceiver;
+    use tower::ServiceExt;
+
+    fn test_state() -> (ApiState, UnboundedReceiver<InferenceJob>) {
+        let (job_tx, job_rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            ApiState {
+                job_tx,
+                request_counter: Arc::new(AtomicU64::new(0)),
+                completed_counter: Arc::new(AtomicU64::new(0)),
+                failed_counter: Arc::new(AtomicU64::new(0)),
+                workers_connected: Arc::new(AtomicU64::new(2)),
+                num_domains: 2,
+                model_name: "qwen-test".to_string(),
+                queued_counter: Arc::new(AtomicU64::new(0)),
+                active_counter: Arc::new(AtomicU64::new(0)),
+            },
+            job_rx,
+        )
+    }
+
+    fn completion_request(body: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn non_streaming_completion_preserves_request_and_response_contract() {
+        let (state, mut jobs) = test_state();
+        let app = build_router(state.clone());
+        let coordinator = tokio::spawn(async move {
+            let job = jobs.recv().await.expect("handler must enqueue one job");
+            assert_eq!(job.request_id, 1);
+            assert_eq!(job.prompt, "contract prompt");
+            assert_eq!(job.max_tokens, 3);
+            assert_eq!(job.temperature, 0.25);
+            assert_eq!(job.top_p, 0.9);
+            assert!(job.stream_tx.is_none());
+            assert!(job
+                .tx
+                .send(InferenceResult {
+                    text: " result".to_string(),
+                    prompt_tokens: 2,
+                    completion_tokens: 1,
+                    finish_reason: Some("length".to_string()),
+                })
+                .is_ok());
+        });
+
+        let response = app
+            .oneshot(completion_request(
+                r#"{"model":"served-qwen","prompt":"contract prompt","max_tokens":3,"temperature":0.25,"top_p":0.9}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["id"], "hcp-completion-1");
+        assert_eq!(json["object"], "text_completion");
+        assert_eq!(json["model"], "served-qwen");
+        assert_eq!(json["choices"][0]["text"], " result");
+        assert_eq!(json["choices"][0]["index"], 0);
+        assert_eq!(json["choices"][0]["finish_reason"], "length");
+        assert!(json["choices"][0]["logprobs"].is_null());
+        assert_eq!(json["usage"]["prompt_tokens"], 2);
+        assert_eq!(json["usage"]["completion_tokens"], 1);
+        assert_eq!(json["usage"]["total_tokens"], 3);
+        assert!(json["created"].as_u64().is_some());
+        coordinator.await.unwrap();
+        assert_eq!(state.request_counter.load(Ordering::SeqCst), 1);
+        assert_eq!(state.completed_counter.load(Ordering::SeqCst), 1);
+        assert_eq!(state.failed_counter.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn streaming_completion_emits_json_events_finish_reason_and_done() {
+        let (state, mut jobs) = test_state();
+        let app = build_router(state.clone());
+        let coordinator = tokio::spawn(async move {
+            let mut job = jobs.recv().await.expect("handler must enqueue one job");
+            assert_eq!(job.request_id, 1);
+            assert_eq!(job.prompt, "stream prompt");
+            let chunks = job.stream_tx.take().expect("streaming job needs chunk tx");
+            chunks
+                .send(StreamChunk {
+                    delta: " first".to_string(),
+                    token_id: 11,
+                    finish_reason: None,
+                })
+                .unwrap();
+            chunks
+                .send(StreamChunk {
+                    delta: " second".to_string(),
+                    token_id: 12,
+                    finish_reason: Some("length".to_string()),
+                })
+                .unwrap();
+        });
+
+        let response = app
+            .oneshot(completion_request(
+                r#"{"prompt":"stream prompt","max_tokens":2,"stream":true}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers()[CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream"));
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        let events = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 3);
+        let first: Value = serde_json::from_str(events[0]).unwrap();
+        let second: Value = serde_json::from_str(events[1]).unwrap();
+        assert_eq!(first["id"], "hcp-completion-1");
+        assert_eq!(first["object"], "text_completion");
+        assert_eq!(first["model"], "qwen-test");
+        assert_eq!(first["choices"][0]["text"], " first");
+        assert!(first["choices"][0]["finish_reason"].is_null());
+        assert_eq!(second["id"], first["id"]);
+        assert_eq!(second["choices"][0]["text"], " second");
+        assert_eq!(second["choices"][0]["finish_reason"], "length");
+        assert_eq!(events[2], "[DONE]");
+        coordinator.await.unwrap();
+        assert_eq!(state.request_counter.load(Ordering::SeqCst), 1);
+        assert_eq!(state.failed_counter.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn closed_coordinator_queue_returns_service_unavailable() {
+        let (state, jobs) = test_state();
+        drop(jobs);
+        let response = build_router(state.clone())
+            .oneshot(completion_request(
+                r#"{"prompt":"queue closed","max_tokens":1}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"Coordinator queue is closed");
+        assert_eq!(state.request_counter.load(Ordering::SeqCst), 1);
+        assert_eq!(state.failed_counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_completion_is_rejected_before_enqueue() {
+        let (state, mut jobs) = test_state();
+        let response = build_router(state.clone())
+            .oneshot(completion_request(r#"{"max_tokens":1}"#))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(jobs.try_recv().is_err());
+        assert_eq!(state.request_counter.load(Ordering::SeqCst), 0);
+    }
 }
