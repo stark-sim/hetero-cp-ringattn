@@ -577,13 +577,57 @@ fn prefill_single_request(
     // Apply ring scheduling strategy (vanilla/striped/zigzag).
     let domain_inputs = apply_ring_strategy(&prompt_ids, &chunk_sizes, strategy);
 
+    // Byte-level KV admission: freeze this request's per-domain per-layer
+    // reservation and prove it fits before any worker sees a Prefill command.
+    // Unknown capacity, unit overflow, and one-byte-short all fail closed here.
+    let reservation = service_layer_capacities(
+        &chunk_sizes,
+        seq_len as usize,
+        job.max_tokens,
+        config.num_layers,
+    );
+    let budget_bytes = match capacity_mb_to_bytes(worker_capacities) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = job.tx.send(InferenceResult {
+                text: format!("[error: service KV byte admission failed: {error}]"),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                finish_reason: Some("error".to_string()),
+            });
+            return Err(format!("service KV byte admission failed: {error}"));
+        }
+    };
+    let admission = match admit_reserved_kv_bytes(
+        &reservation,
+        &budget_bytes,
+        config.num_kv_heads(),
+        config.head_dim(),
+        config.kv_element_size_bytes(),
+    ) {
+        Ok(admission) => admission,
+        Err(error) => {
+            let _ = job.tx.send(InferenceResult {
+                text: format!("[error: service KV byte admission failed: {error}]"),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                finish_reason: Some("error".to_string()),
+            });
+            return Err(format!("service KV byte admission failed: {error}"));
+        }
+    };
+    println!(
+        "[coordinator] service request {} KV byte admission: required={:?} budget={budget_bytes:?} bytes_per_token_per_layer={} status=accepted",
+        job.request_id, admission.required_bytes_per_domain, admission.bytes_per_token_per_layer
+    );
+
     // Legacy chunk boundaries (only meaningful for vanilla; kept for ActiveRequest compatibility).
     let mut chunk_boundaries = vec![0usize];
     for size in &chunk_sizes {
         chunk_boundaries.push(chunk_boundaries.last().unwrap() + size);
     }
 
-    // Prefill
+    // Prefill with the frozen per-domain reservations from admission.
     for (domain_id, (send, _recv)) in worker_streams.iter_mut().enumerate() {
         let (chunk, position_ids, seq_offset) = &domain_inputs[domain_id];
         let cmd = WorkerCommand::Prefill {
@@ -591,7 +635,7 @@ fn prefill_single_request(
             chunk: chunk.clone(),
             seq_offset: *seq_offset,
             position_ids: Some(position_ids.clone()),
-            layer_kv_capacities: None,
+            layer_kv_capacities: Some(reservation[domain_id].clone()),
         };
         if let Err(e) = send_command_quic(send, &cmd, rt.handle()) {
             let _ = job.tx.send(InferenceResult {
@@ -840,6 +884,32 @@ fn reserved_layer_capacities(
             vec![capacity; layers]
         })
         .collect()
+}
+
+/// Per-domain per-layer reserved KV capacities for a plain service prefill.
+///
+/// The request reserves its full decode horizon up front: the `prompt_len`
+/// prefix split by `chunk_sizes` plus every decode position in
+/// `[prompt_len, prompt_len + max_tokens)`, each owned by `position % domains`
+/// (the same keep rule the ring decode applies at attention/ring.rs). Route-B
+/// continuation offsets are deliberately absent — that path reserves separately.
+fn service_layer_capacities(
+    chunk_sizes: &[usize],
+    prompt_len: usize,
+    max_tokens: usize,
+    layers: usize,
+) -> Vec<Vec<usize>> {
+    let domains = chunk_sizes.len();
+    let decode_positions: Vec<i64> =
+        (prompt_len as i64..(prompt_len + max_tokens) as i64).collect();
+    let no_continuation: Vec<Vec<usize>> = vec![Vec::new(); domains];
+    reserved_layer_capacities(
+        chunk_sizes,
+        &decode_positions,
+        &no_continuation,
+        layers,
+        domains,
+    )
 }
 
 /// Final finisher of a stationary continuation ring run: the finisher of the
@@ -1704,6 +1774,39 @@ mod tests {
         // Single layer: finisher is one hop before the starter.
         assert_eq!(continuation_final_finisher(0, 1, 3).unwrap(), 2);
         assert!(continuation_final_finisher(3, 24, 3).is_err());
+    }
+
+    #[test]
+    fn service_layer_capacities_cover_full_decode_horizon() {
+        // 2 domains, prompt 4 split [1,3], max_tokens=3 -> decode positions
+        // 4,5,6 owned by p%2 = {0,1,0}. Per-layer capacities must match the
+        // golden E2E shape minus the continuation offsets.
+        let capacities = service_layer_capacities(&[1, 3], 4, 3, 24);
+        assert_eq!(capacities.len(), 2);
+        // domain 0: 1 prefix + {4,6} decode = 3; domain 1: 3 prefix + {5} = 4.
+        assert!(capacities[0].iter().all(|&c| c == 3));
+        assert!(capacities[1].iter().all(|&c| c == 4));
+        assert_eq!(capacities[0].len(), 24);
+        assert_eq!(capacities[1].len(), 24);
+    }
+
+    #[test]
+    fn service_layer_capacities_with_zero_max_tokens_reserve_prefix_only() {
+        // No decode steps -> reservation is just the prompt prefix split.
+        let capacities = service_layer_capacities(&[1, 3], 4, 0, 24);
+        assert!(capacities[0].iter().all(|&c| c == 1));
+        assert!(capacities[1].iter().all(|&c| c == 3));
+    }
+
+    #[test]
+    fn service_layer_capacities_three_domains_cover_each_owner() {
+        // 3 domains, prompt 6 split [2,2,2], max_tokens=4 -> decode positions
+        // 6,7,8,9 owned by {0,1,2,0}.
+        let capacities = service_layer_capacities(&[2, 2, 2], 6, 4, 2);
+        // domain 0: 2 + {6,9} = 4; domain 1: 2 + {7} = 3; domain 2: 2 + {8} = 3.
+        assert!(capacities[0].iter().all(|&c| c == 4));
+        assert!(capacities[1].iter().all(|&c| c == 3));
+        assert!(capacities[2].iter().all(|&c| c == 3));
     }
 
     #[test]
