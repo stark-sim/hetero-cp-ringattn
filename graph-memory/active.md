@@ -1431,6 +1431,22 @@ type: `decision` · status: `held` · confidence: 0.95 · importance: 0.96 · so
 结论：Node 4b DEFER multi-query continuation ring，只实现有证据的 KV-ring correctness；把 Q-ring 作为独立路线选择记忆，待 baseline 可运行后按 payload bytes 与实测带宽决定。VERDICT: DEFER。
 
 _updated: 2026-08-03 09:14:32_
+### 6b.0 先用真实 vLLM client 探测，不预写 adapter
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `user-confirmed-continue-20260812`
+
+动机剖析六问：
+1. 问题：HCP API 静态上接近 OpenAI completions，但没有实际 `vllm bench serve` parser 证据；直接实现 adapter 会猜测不存在的缺口。
+2. 当前状态：`/v1/completions` 已支持 prompt/model/max_tokens/temperature/top_p/stream，streaming 返回 `choices[0].text` 与 `[DONE]`；仓库已有无需真实模型的单域 mock-worker service script。inventory 尚未声明 vLLM CLI，因此必须先做只读环境发现。
+3. 终态：在不改 Rust/API 的情况下，真实 vLLM client 对现有 HCP endpoint 发一个 streaming completion；成功则保存 metrics 并跳过 6b.1，失败则保存精确 CLI/request/parser 错误作为 6b.1 RED。
+4. 他者：标准 serving 系统先做 protocol conformance probe，再按真实 client failure 补 contract；benchmark client 与模型执行后端可以分离。
+5. 本方案：先查 inventory 节点现有 vLLM CLI；服务端优先用本地 mock-worker 跑完整 coordinator HTTP lifecycle；client 可从已有 Linux vLLM 环境经 Tailscale 访问 Mac endpoint。若 inventory 无现成 CLI，再单独决定最小安装环境，不在本节点擅自安装。
+6. 为什么：mock worker 足以隔离 HTTP/SSE parser 合同，避免把模型加载、QUIC、异构数值或性能问题混入 wire probe；实际 benchmark 性能仍由后续 6c/6d 验证。
+
+必要性审计：真实 vLLM CLI 是“线级兼容”证据的必要条件；真实模型和三机 ring 不是本节点必要条件。
+VERDICT: IMPLEMENT read-only compatibility probe; NO CODE CHANGE unless actual client is RED。
+
+_updated: 2026-08-11 19:03:47_
 ### Q-ring 多请求依赖跨 worker request FIFO 顺序
 
 type: `risk` · status: `open` · confidence: 0.95 · importance: 0.95 · source: `evidence-route-b-6a2-qring-unequal-isolation-20260812`
