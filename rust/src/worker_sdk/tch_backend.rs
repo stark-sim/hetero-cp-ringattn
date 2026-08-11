@@ -1046,6 +1046,282 @@ mod tests {
         }
     }
 
+    /// Verify two unequal-prefix requests remain isolated while both workers
+    /// execute the request-aware decode path over a shared Q-ring transport.
+    ///
+    /// Prefill uses the real two-worker TCP KV exchange so each request owns
+    /// only its capacity-weighted local prefix.  The same transports expose a
+    /// packet-only rendezvous channel for decode, and A/B advance in the same
+    /// order on both workers, matching the coordinator's batch contract.
+    #[test]
+    fn test_decode_qring_request_isolation_with_unequal_prefixes() {
+        use crate::model::transport::{KvBlock, RingPacket};
+        use std::sync::mpsc;
+
+        struct ChanPacketTransport {
+            kv: crate::model::transport::TcpKvTransport,
+            tx: mpsc::Sender<RingPacket>,
+            rx: mpsc::Receiver<RingPacket>,
+        }
+
+        impl KvTransport for ChanPacketTransport {
+            fn submit_send(&mut self, block: &KvBlock) -> Result<(), String> {
+                self.kv.submit_send(block)
+            }
+
+            fn poll_recv(&mut self) -> Result<Option<KvBlock>, String> {
+                self.kv.poll_recv()
+            }
+
+            fn flush_send(&mut self) -> Result<(), String> {
+                self.kv.flush_send()
+            }
+
+            fn supports_ring_packets(&self) -> bool {
+                true
+            }
+
+            fn submit_send_packet(&mut self, packet: &RingPacket) -> Result<(), String> {
+                self.tx.send(packet.clone()).map_err(|e| e.to_string())
+            }
+
+            fn poll_recv_packet(&mut self) -> Result<Option<RingPacket>, String> {
+                Ok(self.rx.try_recv().ok())
+            }
+
+            fn recv_packet(&mut self) -> Result<Option<RingPacket>, String> {
+                self.rx
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .map(Some)
+                    .map_err(|e| format!("recv Q-ring packet timeout: {e}"))
+            }
+        }
+
+        fn make_config() -> ModelConfig {
+            ModelConfig {
+                architectures: Some(vec!["LlamaForCausalLM".to_string()]),
+                hidden_size: 32,
+                num_layers: 2,
+                num_heads: 4,
+                num_kv_heads: Some(1),
+                intermediate_size: 64,
+                vocab_size: 100,
+                rope_theta: 10000.0,
+                rms_norm_eps: 1e-6,
+                tie_word_embeddings: false,
+                torch_dtype: Some("float32".to_string()),
+                hidden_act: "silu".to_string(),
+                max_position_embeddings: Some(128),
+                attention_dropout: 0.0,
+                bos_token_id: None,
+                eos_token_id: None,
+                use_cache: true,
+                sliding_window: None,
+                use_sliding_window: None,
+                partial_rotary_factor: 1.0,
+            }
+        }
+
+        let device = Device::Cpu;
+        let config = make_config();
+        let weights = create_synthetic_weights(&config, device);
+        let mut backend0 = TchWorkerBackend::from_model(
+            LlamaModel::from_weights(config.clone(), &weights, device, 2).unwrap(),
+            device,
+            0,
+        );
+        let mut backend1 = TchWorkerBackend::from_model(
+            LlamaModel::from_weights(config.clone(), &weights, device, 2).unwrap(),
+            device,
+            1,
+        );
+        let mut reference_a = TchWorkerBackend::from_model(
+            LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap(),
+            device,
+            0,
+        );
+        let mut reference_b = TchWorkerBackend::from_model(
+            LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap(),
+            device,
+            0,
+        );
+
+        let mut transports0: Vec<Box<dyn KvTransport>> = Vec::new();
+        let mut transports1: Vec<Box<dyn KvTransport>> = Vec::new();
+        for _ in 0..config.num_layers {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let stream0 = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let stream1 = listener.accept().unwrap().0;
+            let (tx01, rx01) = mpsc::channel::<RingPacket>();
+            let (tx10, rx10) = mpsc::channel::<RingPacket>();
+            transports0.push(Box::new(ChanPacketTransport {
+                kv: crate::model::transport::TcpKvTransport::new(stream0, device).unwrap(),
+                tx: tx01,
+                rx: rx10,
+            }));
+            transports1.push(Box::new(ChanPacketTransport {
+                kv: crate::model::transport::TcpKvTransport::new(stream1, device).unwrap(),
+                tx: tx10,
+                rx: rx01,
+            }));
+        }
+        backend0.setup_kv_transports(transports0);
+        backend1.setup_kv_transports(transports1);
+
+        let prompt_a: Vec<i64> = (0..4).collect();
+        let prompt_b: Vec<i64> = (10..16).collect();
+        let capacities_a0 = vec![5; config.num_layers];
+        let capacities_a1 = vec![7; config.num_layers];
+        let capacities_b0 = vec![6; config.num_layers];
+        let capacities_b1 = vec![8; config.num_layers];
+
+        // Every worker processes requests in the same order.  This is the
+        // current coordinator batch contract because RingPacket has no request
+        // identifier and the per-layer channel is FIFO.
+        let ((_logits_a0, _), (_logits_b0, _), (logits_a1, _), (logits_b1, _)) =
+            std::thread::scope(|scope| {
+                let worker0 = scope.spawn(|| {
+                    let a = backend0.prefill_request_with_reservation(
+                        101,
+                        &prompt_a[..1],
+                        0,
+                        Some(&[0]),
+                        Some(&capacities_a0),
+                    );
+                    let b = backend0.prefill_request_with_reservation(
+                        202,
+                        &prompt_b[..2],
+                        0,
+                        Some(&[0, 1]),
+                        Some(&capacities_b0),
+                    );
+                    (a, b)
+                });
+                let worker1 = scope.spawn(|| {
+                    let a = backend1.prefill_request_with_reservation(
+                        101,
+                        &prompt_a[1..],
+                        1,
+                        Some(&[1, 2, 3]),
+                        Some(&capacities_a1),
+                    );
+                    let b = backend1.prefill_request_with_reservation(
+                        202,
+                        &prompt_b[2..],
+                        2,
+                        Some(&[2, 3, 4, 5]),
+                        Some(&capacities_b1),
+                    );
+                    (a, b)
+                });
+                let (a0, b0) = worker0.join().unwrap();
+                let (a1, b1) = worker1.join().unwrap();
+                (a0.unwrap(), b0.unwrap(), a1.unwrap(), b1.unwrap())
+            });
+        for backend in [&mut backend0, &mut backend1] {
+            backend.sync_global_seq_len_for_request(101, prompt_a.len());
+            backend.sync_global_seq_len_for_request(202, prompt_b.len());
+        }
+
+        let (ref_a, _) = reference_a
+            .prefill_request(101, &prompt_a, 0, None)
+            .unwrap();
+        let (ref_b, _) = reference_b
+            .prefill_request(202, &prompt_b, 0, None)
+            .unwrap();
+        let prefill_a = Tensor::from_slice(&logits_a1);
+        let prefill_b = Tensor::from_slice(&logits_b1);
+        let ref_a = Tensor::from_slice(&ref_a);
+        let ref_b = Tensor::from_slice(&ref_b);
+        assert!((&prefill_a - &ref_a).abs().max().double_value(&[]) < 1e-3);
+        assert!((&prefill_b - &ref_b).abs().max().double_value(&[]) < 1e-3);
+
+        let mut next_a = prefill_a.argmax(-1, false).int64_value(&[]);
+        let mut next_b = prefill_b.argmax(-1, false).int64_value(&[]);
+        const DECODE_STEPS: usize = 3;
+        for step in 0..DECODE_STEPS {
+            let ref_logits_a = reference_a.decode_request(101, next_a).unwrap();
+            let ref_logits_b = reference_b.decode_request(202, next_b).unwrap();
+            let (batch0, batch1) = std::thread::scope(|scope| {
+                let worker0 =
+                    scope.spawn(|| backend0.decode_batch(&[(101, next_a), (202, next_b)]));
+                let worker1 =
+                    scope.spawn(|| backend1.decode_batch(&[(101, next_a), (202, next_b)]));
+                (
+                    worker0.join().unwrap().unwrap(),
+                    worker1.join().unwrap().unwrap(),
+                )
+            });
+            for (worker, batch) in [(0_usize, &batch0), (1, &batch1)] {
+                let logits_a = batch.iter().find(|(id, _)| *id == 101).unwrap().1.clone();
+                let logits_b = batch.iter().find(|(id, _)| *id == 202).unwrap().1.clone();
+                let diff_a = (&Tensor::from_slice(&logits_a) - &Tensor::from_slice(&ref_logits_a))
+                    .abs()
+                    .max()
+                    .double_value(&[]);
+                let diff_b = (&Tensor::from_slice(&logits_b) - &Tensor::from_slice(&ref_logits_b))
+                    .abs()
+                    .max()
+                    .double_value(&[]);
+                assert!(
+                    diff_a < 1e-3,
+                    "step {step} worker {worker} request A diff {diff_a}"
+                );
+                assert!(
+                    diff_b < 1e-3,
+                    "step {step} worker {worker} request B diff {diff_b}"
+                );
+                assert_eq!(
+                    Tensor::from_slice(&logits_a)
+                        .argmax(-1, false)
+                        .int64_value(&[]),
+                    Tensor::from_slice(&ref_logits_a)
+                        .argmax(-1, false)
+                        .int64_value(&[]),
+                    "step {step} worker {worker} request A token"
+                );
+                assert_eq!(
+                    Tensor::from_slice(&logits_b)
+                        .argmax(-1, false)
+                        .int64_value(&[]),
+                    Tensor::from_slice(&ref_logits_b)
+                        .argmax(-1, false)
+                        .int64_value(&[]),
+                    "step {step} worker {worker} request B token"
+                );
+            }
+            next_a = Tensor::from_slice(&ref_logits_a)
+                .argmax(-1, false)
+                .int64_value(&[]);
+            next_b = Tensor::from_slice(&ref_logits_b)
+                .argmax(-1, false)
+                .int64_value(&[]);
+        }
+
+        let split_points = [(101_u64, prompt_a.len(), 1_usize), (202, prompt_b.len(), 2)];
+        for (domain, backend) in [&backend0, &backend1].into_iter().enumerate() {
+            for (request_id, prompt_len, split) in split_points {
+                let context = backend.request_contexts.get(&request_id).unwrap();
+                assert_eq!(context.global_seq_len, prompt_len + DECODE_STEPS);
+                let mut expected_positions = if domain == 0 {
+                    (0..split as i64).collect::<Vec<_>>()
+                } else {
+                    (split as i64..prompt_len as i64).collect::<Vec<_>>()
+                };
+                expected_positions.extend(
+                    (prompt_len as i64..(prompt_len + DECODE_STEPS) as i64)
+                        .filter(|position| *position as usize % 2 == domain),
+                );
+                for cache in &context.kv_caches {
+                    let Some(KvCacheImpl::ReservedPositioned(shard)) = cache else {
+                        panic!("request {request_id} did not use reserved positioned KV");
+                    };
+                    assert_eq!(shard.positions(), expected_positions);
+                }
+            }
+        }
+    }
+
     #[test]
     fn reserved_prefill_uses_explicit_per_layer_capacities() {
         let device = Device::Cpu;
