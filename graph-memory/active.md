@@ -2,6 +2,29 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 6b.3：真实 runtime 固化跨 worker DecodeBatch FIFO 合同
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6b3`
+
+[2026-08-12 完成] 6b.3 真实 runtime 固化跨 worker DecodeBatch FIFO 合同。
+coordinator decode_iteration 新增 batch_request_tokens helper：每个 iteration 只构造一次 request_tokens 向量并按 request_id 排序，原样广播给所有 worker（WorkerCommand::DecodeBatch 同一向量）；worker runtime 原样转发到 backend.decode_batch 按序逐请求 decode。这是 multi-request Q-ring 依赖的 FIFO 合同——RingPacket 无 request_id，所有 worker 必须按同一 per-layer 顺序 decode。
+验收：1) 所有 worker 每轮观测相同 request_id 序列（coordinator 广播同一排序向量 + worker 默认按序 decode）；2) 无错包/死锁（6a.2 真实 TCP Q-ring 交错 decode oracle 已覆盖）；3) 两请求 token 与独立 reference 一致（6a.2 oracle 每步 argmax/diff 断言）；4) 完成后 cache 释放（新增 release_request focused 测试：release 后 context 移除、幂等、再 decode 报错）。
+边界：不增加 RingPacket request_id/decode_step；真实 runtime 未证明会重排，故无需协议修订；不含真实 HTTP 并发 E2E（6d）与吞吐。
+
+_updated: 2026-08-11 21:10:32_
+### 6b.3 DecodeBatch FIFO runtime 合同通过
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6b3`
+
+实现提交 abddbf1（rust: lock DecodeBatch FIFO contract and request release）。
+TDD 与验证：
+1. batch_request_tokens 新增 2 个单测：(a) 乱序插入 active requests(30/10/20) 后 batch 严格按 request_id 排序 [(10,5),(20,6),(30,7)]；(b) 无 active 时返回空向量。
+2. release_request 新增 1 个 focused 测试：prefill + decode 后 release 移除 context，重复 release 幂等，再 decode 报错（不复用 stale state）。
+3. 完整回归：cargo test --features tch-backend --lib = 139 passed、0 failed、5 ignored（129 基线 + 3 service_layer_capacities + 4 kv_ledger + 2 batch + 1 release）。
+4. rustfmt --edition 2021 与 git diff --check 均 exit 0；改动限 coordinator.rs + tch_backend.rs 两个文件。
+证据边界：FIFO 合同是 backend 层 + coordinator 层确定性单测；多 worker 交错数值由 6a.2 真实 TCP Q-ring oracle（证据 evidence-route-b-6a2-qring-unequal-isolation-20260812）覆盖；未在真实 HTTP 并发服务上复跑（6d 完成）。
+
+_updated: 2026-08-11 21:10:32_
 ### 6b.2b：最小 active-request KV byte reserve/release 计数
 
 type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6b2b`
@@ -1443,16 +1466,6 @@ type: `decision` · status: `superseded` · confidence: 0.96 · importance: 0.98
 VERDICT: IMPLEMENT serving-contract path; DEFER vLLM-engine integration.
 
 _updated: 2026-08-11 19:10:38_
-### 6b.3：真实 runtime 固化跨 worker DecodeBatch FIFO 合同
-
-type: `task` · status: `pending` · confidence: 1.0 · importance: 0.98 · source: `user-confirmed-20260812`
-
-问题：RingPacket 无 wire request_id，当前正确性依赖所有 worker 按 coordinator 的同一 request vector 顺序进入每层 Q-ring。
-动作：在 coordinator/runtime 命令路径验证 request_tokens 只生成一次并原样广播；两个不等长请求跨 worker 交错 decode，记录 command 顺序、request horizon、token/reference 和 release。
-验收：所有 worker 每轮观测相同 request_id 序列；无错包/死锁；两请求 token 与独立 reference 一致；完成后 cache 释放。
-边界：不增加 RingPacket request_id/decode_step；若真实 runtime 证明会重排，再单独做协议修订动机剖析。
-
-_updated: 2026-08-11 18:57:00_
 ### 现有多请求 context 未隔离每层 ring phase state
 
 type: `risk` · status: `blocker` · confidence: 1.0 · importance: 0.98 · source: `hetero-cp-ringattn@d1e536a-code-audit`
@@ -1754,13 +1767,13 @@ type: `task` · status: `superseded` · confidence: 1.0 · importance: 0.94 · s
 边界：这里测 HCP service，不把不同硬件总量的结果误称为算法公平 speedup；vLLM engine baseline 属后续受控对照。
 
 _updated: 2026-08-11 19:10:38_
-### 二期下一检查点：6b.3 DecodeBatch FIFO runtime 合同
+### 二期下一检查点：6c.0 benchmark 双平面观测
 
-type: `session` · status: `active` · confidence: 1.0 · importance: 0.9 · source: `hetero-cp-ringattn@6b2b`
+type: `session` · status: `active` · confidence: 1.0 · importance: 0.9 · source: `hetero-cp-ringattn@6b3`
 
-6b.2b 已完成并验证：coordinator 维护 request_id -> per-domain reserved bytes 映射，active sum 原子 admission，三种完成/失败路径恰好释放一次。下一候选节点保持 pending：在 coordinator/runtime 命令路径验证 request_tokens 只生成一次并原样广播；两个不等长请求跨 worker 交错 decode，记录 command 顺序、request horizon、token/reference 和 release。不得增加 RingPacket request_id/decode_step；若真实 runtime 证明会重排，再单独做协议修订动机剖析。
+6b.3 已完成并验证：DecodeBatch FIFO 合同（按 request_id 排序 + 原样广播）与 request release 均以单测锁定。下一候选节点保持 pending：建立 benchmark 最小双平面观测——request queue/prefill/first-token/decode/release 与 ring hops/bytes/reserved bytes 可关联。
 
-_updated: 2026-08-11 20:59:37_
+_updated: 2026-08-11 21:10:32_
 ### 三期：vLLM bench serve 实测与 vLLM 生态接入
 
 type: `task` · status: `deferred` · confidence: 1.0 · importance: 0.9 · source: `user-correction-20260812`
