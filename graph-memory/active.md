@@ -1503,6 +1503,22 @@ type: `decision` · status: `held` · confidence: 0.95 · importance: 0.96 · so
 结论：Node 4b DEFER multi-query continuation ring，只实现有证据的 KV-ring correctness；把 Q-ring 作为独立路线选择记忆，待 baseline 可运行后按 payload bytes 与实测带宽决定。VERDICT: DEFER。
 
 _updated: 2026-08-03 09:14:32_
+### 6b.0 用 Axum 内部测试固化 Rust completions/SSE 合同
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `user-confirmed-fast-phase2-20260812`
+
+动机剖析六问：
+1. 问题：Rust `/v1/completions` 已有实现，但没有直接驱动 Axum router 的内部 wire contract regression；后续 admission/scheduler 修改可能无意破坏 benchmark-facing JSON/SSE。
+2. 当前状态：handler 接收 model/prompt/max_tokens/temperature/top_p/stream，提交 InferenceJob；非流式返回 choices+usage，流式返回 text_completion SSE 和 `[DONE]`；现有 scripts 只用 curl 检查文本非空。
+3. 终态：无需启动 worker/model的 Rust tests 通过真实 router + job channel，精确断言 request mapping、non-stream response、SSE chunks/finish/[DONE]、closed queue 503 与 malformed JSON rejection。
+4. 他者：OpenAI-compatible serving 层通常用 handler/ASGI/router contract tests 隔离协议语义，再用端到端 benchmark 测性能；不能只依赖完整模型 smoke。
+5. 本方案：只在 `rust/src/api/server.rs` 测试模块构造 ApiState；测试侧模拟 coordinator 消费 job 并回送 InferenceResult/StreamChunk；解析实际 HTTP body。若现有实现全绿，不修改生产代码。
+6. 为什么：这是二期 Rust benchmark-readiness 的最小入口，不依赖 vLLM CLI、模型、GPU 或三机；避免把 API、runtime 和性能同时调试。
+
+边界：不新增 chat/auth/sampling，不改 request lifecycle，不声明与某版本 vLLM CLI 线级兼容。
+VERDICT: IMPLEMENT CONTRACT REGRESSION。
+
+_updated: 2026-08-11 19:23:51_
 ### 6c.1：Rust/native client 分级服务稳定性基线
 
 type: `task` · status: `pending` · confidence: 1.0 · importance: 0.95 · source: `user-correction-20260812`
