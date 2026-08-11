@@ -108,6 +108,9 @@ struct CoordinatorArgs {
     /// experimental (route-B observability, test-only): reproduce a remote
     /// handshake's capacity-weighted frozen schedule in a local golden.
     continuation_capacity_tickets: Option<Vec<u64>>,
+    /// Optional JSONL path for per-request structured traces (6c.0). Absent
+    /// disables tracing entirely; tracing never changes the inference result.
+    trace_jsonl: Option<String>,
 }
 
 fn parse_args() -> CoordinatorArgs {
@@ -130,6 +133,7 @@ fn parse_args() -> CoordinatorArgs {
     let mut prompt_token_ids = None;
     let mut continuation_request_id = 1_u64;
     let mut continuation_capacity_tickets = None;
+    let mut trace_jsonl = None;
 
     let mut args = std::env::args().skip(1); // skip binary name
     while let Some(arg) = args.next() {
@@ -182,6 +186,7 @@ fn parse_args() -> CoordinatorArgs {
                 continuation_capacity_tickets =
                     Some(s.split(',').map(|x| x.parse().unwrap()).collect());
             }
+            "--trace-jsonl" => trace_jsonl = Some(args.next().unwrap()),
             _ => eprintln!("[coordinator] unknown arg: {arg}"),
         }
     }
@@ -206,6 +211,7 @@ fn parse_args() -> CoordinatorArgs {
         prompt_token_ids,
         continuation_request_id,
         continuation_capacity_tickets,
+        trace_jsonl,
     }
 }
 
@@ -484,6 +490,162 @@ fn process_single_request(
         completion_tokens: generated_ids.len(),
         finish_reason,
     })
+}
+
+/// Per-request structured trace for the 6c.0 observability plane.
+///
+/// Records lifecycle timestamps (elapsed ms since coordinator start) and byte
+/// accounting per request so a client result can be correlated by `request_id`.
+/// Hop counts are derived from the known N/L formulas — prefill runs
+/// `layers * (domains - 1)` hops, each decode step the same — so they stay
+/// consistent with the ring invariants without per-hop instrumentation.
+#[derive(Clone, Debug, serde::Serialize)]
+struct RequestTrace {
+    request_id: u64,
+    enqueued_elapsed_ms: u64,
+    prefill_accepted_elapsed_ms: u64,
+    first_token_elapsed_ms: u64,
+    completed_elapsed_ms: u64,
+    reserved_bytes: Vec<u64>,
+    released_bytes: Vec<u64>,
+    decode_steps: usize,
+    prompt_tokens: usize,
+    max_tokens: usize,
+    finish_reason: Option<String>,
+    error: Option<String>,
+    prefill_hops: usize,
+    decode_hops: usize,
+}
+
+/// JSONL sink for per-request traces (6c.0). Disabled when no path is given;
+/// enabled it only appends one JSON object per finished request and never
+/// changes the inference result.
+struct TraceSink {
+    writer: Option<std::io::BufWriter<std::fs::File>>,
+    start: std::time::Instant,
+    in_flight: HashMap<u64, RequestTrace>,
+    layers: usize,
+    domains: usize,
+}
+
+impl TraceSink {
+    fn new(path: Option<String>, layers: usize, domains: usize) -> Self {
+        let writer = match path {
+            Some(path) => match std::fs::File::create(&path) {
+                Ok(file) => {
+                    println!("[coordinator] tracing per-request traces to {path}");
+                    Some(std::io::BufWriter::new(file))
+                }
+                Err(e) => {
+                    eprintln!("[coordinator] cannot open trace file {path}: {e}; tracing disabled");
+                    None
+                }
+            },
+            None => None,
+        };
+        Self {
+            writer,
+            start: std::time::Instant::now(),
+            in_flight: HashMap::new(),
+            layers,
+            domains,
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64
+    }
+
+    fn enqueue(&mut self, request_id: u64) {
+        let now = self.elapsed_ms();
+        self.in_flight
+            .entry(request_id)
+            .or_insert_with(|| RequestTrace {
+                request_id,
+                enqueued_elapsed_ms: now,
+                prefill_accepted_elapsed_ms: 0,
+                first_token_elapsed_ms: 0,
+                completed_elapsed_ms: 0,
+                reserved_bytes: Vec::new(),
+                released_bytes: Vec::new(),
+                decode_steps: 0,
+                prompt_tokens: 0,
+                max_tokens: 0,
+                finish_reason: None,
+                error: None,
+                prefill_hops: 0,
+                decode_hops: 0,
+            })
+            .enqueued_elapsed_ms = now;
+    }
+
+    fn prefill_accepted(
+        &mut self,
+        request_id: u64,
+        reserved: Vec<u64>,
+        prompt_tokens: usize,
+        max_tokens: usize,
+    ) {
+        let now = self.elapsed_ms();
+        if let Some(trace) = self.in_flight.get_mut(&request_id) {
+            trace.prefill_accepted_elapsed_ms = now;
+            trace.reserved_bytes = reserved;
+            trace.prompt_tokens = prompt_tokens;
+            trace.max_tokens = max_tokens;
+            trace.prefill_hops = self.layers * self.domains.saturating_sub(1);
+        }
+    }
+
+    fn decode_step(&mut self, request_ids: &[u64]) {
+        if self.writer.is_none() {
+            return;
+        }
+        let now = self.elapsed_ms();
+        for &request_id in request_ids {
+            if let Some(trace) = self.in_flight.get_mut(&request_id) {
+                trace.decode_steps += 1;
+                if trace.first_token_elapsed_ms == 0 {
+                    trace.first_token_elapsed_ms = now;
+                }
+                trace.decode_hops =
+                    trace.decode_steps * self.layers * self.domains.saturating_sub(1);
+            }
+        }
+    }
+
+    fn complete(
+        &mut self,
+        request_id: u64,
+        finish_reason: Option<String>,
+        released_bytes: Vec<u64>,
+    ) {
+        if let Some(mut trace) = self.in_flight.remove(&request_id) {
+            trace.completed_elapsed_ms = self.elapsed_ms();
+            trace.finish_reason = finish_reason;
+            trace.released_bytes = released_bytes;
+            trace.decode_hops = trace.decode_steps * self.layers * self.domains.saturating_sub(1);
+            self.emit(&trace);
+        }
+    }
+
+    fn fail(&mut self, request_id: u64, error: String) {
+        if let Some(mut trace) = self.in_flight.remove(&request_id) {
+            trace.completed_elapsed_ms = self.elapsed_ms();
+            trace.error = Some(error);
+            self.emit(&trace);
+        }
+    }
+
+    fn emit(&mut self, trace: &RequestTrace) {
+        let Some(writer) = self.writer.as_mut() else {
+            return;
+        };
+        use std::io::Write;
+        if let Ok(line) = serde_json::to_string(trace) {
+            let _ = writeln!(writer, "{line}");
+            let _ = writer.flush();
+        }
+    }
 }
 
 /// Per-request KV byte occupancy ledger for the HTTP service loop.
@@ -1667,6 +1829,14 @@ pub fn run() {
         .expect("worker capacities must be convertible to byte budgets");
     let mut kv_ledger = ActiveKvReservation::new(kv_budgets);
 
+    // 6c.0 observability: optional per-request JSONL trace sink. Disabled when
+    // --trace-jsonl is absent; enabled it never changes the inference result.
+    let mut trace_sink = TraceSink::new(
+        args.trace_jsonl.clone(),
+        config.num_layers,
+        args.num_domains,
+    );
+
     // Iterative scheduling loop: each iteration may prefill new requests and/or
     // decode all active requests.  This replaces the request-level spawn_blocking
     // model with an iteration-level scheduler.
@@ -1680,6 +1850,7 @@ pub fn run() {
             match job_rx.try_recv() {
                 Ok(job) => {
                     queued_counter.fetch_sub(1, Ordering::SeqCst);
+                    trace_sink.enqueue(job.request_id);
                     scheduler.enqueue(job);
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
@@ -1697,6 +1868,7 @@ pub fn run() {
             // 2a: Prefill a pending request if batch has room
             if scheduler.can_admit() && !scheduler.pending_is_empty() {
                 if let Some(job) = scheduler.try_dequeue_pending() {
+                    let job_request_id = job.request_id;
                     match prefill_single_request(
                         job,
                         &tokenizer,
@@ -1711,10 +1883,20 @@ pub fn run() {
                     ) {
                         Ok(active_req) => {
                             active_counter.fetch_add(1, Ordering::SeqCst);
+                            trace_sink.prefill_accepted(
+                                active_req.request_id,
+                                kv_ledger
+                                    .reserved_bytes(active_req.request_id)
+                                    .unwrap_or_default()
+                                    .to_vec(),
+                                active_req.prompt_tokens,
+                                active_req.max_tokens,
+                            );
                             scheduler.add_active(active_req);
                         }
                         Err(e) => {
                             eprintln!("[coordinator] prefill failed: {e}");
+                            trace_sink.fail(job_request_id, e);
                             // Error result already sent via job.tx in prefill_single_request
                         }
                     }
@@ -1723,8 +1905,15 @@ pub fn run() {
 
             // 2b: Decode all active requests
             if !scheduler.active_is_empty() {
+                // The batch is exactly the deterministic FIFO vector; every id
+                // in it takes one decode step this iteration (observability).
+                let batch_ids: Vec<u64> = batch_request_tokens(&scheduler)
+                    .into_iter()
+                    .map(|(request_id, _)| request_id)
+                    .collect();
                 match decode_iteration(&mut scheduler, &mut guard, eos_token, vocab_size, &rt) {
                     Ok(completed) => {
+                        trace_sink.decode_step(&batch_ids);
                         // Emit streaming chunks for all active requests.
                         for req in scheduler.active_requests_mut().values_mut() {
                             if let Some(ref chunk_tx) = req.stream_tx {
@@ -1755,8 +1944,17 @@ pub fn run() {
                         for request_id in completed {
                             if let Some(req) = scheduler.remove_active(request_id) {
                                 active_counter.fetch_sub(1, Ordering::SeqCst);
+                                let released_bytes = kv_ledger
+                                    .reserved_bytes(request_id)
+                                    .unwrap_or_default()
+                                    .to_vec();
                                 // Free this request's KV byte reservation.
                                 kv_ledger.release(request_id);
+                                trace_sink.complete(
+                                    request_id,
+                                    req.finish_reason.clone(),
+                                    released_bytes,
+                                );
 
                                 if let Some(ref chunk_tx) = req.stream_tx {
                                     // Streaming: send final chunk with finish_reason.
@@ -1791,6 +1989,7 @@ pub fn run() {
                                 active_counter.fetch_sub(1, Ordering::SeqCst);
                                 // Free each failed request's KV byte reservation.
                                 kv_ledger.release(request_id);
+                                trace_sink.fail(request_id, format!("decode batch failed: {e}"));
                                 let _ = req.result_tx.send(InferenceResult {
                                     text: format!("[error: decode batch failed: {e}]"),
                                     prompt_tokens: req.prompt_tokens,
@@ -1815,6 +2014,7 @@ pub fn run() {
             match rt.block_on(job_rx.recv()) {
                 Some(job) => {
                     queued_counter.fetch_sub(1, Ordering::SeqCst);
+                    trace_sink.enqueue(job.request_id);
                     scheduler.enqueue(job);
                 }
                 None => {
@@ -1958,6 +2158,57 @@ mod tests {
     fn batch_request_tokens_empty_when_no_active_requests() {
         let scheduler = BatchScheduler::new(4);
         assert!(batch_request_tokens(&scheduler).is_empty());
+    }
+
+    #[test]
+    fn trace_sink_disabled_never_writes_and_emits_nothing() {
+        // No --trace-jsonl: the sink keeps no writer, and lifecycle calls are
+        // no-ops that must not panic or change any inference-visible state.
+        let mut sink = TraceSink::new(None, 24, 2);
+        sink.enqueue(1);
+        sink.prefill_accepted(1, vec![100, 200], 4, 5);
+        sink.decode_step(&[1]);
+        sink.complete(1, Some("length".to_string()), vec![100, 200]);
+        sink.fail(2, "boom".to_string());
+        assert!(sink.writer.is_none());
+        assert!(sink.in_flight.is_empty());
+    }
+
+    #[test]
+    fn trace_sink_hop_counts_follow_n_l_formula() {
+        // N=3, L=24: prefill hops = 24*2 = 48, each decode step = 48.
+        // Trace a request through enqueue -> accepted -> 2 decode steps -> complete.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("hcp_trace_test_{}.jsonl", std::process::id()));
+        let mut sink = TraceSink::new(Some(path.to_string_lossy().to_string()), 24, 3);
+        sink.enqueue(7);
+        sink.prefill_accepted(7, vec![36864, 49152, 36864], 4, 5);
+        sink.decode_step(&[7]);
+        sink.decode_step(&[7]);
+        sink.complete(7, Some("length".to_string()), vec![36864, 49152, 36864]);
+
+        let line = std::fs::read_to_string(&path).unwrap();
+        let record: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(record["request_id"], 7);
+        assert_eq!(record["prompt_tokens"], 4);
+        assert_eq!(record["max_tokens"], 5);
+        assert_eq!(record["decode_steps"], 2);
+        assert_eq!(record["prefill_hops"], 48);
+        assert_eq!(record["decode_hops"], 96);
+        assert_eq!(record["finish_reason"], "length");
+        assert!(record["error"].is_null());
+        assert_eq!(
+            record["reserved_bytes"],
+            serde_json::json!([36864, 49152, 36864])
+        );
+        assert_eq!(
+            record["released_bytes"],
+            serde_json::json!([36864, 49152, 36864])
+        );
+        assert!(record["enqueued_elapsed_ms"].as_u64().is_some());
+        assert!(record["completed_elapsed_ms"].as_u64().is_some());
+        // cleanup
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
