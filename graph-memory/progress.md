@@ -2,6 +2,32 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### 4b byte admission 经 N=3 Mac+CUDA+HIP production QUIC 验证通过
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `reports/routeb-byte-admission-n3-20260811-180836@hetero-cp-ringattn-795d7ce`
+
+795d7ce 的 route-B KV byte admission 经 Mac MPS + white CUDA + pearl HIP 三机 production QUIC 复验通过，artifact 为 reports/routeb-byte-admission-n3-20260811-180836/。
+1. 版本与环境：本地、white、pearl 均为 4654a4b（实现 SHA 795d7ce）；远端只经 git pull --ff-only 同步并 release build。inventory 当前 endpoint：white 100.118.253.68、pearl 100.111.242.55；Mac 实时 utun4 地址 100.121.35.138。三机 config SHA256 一致。
+2. 实际 handshake：Mac=8192 MB、white=21793 MB、pearl=15013 MB，均非 u64::MAX。Prefill dispatch 前日志为 required=[36864,49152,36864]、budget=[8589934592,22851616768,15742271488]、bytes_per_token_per_layer=512、status=accepted；每一 domain required<=budget。
+3. 四进程 exit 文件均为 0；generated IDs=[198,15,15]。三个 worker 各 starter/middle/finisher=8/8/8、send/recv=16/16；全局为 24/24/24、48/48=24*(3-1)，N=3 neighbor-only 数据流未变。
+4. 同既有三 MPS golden 的分阶段验收：prefill argmax 198/198、mean=0.035258、max=0.187500，strict pass；stationary continuation argmax 15/15、mean=0.030063、max=0.203125，strict pass；legacy decode argmax 6667/6667、top5=5/5、max=0.648438，mean=0.107887 仅诊断，按既有 phase-specific 决策 guarded pass。
+5. 新 run 与旧 ccc838c 正式三机 production 的 prefill/decode/continuation f32le SHA256 逐文件完全相同，证明 admission 接线没有改变数值数据流。通用统一 mean 脚本仍因 legacy decode 返回 1；专用 phase-2 byte-admission acceptance 返回 PASS，符合已记录路线 B，不是新放宽。
+6. 运行后本地与远端无残留 distributed worker 进程或 33300-33303 UDP listener。
+证据边界：单请求、N=3、24 层、m=4、Qwen2-0.5B BF16、Tailscale QUIC correctness；required bytes 仅是 persistent K/V tensor payload bound，不含 allocator rounding、positions metadata、activation/workspace、多请求并发、性能、N>3 或故障恢复。
+
+_updated: 2026-08-11 10:21:36_
+### Mac GUI Tailscale 正常时 CLI symlink 仍可能丢失 bundle identity
+
+type: `lesson` · status: `held` · confidence: 1.0 · importance: 0.8 · source: `local-environment-observation-20260811`
+
+[2026-08-11] Mac GUI Tailscale 网络正常但 /usr/local/bin/tailscale 便利链接不可直接使用。
+症状：执行 tailscale ip -4 稳定触发 Tailscale/BundleIdentifiers.swift 的 unknown bundleIdentifier fatal error。
+根因：Mac 只有 io.tailscale.ipn.macsys 1.102.2 GUI/Network Extension；/usr/local/bin/tailscale 是 root-owned symlink，指向 /Applications/Tailscale.app/Contents/MacOS/Tailscale。当前版本通过该 symlink 启动时 bundle identity 解析失败，并非隧道或第二套 daemon 冲突。
+验证：network extension activated/enabled，utun4 UP 且路由覆盖 100.64/10，white/pearl SSH 正常；直接执行真实路径 /Applications/Tailscale.app/Contents/MacOS/Tailscale ip -4 返回当前地址。
+处理：HCP 操作可直接调用真实 app executable，或从目标路由的 utun interface 查询 source address；不要安装并启动第二套 Homebrew tailscaled。未修改 /usr/local 或系统配置；若以后修便利命令，root-owned 路径须由用户手动处理。
+边界：这是当前 Mac 安装状态的环境事实，不代表所有 macOS Tailscale 分发版都有同一 symlink 行为，也不把本次易变 IP 固化为项目 endpoint。
+
+_updated: 2026-08-11 10:21:36_
 ### 4b coordinator KV byte admission 本地 RED/GREEN 与完整回归通过
 
 type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@795d7ce`

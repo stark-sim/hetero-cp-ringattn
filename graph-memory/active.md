@@ -2,13 +2,33 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 路线 B 二期：工程性能力（中）
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@795d7ce`
+
+出口标准（真实跨节点 E2E 通过才考虑工程层合 main）：
+1. [done] m>1 stationary packet 的 TCP/QUIC wire codec（129de9b；codec shape-generic，m>1 回环测试与 N=3 QUIC loopback 已固化）
+2. [done] WorkerRuntime/coordinator 一等命令（StationaryContinuation 主路径；2592795/a4ab7f4/1aee8e6）
+3. [done] frozen request plan 的分发/重建机制（plan 随 StationaryContinuation 命令广播，worker 无状态推导；1aee8e6）
+4. [done] capacity/placement byte-level admission：4a e610d2a 建立冻结 per-layer capacities 的纯 KV payload byte validator；4b 795d7ce 拆分 schedule tickets 与 handshake budget，在任何 Prefill command 前按实际 dtype/geometry fail-closed admission。Mac+white+pearl 三机复验 required=[36864,49152,36864]、budget=[8589934592,22851616768,15742271488]，四进程 exit=0。
+5. [done] production-path QUIC E2E：Mac MPS + white CUDA + pearl HIP 三个 worker 经 coordinator/WorkerRuntime/StationaryContinuation 在 N=3 neighbor-only QUIC ring 上通过；三 worker 全局 send/recv=48/48=24*(3-1)，目标 prefill/continuation 通过严格阶段门，legacy decode 通过 argmax/top-5/max 守护。
+二期五项出口均完成。边界仍是单请求 correctness；main 的完整 placement/ledger WIP、多请求、workspace、性能和故障恢复未被引入或证明。
+
+_updated: 2026-08-11 10:21:36_
+### 二期 4b：coordinator Prefill 前执行 KV byte admission
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `reports/routeb-byte-admission-n3-20260811-180836@hetero-cp-ringattn-795d7ce`
+
+二期第 4 项的 4b 小节点：把 4a 的冻结 KV payload byte validator 接入实验 route-B continuation coordinator。schedule tickets 只决定 layer-striped KV assignment；worker handshake capacity_mb 单独作为真实预算输入。coordinator 在发送任何本请求 Prefill 前，按 ModelConfig 的 KV geometry 与实际 dtype bytes 完成 admission。u64::MAX 表示容量查询未知，必须 fail-closed。验收：unknown capacity 与少 1 byte 在发送前拒绝；合法预算打印逐 domain required/budget bytes 并保持现有 prefill -> decode -> stationary continuation -> decode 数值与 hop 结果。边界：只改实验 continuation E2E，不改普通 legacy prefill，不引入多请求 ledger、workspace、动态 repair planner 或生产级 allocator。
+
+_updated: 2026-08-11 10:21:36_
 ### 4b 三机 production QUIC byte admission 复验
 
-type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-10`
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `reports/routeb-byte-admission-n3-20260811-180836@hetero-cp-ringattn-795d7ce`
 
 4b 的独立跨硬件验证节点：在当前 inventory endpoint 上重跑 Mac coordinator+domain0 MPS、white domain1 CUDA、pearl domain2 HIP 的 24 层 production QUIC continuation 场景。所有源码经 Git commit/remote 同步，不远端直接编辑。验收新增 coordinator admission required/budget 日志且三端 capacity 均不是 unknown；同时保持四进程 exit=0、generated IDs、分阶段 logits 守护与全局 48/48 neighbor-only hops。边界：单请求 correctness，不测性能、多请求、N>3 或完整 allocator OOM 充分条件。
 
-_updated: 2026-08-10 14:24:15_
+_updated: 2026-08-11 10:21:36_
 ### 复用已知 N=3 场景验证真实 handshake byte admission
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-10`
@@ -23,13 +43,6 @@ type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · sour
 VERDICT: IMPLEMENT。该节点不改变算法和服务接口，仅补足 4b 已约定的跨硬件出口证据。
 
 _updated: 2026-08-10 14:24:15_
-### 二期 4b：coordinator Prefill 前执行 KV byte admission
-
-type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@795d7ce`
-
-二期第 4 项的 4b 小节点：把 4a 的冻结 KV payload byte validator 接入实验 route-B continuation coordinator。schedule tickets 只决定 layer-striped KV assignment；worker handshake capacity_mb 单独作为真实预算输入。coordinator 在发送任何本请求 Prefill 前，按 ModelConfig 的 KV geometry 与实际 dtype bytes 完成 admission。u64::MAX 表示容量查询未知，必须 fail-closed。验收：unknown capacity 与少 1 byte 在发送前拒绝；合法预算打印逐 domain required/budget bytes 并保持现有 prefill -> decode -> stationary continuation -> decode 数值与 hop 结果。边界：只改实验 continuation E2E，不改普通 legacy prefill，不引入多请求 ledger、workspace、动态 repair planner 或生产级 allocator。
-
-_updated: 2026-08-10 13:18:32_
 ### route-B 在 Prefill dispatch 前 fail-closed 校验冻结 KV 字节
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-10`
@@ -50,19 +63,6 @@ type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · sour
 VERDICT: IMPLEMENT。用户已明确确认 unknown capacity 必须 fail-closed，并要求继续。
 
 _updated: 2026-08-10 12:33:19_
-### 路线 B 二期：工程性能力（中）
-
-type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@e610d2a`
-
-出口标准（真实跨节点 E2E 通过才考虑工程层合 main）：
-1. [done] m>1 stationary packet 的 TCP/QUIC wire codec（129de9b；codec shape-generic，m>1 回环测试与 N=3 QUIC loopback 已固化）
-2. [done] WorkerRuntime/coordinator 一等命令（StationaryContinuation 主路径；2592795/a4ab7f4/1aee8e6）
-3. [done] frozen request plan 的分发/重建机制（plan 随 StationaryContinuation 命令广播，worker 无状态推导；1aee8e6）
-4. [partial] capacity/placement byte-level admission：4a 冻结 per-layer capacities 的纯 KV payload byte validator 已由 e610d2a 完成；4b 尚需把 model dtype/geometry 与 handshake budget 接入 coordinator，在任何 Prefill command 发送前执行门禁，并做 Mac+white+pearl 三机验证。main 的完整 placement/ledger WIP 继续保持只读，不引入多请求能力。
-5. [done] production-path QUIC E2E：Mac MPS + white CUDA + pearl HIP 三个 worker 经 coordinator/WorkerRuntime/StationaryContinuation 在 N=3 neighbor-only QUIC ring 上通过；三 worker 全局 send/recv=48/48=24*(3-1)，目标 prefill/continuation 通过严格阶段门，legacy decode 通过 argmax/top-5/max 守护。
-依赖一期完成；当前只剩第 4 项的 4b coordinator admission 接线与三机证据。
-
-_updated: 2026-08-10 08:52:49_
 ### byte admission 先做 post-plan 纯校验，不导入完整 ledger
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-continue-2026-08-10`
