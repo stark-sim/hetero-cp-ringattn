@@ -821,10 +821,9 @@ mod tests {
         (logits, current_starter, total_hops, total_wire_bytes)
     }
 
-    /// Verify that `decode_batch` produces identical logits to individual `decode_request`
-    /// calls, and that per-request KV caches remain isolated (no cross-contamination).
+    /// Verify unequal-prefix request isolation against independent references.
     #[test]
-    fn test_decode_batch_isolation() {
+    fn test_decode_batch_isolation_with_unequal_prefixes() {
         let device = Device::Cpu;
 
         let config = ModelConfig {
@@ -854,26 +853,37 @@ mod tests {
 
         // Create two independent backends from identical weights.
         let model_batch = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
-        let model_ref = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+        let model_ref_a = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+        let model_ref_b = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
 
         let mut backend_batch = TchWorkerBackend::from_model(model_batch, device, 0);
-        let mut backend_ref = TchWorkerBackend::from_model(model_ref, device, 0);
+        let mut backend_ref_a = TchWorkerBackend::from_model(model_ref_a, device, 0);
+        let mut backend_ref_b = TchWorkerBackend::from_model(model_ref_b, device, 0);
 
-        // Two different prompts (same length to keep things simple)
-        let seq_len = 12i64;
-        let prompt_a: Vec<i64> = (0..seq_len).collect();
-        let prompt_b: Vec<i64> = (10..10 + seq_len).collect();
+        // Two different prompts with different prefix lengths.
+        let prompt_a: Vec<i64> = (0..8).collect();
+        let prompt_b: Vec<i64> = (10..22).collect();
 
-        // Prefill both requests on both backends
-        let (logits_a_batch, _) = backend_batch
+        // Prefill both requests on the mixed backend and on independent references.
+        let (logits_a_batch, len_a_batch) = backend_batch
             .prefill_request(1, &prompt_a, 0, None)
             .unwrap();
-        let (logits_b_batch, _) = backend_batch
+        let (logits_b_batch, len_b_batch) = backend_batch
             .prefill_request(2, &prompt_b, 0, None)
             .unwrap();
 
-        let (logits_a_ref, _) = backend_ref.prefill_request(1, &prompt_a, 0, None).unwrap();
-        let (logits_b_ref, _) = backend_ref.prefill_request(2, &prompt_b, 0, None).unwrap();
+        let (logits_a_ref, len_a_ref) = backend_ref_a
+            .prefill_request(1, &prompt_a, 0, None)
+            .unwrap();
+        let (logits_b_ref, len_b_ref) = backend_ref_b
+            .prefill_request(2, &prompt_b, 0, None)
+            .unwrap();
+
+        assert_eq!(prompt_a.len(), 8);
+        assert_eq!(prompt_b.len(), 12);
+        assert_ne!(prompt_a.len(), prompt_b.len());
+        assert_eq!(len_a_batch, len_a_ref);
+        assert_eq!(len_b_batch, len_b_ref);
 
         // Verify prefill logits match (sanity check)
         let prefill_diff_a = Tensor::from_slice(&logits_a_batch)
@@ -908,8 +918,8 @@ mod tests {
             .int64_value(&[]) as i64;
 
         // ====== Single-step decode: batch vs individual ======
-        let ref_logits_a = backend_ref.decode_request(1, token_a).unwrap();
-        let ref_logits_b = backend_ref.decode_request(2, token_b).unwrap();
+        let ref_logits_a = backend_ref_a.decode_request(1, token_a).unwrap();
+        let ref_logits_b = backend_ref_b.decode_request(2, token_b).unwrap();
 
         let batch_results = backend_batch
             .decode_batch(&[(1, token_a), (2, token_b)])
@@ -966,9 +976,9 @@ mod tests {
         let mut next_token_b = token_b;
 
         for step in 0..NUM_DECODE_STEPS {
-            // Reference: individual decode requests
-            let ref_la = backend_ref.decode_request(1, next_token_a).unwrap();
-            let ref_lb = backend_ref.decode_request(2, next_token_b).unwrap();
+            // References remain fully independent so shared state cannot mask a mismatch.
+            let ref_la = backend_ref_a.decode_request(1, next_token_a).unwrap();
+            let ref_lb = backend_ref_b.decode_request(2, next_token_b).unwrap();
 
             // Batch decode
             let batch_res = backend_batch
