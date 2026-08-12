@@ -2,6 +2,19 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 路线 B 二期：工程性能力（中）
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@795d7ce`
+
+出口标准（真实跨节点 E2E 通过才考虑工程层合 main）：
+1. [done] m>1 stationary packet 的 TCP/QUIC wire codec（129de9b；codec shape-generic，m>1 回环测试与 N=3 QUIC loopback 已固化）
+2. [done] WorkerRuntime/coordinator 一等命令（StationaryContinuation 主路径；2592795/a4ab7f4/1aee8e6）
+3. [done] frozen request plan 的分发/重建机制（plan 随 StationaryContinuation 命令广播，worker 无状态推导；1aee8e6）
+4. [done] capacity/placement byte-level admission：4a e610d2a 建立冻结 per-layer capacities 的纯 KV payload byte validator；4b 795d7ce 拆分 schedule tickets 与 handshake budget，在任何 Prefill command 前按实际 dtype/geometry fail-closed admission。Mac+white+pearl 三机复验 required=[36864,49152,36864]、budget=[8589934592,22851616768,15742271488]，四进程 exit=0。
+5. [done] production-path QUIC E2E：Mac MPS + white CUDA + pearl HIP 三个 worker 经 coordinator/WorkerRuntime/StationaryContinuation 在 N=3 neighbor-only QUIC ring 上通过；三 worker 全局 send/recv=48/48=24*(3-1)，目标 prefill/continuation 通过严格阶段门，legacy decode 通过 argmax/top-5/max 守护。
+二期五项出口均完成。边界仍是单请求 correctness；main 的完整 placement/ledger WIP、多请求、workspace、性能和故障恢复未被引入或证明。
+
+_updated: 2026-08-12 04:33:38_
 ### 二期 Rust 推理服务 benchmark-readiness
 
 type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6d`
@@ -14,7 +27,34 @@ type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · sou
 5. 稳定性 ✅：native concurrency 1/2/4（6c.1）；Mac MPS + white CUDA + pearl HIP N=3 真实 Qwen 服务闭环（6d，test_phase2_6d_n3_service.sh）。
 二期不改 vLLM engine/plugin。三期（生态：多请求 batching、placement/ledger WIP 重启、外部 benchmark）待用户规划。
 
-_updated: 2026-08-11 22:14:54_
+_updated: 2026-08-12 04:33:38_
+### 二期工程层以纯增量合入 main
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@phase2-merge`
+
+【动机六问】
+1. 问题：二期工程层（benchmark-readiness 五项出口）已在 codex 分支验证完成，成果仍未在 main；后续路线组合/公平比较需要共同锚点，且 placement/ledger WIP 等待三期重启前需有稳定 main 基线。
+2. 现状：分支领先 main 40 个 checkpoint 提交（6b.0/6b.2a/6b.2b/6b.3/6c.0/6c.1/6d + graph 记录）；一期已确立合并模式（5f7a3e2 纯增量 + 边界文档 + graph.db 冲突取超集版）；二期全部证据为 correctness/服务稳定性，不含性能声明。
+3. 终态：merge commit 547e970 把二期服务化资产纯增量合入 main；边界文档 docs/CONTINUATION_ROUTE_BOUNDARIES.md 补充 G 节（二期资产/语义边界/验证矩阵）与证据索引；main 行为零变化；分支保留。
+4. 他者：一期合 main 的决策（decision-route-b-phase1-merge-main-20260809）确立六类边界与 graph 冲突处理；本决策沿用同一纪律。
+5. 本方案：--no-ff merge 保留 40 个 checkpoint 的 RED/GREEN 历史；代码全部自动合并无冲突；graph.db/active.md 冲突取 codex 超集版（483 节点）后重新 export；边界文档 G 节定义二期服务化语义边界（admission/active ledger/FIFO decode/trace，均不含性能）。
+6. 为什么：二期以三期里程碑门禁第二阶段（工程性能力）过关，使 Rust HCP 服务具备接受外部 benchmark 的基础；合 main 使二期资产成为可组合的共同锚点，同时以文档明确"不含性能结论、placement WIP 留三期"。
+VERDICT: MERGED(547e970)。
+
+_updated: 2026-08-12 04:33:38_
+### 二期合 main 后回归验证通过
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@phase2-merge`
+
+合并后 main(547e970) 完整回归验证通过：
+1. cargo test --features tch-backend --lib = 141 passed、0 failed、5 ignored（与 codex 分支二期收口时一致，main 行为零回归）。
+2. graph.db 冲突取 codex 超集版（483 节点）后重新 export，active/progress/systemPatterns/productContext/techContext 与 graph.db 一致。
+3. 边界文档 docs/CONTINUATION_ROUTE_BOUNDARIES.md 补充 G 节：二期服务化资产表（4784acf/d57b9ca/9ec8f96/abddbf1/78be1d0/f249d90/9a42934）、五条语义边界（admission/active ledger/FIFO/trace/不含性能）、二期验证矩阵（N=2 concurrency 1/2/4 + N=3 异构真实 Qwen）；证据索引追加二期 7 条。
+4. 二期全部证据为 correctness/服务稳定性；不含性能结论；placement/ledger WIP 保持 main 工作区 stash DEFER 状态（三期素材）。
+5. 代码冲突为零（40 个 checkpoint 全部纯增量），仅 graph-memory 两文件冲突按一期约定处理。
+边界：二期 benchmark-readiness 五项出口达成；三期（生态：多请求 batching、placement/ledger WIP 重启、外部 benchmark）待用户规划。
+
+_updated: 2026-08-12 04:33:38_
 ### 6d：N=3 异构 Rust 服务真实 Qwen readiness
 
 type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6d`
@@ -328,19 +368,6 @@ AIPerf 官方 multi-turn 文档说明后续 turn 会携带完整 conversation hi
 - rust/src/distributed/coordinator.rs
 
 _updated: 2026-08-11 13:19:55_
-### 路线 B 二期：工程性能力（中）
-
-type: `task` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@795d7ce`
-
-出口标准（真实跨节点 E2E 通过才考虑工程层合 main）：
-1. [done] m>1 stationary packet 的 TCP/QUIC wire codec（129de9b；codec shape-generic，m>1 回环测试与 N=3 QUIC loopback 已固化）
-2. [done] WorkerRuntime/coordinator 一等命令（StationaryContinuation 主路径；2592795/a4ab7f4/1aee8e6）
-3. [done] frozen request plan 的分发/重建机制（plan 随 StationaryContinuation 命令广播，worker 无状态推导；1aee8e6）
-4. [done] capacity/placement byte-level admission：4a e610d2a 建立冻结 per-layer capacities 的纯 KV payload byte validator；4b 795d7ce 拆分 schedule tickets 与 handshake budget，在任何 Prefill command 前按实际 dtype/geometry fail-closed admission。Mac+white+pearl 三机复验 required=[36864,49152,36864]、budget=[8589934592,22851616768,15742271488]，四进程 exit=0。
-5. [done] production-path QUIC E2E：Mac MPS + white CUDA + pearl HIP 三个 worker 经 coordinator/WorkerRuntime/StationaryContinuation 在 N=3 neighbor-only QUIC ring 上通过；三 worker 全局 send/recv=48/48=24*(3-1)，目标 prefill/continuation 通过严格阶段门，legacy decode 通过 argmax/top-5/max 守护。
-二期五项出口均完成。边界仍是单请求 correctness；main 的完整 placement/ledger WIP、多请求、workspace、性能和故障恢复未被引入或证明。
-
-_updated: 2026-08-11 12:00:12_
 ### 路线 B 二期扩展：基础多请求推理服务
 
 type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-11`

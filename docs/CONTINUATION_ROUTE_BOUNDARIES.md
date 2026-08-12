@@ -43,8 +43,36 @@
 ## D. 合并不改变什么
 
 - KV-ring baseline(initial/continuation prefill)与 Q-ring decode 的生产路径零改动;main 行为不变;
-- placement/ledger WIP 保持 main 工作区未提交 DEFER 状态(二期 admission 素材);
+- placement/ledger WIP 保持 main 工作区未提交 DEFER 状态(三期素材);
 - 路线分支 `codex/route-b-continuation-stationary-packet` 保留继续探索。
+
+## G. 二期工程层合入(benchmark-readiness 五项出口,547e970)
+
+二期以三期里程碑门禁第二阶段(工程性能力,medium)过关后合入 main。与一期纯增量一致,**main 上既有生产调用路径行为不变**;新增的是服务化能力与可观测性。
+
+| 资产 | 位置 | 提交 |
+|---|---|---|
+| HTTP `/v1/completions` 非 streaming/streaming + SSE `[DONE]` + usage/error 合同 | `rust/src/api/server.rs` | 4784acf(6b.0) |
+| 普通 service prefill frozen reservation + byte admission | `rust/src/distributed/coordinator.rs` `prefill_single_request` | d57b9ca(6b.2a) |
+| active-request KV byte reserve/release ledger(`ActiveKvReservation` + RAII guard) | 同上 | 9ec8f96(6b.2b) |
+| DecodeBatch FIFO 合同(`batch_request_tokens` 按 request_id 排序、原样广播) | 同上 `decode_iteration` | abddbf1(6b.3) |
+| per-request JSONL trace(`--trace-jsonl`:queue/prefill/first-token/decode/release + hops/bytes/reserved) | 同上 `TraceSink` | 78be1d0(6c.0) |
+| native 稳定性基线脚本 | `scripts/test_phase2_6c1_native_baseline.sh` | f249d90(6c.1) |
+| N=3 异构服务脚本 | `scripts/test_phase2_6d_n3_service.sh` | 9a42934(6d) |
+
+二期服务化语义边界:
+
+- **admission**:每个 service request 在任意 Prefill 前冻结 per-domain per-layer reservation 并做 exact KV payload byte admission(unknown/overflow/one-byte-short fail-closed);capacities 随 Prefill 命令下发,worker 以 `ReservedPositioned` shard 承载;
+- **active-request 账本**:并发下每请求单独 fit 不代表总和 fit;coordinator 维护 request_id → per-domain reserved bytes,dispatch 前原子检查 active sum + new,完成/拒绝/失败路径恰好释放一次(RAII 保证);
+- **FIFO decode 合同**:`RingPacket` 无 request_id,coordinator 每 iteration 只生成一次 request_tokens 向量(按 request_id 排序)并原样广播;所有 worker 按同一 per-layer 顺序 decode;
+- **观测**:`--trace-jsonl` 输出结构化 per-request 记录,可按 request_id 与 client 结果关联;hop 数按 N/L 公式派生(prefill = L*(N-1),decode 每步同),不逐 hop 埋点;默认关闭、不改变推理结果;
+- **二期不含性能结论**:全部为 correctness + 服务稳定性证据;吞吐/公平 benchmark 属三期出口标准(二期不运行 vLLM benchmark、不改 vLLM engine/plugin)。
+
+二期验证矩阵补充(6c.1/6d 证据边界):
+
+- N=2 本地 Mac MPS concurrency 1/2/4,8 请求 0 错误,metrics + trace 一致;
+- N=3 异构 Mac MPS + white CUDA(RTX 4090)+ pearl HIP(RX 9060 XT)经 coordinator/生产 QUIC neighbor-only ring 处理真实 Qwen2-0.5B 多请求(4 请求 0 错误,不等长 prompt 6/13/40/49 tokens);
+- trace 断言:prefill_hops=48=L*(N-1)、decode_hops=steps*48、reserved==released 全部成立。
 
 ## E. 组合接缝(供路线间结合)
 
@@ -71,3 +99,10 @@
 | 跨设备数值验证(MPS+CUDA) | evidence-route-b-cross-device-mac-mps-white-cuda-20260809 | d9c1d35/ed6e658/9490c6f |
 | 三平台三节点真 ring | evidence-route-b-three-node-ring-mac-white-pearl-20260809 | 246aa8c/0a67cce/9ab909b/8a5b04e |
 | bf16 argmax 平局翻转判据 | belief-bf16-argmax-near-tie-flip-20260809 | 9ab909b |
+| (二期) Rust completions/SSE API 合同 | evidence-phase2-rust-6b0-api-contract-20260812 | 4784acf |
+| (二期) service prefill byte admission | evidence-phase2-rust-6b2a-service-admission-20260812 | d57b9ca |
+| (二期) active-request reserve/release | evidence-phase2-rust-6b2b-active-reservation-20260812 | 9ec8f96 |
+| (二期) DecodeBatch FIFO runtime 合同 | evidence-phase2-rust-6b3-fifo-runtime-20260812 | abddbf1 |
+| (二期) per-request JSONL trace | evidence-phase2-rust-6c0-observability-20260812 | 78be1d0 |
+| (二期) native 服务稳定性基线 | evidence-phase2-rust-6c1-native-baseline-20260812 | f249d90 |
+| (二期) N=3 异构真实 Qwen 服务闭环 | evidence-phase2-rust-6d-n3-service-20260812 | 9a42934 |
