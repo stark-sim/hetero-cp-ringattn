@@ -290,7 +290,9 @@ PHASES="${PHASES:-n2 n3}"
 echo ""
 echo "########## Phase N=2: white + pearl (LAN-resident, white-driven) ##########"
 N2_STATE_DIR="/tmp/hcp-n2-${RUN_ID}"
-run_remote_white "mkdir -p ${N2_STATE_DIR} && setsid nohup bash $(shell_quote "${WHITE_REPO_DIR}")/scripts/phase3_7a_n2_driver.sh ${RUN_ID} > ${N2_STATE_DIR}/driver.log 2>&1 < /dev/null &"
+# ssh -n -f returns right after launching the driver; the driver then owns
+# the full N=2 lifecycle on white even if the Mac goes away.
+ssh -n -f -o ConnectTimeout=20 "${WHITE_SSH}" "mkdir -p ${N2_STATE_DIR} && setsid bash $(shell_quote "${WHITE_REPO_DIR}")/scripts/phase3_7a_n2_driver.sh ${RUN_ID} > ${N2_STATE_DIR}/driver.log 2>&1 </dev/null"
 echo "N=2 driver launched on white; polling STATUS (Mac network drops tolerated)..."
 
 n2_status=""

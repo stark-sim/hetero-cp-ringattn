@@ -74,8 +74,12 @@ setsid nohup env HCP_TCH_DEVICE=cuda:0 LD_LIBRARY_PATH=/home/stark/libtorch/lib 
 sleep 3
 
 log "launching worker 1 (pearl, HIP) via ssh"
-ssh -o ConnectTimeout=15 "${PEARL_SSH}" "mkdir -p '${STATE_DIR}' && cd '${PEARL_REPO}' && \
-  setsid nohup env LD_PRELOAD=/home/stark/libtorch/lib/libtorch_hip.so HCP_TCH_DEVICE=cuda:0 LD_LIBRARY_PATH=/home/stark/libtorch/lib \
+# ssh -n -f returns immediately after launching the remote command; combined
+# with remote-side file redirection the ssh channel never blocks on the
+# daemon's lifetime (an earlier pattern held the channel open until the
+# remote worker exited, stalling orchestration for its full lifetime).
+ssh -n -f -o ConnectTimeout=15 "${PEARL_SSH}" "mkdir -p '${STATE_DIR}' && cd '${PEARL_REPO}' && \
+  setsid env LD_PRELOAD=/home/stark/libtorch/lib/libtorch_hip.so HCP_TCH_DEVICE=cuda:0 LD_LIBRARY_PATH=/home/stark/libtorch/lib \
   ./rust/target/release/hcp-ringattn-rust \
     --distributed-role worker \
     --domain-id 1 \
@@ -84,7 +88,7 @@ ssh -o ConnectTimeout=15 "${PEARL_SSH}" "mkdir -p '${STATE_DIR}' && cd '${PEARL_
     --next-peer-addr ${WHITE_LAN}:${W0_PORT} \
     --coordinator-addr ${WHITE_LAN}:${COORD_PORT} \
     --num-domains 2 \
-    >'${STATE_DIR}/worker1-pearl-n2.log' 2>&1 </dev/null &" || fail "pearl worker launch ssh failed"
+    >'${STATE_DIR}/worker1-pearl-n2.log' 2>&1 </dev/null" || fail "pearl worker launch ssh failed"
 
 # === Wait for health (up to ~4 min) ===
 log "waiting for 2 workers connected"
