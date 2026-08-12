@@ -261,8 +261,10 @@ assert prompts_seen == total, f"bench completed total {prompts_seen} != {total}"
 # --- HCP trace plane ---
 records = [json.loads(l) for l in open(trace_path) if l.strip()]
 assert len(records) == total, f"trace records {len(records)} != {total}"
-ids = [r["request_id"] for r in records]
-assert ids == list(range(1, total + 1)), f"request_id sequence broken: {ids[:5]}...{ids[-3:]}"
+# Concurrent requests complete out of order; trace rows are written at
+# completion time, so only the id SET must be exact.
+ids = sorted(r["request_id"] for r in records)
+assert ids == list(range(1, total + 1)), f"request_id set broken: {ids[:5]}...{ids[-3:]}"
 for r in records:
     assert r["error"] is None, f"req {r['request_id']} error {r['error']}"
     assert r["reserved_bytes"] == r["released_bytes"], f"req {r['request_id']} release mismatch"
