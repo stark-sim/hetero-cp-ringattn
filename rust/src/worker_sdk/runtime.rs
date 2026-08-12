@@ -124,6 +124,15 @@ impl WorkerRuntime {
                         println!("[worker {domain_id}] coordinator connection closed, exiting gracefully");
                         return Ok(());
                     }
+                    // A length-read timeout only means no command arrived within
+                    // the read window. Idle periods longer than the timeout are
+                    // normal for a service (orchestration stalls, gaps between
+                    // requests) and must not kill the worker. Payload timeouts
+                    // remain fatal because the framing is then desynchronized.
+                    if msg.contains("length timeout") {
+                        eprintln!("[worker {domain_id}] command wait timed out, keep waiting: {e}");
+                        continue;
+                    }
                     return Err(format!("recv_command failed: {e}"));
                 }
             };
