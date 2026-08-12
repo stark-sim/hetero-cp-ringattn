@@ -114,6 +114,33 @@ impl FrozenKvAssigneeSchedule {
     }
 }
 
+/// Per-layer starter sequence for a stationary ring phase: the starter of the
+/// first layer is `initial_starter`; every later layer's starter is the
+/// previous layer's finisher, i.e. `(starter + domains - 1) % domains`. Pure
+/// and deterministic so the coordinator and every worker derive the same
+/// route from the frozen plan.
+pub fn stationary_layer_starters(
+    initial_starter: usize,
+    layers: usize,
+    domains: usize,
+) -> Result<Vec<usize>, String> {
+    if domains == 0 {
+        return Err("stationary ring requires at least one domain".to_string());
+    }
+    if initial_starter >= domains {
+        return Err(format!(
+            "stationary ring starter {initial_starter} out of {domains} domains"
+        ));
+    }
+    let mut starters = Vec::with_capacity(layers);
+    let mut starter = initial_starter;
+    for _ in 0..layers {
+        starters.push(starter);
+        starter = (starter + domains - 1) % domains;
+    }
+    Ok(starters)
+}
+
 /// Experimental finite-horizon KV shard with stable, position-indexed storage.
 #[derive(Debug)]
 pub struct ReservedPositionedKvShard {
@@ -277,8 +304,13 @@ impl KvCache for ReservedPositionedKvShard {
         if keep {
             return self.update(new_k, new_v);
         }
-        Err(ModelError::Backend(
-            "reserved positioned KV decode must use the self-driving ring".to_string(),
+        // experimental: raised for the route-B E2E (phase-2 node 2c) — legacy
+        // decode-ring growth on a non-owner domain drops the new token without
+        // persisting it, mirroring ContiguousKvCache::update_sharded; the
+        // returned concat only feeds this step's attention.
+        Ok((
+            Tensor::cat(&[&self.active_k(), new_k], 2),
+            Tensor::cat(&[&self.active_v(), new_v], 2),
         ))
     }
 
@@ -1030,6 +1062,47 @@ mod tests {
             use_sliding_window: None,
             partial_rotary_factor: 1.0,
         }
+    }
+
+    #[test]
+    fn stationary_layer_starters_rotate_to_previous_finisher() {
+        // N=2 alternates; N=3 walks backwards through the ring (finisher of
+        // layer k is (starter + N - 1) % N and becomes starter of k+1).
+        assert_eq!(
+            stationary_layer_starters(1, 4, 2).unwrap(),
+            vec![1, 0, 1, 0]
+        );
+        assert_eq!(
+            stationary_layer_starters(2, 7, 3).unwrap(),
+            vec![2, 1, 0, 2, 1, 0, 2]
+        );
+        assert!(stationary_layer_starters(2, 1, 2).is_err());
+        assert!(stationary_layer_starters(0, 1, 0).is_err());
+    }
+
+    #[test]
+    fn frozen_schedule_derivation_matches_smoke_scenarios() {
+        // N=2 scenario (97ca355): tickets [1,3], m=4 -> counts [1,3].
+        let schedule = FrozenKvAssigneeSchedule::new(&[1, 3], 75, 4).unwrap();
+        assert_eq!(schedule.counts(), &[1, 3]);
+        let offsets_by_domain = {
+            let mut by_domain = vec![Vec::new(); 2];
+            for offset in 0..4 {
+                let domain = schedule.assignee_for(offset, 0, 1).unwrap();
+                by_domain[domain].push(offset);
+            }
+            by_domain
+        };
+        let mut assigned: Vec<usize> = offsets_by_domain.iter().flatten().copied().collect();
+        assigned.sort_unstable();
+        assert_eq!(assigned, vec![0, 1, 2, 3]);
+
+        // N=3 scenario (246aa8c): tickets [1,2,3], m=4 -> counts [1,1,2].
+        let schedule3 = FrozenKvAssigneeSchedule::new(&[1, 2, 3], 75, 4).unwrap();
+        assert_eq!(schedule3.counts(), &[1, 1, 2]);
+        // N=3 decode over 24 layers -> counts [4,8,12].
+        let decode3 = FrozenKvAssigneeSchedule::new(&[1, 2, 3], 75, 24).unwrap();
+        assert_eq!(decode3.counts(), &[4, 8, 12]);
     }
 
     fn deterministic_tensor(shape: &[i64], phase: f64, device: Device) -> Tensor {

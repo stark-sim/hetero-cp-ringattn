@@ -18,6 +18,8 @@ pub use attention::GqaAttention;
 
 #[cfg(feature = "tch-backend")]
 use crate::model::ModelError;
+#[cfg(feature = "tch-backend")]
+use crate::model::transport::KvTransport;
 
 #[cfg(feature = "tch-backend")]
 use tch::Tensor;
@@ -72,6 +74,18 @@ impl DecoderLayer {
         let hidden_states = self.post_attention_layernorm.forward(&hidden_states);  // Pre-Norm
         let hidden_states = self.mlp.forward(&hidden_states);  // 前馈网络
         Ok(&hidden_states + &residual)  // Residual
+    }
+
+    /// experimental: raised for the stationary continuation driver (route-B 2b)
+    ///
+    /// Returns the per-layer KV transport when the attention backend is the
+    /// distributed ring backend and a transport was installed via
+    /// `setup_kv_transports`.
+    pub fn kv_transport_mut(&mut self) -> Option<&mut Box<dyn KvTransport>> {
+        self.attention
+            .as_any_mut()
+            .downcast_mut::<crate::model::attention::HcpRingAttentionBackend>()
+            .and_then(|ring| ring.kv_transport_mut())
     }
 }
 

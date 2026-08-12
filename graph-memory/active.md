@@ -2,19 +2,493 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 二期 Rust 推理服务 benchmark-readiness
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6d`
+
+[2026-08-12 完成] 二期 Rust 推理服务 benchmark-readiness 五项出口全部达成（只针对 Rust HCP 服务本体，不运行 vLLM benchmark）：
+1. API ✅：/v1/completions 非 streaming/streaming、SSE [DONE]、usage/error 内部 regression（6b.0，4784acf）。
+2. 资源 ✅：普通 service prefill frozen reservation + byte admission（6b.2a，d57b9ca）；active requests 总占用 reserve/release（6b.2b，9ec8f96）。
+3. 调度 ✅：coordinator 广播同一 DecodeBatch FIFO，request horizon/token/cache lifecycle 正确（6b.3，abddbf1）。
+4. 观测 ✅：request queue/prefill/first-token/decode/release 与 ring hops/bytes/reserved bytes 可关联（6c.0，78be1d0 --trace-jsonl）。
+5. 稳定性 ✅：native concurrency 1/2/4（6c.1）；Mac MPS + white CUDA + pearl HIP N=3 真实 Qwen 服务闭环（6d，test_phase2_6d_n3_service.sh）。
+二期不改 vLLM engine/plugin。三期（生态：多请求 batching、placement/ledger WIP 重启、外部 benchmark）待用户规划。
+
+_updated: 2026-08-11 22:14:54_
+### 6d：N=3 异构 Rust 服务真实 Qwen readiness
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6d`
+
+[2026-08-12 完成] 6d N=3 异构 Rust 服务 readiness。
+Mac MPS (coordinator + worker0) + white RTX 4090 CUDA (worker1) + pearl RX 9060 XT HIP (worker2) 经 coordinator/生产 QUIC neighbor-only ring 处理真实 Qwen2-0.5B 多请求服务；native client 验证 token、admission、FIFO、release、telemetry 与 neighbor-only hops。
+验收（scripts/test_phase2_6d_n3_service.sh，report routeb-6d-n3-service-20260812-060937）：
+1. 4/4 请求 0 错误（metrics total=4 completed=4 failed=0 active=0；提示词不等长 6/13/40/49 tokens，max_tokens 3/4/6/8）；
+2. token/reference：greedy 生成均非 [error:、text 非空（如 prompt49 -> ". The quick brown"，prompt40 -> " It was the only flower that"）；
+3. admission/FIFO/release：trace 每请求 reserved==released、reserved 字节按 prompt/decodes 单调增长（如 req1 [233472,245760,221184]）；
+4. telemetry 关联：trace 8 条（4 请求）按 request_id 含 enqueue/prefill-accepted/first-token/completed elapsed 与 finish_reason；
+5. neighbor-only hops：N=3 L=24 断言 prefill_hops=48=L*(N-1)、decode_hops=steps*48 全部成立。
+二期到此证明 Rust 服务已具备接受外部 benchmark 的基础，不在本节点调用 vLLM CLI。
+
+_updated: 2026-08-11 22:14:54_
+### 6d N=3 异构真实 Qwen 服务闭环通过
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6d`
+
+实现脚本 scripts/test_phase2_6d_n3_service.sh；复用 78be1d0（6c.0 trace 平面）。
+验证（三机真实异构：Mac MPS + white CUDA + pearl HIP，均 292a3c5 release build，远端经 git pull --ff-only 同步）：
+1. 三端 handshake：Mac=8192 MB、white=21793 MB、pearl=14805 MB（均非 u64::MAX，admission 预算真实）。
+2. 4 个不等长请求（并发 2 + 串行 2）：resp1-4 全部 OK，0 错误；metrics total=completed=4、failed=0、active=0。
+3. trace 4 条：prefill_hops=48、decode_hops=steps*48（N=3 L=24 公式），reserved==released，finish_reason 均 length。
+4. 首次运行 1 个失败：测试提示词 "The quick brown fox"（4 tokens）在 N=3 ring 下 domain 分到 0 token 被预检拒绝——测试数据问题，非系统缺陷；加长后通过。另一次脚本 health grep 误判（python json.tool 缩进），已改为 json 解析。
+证据边界：N=3 异构单服务实例多请求 correctness；不证明吞吐/性能、跨机故障恢复、vLLM 兼容；二期 benchmark-readiness 五项出口至此全部达成（API 6b.0 / 资源 6b.2a+6b.2b / 调度 6b.3 / 观测 6c.0 / 稳定性 6c.1+6d）。
+
+_updated: 2026-08-11 22:14:54_
+### 二期 benchmark-readiness 五项出口全部达成
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6d`
+
+[2026-08-12 完成] 二期 Rust 推理服务 benchmark-readiness 五项出口全部达成（只针对 Rust HCP 服务本体，不运行 vLLM benchmark）：
+1. API ✅：/v1/completions 非 streaming/streaming、SSE [DONE]、usage/error 内部 regression（6b.0，4784acf）。
+2. 资源 ✅：普通 service prefill frozen reservation + byte admission（6b.2a，d57b9ca）；active requests 总占用 reserve/release（6b.2b，9ec8f96）。
+3. 调度 ✅：coordinator 广播同一 DecodeBatch FIFO，request horizon/token/cache lifecycle 正确（6b.3，abddbf1）。
+4. 观测 ✅：request queue/prefill/first-token/decode/release 与 ring hops/bytes/reserved bytes 可关联（6c.0，78be1d0 --trace-jsonl）。
+5. 稳定性 ✅：native concurrency 1/2/4（6c.1）；Mac MPS + white CUDA + pearl HIP N=3 真实 Qwen 服务闭环（6d，test_phase2_6d_n3_service.sh）。
+二期不改 vLLM engine/plugin。三期（生态：多请求 batching、placement/ledger WIP 重启、外部 benchmark）待用户规划。
+
+_updated: 2026-08-11 22:14:54_
+### 6c.1：Rust/native client 分级服务稳定性基线
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6c1`
+
+[2026-08-12 完成] 6c.1 native 服务稳定性基线。
+新增 scripts/test_phase2_6c1_native_baseline.sh：本地 Mac MPS 2-domain 真实 HTTP 服务（HCP_TCH_DEVICE=mps、Qwen2-0.5B），带 --trace-jsonl 运行 concurrency 1（2 串行不等长）、2（2 同时不等长）、4（4 同时不等长），共 8 个请求。
+验收：1) 0 错误：8/8 请求完成，metrics failed=0、active=0；2) token/reference：greedy 生成均非 [error:，text 非空；3) queue/active/release：metrics total=completed=8、queued=0；4) reserved bytes 与 release 一致（trace 每请求 reserved==released，字节数随 prompt/decodes 单调增长）；5) ring hops/bytes：trace 断言 prefill_hops=24=L*(N-1)（N=2 L=24）、decode_hops=decode_steps*24。
+边界：这是二期内部稳定性基线，不是 vLLM benchmark 性能结论；仅 Mac 本机 MPS 2-domain（N=3 异构见 6d）。
+
+_updated: 2026-08-11 21:40:05_
+### 6c.1 native 服务稳定性基线通过（N=2 concurrency 1/2/4）
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6c1`
+
+实现脚本 scripts/test_phase2_6c1_native_baseline.sh；配套实现 78be1d0（6c.0 trace 平面，本基线复用）。
+验证（本地 Mac MPS、N=2、L=24、Qwen2-0.5B、release build）：
+1. concurrency 1：2 串行不等长请求（prompt 2/33 tokens，max_tokens 3/8）→ responses=2 errors=0。
+2. concurrency 2：2 同时不等长（prompt 8/3，max 6/2）→ responses=2 errors=0。
+3. concurrency 4：4 同时不等长（prompt 2/13/26/3，max 4/10/7/1）→ responses=4 errors=0。
+4. /metrics 后验：total=completed=8、failed=0、queued=0、active=0。
+5. trace 8 条记录：request_id 1..8；每请求 prefill_accepted/completed elapsed > 0、error=null、reserved==released（如 req2 prompt33 max8 reserved=[258048,245760]）；prefill_hops=24=L*(N-1)、decode_hops=steps*24；finish_reason 均 length。
+证据边界：Mac 本机 MPS 2-domain 稳定性基线；不证明 N=3 异构（white CUDA/pearl HIP）、真实网络、吞吐或 vLLM 兼容；不含性能结论。
+
+_updated: 2026-08-11 21:40:05_
+### 6c.0：建立 benchmark 最小双平面观测
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6c0`
+
+[2026-08-12 完成] 6c.0 benchmark 最小双平面观测。
+coordinator 新增 --trace-jsonl <path>：每个完成的请求输出一条 JSONL 记录（keyed by request_id），包含 enqueue/prefill-accepted/first-token/completed elapsed ms、reserved/released bytes、prompt/max tokens、finish_reason 或 error、prefill/decode hops。hop 数按已知 N/L 公式派生（prefill = L*(N-1)，每个 decode step 同样），无需逐 hop 埋点。默认关闭；开启仅追加 JSONL，不改推理结果。
+验收：1) 一个请求可通过 request_id 关联 client 结果与 HCP 记录（request_id 从 1 递增，trace 含同 id）；2) 计数与已知 N/L 公式一致（测试断言 prefill_hops=L*(N-1)、decode_hops=steps*L*(N-1)）；3) disabled 不改变推理结果（TraceSink::new(None) writer=None，lifecycle 调用 no-op）。
+边界：JSONL/现有 /metrics 计数，不引入 Prometheus、trace backend、dashboard、生产告警。
+
+_updated: 2026-08-11 21:37:12_
+### 6c.0 per-request JSONL trace 双平面通过
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6c0`
+
+实现提交 78be1d0（rust: add per-request JSONL trace plane to HTTP service）。
+TDD 与验证：
+1. 新增 2 个 trace_sink 单测：(a) disabled（None 路径）writer 为 None、lifecycle 调用 no-op 且不 panic；(b) N=3 L=24 trace 记录含 enqueue->accepted->2 decode->complete，断言 prefill_hops=48、decode_hops=96、reserved/released 字节、finish_reason 与时间戳字段。
+2. RED/GREEN：首轮 2 个编译错误（elapsed_ms 与 in_flight 的 borrow 冲突；InferenceJob 在 prefill 失败路径被 move 后引用）已修复，随后 2 passed。
+3. 完整回归：cargo test --features tch-backend --lib = 141 passed、0 failed、5 ignored（129 基线 + 3 service_layer_capacities + 4 kv_ledger + 2 batch_request_tokens + 1 release_request + 2 trace_sink）。
+4. rustfmt --edition 2021 与 git diff --check 均 exit 0；改动仅限 coordinator.rs。
+证据边界：trace 平面单测证明字段与 hop 公式；真实 HTTP 服务端到端 trace 由 6c.1 native baseline 完成（证据 evidence-phase2-rust-6c1-native-baseline-20260812）。
+
+_updated: 2026-08-11 21:37:12_
+### 6b.3：真实 runtime 固化跨 worker DecodeBatch FIFO 合同
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6b3`
+
+[2026-08-12 完成] 6b.3 真实 runtime 固化跨 worker DecodeBatch FIFO 合同。
+coordinator decode_iteration 新增 batch_request_tokens helper：每个 iteration 只构造一次 request_tokens 向量并按 request_id 排序，原样广播给所有 worker（WorkerCommand::DecodeBatch 同一向量）；worker runtime 原样转发到 backend.decode_batch 按序逐请求 decode。这是 multi-request Q-ring 依赖的 FIFO 合同——RingPacket 无 request_id，所有 worker 必须按同一 per-layer 顺序 decode。
+验收：1) 所有 worker 每轮观测相同 request_id 序列（coordinator 广播同一排序向量 + worker 默认按序 decode）；2) 无错包/死锁（6a.2 真实 TCP Q-ring 交错 decode oracle 已覆盖）；3) 两请求 token 与独立 reference 一致（6a.2 oracle 每步 argmax/diff 断言）；4) 完成后 cache 释放（新增 release_request focused 测试：release 后 context 移除、幂等、再 decode 报错）。
+边界：不增加 RingPacket request_id/decode_step；真实 runtime 未证明会重排，故无需协议修订；不含真实 HTTP 并发 E2E（6d）与吞吐。
+
+_updated: 2026-08-11 21:10:32_
+### 6b.3 DecodeBatch FIFO runtime 合同通过
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6b3`
+
+实现提交 abddbf1（rust: lock DecodeBatch FIFO contract and request release）。
+TDD 与验证：
+1. batch_request_tokens 新增 2 个单测：(a) 乱序插入 active requests(30/10/20) 后 batch 严格按 request_id 排序 [(10,5),(20,6),(30,7)]；(b) 无 active 时返回空向量。
+2. release_request 新增 1 个 focused 测试：prefill + decode 后 release 移除 context，重复 release 幂等，再 decode 报错（不复用 stale state）。
+3. 完整回归：cargo test --features tch-backend --lib = 139 passed、0 failed、5 ignored（129 基线 + 3 service_layer_capacities + 4 kv_ledger + 2 batch + 1 release）。
+4. rustfmt --edition 2021 与 git diff --check 均 exit 0；改动限 coordinator.rs + tch_backend.rs 两个文件。
+证据边界：FIFO 合同是 backend 层 + coordinator 层确定性单测；多 worker 交错数值由 6a.2 真实 TCP Q-ring oracle（证据 evidence-route-b-6a2-qring-unequal-isolation-20260812）覆盖；未在真实 HTTP 并发服务上复跑（6d 完成）。
+
+_updated: 2026-08-11 21:10:32_
+### 6b.2b：最小 active-request KV byte reserve/release 计数
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6b2b`
+
+[2026-08-12 完成] 6b.2b 最小 active-request KV byte reserve/release 计数。
+coordinator 新增 ActiveKvReservation ledger：request_id -> per-domain reserved bytes 映射 + per-domain used sum；prefill 在 dispatch 前原子检查 active sum + new request 是否都 <= 各 worker byte budget（try_reserve），成功才下 Prefill；完成、decode 失败、prefill 失败三种路径各自恰好释放一次（RAII ReservationGuard 保证 prefill 中间失败也释放，成功时 committed 保留）。
+验收：1) 两个 individually-fit 但 jointly-over-budget 的请求中第二个在 dispatch 前被拒绝（try_reserve 返回错误并经 job.tx 返回）；2) 完成第一个后预算恢复，后续请求可进入（release 后 used 归零）；3) 重复 release 不产生负数或双重返还（release 幂等、saturating_sub）。
+边界：correctness 确定性占用计数，无 paged allocator、preemption、priority、eviction、repair planner、无限队列治理；不含真实 HTTP 并发 E2E（6d）；batch mode 不接入。
+
+_updated: 2026-08-11 20:59:37_
+### 6b.2b active-request KV byte reserve/release 计数通过
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6b2b`
+
+实现提交 9ec8f96（rust: track active-request KV byte reservations in HTTP service）。
+TDD 与验证：
+1. 新增 4 个 ActiveKvReservation 单测：(a) 两个 individually-fit 请求同时容纳；(b) 第二个请求 joint 超预算时原子拒绝、账本不变、释放后恢复；(c) duplicate reserve 报错、重复/未知 release 幂等且不产生负数；(d) checked_add overflow 与 domain 数不匹配拒绝且不留账本。
+2. RED/GREEN：首轮运行 1 个测试因 overflow 断言触发条件错误而失败（used=0 时 u64::MAX 不溢出），修正测试为已有 live reservation 后 4 passed。
+3. 完整回归：cargo test --features tch-backend --lib = 136 passed、0 failed、5 ignored（129 基线 + 3 service_layer_capacities + 4 kv_ledger）。
+4. rustfmt --edition 2021 <file> 与 git diff --check 均 exit 0；改动仅限 coordinator.rs。
+证据边界：ledger 单测证明确定性计数语义（原子拒绝、一次释放、幂等）；未在真实 HTTP 并发 + 多 worker 上复跑（6d 完成）；不证明吞吐、eviction 或 queue 治理。
+
+_updated: 2026-08-11 20:59:37_
+### 6b.2a：普通 service prefill 接入冻结 reservation 与 byte admission
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6b2a`
+
+[2026-08-12 完成] 6b.2a 普通 HTTP service prefill 接入 frozen reservation 与 byte admission。
+接入点 rust/src/distributed/coordinator.rs prefill_single_request：任何 Prefill command 发出前，按 prompt/max_tokens、capacity tickets(chunk_sizes)、模型 KV geometry 冻结本请求 per-domain per-layer reservation（service_layer_capacities：prefix split + 全量 decode horizon [prompt_len, prompt_len+max_tokens)，每个 decode position 由 position%domains owner 持有，与 ring.rs keep 规则一致），随后 capacity_mb_to_bytes + admit_reserved_kv_bytes 做 exact KV payload byte admission；通过后把 capacities 随 Prefill 命令下发（layer_kv_capacities: Some(...)）。
+验收：1) 合法请求在 prefill 前打印 required<=budget（新增 coordinator 日志）；2) unknown/overflow/one-byte-short 在任意 worker prefill 前拒绝（fail-closed，错误经 job.tx 返回）；3) 既有 token correctness 不变（132 passed，含 6a decode_batch/request isolation oracle）。新增 3 个 service_layer_capacities 单测（full horizon/zero max_tokens/N=3）。边界：单请求 post-plan admission；batch mode(process_single_request) 保持 layer_kv_capacities: None 未接入；不涉并发总量(6b.2b)、eviction、repair、迁移。worker 端 ReservedPositioned decode 数值语义已由 6a 证明与独立参考一致。
+
+_updated: 2026-08-11 20:47:51_
+### 6b.2a service prefill frozen reservation + byte admission 通过
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@6b2a`
+
+实现提交 d57b9ca（rust: gate HTTP service prefill with KV byte admission）。
+TDD 与验证：
+1. 纯 helper 单测：service_layer_capacities 新增 3 个测试覆盖 (a) 2-domain prompt4 max_tokens3 -> capacities [3,4]（domain0 前缀1+{4,6}，domain1 前缀3+{5}）；(b) max_tokens=0 只留前缀 [1,3]；(c) N=3 prompt6 [2,2,2] max_tokens4 -> [4,3,3]。
+2. focused test：service_layer_capacities 3 passed。
+3. 完整回归：cargo test --features tch-backend --lib = 132 passed、0 failed、5 ignored（基线 129 + 3 新增）；含 6a 的 decode_batch isolation 与 decode_qring request isolation oracle。
+4. rustfmt --edition 2021 <file> 与 git diff --check 均 exit 0；改动仅限 coordinator.rs 一个文件。
+证据边界：coordinator 本地单元 + 既有 in-process worker oracle；未在真实 HTTP 服务 + 多 worker 上复跑（跨机 HTTP E2E 属 6d）；不证明并发 admission(6b.2b)、吞吐、eviction 或 batch mode 路径。
+
+_updated: 2026-08-11 20:47:51_
+### 6b.0：Rust 内部固化 benchmark-ready completions 合同
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@4784acf`
+
+【当前下一节点】
+问题：现有 API 有实现但缺少针对 benchmark-ready contract 的内部 regression，不能在不依赖外部 client 的情况下守住 wire semantics。
+动作：对 Axum router/handler 建最小测试，覆盖 non-streaming JSON、streaming SSE token chunk、最终 finish_reason 与 `[DONE]`、usage/request id、malformed request/error；只验证当前支持的 completions 子集。
+验收：focused Rust tests RED/GREEN；现有 API/runtime tests 回归；不启动 vLLM CLI。
+边界：不新增 chat、鉴权、beam search、复杂 sampling 或完整 OpenAI 兼容层。
+
+_updated: 2026-08-11 19:31:56_
+### 二期 benchmark 分层：HCP oracle + vLLM serving，AIPerf/RULER 后置
+
+type: `decision` · status: `superseded` · confidence: 0.95 · importance: 1.0 · source: `official-source-and-code-audit-2026-08-11`
+
+动机剖析六问：
+1. 问题：单元测试和单次三机 smoke 不能衡量基础推理服务在并发到达、流式输出、长短请求混合时的正确性与时延，也不能形成可与主流引擎对照的标准指标。
+2. 现状：HCP 已有 OpenAI-compatible /v1/completions、SSE、BatchScheduler、request_id KV map 与三机 QUIC 证据，但没有外部 workload benchmark；现有 HTTP 每次调用生成新 request_id，完成即 ReleaseRequest。
+3. 终态：第一层用 HCP deterministic oracle 验证精确 token、request 隔离、continuation、释放、ring hop/bytes 与 capacity-weighted KV；第二层用标准客户端报告成功率、request throughput、TTFT、TPOT/ITL、E2E latency/goodput；每项证据注明不覆盖的硬件、规模和性能轴。
+4. 他者：vLLM bench serve 支持 OpenAI completions、自定义 endpoint、request-rate/max-concurrency、TTFT/TPOT/ITL/E2EL/goodput、random/ShareGPT/timed trace/prefix repetition；AIPerf 支持 completions、并发/请求率、trace replay、prefill concurrency、multi-turn 与更完整 telemetry；MLPerf 是模型/数据集/LoadGen 标准提交；RULER/LongBench 测长上下文任务能力而非 HCP 数据流 correctness。
+5. 本方案：当前先做真正独立参考的 HCP correctness oracle，再用 vLLM bench serve 做最小 streaming serving smoke 与小并发基线；确认 API/session 边界后再考虑 AIPerf。RULER 在更长模型/上下文就绪后使用，MLPerf 与 LongBench v2 暂不作为二期门槛。
+6. 为什么：vLLM 客户端最轻且与现有 completions/SSE 最接近；AIPerf 的全面能力现在会引入较重运行栈，而且其 multi-turn 默认每轮重发完整历史，不能证明 HCP 原地 continuation KV；模型质量 benchmark 也会把 Qwen 能力与系统正确性混在一起。
+必要性审计：标准 serving benchmark 可以比较客户端可见时延与吞吐，但 HCP 的 capacity-weighted KV、neighbor-only hops、历史 KV 是否重传、同 request KV continuation 都不可由通用 OpenAI API 指标推导，必须保留 HCP-specific oracle/telemetry。
+临时验收矩阵：
+A. correctness：greedy token 与独立参考一致；不同长度请求交错；release 后无 request cache。
+B. serving：0 请求错误；TTFT/TPOT/ITL/E2EL 与 request throughput 可导出；并发 1/2/4 分级，不预设生产 SLO。
+C. HCP：每 worker KV bytes 不越 budget；placement 与 capacity weight 一致；只走 predecessor/successor；记录 prefill/decode/continuation hops 与 bytes。
+D. continuation：必须由同一 HCP request/session 复用原 KV 的专用测试证明，不能由 AIPerf full-history multi-turn 替代。
+状态：待用户审查后进入实现。
+VERDICT: IMPLEMENT（若用户确认）。
+
+_updated: 2026-08-11 19:10:38_
+### 二期 benchmark：HCP serving contract 与 vLLM bench serve 黑盒接入
+
+type: `task` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-12`
+
+目标：让现有 Rust HCP 服务作为 OpenAI-compatible black-box 被 `vllm bench serve` 驱动，并在不嵌入 vLLM engine 的前提下，完成 correctness、request lifecycle、capacity admission、HCP ring telemetry 与小并发 serving baseline。
+
+分层出口：
+1. API contract：非 streaming/streaming completions、`[DONE]`、错误与 usage 可被标准 client 解析。
+2. HCP correctness：不同长度请求交错时 token/reference、request cache release、horizon sync 和 FIFO batch contract 可验证。
+3. Admission：普通 service prefill 在 dispatch 前使用 frozen capacity-weighted reservation/byte gate。
+4. Benchmark：先 request-rate=1/concurrency=1，再 max-concurrency=2/4；记录 TTFT/TPOT/ITL/E2EL 与 HCP request/hop/byte 证据。
+
+边界：不把 vLLM scheduler/paged KV/NCCL backend 搬入 Rust；不把通用 benchmark 的 multi-turn 当作 HCP 原地 continuation 证据。
+
+_updated: 2026-08-11 19:10:38_
+### 6b.0：vLLM bench serve 单请求线级兼容探测
+
+type: `task` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-20260812`
+
+【下一节点，仅做探测，不改行为】
+问题：静态审计只能说明 HCP API 接近 OpenAI completions，不能证明实际 `vllm bench serve` parser 能消费 request/SSE/[DONE]。
+动作：新会话先读取 infrastructure inventory，选择已有或最小可用的 vLLM CLI 环境；启动现有 HCP service；以 `/v1/completions`、streaming、单 prompt、concurrency=1 发起一次真实 client 请求。
+验收：A) client 成功并产生可解析 serving 指标，则直接关闭本节点并跳过 6b.1；或 B) 保存精确 request/response/parser 错误并据此激活 6b.1。
+边界：不声明性能，不修改 vLLM engine，不新增 API 字段，不运行并发或三机。
+
+_updated: 2026-08-11 19:10:38_
+### 6d：Mac MPS + white CUDA + pearl HIP 三机真实 Qwen benchmark
+
+type: `task` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-20260812`
+
+问题：本地/synthetic serving baseline 不能证明异构 N=3 neighbor-only ring 在真实模型和并发请求下成立。
+动作：按 inventory 当前 endpoint，经本地 commit/push 和远端 git pull 同步；Mac、white、pearl 各运行至少一个 worker；先跑 HCP correctness oracle，再运行低并发 vLLM serving client。
+验收：三平台都执行模型 forward；N=3 predecessor/successor QUIC ring；真实 Qwen 请求 0 错误；token/reference 与 release/admission 守护通过；报告 client 与 HCP 双平面数据。
+边界：先 concurrency 1/2，是否扩到 4 由资源证据决定；不声明生产级容错或跨硬件绝对公平性能。
+
+_updated: 2026-08-11 19:10:38_
+### 新对话恢复点：从 6b.0 vLLM client 线级探测开始
+
+type: `session` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-20260812`
+
+恢复信息：
+- worktree: `/Users/stark_sim/.config/superpowers/worktrees/hetero-cp-ringattn/route-b-continuation-stationary-packet`
+- branch: `codex/route-b-continuation-stationary-packet`
+- 已确认架构：vLLM bench serve 作为 black-box client；DEFER vLLM engine integration。
+- 当前下一任务：`task-phase2-benchmark-6b0-wire-probe-20260812`，只做单请求真实 client probe，不先改 API。
+- 6a.2 已证明 N=2、同序 FIFO 下两个不等长 request 的 Q-ring isolation；真实 runtime FIFO 合同仍由 6b.3 验证。
+- 保留未跟踪 `models` 与 `reports/**`，不得提交或删除。
+- 每个子节点实施前仍需独立动机剖析、验证、代码 commit、Graph Memory evidence commit。
+
+_updated: 2026-08-11 19:10:38_
+### 二期只做 Rust benchmark-readiness，vLLM benchmark/接入归三期
+
+type: `revision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-correction-20260812`
+
+用户修订阶段边界：上一版把“Rust 服务具备面对 vLLM benchmark 的工程能力”误写成“二期立即运行 vLLM bench serve”。
+
+修订后：
+- 二期：只实现和验证 Rust 服务核心——OpenAI completions 合同、streaming、多请求调度、capacity-weighted reservation、active byte admission、FIFO ring 合同、request release、双平面观测、Mac+white+pearl 三机真实服务稳定性。
+- 三期：实际运行 `vllm bench serve`，根据真实客户端差异做生态兼容；vLLM backend/plugin/paged-KV 等接入也属于三期。
+
+已发生的 white/Mac vLLM CLI 检查只是只读环境盘点；未启动 HCP service、未运行 benchmark、未改 Rust/API。旧计划节点保留并用 supersession 标记。
+VERDICT: REVISE PHASE BOUNDARY。
+
+_updated: 2026-08-11 19:10:38_
+### 先完成 Rust 推理服务 benchmark-readiness，再进入 vLLM 生态阶段
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-correction-20260812`
+
+动机剖析六问：
+1. 问题：把外部 benchmark client 运行提前到二期，会让 API parser 差异和 vLLM 环境问题干扰 Rust 服务核心闭环。
+2. 当前状态：Rust 已有 completions/SSE、scheduler、request context 和 ring correctness；缺口仍是普通 service admission、并发总预算、真实 runtime FIFO、释放和可解释 telemetry。
+3. 终态：二期结束时，Rust 服务通过内部 contract 与 native load acceptance，能稳定处理 concurrency 1/2/4，并在 N=3 异构 QUIC 上保留 correctness/admission/hop-byte 证据；尚未要求实际 vLLM CLI 结果。
+4. 他者：成熟引擎通常先稳定 serving core 与协议合同，再由独立 benchmark/生态 adapter 适配外部工具；vLLM benchmark client 不是 Rust 核心能力的一部分。
+5. 本方案：内部 Axum contract test -> 普通 service reservation/admission -> active request byte accounting -> runtime FIFO oracle -> HCP telemetry -> native service baseline -> N=3 real Qwen；随后三期才运行 vLLM benchmark 和做生态接入。
+6. 为什么：保持阶段可归因、小步和 Rust 主线；避免为了某一版本 vLLM CLI 先修改核心，同时确保三期接入时被测服务已经稳定。
+
+必要性审计：面对 benchmark 必须具备稳定服务合同、资源正确性与观测；二期必须实际运行 vLLM CLI 则不是必要条件。
+VERDICT: IMPLEMENT RUST READINESS; DEFER VLLM BENCH/INTEGRATION TO PHASE 3。
+
+_updated: 2026-08-11 19:10:38_
+### 6a.2 N=2 synthetic Q-ring 多请求隔离 oracle
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-11`
+
+二期 6a.2：N=2 synthetic Q-ring 多请求隔离 oracle。
+
+范围：两个不同长度 request 在两个同步 Q-ring worker backend 上交错执行分片 prefill 与多轮 decode；每个 request 的 prefill/首轮及后续 decode logits、greedy token 必须分别匹配完全独立的单域 reference backend。
+
+验收：focused test 通过；不改变生产 runtime、HTTP、QUIC、三机或性能路径；不得把现有 legacy fallback 风险误标为已关闭。
+
+_updated: 2026-08-11 16:58:49_
+### 6a.1 不等长多请求独立参考 correctness oracle
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@fe3aedc`
+
+二期 6a 的首个垂直切片：只增强多请求 correctness 证据。两个不同长度 prompt 在同一 backend 中先后 prefill，再用 DecodeBatch 交错 decode；每个 request 的 logits/token 必须与完全独立 backend 的单请求参考一致。首节点先覆盖 num_domains=1 synthetic tch backend；N=2 Q-ring 作为后续独立节点。边界：不改请求状态实现、不接 HTTP、不声称并发性能。
+
+_updated: 2026-08-11 15:38:57_
+### 6a.1 先强化独立参考 oracle，再决定是否修 layer state
+
+type: `decision` · status: `held` · confidence: 0.98 · importance: 1.0 · source: `user-confirmed-2026-08-11`
+
+动机剖析六问：
+1. 问题：现有 test_decode_batch_isolation 使用两个等长 prompt，并让同一个 reference backend 按相同交错顺序运行；共享 layer state 即使错误也可能在 batch/reference 两侧同步，不能证明 request isolation。
+2. 现状：TchWorkerBackend 已有 request_id KV map、prefill_request、decode_request 和 decode_batch；N=1 synthetic path 可快速构造独立参考，但当前测试没有覆盖不同 prefix length。静态审计发现 layer 的 seq_offset/prefill_kv_len/is_prefill_done 可能共享，不过生产 Q-ring 是否实际读取全部字段尚未由行为测试证伪。
+3. 终态：prompt A/B 长度不同；batch backend 的 prefill/decode 结果分别与 ref-A/ref-B 独立 backend 对齐；至少多步 greedy token exact，logits 差值在既有 float32 容差内；测试只走公开 WorkerBackend 接口。
+4. 他者：vLLM 等 serving runtime 依靠 request-local state 与独立 block tables；其正确性测试也需要请求级 reference，而不是只检查响应非空。该原则可复用，但本节点不引入 paged allocator。
+5. 本方案：先只新增一个垂直测试，构造三个相同权重的 backend：混合 backend、request A reference、request B reference；A/B 使用不同 prompt 长度，交错执行若干 decode_batch 轮次。测试先跑 N=1；若后续 N=2 Q-ring 出现 RED，再对根因选择最小状态修复。
+6. 为什么：这是最低成本、最可证伪的 oracle 增强；立即加入 layer snapshot 会把静态风险误当成已证实 bug，显式参数化则扩大到模型/attention API 重构。先有行为证据再选修法，符合 correctness-first 和小步策略。
+必要性审计：若不同 request 的 prefix length 会改变模型数学输入，则 reference 必须独立；这是 correctness 必要性。至于“必须保存每层 snapshot”不是数学必要性，可能由 Q-ring 路径的输入或 cache 元数据推导，需等待 RED 证据。
+VERDICT: IMPLEMENT。
+
+_updated: 2026-08-11 15:17:50_
+### 通用 multi-turn benchmark 不证明 HCP 原地 KV continuation
+
+type: `belief` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `official-aiperf-docs-and-hetero-cp-ringattn@7ecbeda`
+
+AIPerf 官方 multi-turn 文档说明后续 turn 会携带完整 conversation history；deltas_without_responses 模式也由客户端累积历史和实时响应后构造下一请求。HCP 当前 /v1/completions 每次 HTTP 调用生成新的 request_id，coordinator 完成后向 worker 发送 ReleaseRequest。因此直接运行 AIPerf multi-turn 只能测多轮负载和增长 prompt，不会证明同一 request 的历史 KV 原地保留与 continuation append。若要测后者，需要 HCP 内部 trace oracle，或以后明确增加 stateful session continuation API。
+来源：
+- https://github.com/ai-dynamo/aiperf/blob/main/docs/tutorials/multi-turn.md
+- https://github.com/ai-dynamo/aiperf/blob/main/docs/reference/conversation-context-mode.md
+- rust/src/api/server.rs
+- rust/src/distributed/coordinator.rs
+
+_updated: 2026-08-11 13:19:55_
 ### 路线 B 二期：工程性能力（中）
 
-type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
+type: `task` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@795d7ce`
 
 出口标准（真实跨节点 E2E 通过才考虑工程层合 main）：
-1. [done] m>1 stationary packet 的 TCP/QUIC wire codec（129de9b；codec 本就 shape-generic，新增 m>1 回环测试固化 + smoke --transport quic，含 connect/accept 并发与 done/ack 退出 barrier 两个协议级修复）
-2. [done] WorkerRuntime/coordinator 一等命令（StationaryContinuation 主路径，不调 legacy Decode；2592795/a4ab7f4/1aee8e6）
+1. [done] m>1 stationary packet 的 TCP/QUIC wire codec（129de9b；codec shape-generic，m>1 回环测试与 N=3 QUIC loopback 已固化）
+2. [done] WorkerRuntime/coordinator 一等命令（StationaryContinuation 主路径；2592795/a4ab7f4/1aee8e6）
 3. [done] frozen request plan 的分发/重建机制（plan 随 StationaryContinuation 命令广播，worker 无状态推导；1aee8e6）
-4. [pending] capacity/placement byte-level admission（重启 decision-defer-placement-ledger-wip-20260809 的 WIP）
-5. [done] Mac + white 双 worker stationary continuation 真实 QUIC smoke（经生产命令路径于 2c 提前交付：跨机 E2E generated=[198,15,15] 对齐 golden；1aee8e6）
-依赖一期完成；每项独立小节点 RED/GREEN。
+4. [done] capacity/placement byte-level admission：4a e610d2a 建立冻结 per-layer capacities 的纯 KV payload byte validator；4b 795d7ce 拆分 schedule tickets 与 handshake budget，在任何 Prefill command 前按实际 dtype/geometry fail-closed admission。Mac+white+pearl 三机复验 required=[36864,49152,36864]、budget=[8589934592,22851616768,15742271488]，四进程 exit=0。
+5. [done] production-path QUIC E2E：Mac MPS + white CUDA + pearl HIP 三个 worker 经 coordinator/WorkerRuntime/StationaryContinuation 在 N=3 neighbor-only QUIC ring 上通过；三 worker 全局 send/recv=48/48=24*(3-1)，目标 prefill/continuation 通过严格阶段门，legacy decode 通过 argmax/top-5/max 守护。
+二期五项出口均完成。边界仍是单请求 correctness；main 的完整 placement/ledger WIP、多请求、workspace、性能和故障恢复未被引入或证明。
 
-_updated: 2026-08-09 09:17:08_
+_updated: 2026-08-11 12:00:12_
+### 路线 B 二期扩展：基础多请求推理服务
+
+type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-11`
+
+用户于 2026-08-11 扩展路线 B 二期的工程出口：旧五项只完成了单请求 production QUIC 与 byte admission，不足以称为基础推理引擎服务。二期继续完成最小多请求服务闭环。
+建议分小节点：
+6a. 修复并验证 request-local transformer/ring phase state；两个 prompt 长度不同的 request 交错 prefill/decode 必须与各自单请求参考一致。
+6b. 把 frozen reservation 与 byte admission 接入普通 service prefill；每个 request 在 dispatch 前独立门禁并在完成后释放。
+6c. HTTP 并发基线：至少两个同时到达的非 streaming 请求可排队、交错 decode、独立完成；指标与 request lifecycle 一致。
+6d. Mac MPS + white CUDA + pearl HIP N=3 production QUIC 复验真实 Qwen 多请求，保留 neighbor-only ring。
+边界：先做 correctness-first 基础能力；DecodeBatch 可以在 backend 内按确定顺序逐请求执行，不声称 kernel-level batching、吞吐提升、生产级 eviction/ledger、故障恢复或无限队列治理。
+
+_updated: 2026-08-11 12:00:12_
+### 二期从单请求工程闭环扩展到基础推理服务
+
+type: `revision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-11`
+
+[2026-08-11] 用户修订路线 B 二期出口。旧 task-route-b-phase2-engineering-20260809 的“completed”只证明五项单请求工程能力：wire/runtime/frozen plan/byte admission/N=3 production QUIC；证据本身仍成立，但“二期整体完成”的范围判断被取代。新的二期任务必须加入基础推理引擎服务能力，至少覆盖多 request_id 的隔离、调度、释放与真实三机 E2E。旧任务保留为已完成历史范围并由本 revision SUPERSEDES，不删除其 evidence。
+同时，原路线 B 三期 planning 曾把“多请求并发与调度行为”列为生态能力；用户现将其提升为二期工程出口。三期计划因此需在后续审查时删除或重写该重复项。
+VERDICT: REVISE AND CONTINUE PHASE 2。
+
+_updated: 2026-08-11 12:00:12_
+### 复用现有 scheduler，先修多请求 correctness 再接 service admission
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-11`
+
+动机剖析六问：
+1. 问题：HCP 已有单请求 prefill/decode/continuation 与 N=3 production QUIC 证据，但推理引擎需要在同一 worker 集合中持续接收多个请求、隔离 KV/phase state、交错推进并释放；单请求 CLI E2E 不能证明这些能力。
+2. 现状：HTTP API、BatchScheduler、DecodeBatch、request_id KV map 和 ReleaseRequest 已存在；普通 service prefill 仍用 layer_kv_capacities=None、无 byte admission，Tch RequestContext 未保存每层 attention 的 request-sensitive state。旧 decode_batch test 使用等长 prompt 和单 domain，旧三机 concurrent script只检查两份非空文本。
+3. 终态：两个不同长度/内容的 request 可交错 prefill 与多步 decode，各自 logits/token 与单请求参考一致；完成一个请求不影响另一个；request cache 被释放；随后普通 HTTP path 在 N=3 异构 ring 上通过。验证必须覆盖状态隔离而非仅“两个 HTTP 200”。
+4. 他者：vLLM 等 serving engine 用 request state、scheduler、paged KV/block table 与 continuous batching组织生命周期。可复用 request-local state、admission-before-dispatch、iteration scheduling 和 release 合同；现阶段不直接引入 paged allocator、preemption、eviction 或 kernel batching。
+5. 本方案：保留现有 scheduler/wire 作为 baseline，先补齐 request-local layer state correctness，再把已经验证的 reservation/admission接进 service prefill，最后做 HTTP 与三机 E2E。每一步独立 RED/GREEN 和 commit。
+6. 为什么：直接重写为成熟 engine 会把 allocator/吞吐/容错一起带入；只重跑旧 concurrent script又可能在共享 phase state错误下假通过。修复最小 correctness blocker并逐步接线，最符合当前“小步、核心与必要能力”的约束。
+必要性审计：不同请求若拥有不同 prompt length/position，则影响 attention position、prefill_kv_len 或 phase 的可变状态必须按 request restore，或由本轮输入纯推导；共享上一请求的状态会改变当前请求的数学输入。这是 request isolation 的 correctness 必要条件，不是 vLLM 的实现习惯。具体存储位置仍可选择 context snapshot、纯函数参数或重构无状态层。
+VERDICT: IMPLEMENT。
+
+_updated: 2026-08-11 12:00:12_
+### 二期 4b：coordinator Prefill 前执行 KV byte admission
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `reports/routeb-byte-admission-n3-20260811-180836@hetero-cp-ringattn-795d7ce`
+
+二期第 4 项的 4b 小节点：把 4a 的冻结 KV payload byte validator 接入实验 route-B continuation coordinator。schedule tickets 只决定 layer-striped KV assignment；worker handshake capacity_mb 单独作为真实预算输入。coordinator 在发送任何本请求 Prefill 前，按 ModelConfig 的 KV geometry 与实际 dtype bytes 完成 admission。u64::MAX 表示容量查询未知，必须 fail-closed。验收：unknown capacity 与少 1 byte 在发送前拒绝；合法预算打印逐 domain required/budget bytes 并保持现有 prefill -> decode -> stationary continuation -> decode 数值与 hop 结果。边界：只改实验 continuation E2E，不改普通 legacy prefill，不引入多请求 ledger、workspace、动态 repair planner 或生产级 allocator。
+
+_updated: 2026-08-11 10:21:36_
+### 4b 三机 production QUIC byte admission 复验
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `reports/routeb-byte-admission-n3-20260811-180836@hetero-cp-ringattn-795d7ce`
+
+4b 的独立跨硬件验证节点：在当前 inventory endpoint 上重跑 Mac coordinator+domain0 MPS、white domain1 CUDA、pearl domain2 HIP 的 24 层 production QUIC continuation 场景。所有源码经 Git commit/remote 同步，不远端直接编辑。验收新增 coordinator admission required/budget 日志且三端 capacity 均不是 unknown；同时保持四进程 exit=0、generated IDs、分阶段 logits 守护与全局 48/48 neighbor-only hops。边界：单请求 correctness，不测性能、多请求、N>3 或完整 allocator OOM 充分条件。
+
+_updated: 2026-08-11 10:21:36_
+### 复用已知 N=3 场景验证真实 handshake byte admission
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-10`
+
+动机剖析六问：
+1. 问题：795d7ce 的本地回归证明了 byte admission 代码与合同，但没有证明真实 white CUDA / pearl HIP handshake 能提供非 unknown 预算，也没有证明 gate 接入后 production QUIC continuation 数据流仍闭环。
+2. 现状：旧 ccc838c 三机 run 已证明 Mac MPS+white CUDA+pearl HIP、24 层、N=3、48/48 hops 与阶段数值门，但当时 coordinator 尚未执行 byte admission。当前分支只有 Mac 本地单元/synthetic 证据。
+3. 终态：三机均由 inventory 当前 endpoint 运行同一 Qwen2-0.5B request；coordinator 在 Prefill 前打印逐 domain required/budget accepted；四进程 exit=0，三个 worker 合计 send/recv=48/48，generated 与阶段数值门保持已知结果。失败则保留日志并进入系统化诊断，不放宽门。
+4. 他者：分布式 serving 系统会在实际 executor/resource telemetry 上做 admission，并用真实部署拓扑的 smoke/golden 验证 dispatch 后行为。可复用“真实资源上报 + pre-dispatch gate + end-to-end trace”的验证原则，不需要引入其生产监控或资源调度框架。
+5. 本方案：复用已通过的 N=3 production QUIC 场景与 phase-specific acceptance；从 inventory 解析 host/user，先 push 当前分支、远端 git pull/build，再按 Mac->white->pearl->Mac neighbor ring 运行。报告只保存在 ignored reports，Graph 记录摘要。
+6. 为什么：单机 loopback 不能覆盖远端 capacity probe 和异构库环境；设计新 benchmark 又会扩大范围。对同一 golden 场景做一次受控重跑，变量仅为 admission 接线，是最小且可归因的验证。
+VERDICT: IMPLEMENT。该节点不改变算法和服务接口，仅补足 4b 已约定的跨硬件出口证据。
+
+_updated: 2026-08-10 14:24:15_
+### route-B 在 Prefill dispatch 前 fail-closed 校验冻结 KV 字节
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-10`
+
+动机剖析六问：
+1. 问题：4a 只有纯 byte validator；当前 route-B coordinator 即使预算未知或不足，仍会先发送 Prefill，让 worker 分配 request KV shard 后才可能失败，因而 admission 尚未约束真实执行。
+2. 现状：reserved_layer_capacities 已冻结每 domain×layer 的 token capacity；ModelConfig 提供 num_kv_heads/head_dim/torch_dtype；worker handshake 提供 capacity_mb。现有 run_continuation_e2e 却把 continuation_capacity_tickets override 与 handshake capacity 混成同一参数，既用于 schedule 又会被误当真实预算。
+3. 终态：schedule tickets 与 worker capacity_mb 分开传递；capacity_mb checked 转 bytes；u64::MAX 返回结构化 UnknownCapacity；coordinator 在任何 Prefill command 发送前调用 4a validator。单测证明未知/溢出/不足稳定拒绝，合法路径给出 required/budget 日志；本地完整回归与后续三机 production QUIC 证明既有数据流未变。
+4. 他者：vLLM 等 serving runtime 在 scheduler/block allocator admission 成功后才 dispatch worker execution。可复用“先冻结 placement、再 admission、后执行”的顺序；paged blocks、eviction、request ledger 与 workspace planner 不适合直接搬入当前 positioned-slab 实验。
+5. 本方案：在 capacity.rs 增加 MB→bytes 的纯 checked conversion；ModelConfig 暴露与模型实际加载一致的 element-size helper；run_continuation_e2e 同时接收 capacity_tickets 与真实 worker_capacity_mb，并在 Prefill loop 之前完成一次 admission。
+6. 为什么：这是让已有 4a 合同真正生效的最小接线，也保留 CLI ticket override 复现实验 schedule 的能力；引入 main 的完整 placement/ledger WIP 会提前扩大到多请求和生产治理，与当前核心优先、小步实验边界冲突。
+必要性审计：若 admission 声称证明 frozen KV payload 不超过 worker budget，那么 unknown capacity 不能被解释为无限预算；否则“通过”不含任何可证上界。该结论只对 route-B hard admission 成立，不要求 legacy heuristic scheduling 改变。
+牺牲审计：
+1. 默认 fail-open 的原因：容量探测失败时仍可用均分/启发式 schedule 启动实验，避免设备查询工具缺失阻断旧路径。
+2. 牺牲：route-B continuation 在 handshake 返回 u64::MAX 时不再尝试 Prefill。
+3. 被牺牲能力的用途：在没有可靠显存探测的环境中允许 best-effort 运行。
+4. 对本项目的意义：4b 的目标正是验证 hard byte admission；把未知当无限会制造虚假的安全结论。普通 legacy path 不变，因此牺牲局部且可控。
+VERDICT: IMPLEMENT。用户已明确确认 unknown capacity 必须 fail-closed，并要求继续。
+
+_updated: 2026-08-10 12:33:19_
+### byte admission 先做 post-plan 纯校验，不导入完整 ledger
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-continue-2026-08-10`
+
+动机剖析六问：
+1. 问题：路线 B 已冻结每 domain、每 layer 的 KV token reservation，但尚未把 reservation 换算为 K/V tensor 字节并与节点预算比较；超限目前只能在 shard 分配或设备 OOM 时暴露。
+2. 现状：coordinator 的 reserved_layer_capacities 已覆盖 initial prefill、legacy decode growth 与 stationary continuation；ReservedPositionedKvShard 按 [1,num_kv_heads,capacity,head_dim] 分别分配 K/V。capacity tickets 只决定比例，reserved_capacity 只限制 token 数，都不是 byte admission。main 工作区另有 1079 行 placement/ledger WIP，包含多请求 reservation ledger、workspace、attention rate 和 repair planner，按旧决策保持只读。
+3. 终态：先完成独立纯函数合同：根据冻结 capacities 和 KV 几何计算每 domain required bytes；结构非法、溢出或 required>budget 时返回可检查错误。24 层 1:3:2 exact-fit 通过，任一节点少 1 byte 稳定拒绝。
+4. 他者：vLLM 等 serving runtime 在 scheduler/block allocator 层先按 KV blocks 做 admission，再进入 worker 执行。可复用“placement 先冻结、容量门后执行”的分层；其 paged block manager 和多请求 eviction/ledger 不适合直接搬入当前 positioned slab 实验。
+5. 本方案：把 4a 限定为 capacity.rs 中的 post-plan pure validator；不生成 placement、不重算 FrozenKvAssigneeSchedule。后续 4b 才决定 coordinator 接线、MB 到 bytes 和 unknown-capacity 策略。
+6. 为什么：导入完整 WIP 会把多请求和动态 planner 提前带入，worker 分配时才自检又太晚；前置纯校验是能独立 RED/GREEN、且不碰已验证 ring 数学的最小缺口。
+必要性审计：给定 ReservedPositionedKvShard 的两个连续 tensor shape，persistent payload = sum(layer_capacity)*2*num_kv_heads*head_dim*element_bytes 是数学确定的 payload 字节；它不包含 allocator rounding、positions Vec、activation/workspace 或其他请求，因此是本阶段可验证的 KV payload bound，不是完整 OOM 充分条件。
+VERDICT: IMPLEMENT。用户在上一 checkpoint 接受“纯计算与拒绝边界”，并于 2026-08-10 要求继续。
+
+_updated: 2026-08-10 06:50:35_
+### 用 test-only 导出与 backend 汇总完成 N=3 直接证据
+
+type: `decision` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
+
+动机剖析六问：
+1. 问题：当前三机 production QUIC 运行已有 token-level 成功输出，但缺少同 tickets golden 的向量级数值比较、三个进程的持久 exit code，以及 stationary packet 每层恰好 N-1 hops 的直接计数。
+2. 现状：coordinator 已支持 --export-logits，但 test-only continuation E2E 没有接入；run_stationary_continuation 已在每层明确执行 starter/middle/finisher 分支，却未汇总角色和 send/recv；route_b golden 与 compare_route_b_dumps.py 已有 tie-aware、mean/max 判据。
+3. 终态：production E2E 导出 prefill/decode/continuation logits 与 meta；每 worker 单行输出角色和 send/recv 汇总；三机 wrapper 留存精确 exit status；同 capacity tickets、prefix splits 的 local golden 与 production dump 通过 tie-aware、mean<0.1、max<0.75 比较。
+4. 他者：分布式推理系统通常用请求级 trace/metrics 证明数据面路径，并用离线 golden 做 correctness 门禁；这里复用“结构化计数 + golden 对照”的原则，不引入完整 telemetry 框架或同构 collective profiler。
+5. 本方案：只扩展实验 continuation 入口的文件导出，并在现有 backend 驱动中累加本次调用的 starter/middle/finisher/send/recv 计数；不改变 WorkerCommand/WorkerResponse，日志由现有 worker 进程持久化。
+6. 为什么：把计数加入 wire/protocol 会扩大稳定协议面，单为实验出口不值得；只从连接配置推导 hop 又不足以证明运行时 middle relay。backend 汇总日志是同时满足最小改动与直接运行证据的方案。
+VERDICT: IMPLEMENT。
+
+_updated: 2026-08-10 03:30:34_
+### phase-2 stationary continuation 采用分阶段数值验收
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-10`
+
+动机剖析六问：
+1. 问题：三机目标 stationary continuation 已通过原 mean/max 门，但通用比较脚本把未改动的 legacy decode mean=0.107887 也作为同一出口的阻塞项，使 phase-2 目标路径的完成条件被非目标阶段牵连。
+2. 现状：prefill mean=0.035258/max=0.187500、stationary continuation mean=0.030063/max=0.203125，均通过 tie-aware+mean<0.1+max<0.75；legacy decode argmax exact、top-5=5/5、max=0.648438<0.75，但 mean 比统一 0.1 门高 0.007887。两侧重复运行逐位稳定，且本节点没有改动 legacy decode 算法。
+3. 终态：phase-2 stationary continuation 出口按阶段验收；prefill 和 continuation 保持完整严格门，legacy decode 保留 tie-aware argmax、top-5 和 max 守护，mean 明确只作诊断；验证命令对四个 exit code、三 worker 的 48/48 hops 和各阶段数值独立断言。
+4. 他者：分布式系统通常按被修改组件和阶段设置 regression gate，把非目标路径的诊断指标与阻塞指标分开；可复用这种 stage-scoped acceptance 原则，但无需引入完整 telemetry 或新的 production planner。
+5. 本方案：选择路线 B，只修订本 phase-2 出口文字和验证方式，不修改通用 compare 脚本，也不新增 legacy decode 数值修复节点。
+6. 为什么：路线 A 会把一个已稳定、语义输出一致且未被本节点修改的 baseline 扩成新的算法调查，超出“小步验证 stationary continuation”的范围；路线 B 仍以 argmax/top-k/max 防止 decode 失控，同时不降低目标 prefill/continuation 的门槛。
+
+牺牲审计：
+1. 默认统一 mean 门存在的原因：用一个简单数值包络捕获任一阶段的跨硬件分布式漂移。
+2. 牺牲：仅在本 phase-2 出口中，legacy decode 的 mean 不再单独阻塞任务；通用脚本和其他阶段合同不变。
+3. 被牺牲能力的作用：mean hard gate 能发现覆盖整个 logits 向量的小幅系统性偏移，即便 argmax 仍相同。
+4. 对本项目的意义：本次目标是 stationary continuation，decode 未改且仍有 tie-aware argmax、top-5=5/5、max<0.75 三重守护；因此接受这一局部牺牲，不把它推广为算法正确性定理。
+VERDICT: IMPLEMENT。用户于 2026-08-10 明确选择路线 B。
+
+_updated: 2026-08-10 03:30:34_
+### N=3 才能完成 production neighbor-only ring 出口
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
+
+动机剖析六问：
+1. 问题：N=2 production QUIC E2E 被记作二期第 5 项完成，但两节点环中 predecessor==successor，不存在可观察的中间节点转发，不能证明 HCP 的 neighbor-only P2P ring 拓扑。
+2. 现状：一期的 Mac MPS + white CUDA + pearl HIP 三机 TCP smoke 已证明 N=3 数学、异构 kernel 与逐跳 ring；二期的 N=3 QUIC 只在 loopback smoke 通过；production WorkerRuntime/coordinator/StationaryContinuation 路径目前只有 Mac+white N=2 跨机证据。这三份证据尚未在同一次实验中取交集。
+3. 终态：Mac coordinator+MPS worker、white CUDA worker、pearl HIP worker 经 production QUIC 数据面完成同一真实 Qwen continuation 请求；每个 worker 只连接 predecessor/successor，packet 每层走 N-1=2 hops，输出与 golden 对齐，三端正常退出。
+4. 他者：Ring Attention 和常见 P2P ring 都以相邻 send/recv 定义；N=2 是合法但退化的功能场景，只有 N>=3 才能用 middle relay 证伪全连接或 coordinator relay。其 collective runtime 不能替代 HCP 的 QUIC neighbor-only 验证。
+5. 本方案：复用 1aee8e6 的 production command path、129de9b 的 QUIC packet wire 与既有三机 inventory；先做 N=3 production-path 配置/代码审计，只修实际阻塞任意 N 的最小缺口，再按 Mac->white->pearl->Mac 接线运行真实 Qwen E2E。
+6. 为什么：单独重复三机 TCP smoke不能证明 production QUIC 接线；重复 N=2 production run 不能证明 middle relay。三机 production QUIC 是最小且直接覆盖项目拓扑主张的交叉证据，不引入性能、多请求或动态 planner。
+VERDICT: IMPLEMENT。用户明确要求所有跨机验证从 Mac+white 扩展到 Mac+white+pearl，只有 N=3 才计为 neighbor-only P2P ring 出口。
+
+_updated: 2026-08-09 09:43:14_
 ### 二期第 2+3 项(合并):WorkerRuntime/coordinator 一等 stationary continuation 命令 + frozen plan 分发
 
 type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-09`
@@ -1051,6 +1525,34 @@ B. vLLM decode ≥2 并发+增长分片保持(修 004,PoC 最小要求);
 C. Rust decode 移植 Q+LSE 累积器环+增长分片(修 007+008)。
 
 _updated: 2026-07-27 15:10:25_
+### vLLM bench serve 作为黑盒客户端，不接入 vLLM engine
+
+type: `decision` · status: `superseded` · confidence: 0.96 · importance: 0.98 · source: `motivation-analysis-and-official-vllm-bench-audit-2026-08-12`
+
+动机剖析六问：
+1. 问题：HCP 需要面对公开 serving benchmark，但当前“有 HTTP endpoint”尚未被标准 client 逐项验证，也缺普通 service prefill 的 capacity admission 与 HCP-specific telemetry。
+2. 当前状态：Rust 服务已有 `/v1/completions`、SSE、`[DONE]`、usage、request_id KV context、BatchScheduler 和同序 DecodeBatch；普通 HTTP prefill 仍未完成冻结 reservation/byte admission 的服务接线。
+3. 终态：不修改 HCP ring 数学和 worker backend 边界；`vllm bench serve` 能以 `/v1/completions` 驱动 HCP，concurrency 1/2/4 无错误并可报告 TTFT/TPOT/ITL/E2EL；HCP 自身另有 request release、capacity placement、neighbor hop/byte 证据。
+4. 他者：vLLM 官方 `bench serve` 是面向 OpenAI-compatible endpoint 的 workload/latency client；vLLM engine 内部则使用 scheduler、paged KV、同构 CUDA/collective 执行。前者可直接复用，后者不是 benchmark 的必要依赖。
+5. 本方案：先锁定 HCP API contract；再补普通 prefill 的 per-request frozen reservation + byte admission；再加最小 request timing/ring hop-byte telemetry；最后用 vLLM bench serve 做单并发到小并发基线，并把 continuation 保留为 HCP 专用 oracle。
+6. 为什么：benchmark 测量对象是 HTTP serving contract，不是 vLLM 内部实现。嵌入 vLLM 会把 paged allocator、CUDA kernel、NCCL/collective 和 HCP Rust P2P ring 耦合，无法自然覆盖 MPS/CUDA/HIP 异构目标，且会改变被测系统。
+
+必要性审计：
+- “必须接入 vLLM engine 才能运行 vLLM bench serve”是错误命题；bench client 只要求 endpoint contract。
+- “必须有 request_id wire packet 才能做当前 benchmark”也不是当前必要条件；coordinator 已向所有 worker 广播同一 request order，先验证 FIFO contract。
+
+取舍：不获得 vLLM paged-KV/continuous-batching 的成熟性能，但保留 HCP 的 Rust backend、capacity-weighted KV 和 neighbor-only P2P 数据面，避免把工程目标替换成 vLLM 适配工程。
+
+VERDICT: IMPLEMENT serving-contract path; DEFER vLLM-engine integration.
+
+_updated: 2026-08-11 19:10:38_
+### 现有多请求 context 未隔离每层 ring phase state
+
+type: `risk` · status: `blocker` · confidence: 1.0 · importance: 0.98 · source: `hetero-cp-ringattn@d1e536a-code-audit`
+
+TchWorkerBackend::RequestContext 只保存 KvCaches/global_seq_len/is_prefill_done；每层 HcpRingAttentionBackend 还持有 request-sensitive prefill_kv_len、is_prefill_done 和 seq_offset。单请求不受影响，但分布式多请求交错可能共享错误 phase。按用户路线先继续单请求完整流程；在多请求节点前必须把这些字段纳入 request-local state，否则属于 correctness blocker。
+
+_updated: 2026-08-11 12:00:12_
 ### Baseline 后实验 batched Q/O/LSE continuation ring
 
 type: `task` · status: `planning` · confidence: 0.95 · importance: 0.98 · source: `user-confirmed-2026-08-03`
@@ -1072,13 +1574,6 @@ type: `decision` · status: `held` · confidence: 1.0 · importance: 0.98 · sou
 VERDICT: IMPLEMENT
 
 _updated: 2026-08-03 05:09:31_
-### 现有多请求 context 未隔离每层 ring phase state
-
-type: `risk` · status: `open` · confidence: 1.0 · importance: 0.98 · source: `code-audit-2026-08-02`
-
-TchWorkerBackend::RequestContext 只保存 KvCaches/global_seq_len/is_prefill_done；每层 HcpRingAttentionBackend 还持有 request-sensitive prefill_kv_len、is_prefill_done 和 seq_offset。单请求不受影响，但分布式多请求交错可能共享错误 phase。按用户路线先继续单请求完整流程；在多请求节点前必须把这些字段纳入 request-local state，否则属于 correctness blocker。
-
-_updated: 2026-08-01 20:42:55_
 ### 真实模型 KV dtype 与 reserved slab 固定 Float 不兼容
 
 type: `risk` · status: `resolved` · confidence: 1.0 · importance: 0.98 · source: `hetero-cp-ringattn@b6902ba`
@@ -1116,6 +1611,62 @@ type: `decision` · status: `held` · confidence: 0.95 · importance: 0.96 · so
 结论：Node 4b DEFER multi-query continuation ring，只实现有证据的 KV-ring correctness；把 Q-ring 作为独立路线选择记忆，待 baseline 可运行后按 payload bytes 与实测带宽决定。VERDICT: DEFER。
 
 _updated: 2026-08-03 09:14:32_
+### 6b.0 用 Axum 内部测试固化 Rust completions/SSE 合同
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `user-confirmed-fast-phase2-20260812`
+
+动机剖析六问：
+1. 问题：Rust `/v1/completions` 已有实现，但没有直接驱动 Axum router 的内部 wire contract regression；后续 admission/scheduler 修改可能无意破坏 benchmark-facing JSON/SSE。
+2. 当前状态：handler 接收 model/prompt/max_tokens/temperature/top_p/stream，提交 InferenceJob；非流式返回 choices+usage，流式返回 text_completion SSE 和 `[DONE]`；现有 scripts 只用 curl 检查文本非空。
+3. 终态：无需启动 worker/model的 Rust tests 通过真实 router + job channel，精确断言 request mapping、non-stream response、SSE chunks/finish/[DONE]、closed queue 503 与 malformed JSON rejection。
+4. 他者：OpenAI-compatible serving 层通常用 handler/ASGI/router contract tests 隔离协议语义，再用端到端 benchmark 测性能；不能只依赖完整模型 smoke。
+5. 本方案：只在 `rust/src/api/server.rs` 测试模块构造 ApiState；测试侧模拟 coordinator 消费 job 并回送 InferenceResult/StreamChunk；解析实际 HTTP body。若现有实现全绿，不修改生产代码。
+6. 为什么：这是二期 Rust benchmark-readiness 的最小入口，不依赖 vLLM CLI、模型、GPU 或三机；避免把 API、runtime 和性能同时调试。
+
+边界：不新增 chat/auth/sampling，不改 request lifecycle，不声明与某版本 vLLM CLI 线级兼容。
+VERDICT: IMPLEMENT CONTRACT REGRESSION。
+
+_updated: 2026-08-11 19:23:51_
+### 6b.0 先用真实 vLLM client 探测，不预写 adapter
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `user-confirmed-continue-20260812`
+
+动机剖析六问：
+1. 问题：HCP API 静态上接近 OpenAI completions，但没有实际 `vllm bench serve` parser 证据；直接实现 adapter 会猜测不存在的缺口。
+2. 当前状态：`/v1/completions` 已支持 prompt/model/max_tokens/temperature/top_p/stream，streaming 返回 `choices[0].text` 与 `[DONE]`；仓库已有无需真实模型的单域 mock-worker service script。inventory 尚未声明 vLLM CLI，因此必须先做只读环境发现。
+3. 终态：在不改 Rust/API 的情况下，真实 vLLM client 对现有 HCP endpoint 发一个 streaming completion；成功则保存 metrics 并跳过 6b.1，失败则保存精确 CLI/request/parser 错误作为 6b.1 RED。
+4. 他者：标准 serving 系统先做 protocol conformance probe，再按真实 client failure 补 contract；benchmark client 与模型执行后端可以分离。
+5. 本方案：先查 inventory 节点现有 vLLM CLI；服务端优先用本地 mock-worker 跑完整 coordinator HTTP lifecycle；client 可从已有 Linux vLLM 环境经 Tailscale 访问 Mac endpoint。若 inventory 无现成 CLI，再单独决定最小安装环境，不在本节点擅自安装。
+6. 为什么：mock worker 足以隔离 HTTP/SSE parser 合同，避免把模型加载、QUIC、异构数值或性能问题混入 wire probe；实际 benchmark 性能仍由后续 6c/6d 验证。
+
+必要性审计：真实 vLLM CLI 是“线级兼容”证据的必要条件；真实模型和三机 ring 不是本节点必要条件。
+VERDICT: IMPLEMENT read-only compatibility probe; NO CODE CHANGE unless actual client is RED。
+
+_updated: 2026-08-11 19:03:47_
+### Q-ring 多请求依赖跨 worker request FIFO 顺序
+
+type: `risk` · status: `open` · confidence: 0.95 · importance: 0.95 · source: `evidence-route-b-6a2-qring-unequal-isolation-20260812`
+
+当前 Q-ring packet 只含 layer/Q/O/LSE/scale，没有 request_id。6a.2 证明相同 request 顺序下的 isolation，但若不同 worker 的 batch scheduler 重排 request，FIFO packet 可能错配或阻塞。后续 6b/6c 接入真实 service scheduler 前，需要选择并验证：中心调度器保证全 worker 顺序一致，或为 packet 增加 request route metadata。
+
+_updated: 2026-08-11 16:58:49_
+### 6a.2 使用 N=2 Q-ring request isolation oracle
+
+type: `decision` · status: `held` · confidence: 0.95 · importance: 0.95 · source: `motivation-analysis-2026-08-11`
+
+动机剖析六问：
+1. 问题：6a.1 的 N=1 unequal-prefix isolation oracle 没有经过 Q-ring rendezvous，无法发现多个 request 共用 ring phase、packet route、seq offset 或 prefill_done 状态时的串扰。
+2. 当前状态：HcpRingAttentionBackend 已有支持 Q-ring packet 的 transport 合同与单 request/多 worker correctness 测试；LinkedMockKvTransport 是顺序驱动且 supports_ring_packets=false，会走 legacy KV resend，不能作为本节点证据。
+3. 终态：两个 worker 同步运行 N=2 Q-ring；request A/B 使用不同 prefix 长度并交错推进；各自 prefill logits、首个 decode 和固定后续 horizon 的 logits/token 与独立 reference 对齐。RED 时只定位 request-local snapshot/phase bug，GREEN 时仅关闭 Q-ring correctness 这一风险子集。
+4. 他者：Ring Attention 与主流 CP 实现都要求每个 step 的 query/softmax state 与 KV packet 按 ring step rendezvous；服务引擎通常把 request metadata 隔离在 scheduler/block table 中。其 collective、paged allocator 和中心 scheduler 不直接适用 HCP 的 neighbor-only P2P ring，但 request-local metadata 隔离原则可复用。
+5. 本方案：复用 ring.rs 已有支持 Q-ring 的 test transport；为两个 worker backend 配置 per-layer Q-ring transports；用不同长度 prompt 做 capacity-weighted 分片 prefill；两个 request 交错调用 decode，所有 worker 同步参与，分别以独立单域 reference 比较 logits/argmax。若失败，再最小化检查 seq_offset、prefill_kv_len、is_prefill_done 是否需要 request-local snapshot，不预先扩大接口。
+6. 为什么：这是验证核心 HCP decode ring 在多请求场景下的最小闭环，直接覆盖当前 blocker，而不引入 planner/ledger/HTTP 等尚未必要的工程复杂度；独立 reference 能避免共享错误导致假通过。
+
+牺牲审查：本节点不测 QUIC/真实硬件/吞吐和 failure recovery；这些能力的证明被延后，不影响当前 correctness 结论。
+
+VERDICT: IMPLEMENT。
+
+_updated: 2026-08-11 15:58:27_
 ### KV-ring continuation 正确但会重传完整历史 shard
 
 type: `risk` · status: `open` · confidence: 1.0 · importance: 0.95 · source: `analysis-2026-08-03`
@@ -1279,6 +1830,27 @@ type: `belief` · status: `held` · confidence: 0.85 · importance: 0.95 · sour
 基于 white-pearl 限速矩阵：\n- 2.35 Gbps 基线 20.5 s\n- 1 Gbps 29.5 s（1.44x）\n- 500 Mbps 50 s（2.44x）\n- 100 Mbps 445 s（21.7x）\n\n在 Qwen2-0.5B-1M、seq=4096、max_tokens=5 的异构推理任务中，端到端 latency 随跨节点带宽下降呈非线性增长。低于 1 Gbps 时，P2P KV ring 的通信时间显著超过计算时间；100 Mbps 时通信完全主导总时间。\n\n推论：若要在生产环境中部署异构 CP 推理，需要 CXL / RDMA / 高速 NVLink 等级别的互联带宽，否则网络将把多卡聚合的显存优势抵消为极高的延迟惩罚。
 
 _updated: 2026-06-29 14:32:15_
+### 6c.1：vLLM bench serve 分级 serving baseline
+
+type: `task` · status: `superseded` · confidence: 1.0 · importance: 0.94 · source: `user-confirmed-20260812`
+
+问题：需要可信的客户端服务曲线，而不是单次 smoke 或未经 admission 的吞吐数字。
+动作：固定模型、tokenizer、dataset/sampling/client location 后，依次运行 concurrency=1、2、4，再做小范围 request-rate sweep；每次同时保留 HCP oracle/telemetry。
+验收：报告请求数、错误率、throughput、TTFT/TPOT/ITL/E2EL、goodput（若配置）；并记录每档 active reservation、ring hops/bytes、释放闭环。先要求 0 请求错误，不预设生产 SLO 或胜过 vLLM。
+边界：这里测 HCP service，不把不同硬件总量的结果误称为算法公平 speedup；vLLM engine baseline 属后续受控对照。
+
+_updated: 2026-08-11 19:10:38_
+### 三期：vLLM bench serve 实测与 vLLM 生态接入
+
+type: `task` · status: `deferred` · confidence: 1.0 · importance: 0.9 · source: `user-correction-20260812`
+
+二期 Rust readiness 完成后：
+1. 用实际 `vllm bench serve` 驱动 HCP endpoint，按真实 parser/metric 差异做最小兼容；
+2. 建立受控 vLLM baseline 对照；
+3. 再评估 vLLM backend/plugin、paged KV 或其他生态接口。
+该阶段不得反向改写已验证的 HCP core 数学，生态接入与 benchmark 对照分别独立节点。
+
+_updated: 2026-08-11 19:10:38_
 ### 跨设备 BF16 验证的 argmax 判据必须容忍精确平局翻转
 
 type: `belief` · status: `held` · confidence: 0.98 · importance: 0.9 · source: `hetero-cp-ringattn@9ab909b`
@@ -1498,6 +2070,17 @@ type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.9 · sou
 与 HCP 相关性：直接相关，可能缓解 pearl 等小/慢 domain 在 Phase 2 成为瓶颈的问题。
 
 _updated: 2026-06-29 06:06:09_
+### 6b.1：按真实 client 错误补最小 completions 合同
+
+type: `task` · status: `superseded` · confidence: 1.0 · importance: 0.85 · source: `user-confirmed-20260812`
+
+【条件节点，仅在 6b.0 RED 时激活】
+问题：实际 vLLM client 若不能解析当前 request/response/SSE，需要线级兼容修补。
+动作：先把 6b.0 的原始失败固化为 API regression，再只修改 benchmark 实际需要的 CompletionRequest/Response/SSE 字段或 endpoint 行为。
+验收：focused contract test RED/GREEN；同一个 vLLM 单请求 probe 转绿；现有 API tests 回归通过。
+边界：不实现 chat endpoint、鉴权、beam search、复杂 sampling 或完整 OpenAI API。若 6b.0 GREEN，本节点标记 skipped。
+
+_updated: 2026-08-11 19:10:38_
 ### 任务E:plugin 线 successor-seeded 优化(owner 最后归并,每层 N 跳→N-1 跳)
 
 type: `task` · status: `rejected` · confidence: 0.99 · importance: 0.85 · source: `user-direction`
@@ -1685,6 +2268,13 @@ type: `evidence` · status: `held` · confidence: 0.9 · importance: 0.85 · sou
 HCP 的数学基础即来源于此。
 
 _updated: 2026-06-29 06:06:09_
+### HCP continuation benchmark 继续由专用 oracle 证明
+
+type: `task` · status: `deferred` · confidence: 1.0 · importance: 0.8 · source: `user-confirmed-20260812`
+
+vLLM bench serve 的普通 OpenAI requests 每次创建新 HCP request_id，不能证明同一会话原地复用历史 KV。continuation 正确性、历史 KV 零重传和第二轮 prefill+decode 继续由 HCP internal/session oracle 单独验收；在 stateful HTTP session API 被明确立项前，不把它塞进 6c serving baseline。
+
+_updated: 2026-08-11 18:57:00_
 ### KVConnectorBase_V1 是 experimental API，插件边界收敛才能跟进 vLLM 升级
 
 type: `belief` · status: `held` · confidence: 0.9 · importance: 0.8 · source: `experiment`

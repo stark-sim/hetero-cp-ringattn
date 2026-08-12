@@ -19,7 +19,11 @@
 
 use crate::model::cache::{KvCacheImpl, KvCaches};
 use crate::model::model::LlamaModel;
-use crate::model::self_driving::ReservedPositionedKvShard;
+use crate::model::self_driving::{
+    process_layer_packet_with_reserved_history_for_positions, project_final_logits,
+    stationary_layer_starters, FrozenKvAssigneeSchedule, LayerPacket, LayerStepOutcome,
+    ReservedPositionedKvShard,
+};
 use crate::model::transport::KvTransport;
 use crate::model::{ModelConfig, ModelWeights};
 use crate::worker_sdk::backend::WorkerBackend;
@@ -320,6 +324,247 @@ impl TchWorkerBackend {
 
     // Note: do_decode removed to avoid borrow checker issues.
     // decode() and decode_request() inline the small forward logic directly.
+
+    /// 【Stationary continuation 生产驱动】(route-B 2b)
+    ///
+    /// Drives one m>1 stationary continuation segment through the self-driving
+    /// ring: per layer the packet starts at the layer's starter domain, visits
+    /// every domain in successor order, and finishes one hop before the
+    /// starter. Every domain projects and appends only its own frozen position
+    /// offsets; historical KV never enters the packet. Transport I/O uses the
+    /// per-layer transports installed by `setup_kv_transports`.
+    ///
+    /// Returns the last-position logits as `Some(Vec<f32>)` on the final
+    /// finisher domain, `None` on every other domain. The request's
+    /// `global_seq_len` is advanced to the segment end on every domain.
+    pub fn run_stationary_continuation(
+        &mut self,
+        request_id: u64,
+        tokens: &[i64],
+        position_ids: &[i64],
+        capacity_tickets: &[u64],
+        starter_domain: usize,
+    ) -> Result<Option<Vec<f32>>, String> {
+        let domains = self.model.num_domains;
+        crate::distributed::protocol::validate_stationary_continuation(
+            domains,
+            tokens,
+            position_ids,
+            capacity_tickets,
+            starter_domain,
+        )?;
+        let layers = self.model.config.num_layers;
+
+        // Frozen plan: this domain's position offsets and the per-layer starters.
+        let schedule = FrozenKvAssigneeSchedule::new(capacity_tickets, request_id, tokens.len())?;
+        let my_offsets = (0..tokens.len())
+            .filter(|&offset| schedule.assignee_for(offset, 0, 1) == Some(self.domain_id))
+            .collect::<Vec<_>>();
+        let starters = stationary_layer_starters(starter_domain, layers, domains)?;
+
+        // Admission: every layer shard must be reserved positioned KV with
+        // enough headroom for this domain's new offsets (byte-level admission
+        // is a later work item).
+        {
+            let context = self
+                .request_contexts
+                .get(&request_id)
+                .ok_or_else(|| format!("request {request_id} not found"))?;
+            for (layer_idx, cache) in context.kv_caches.iter().enumerate() {
+                let Some(KvCacheImpl::ReservedPositioned(shard)) = cache else {
+                    return Err(format!(
+                        "request {request_id} layer {layer_idx} does not have reserved positioned KV"
+                    ));
+                };
+                if shard.committed_len() + my_offsets.len() > shard.reserved_capacity() {
+                    return Err(format!(
+                        "request {request_id} layer {layer_idx} stationary continuation exceeds reserved capacity: committed {} + new {} > {}",
+                        shard.committed_len(),
+                        my_offsets.len(),
+                        shard.reserved_capacity()
+                    ));
+                }
+            }
+        }
+
+        let position_tensor = Tensor::from_slice(position_ids)
+            .unsqueeze(0)
+            .to_device(self.device);
+        let mut hidden_states = if starters[0] == self.domain_id {
+            let input = Tensor::from_slice(tokens)
+                .unsqueeze(0)
+                .to_device(self.device);
+            Some(Tensor::embedding(
+                &self.model.embedding,
+                &input,
+                -1,
+                false,
+                false,
+            ))
+        } else {
+            None
+        };
+
+        let mut final_finisher = starter_domain;
+        let mut starter_layers = 0_usize;
+        let mut middle_layers = 0_usize;
+        let mut finisher_layers = 0_usize;
+        let mut sends = 0_usize;
+        let mut recvs = 0_usize;
+        for (layer_idx, &starter) in starters.iter().enumerate() {
+            let finisher = (starter + domains - 1) % domains;
+            final_finisher = finisher;
+            if starter == self.domain_id {
+                let packet = LayerPacket::start(
+                    &mut self.model.layers[layer_idx],
+                    hidden_states
+                        .as_ref()
+                        .ok_or("stationary continuation starter is missing hidden states")?,
+                    &position_tensor,
+                    self.domain_id,
+                    self.domain_id,
+                    domains,
+                )
+                .map_err(|e| {
+                    format!("stationary continuation layer {layer_idx} start failed: {e}")
+                })?;
+                let outcome = {
+                    let context = self.request_contexts.get_mut(&request_id).unwrap();
+                    let Some(KvCacheImpl::ReservedPositioned(shard)) =
+                        &mut context.kv_caches[layer_idx]
+                    else {
+                        return Err(format!(
+                            "request {request_id} layer {layer_idx} does not have reserved positioned KV"
+                        ));
+                    };
+                    process_layer_packet_with_reserved_history_for_positions(
+                        &mut self.model.layers[layer_idx],
+                        packet,
+                        shard,
+                        &my_offsets,
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "stationary continuation layer {layer_idx} starter step failed: {e}"
+                        )
+                    })?
+                };
+                let LayerStepOutcome::Forward(next_packet) = outcome else {
+                    return Err(format!(
+                        "stationary continuation layer {layer_idx} starter finished a {domains}-domain route"
+                    ));
+                };
+                let wire = next_packet.into_self_driving_packet(0).map_err(|e| {
+                    format!("stationary continuation layer {layer_idx} wire encode failed: {e}")
+                })?;
+                let transport =
+                    self.model.layers[layer_idx]
+                        .kv_transport_mut()
+                        .ok_or_else(|| {
+                            format!("stationary continuation layer {layer_idx} has no KV transport")
+                        })?;
+                transport.submit_send_self_driving_packet(&wire)?;
+                transport.flush_send()?;
+                starter_layers += 1;
+                sends += 1;
+            } else {
+                let wire = {
+                    let transport =
+                        self.model.layers[layer_idx]
+                            .kv_transport_mut()
+                            .ok_or_else(|| {
+                                format!(
+                                    "stationary continuation layer {layer_idx} has no KV transport"
+                                )
+                            })?;
+                    transport.recv_self_driving_packet()?.ok_or_else(|| {
+                        format!("stationary continuation layer {layer_idx} predecessor closed")
+                    })?
+                };
+                recvs += 1;
+                let packet = LayerPacket::from_self_driving_packet(wire).map_err(|e| {
+                    format!("stationary continuation layer {layer_idx} wire decode failed: {e}")
+                })?;
+                let outcome = {
+                    let context = self.request_contexts.get_mut(&request_id).unwrap();
+                    let Some(KvCacheImpl::ReservedPositioned(shard)) =
+                        &mut context.kv_caches[layer_idx]
+                    else {
+                        return Err(format!(
+                            "request {request_id} layer {layer_idx} does not have reserved positioned KV"
+                        ));
+                    };
+                    process_layer_packet_with_reserved_history_for_positions(
+                        &mut self.model.layers[layer_idx],
+                        packet,
+                        shard,
+                        &my_offsets,
+                    )
+                    .map_err(|e| {
+                        format!("stationary continuation layer {layer_idx} ring step failed: {e}")
+                    })?
+                };
+                if finisher == self.domain_id {
+                    let LayerStepOutcome::Finished {
+                        hidden_states: next_hidden,
+                        ..
+                    } = outcome
+                    else {
+                        return Err(format!(
+                            "stationary continuation layer {layer_idx} finisher forwarded a {domains}-domain route"
+                        ));
+                    };
+                    hidden_states = Some(next_hidden);
+                    finisher_layers += 1;
+                } else {
+                    let LayerStepOutcome::Forward(next_packet) = outcome else {
+                        return Err(format!(
+                            "stationary continuation layer {layer_idx} middle domain finished a {domains}-domain route"
+                        ));
+                    };
+                    let wire = next_packet.into_self_driving_packet(0).map_err(|e| {
+                        format!("stationary continuation layer {layer_idx} wire encode failed: {e}")
+                    })?;
+                    let transport =
+                        self.model.layers[layer_idx]
+                            .kv_transport_mut()
+                            .ok_or_else(|| {
+                                format!(
+                                    "stationary continuation layer {layer_idx} has no KV transport"
+                                )
+                            })?;
+                    transport.submit_send_self_driving_packet(&wire)?;
+                    transport.flush_send()?;
+                    middle_layers += 1;
+                    sends += 1;
+                }
+            }
+        }
+
+        println!(
+            "[TchWorkerBackend] stationary continuation stats: request_id={request_id} domain={} layers={} domains={domains} starter_layers={starter_layers} middle_layers={middle_layers} finisher_layers={finisher_layers} sends={sends} recvs={recvs} expected_hops_per_layer={}",
+            self.domain_id,
+            starters.len(),
+            domains - 1,
+        );
+
+        // Every domain resyncs the request horizon to the segment end.
+        {
+            let context = self.request_contexts.get_mut(&request_id).unwrap();
+            context.global_seq_len = position_ids[position_ids.len() - 1] as usize + 1;
+        }
+
+        if final_finisher != self.domain_id {
+            return Ok(None);
+        }
+        let hidden =
+            hidden_states.ok_or("stationary continuation finisher has no hidden states")?;
+        let logits = project_final_logits(&self.model, &hidden);
+        let last = logits.select(1, tokens.len() as i64 - 1).squeeze();
+        let values: Vec<f32> = Vec::try_from(&last.contiguous())
+            .map_err(|e| format!("stationary continuation logits to vec failed: {e}"))?;
+        Ok(Some(values))
+    }
 }
 
 impl WorkerBackend for TchWorkerBackend {
@@ -418,6 +663,26 @@ impl WorkerBackend for TchWorkerBackend {
 
     fn sync_global_seq_len(&mut self, len: usize) {
         self.model.global_seq_len = len;
+    }
+
+    // experimental: route-B stationary continuation driver (phase-2 node 2c);
+    // delegates to the inherent implementation.
+    fn run_stationary_continuation(
+        &mut self,
+        request_id: u64,
+        tokens: &[i64],
+        position_ids: &[i64],
+        capacity_tickets: &[u64],
+        starter_domain: usize,
+    ) -> Result<Option<Vec<f32>>, String> {
+        TchWorkerBackend::run_stationary_continuation(
+            self,
+            request_id,
+            tokens,
+            position_ids,
+            capacity_tickets,
+            starter_domain,
+        )
     }
 
     /// Request-aware sync: updates the per-request context.
@@ -556,10 +821,9 @@ mod tests {
         (logits, current_starter, total_hops, total_wire_bytes)
     }
 
-    /// Verify that `decode_batch` produces identical logits to individual `decode_request`
-    /// calls, and that per-request KV caches remain isolated (no cross-contamination).
+    /// Verify unequal-prefix request isolation against independent references.
     #[test]
-    fn test_decode_batch_isolation() {
+    fn test_decode_batch_isolation_with_unequal_prefixes() {
         let device = Device::Cpu;
 
         let config = ModelConfig {
@@ -589,26 +853,37 @@ mod tests {
 
         // Create two independent backends from identical weights.
         let model_batch = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
-        let model_ref = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+        let model_ref_a = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+        let model_ref_b = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
 
         let mut backend_batch = TchWorkerBackend::from_model(model_batch, device, 0);
-        let mut backend_ref = TchWorkerBackend::from_model(model_ref, device, 0);
+        let mut backend_ref_a = TchWorkerBackend::from_model(model_ref_a, device, 0);
+        let mut backend_ref_b = TchWorkerBackend::from_model(model_ref_b, device, 0);
 
-        // Two different prompts (same length to keep things simple)
-        let seq_len = 12i64;
-        let prompt_a: Vec<i64> = (0..seq_len).collect();
-        let prompt_b: Vec<i64> = (10..10 + seq_len).collect();
+        // Two different prompts with different prefix lengths.
+        let prompt_a: Vec<i64> = (0..8).collect();
+        let prompt_b: Vec<i64> = (10..22).collect();
 
-        // Prefill both requests on both backends
-        let (logits_a_batch, _) = backend_batch
+        // Prefill both requests on the mixed backend and on independent references.
+        let (logits_a_batch, len_a_batch) = backend_batch
             .prefill_request(1, &prompt_a, 0, None)
             .unwrap();
-        let (logits_b_batch, _) = backend_batch
+        let (logits_b_batch, len_b_batch) = backend_batch
             .prefill_request(2, &prompt_b, 0, None)
             .unwrap();
 
-        let (logits_a_ref, _) = backend_ref.prefill_request(1, &prompt_a, 0, None).unwrap();
-        let (logits_b_ref, _) = backend_ref.prefill_request(2, &prompt_b, 0, None).unwrap();
+        let (logits_a_ref, len_a_ref) = backend_ref_a
+            .prefill_request(1, &prompt_a, 0, None)
+            .unwrap();
+        let (logits_b_ref, len_b_ref) = backend_ref_b
+            .prefill_request(2, &prompt_b, 0, None)
+            .unwrap();
+
+        assert_eq!(prompt_a.len(), 8);
+        assert_eq!(prompt_b.len(), 12);
+        assert_ne!(prompt_a.len(), prompt_b.len());
+        assert_eq!(len_a_batch, len_a_ref);
+        assert_eq!(len_b_batch, len_b_ref);
 
         // Verify prefill logits match (sanity check)
         let prefill_diff_a = Tensor::from_slice(&logits_a_batch)
@@ -643,8 +918,8 @@ mod tests {
             .int64_value(&[]) as i64;
 
         // ====== Single-step decode: batch vs individual ======
-        let ref_logits_a = backend_ref.decode_request(1, token_a).unwrap();
-        let ref_logits_b = backend_ref.decode_request(2, token_b).unwrap();
+        let ref_logits_a = backend_ref_a.decode_request(1, token_a).unwrap();
+        let ref_logits_b = backend_ref_b.decode_request(2, token_b).unwrap();
 
         let batch_results = backend_batch
             .decode_batch(&[(1, token_a), (2, token_b)])
@@ -701,9 +976,9 @@ mod tests {
         let mut next_token_b = token_b;
 
         for step in 0..NUM_DECODE_STEPS {
-            // Reference: individual decode requests
-            let ref_la = backend_ref.decode_request(1, next_token_a).unwrap();
-            let ref_lb = backend_ref.decode_request(2, next_token_b).unwrap();
+            // References remain fully independent so shared state cannot mask a mismatch.
+            let ref_la = backend_ref_a.decode_request(1, next_token_a).unwrap();
+            let ref_lb = backend_ref_b.decode_request(2, next_token_b).unwrap();
 
             // Batch decode
             let batch_res = backend_batch
@@ -771,6 +1046,282 @@ mod tests {
         }
     }
 
+    /// Verify two unequal-prefix requests remain isolated while both workers
+    /// execute the request-aware decode path over a shared Q-ring transport.
+    ///
+    /// Prefill uses the real two-worker TCP KV exchange so each request owns
+    /// only its capacity-weighted local prefix.  The same transports expose a
+    /// packet-only rendezvous channel for decode, and A/B advance in the same
+    /// order on both workers, matching the coordinator's batch contract.
+    #[test]
+    fn test_decode_qring_request_isolation_with_unequal_prefixes() {
+        use crate::model::transport::{KvBlock, RingPacket};
+        use std::sync::mpsc;
+
+        struct ChanPacketTransport {
+            kv: crate::model::transport::TcpKvTransport,
+            tx: mpsc::Sender<RingPacket>,
+            rx: mpsc::Receiver<RingPacket>,
+        }
+
+        impl KvTransport for ChanPacketTransport {
+            fn submit_send(&mut self, block: &KvBlock) -> Result<(), String> {
+                self.kv.submit_send(block)
+            }
+
+            fn poll_recv(&mut self) -> Result<Option<KvBlock>, String> {
+                self.kv.poll_recv()
+            }
+
+            fn flush_send(&mut self) -> Result<(), String> {
+                self.kv.flush_send()
+            }
+
+            fn supports_ring_packets(&self) -> bool {
+                true
+            }
+
+            fn submit_send_packet(&mut self, packet: &RingPacket) -> Result<(), String> {
+                self.tx.send(packet.clone()).map_err(|e| e.to_string())
+            }
+
+            fn poll_recv_packet(&mut self) -> Result<Option<RingPacket>, String> {
+                Ok(self.rx.try_recv().ok())
+            }
+
+            fn recv_packet(&mut self) -> Result<Option<RingPacket>, String> {
+                self.rx
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .map(Some)
+                    .map_err(|e| format!("recv Q-ring packet timeout: {e}"))
+            }
+        }
+
+        fn make_config() -> ModelConfig {
+            ModelConfig {
+                architectures: Some(vec!["LlamaForCausalLM".to_string()]),
+                hidden_size: 32,
+                num_layers: 2,
+                num_heads: 4,
+                num_kv_heads: Some(1),
+                intermediate_size: 64,
+                vocab_size: 100,
+                rope_theta: 10000.0,
+                rms_norm_eps: 1e-6,
+                tie_word_embeddings: false,
+                torch_dtype: Some("float32".to_string()),
+                hidden_act: "silu".to_string(),
+                max_position_embeddings: Some(128),
+                attention_dropout: 0.0,
+                bos_token_id: None,
+                eos_token_id: None,
+                use_cache: true,
+                sliding_window: None,
+                use_sliding_window: None,
+                partial_rotary_factor: 1.0,
+            }
+        }
+
+        let device = Device::Cpu;
+        let config = make_config();
+        let weights = create_synthetic_weights(&config, device);
+        let mut backend0 = TchWorkerBackend::from_model(
+            LlamaModel::from_weights(config.clone(), &weights, device, 2).unwrap(),
+            device,
+            0,
+        );
+        let mut backend1 = TchWorkerBackend::from_model(
+            LlamaModel::from_weights(config.clone(), &weights, device, 2).unwrap(),
+            device,
+            1,
+        );
+        let mut reference_a = TchWorkerBackend::from_model(
+            LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap(),
+            device,
+            0,
+        );
+        let mut reference_b = TchWorkerBackend::from_model(
+            LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap(),
+            device,
+            0,
+        );
+
+        let mut transports0: Vec<Box<dyn KvTransport>> = Vec::new();
+        let mut transports1: Vec<Box<dyn KvTransport>> = Vec::new();
+        for _ in 0..config.num_layers {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let stream0 = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let stream1 = listener.accept().unwrap().0;
+            let (tx01, rx01) = mpsc::channel::<RingPacket>();
+            let (tx10, rx10) = mpsc::channel::<RingPacket>();
+            transports0.push(Box::new(ChanPacketTransport {
+                kv: crate::model::transport::TcpKvTransport::new(stream0, device).unwrap(),
+                tx: tx01,
+                rx: rx10,
+            }));
+            transports1.push(Box::new(ChanPacketTransport {
+                kv: crate::model::transport::TcpKvTransport::new(stream1, device).unwrap(),
+                tx: tx10,
+                rx: rx01,
+            }));
+        }
+        backend0.setup_kv_transports(transports0);
+        backend1.setup_kv_transports(transports1);
+
+        let prompt_a: Vec<i64> = (0..4).collect();
+        let prompt_b: Vec<i64> = (10..16).collect();
+        let capacities_a0 = vec![5; config.num_layers];
+        let capacities_a1 = vec![7; config.num_layers];
+        let capacities_b0 = vec![6; config.num_layers];
+        let capacities_b1 = vec![8; config.num_layers];
+
+        // Every worker processes requests in the same order.  This is the
+        // current coordinator batch contract because RingPacket has no request
+        // identifier and the per-layer channel is FIFO.
+        let ((_logits_a0, _), (_logits_b0, _), (logits_a1, _), (logits_b1, _)) =
+            std::thread::scope(|scope| {
+                let worker0 = scope.spawn(|| {
+                    let a = backend0.prefill_request_with_reservation(
+                        101,
+                        &prompt_a[..1],
+                        0,
+                        Some(&[0]),
+                        Some(&capacities_a0),
+                    );
+                    let b = backend0.prefill_request_with_reservation(
+                        202,
+                        &prompt_b[..2],
+                        0,
+                        Some(&[0, 1]),
+                        Some(&capacities_b0),
+                    );
+                    (a, b)
+                });
+                let worker1 = scope.spawn(|| {
+                    let a = backend1.prefill_request_with_reservation(
+                        101,
+                        &prompt_a[1..],
+                        1,
+                        Some(&[1, 2, 3]),
+                        Some(&capacities_a1),
+                    );
+                    let b = backend1.prefill_request_with_reservation(
+                        202,
+                        &prompt_b[2..],
+                        2,
+                        Some(&[2, 3, 4, 5]),
+                        Some(&capacities_b1),
+                    );
+                    (a, b)
+                });
+                let (a0, b0) = worker0.join().unwrap();
+                let (a1, b1) = worker1.join().unwrap();
+                (a0.unwrap(), b0.unwrap(), a1.unwrap(), b1.unwrap())
+            });
+        for backend in [&mut backend0, &mut backend1] {
+            backend.sync_global_seq_len_for_request(101, prompt_a.len());
+            backend.sync_global_seq_len_for_request(202, prompt_b.len());
+        }
+
+        let (ref_a, _) = reference_a
+            .prefill_request(101, &prompt_a, 0, None)
+            .unwrap();
+        let (ref_b, _) = reference_b
+            .prefill_request(202, &prompt_b, 0, None)
+            .unwrap();
+        let prefill_a = Tensor::from_slice(&logits_a1);
+        let prefill_b = Tensor::from_slice(&logits_b1);
+        let ref_a = Tensor::from_slice(&ref_a);
+        let ref_b = Tensor::from_slice(&ref_b);
+        assert!((&prefill_a - &ref_a).abs().max().double_value(&[]) < 1e-3);
+        assert!((&prefill_b - &ref_b).abs().max().double_value(&[]) < 1e-3);
+
+        let mut next_a = prefill_a.argmax(-1, false).int64_value(&[]);
+        let mut next_b = prefill_b.argmax(-1, false).int64_value(&[]);
+        const DECODE_STEPS: usize = 3;
+        for step in 0..DECODE_STEPS {
+            let ref_logits_a = reference_a.decode_request(101, next_a).unwrap();
+            let ref_logits_b = reference_b.decode_request(202, next_b).unwrap();
+            let (batch0, batch1) = std::thread::scope(|scope| {
+                let worker0 =
+                    scope.spawn(|| backend0.decode_batch(&[(101, next_a), (202, next_b)]));
+                let worker1 =
+                    scope.spawn(|| backend1.decode_batch(&[(101, next_a), (202, next_b)]));
+                (
+                    worker0.join().unwrap().unwrap(),
+                    worker1.join().unwrap().unwrap(),
+                )
+            });
+            for (worker, batch) in [(0_usize, &batch0), (1, &batch1)] {
+                let logits_a = batch.iter().find(|(id, _)| *id == 101).unwrap().1.clone();
+                let logits_b = batch.iter().find(|(id, _)| *id == 202).unwrap().1.clone();
+                let diff_a = (&Tensor::from_slice(&logits_a) - &Tensor::from_slice(&ref_logits_a))
+                    .abs()
+                    .max()
+                    .double_value(&[]);
+                let diff_b = (&Tensor::from_slice(&logits_b) - &Tensor::from_slice(&ref_logits_b))
+                    .abs()
+                    .max()
+                    .double_value(&[]);
+                assert!(
+                    diff_a < 1e-3,
+                    "step {step} worker {worker} request A diff {diff_a}"
+                );
+                assert!(
+                    diff_b < 1e-3,
+                    "step {step} worker {worker} request B diff {diff_b}"
+                );
+                assert_eq!(
+                    Tensor::from_slice(&logits_a)
+                        .argmax(-1, false)
+                        .int64_value(&[]),
+                    Tensor::from_slice(&ref_logits_a)
+                        .argmax(-1, false)
+                        .int64_value(&[]),
+                    "step {step} worker {worker} request A token"
+                );
+                assert_eq!(
+                    Tensor::from_slice(&logits_b)
+                        .argmax(-1, false)
+                        .int64_value(&[]),
+                    Tensor::from_slice(&ref_logits_b)
+                        .argmax(-1, false)
+                        .int64_value(&[]),
+                    "step {step} worker {worker} request B token"
+                );
+            }
+            next_a = Tensor::from_slice(&ref_logits_a)
+                .argmax(-1, false)
+                .int64_value(&[]);
+            next_b = Tensor::from_slice(&ref_logits_b)
+                .argmax(-1, false)
+                .int64_value(&[]);
+        }
+
+        let split_points = [(101_u64, prompt_a.len(), 1_usize), (202, prompt_b.len(), 2)];
+        for (domain, backend) in [&backend0, &backend1].into_iter().enumerate() {
+            for (request_id, prompt_len, split) in split_points {
+                let context = backend.request_contexts.get(&request_id).unwrap();
+                assert_eq!(context.global_seq_len, prompt_len + DECODE_STEPS);
+                let mut expected_positions = if domain == 0 {
+                    (0..split as i64).collect::<Vec<_>>()
+                } else {
+                    (split as i64..prompt_len as i64).collect::<Vec<_>>()
+                };
+                expected_positions.extend(
+                    (prompt_len as i64..(prompt_len + DECODE_STEPS) as i64)
+                        .filter(|position| *position as usize % 2 == domain),
+                );
+                for cache in &context.kv_caches {
+                    let Some(KvCacheImpl::ReservedPositioned(shard)) = cache else {
+                        panic!("request {request_id} did not use reserved positioned KV");
+                    };
+                    assert_eq!(shard.positions(), expected_positions);
+                }
+            }
+        }
+    }
+
     #[test]
     fn reserved_prefill_uses_explicit_per_layer_capacities() {
         let device = Device::Cpu;
@@ -827,6 +1378,50 @@ mod tests {
             assert_eq!(shard.committed_len(), prompt.len());
             assert_eq!(shard.positions(), &[0, 1]);
         }
+    }
+
+    #[test]
+    fn release_request_frees_context_and_further_decode_fails() {
+        let device = Device::Cpu;
+        let config = ModelConfig {
+            architectures: Some(vec!["LlamaForCausalLM".to_string()]),
+            hidden_size: 32,
+            num_layers: 2,
+            num_heads: 4,
+            num_kv_heads: Some(1),
+            intermediate_size: 64,
+            vocab_size: 100,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-6,
+            tie_word_embeddings: false,
+            torch_dtype: Some("float32".to_string()),
+            hidden_act: "silu".to_string(),
+            max_position_embeddings: Some(128),
+            attention_dropout: 0.0,
+            bos_token_id: None,
+            eos_token_id: None,
+            use_cache: true,
+            sliding_window: None,
+            use_sliding_window: None,
+            partial_rotary_factor: 1.0,
+        };
+        let weights = create_synthetic_weights(&config, device);
+        let model = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+        let mut backend = TchWorkerBackend::from_model(model, device, 0);
+
+        backend.prefill_request(1, &[3, 5], 0, None).unwrap();
+        assert!(backend.request_contexts.contains_key(&1));
+        let logits = backend.decode_request(1, 7).unwrap();
+        assert_eq!(logits.len(), config.vocab_size);
+
+        // Release must free the per-request KV cache exactly like the
+        // coordinator's ReleaseRequest command after completion.
+        backend.release_request(1);
+        assert!(!backend.request_contexts.contains_key(&1));
+        // Idempotent release is a no-op, not an error.
+        backend.release_request(1);
+        // Decoding a released request must fail, not reuse stale state.
+        assert!(backend.decode_request(1, 7).is_err());
     }
 
     #[test]
@@ -1893,6 +2488,495 @@ mod tests {
                 let Some(KvCacheImpl::ReservedPositioned(shard)) = &context.kv_caches[layer_idx]
                 else {
                     panic!("worker {domain} layer {layer_idx} did not use reserved KV");
+                };
+                positions.extend_from_slice(shard.positions());
+            }
+            positions.sort_unstable();
+            assert_eq!(positions, (0_i64..=8).collect::<Vec<_>>());
+        }
+    }
+
+    /// The production `run_stationary_continuation` driver on a mock ring,
+    /// synthetic config: same 97ca355-style scenario, continuation phase
+    /// executed by the new method instead of the in-test hand-to-hand loop.
+    #[test]
+    fn stationary_continuation_driver_matches_reference_on_mock_ring() {
+        let device = Device::Cpu;
+        let config = ModelConfig {
+            architectures: Some(vec!["LlamaForCausalLM".to_string()]),
+            hidden_size: 32,
+            num_layers: 24,
+            num_heads: 4,
+            num_kv_heads: Some(1),
+            intermediate_size: 64,
+            vocab_size: 100,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-6,
+            tie_word_embeddings: false,
+            torch_dtype: Some("float32".to_string()),
+            hidden_act: "silu".to_string(),
+            max_position_embeddings: Some(128),
+            attention_dropout: 0.0,
+            bos_token_id: None,
+            eos_token_id: None,
+            use_cache: true,
+            sliding_window: None,
+            use_sliding_window: None,
+            partial_rotary_factor: 1.0,
+        };
+        let weights = create_synthetic_weights(&config, device);
+        let mut reference = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+        let layers = config.num_layers;
+        let domains = 2_usize;
+        let mut backends = (0..domains)
+            .map(|domain| {
+                TchWorkerBackend::from_model(
+                    LlamaModel::from_weights(config.clone(), &weights, device, domains).unwrap(),
+                    device,
+                    domain,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut per_backend: Vec<Vec<Box<dyn KvTransport>>> =
+            (0..domains).map(|_| Vec::with_capacity(layers)).collect();
+        for _ in 0..layers {
+            for (domain, endpoint) in
+                crate::model::transport::LinkedMockKvTransport::create_ring(domains)
+                    .into_iter()
+                    .enumerate()
+            {
+                per_backend[domain].push(Box::new(endpoint));
+            }
+        }
+        for (domain, transports) in per_backend.into_iter().enumerate() {
+            backends[domain].setup_kv_transports(transports);
+        }
+
+        let request_id = 81_u64;
+        let prompt = [3_i64, 5, 7, 9];
+        let continuation_prompt = [11_i64, 13, 17, 19];
+        let continuation_positions = [5_i64, 6, 7, 8];
+        let capacity_tickets = [1_u64, 3];
+        let prefix_splits = [1_usize, 3];
+
+        let decode_schedule =
+            FrozenKvAssigneeSchedule::new(&capacity_tickets, request_id, layers).unwrap();
+        assert_eq!(decode_schedule.counts(), &[6, 18]);
+        let decode_assignees = (0..layers)
+            .map(|layer_idx| decode_schedule.assignee_for(0, layer_idx, layers).unwrap())
+            .collect::<Vec<_>>();
+        let continuation_schedule =
+            FrozenKvAssigneeSchedule::new(&capacity_tickets, request_id, continuation_prompt.len())
+                .unwrap();
+        assert_eq!(continuation_schedule.counts(), prefix_splits);
+        let mut continuation_offsets_by_domain = vec![Vec::new(); domains];
+        for offset in 0..continuation_prompt.len() {
+            let domain = continuation_schedule.assignee_for(offset, 0, 1).unwrap();
+            continuation_offsets_by_domain[domain].push(offset);
+        }
+        let capacities = (0..domains)
+            .map(|domain| {
+                (0..layers)
+                    .map(|layer_idx| {
+                        prefix_splits[domain]
+                            + usize::from(decode_assignees[layer_idx] == domain)
+                            + continuation_offsets_by_domain[domain].len()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        let mut reference_caches = reference.create_kv_caches();
+        let reference_prefill_logits = reference
+            .forward(
+                &Tensor::from_slice(&prompt).unsqueeze(0),
+                &mut reference_caches,
+            )
+            .unwrap()
+            .select(1, prompt.len() as i64 - 1)
+            .squeeze();
+        backends[0]
+            .prefill_request_with_reservation(
+                request_id,
+                &prompt[..1],
+                0,
+                Some(&[0]),
+                Some(&capacities[0]),
+            )
+            .unwrap();
+        let (prefill_logits1, _) = backends[1]
+            .prefill_request_with_reservation(
+                request_id,
+                &prompt[1..],
+                1,
+                Some(&[1, 2, 3]),
+                Some(&capacities[1]),
+            )
+            .unwrap();
+        let decode_token = Tensor::from_slice(&prefill_logits1)
+            .argmax(-1, false)
+            .int64_value(&[]);
+        assert_eq!(
+            decode_token,
+            reference_prefill_logits.argmax(-1, false).int64_value(&[])
+        );
+
+        let (distributed_decode_logits, decode_finisher) = run_two_backend_reserved_local_decode(
+            &mut backends,
+            request_id,
+            decode_token,
+            prompt.len() as i64,
+            1,
+            &decode_assignees,
+        );
+        assert_eq!(decode_finisher, 1);
+        let reference_decode_logits = reference
+            .forward(
+                &Tensor::from_slice(&[decode_token]).unsqueeze(0),
+                &mut reference_caches,
+            )
+            .unwrap()
+            .squeeze();
+        assert_eq!(
+            distributed_decode_logits
+                .squeeze()
+                .argmax(-1, false)
+                .int64_value(&[]),
+            reference_decode_logits.argmax(-1, false).int64_value(&[])
+        );
+
+        // The continuation phase runs through the production driver; the two
+        // backends must proceed concurrently because mock receives busy-wait.
+        let (left, right) = backends.split_at_mut(1);
+        let (result0, result1) = std::thread::scope(|scope| {
+            let worker0 = scope.spawn(|| {
+                left[0].run_stationary_continuation(
+                    request_id,
+                    &continuation_prompt,
+                    &continuation_positions,
+                    &capacity_tickets,
+                    decode_finisher,
+                )
+            });
+            let worker1 = scope.spawn(|| {
+                right[0].run_stationary_continuation(
+                    request_id,
+                    &continuation_prompt,
+                    &continuation_positions,
+                    &capacity_tickets,
+                    decode_finisher,
+                )
+            });
+            (worker0.join().unwrap(), worker1.join().unwrap())
+        });
+        let logits0 = result0.unwrap();
+        let logits1 = result1.unwrap();
+        assert!(logits0.is_none(), "non-finisher must not return logits");
+        let continuation_logits =
+            Tensor::from_slice(&logits1.expect("final finisher must return logits"));
+
+        reference.set_prefill_position_ids(&continuation_positions, device);
+        let reference_continuation_logits = reference
+            .forward(
+                &Tensor::from_slice(&continuation_prompt).unsqueeze(0),
+                &mut reference_caches,
+            )
+            .unwrap()
+            .select(1, continuation_prompt.len() as i64 - 1)
+            .squeeze();
+        let max_diff = (&continuation_logits - &reference_continuation_logits)
+            .abs()
+            .max()
+            .double_value(&[]);
+        assert_eq!(
+            continuation_logits.argmax(-1, false).int64_value(&[]),
+            reference_continuation_logits
+                .argmax(-1, false)
+                .int64_value(&[])
+        );
+        assert!(max_diff < 1e-3, "driver continuation max diff: {max_diff}");
+
+        // Both backends resynced the request horizon to the segment end.
+        for backend in &backends {
+            let context = backend.request_contexts.get(&request_id).unwrap();
+            assert_eq!(context.global_seq_len, 9);
+        }
+
+        let domain_totals = (0..domains)
+            .map(|domain| {
+                let context = backends[domain].request_contexts.get(&request_id).unwrap();
+                (0..layers)
+                    .map(|layer_idx| {
+                        let Some(KvCacheImpl::ReservedPositioned(shard)) =
+                            &context.kv_caches[layer_idx]
+                        else {
+                            panic!("worker {domain} layer {layer_idx} did not use reserved KV");
+                        };
+                        assert_eq!(shard.committed_len(), shard.reserved_capacity());
+                        shard.committed_len()
+                    })
+                    .sum::<usize>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(domain_totals, vec![54, 162]);
+
+        for layer_idx in 0..layers {
+            let mut positions = Vec::new();
+            for backend in &backends {
+                let context = backend.request_contexts.get(&request_id).unwrap();
+                let Some(KvCacheImpl::ReservedPositioned(shard)) = &context.kv_caches[layer_idx]
+                else {
+                    panic!("layer {layer_idx} did not use reserved KV");
+                };
+                positions.extend_from_slice(shard.positions());
+            }
+            positions.sort_unstable();
+            assert_eq!(positions, (0_i64..=8).collect::<Vec<_>>());
+        }
+
+        // Validation rejects malformed segments before touching state.
+        backends[0]
+            .run_stationary_continuation(request_id, &[], &[], &capacity_tickets, 1)
+            .unwrap_err();
+        backends[0]
+            .run_stationary_continuation(
+                request_id,
+                &continuation_prompt,
+                &continuation_positions[..2],
+                &capacity_tickets,
+                1,
+            )
+            .unwrap_err();
+        backends[0]
+            .run_stationary_continuation(
+                999,
+                &continuation_prompt,
+                &continuation_positions,
+                &capacity_tickets,
+                1,
+            )
+            .unwrap_err();
+    }
+
+    /// Real-weight 97ca355 scenario: prefill [1,3] split + one local decode
+    /// step + continuation via the production driver, compared against the
+    /// contiguous reference with the golden tolerances.
+    #[test]
+    #[ignore = "requires the local Qwen2-0.5B model weights"]
+    fn real_qwen_stationary_continuation_driver_matches_reference() {
+        let device = Device::Cpu;
+        let model_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("models")
+            .join("Qwen2-0.5B");
+        let config = ModelConfig::from_file(model_dir.join("config.json")).unwrap();
+        assert_eq!(config.num_layers, 24);
+        let layers = config.num_layers;
+        let domains = 2_usize;
+        let weights = ModelWeights::from_dir(&model_dir, device).unwrap();
+
+        let mut reference = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+        let mut backends = (0..domains)
+            .map(|domain| {
+                TchWorkerBackend::from_model(
+                    LlamaModel::from_weights(config.clone(), &weights, device, domains).unwrap(),
+                    device,
+                    domain,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut per_backend: Vec<Vec<Box<dyn KvTransport>>> =
+            (0..domains).map(|_| Vec::with_capacity(layers)).collect();
+        for _ in 0..layers {
+            for (domain, endpoint) in
+                crate::model::transport::LinkedMockKvTransport::create_ring(domains)
+                    .into_iter()
+                    .enumerate()
+            {
+                per_backend[domain].push(Box::new(endpoint));
+            }
+        }
+        for (domain, transports) in per_backend.into_iter().enumerate() {
+            backends[domain].setup_kv_transports(transports);
+        }
+
+        let request_id = 75_u64;
+        let prompt = [151644_i64, 9707, 0, 16];
+        let continuation_prompt = [11_i64, 13, 17, 19];
+        let continuation_positions = [5_i64, 6, 7, 8];
+        let capacity_tickets = [1_u64, 3];
+        let prefix_splits = [1_usize, 3];
+
+        let decode_schedule =
+            FrozenKvAssigneeSchedule::new(&capacity_tickets, request_id, layers).unwrap();
+        assert_eq!(decode_schedule.counts(), &[6, 18]);
+        let decode_assignees = (0..layers)
+            .map(|layer_idx| decode_schedule.assignee_for(0, layer_idx, layers).unwrap())
+            .collect::<Vec<_>>();
+        let continuation_schedule =
+            FrozenKvAssigneeSchedule::new(&capacity_tickets, request_id, continuation_prompt.len())
+                .unwrap();
+        assert_eq!(continuation_schedule.counts(), prefix_splits);
+        let mut continuation_offsets_by_domain = vec![Vec::new(); domains];
+        for offset in 0..continuation_prompt.len() {
+            let domain = continuation_schedule.assignee_for(offset, 0, 1).unwrap();
+            continuation_offsets_by_domain[domain].push(offset);
+        }
+        let capacities = (0..domains)
+            .map(|domain| {
+                (0..layers)
+                    .map(|layer_idx| {
+                        prefix_splits[domain]
+                            + usize::from(decode_assignees[layer_idx] == domain)
+                            + continuation_offsets_by_domain[domain].len()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        let mut reference_caches = reference.create_kv_caches();
+        let reference_prefill_logits = reference
+            .forward(
+                &Tensor::from_slice(&prompt).unsqueeze(0),
+                &mut reference_caches,
+            )
+            .unwrap()
+            .select(1, prompt.len() as i64 - 1)
+            .squeeze();
+        backends[0]
+            .prefill_request_with_reservation(
+                request_id,
+                &prompt[..1],
+                0,
+                Some(&[0]),
+                Some(&capacities[0]),
+            )
+            .unwrap();
+        let (prefill_logits1, _) = backends[1]
+            .prefill_request_with_reservation(
+                request_id,
+                &prompt[1..],
+                1,
+                Some(&[1, 2, 3]),
+                Some(&capacities[1]),
+            )
+            .unwrap();
+        let decode_token = Tensor::from_slice(&prefill_logits1)
+            .argmax(-1, false)
+            .int64_value(&[]);
+        assert_eq!(
+            decode_token,
+            reference_prefill_logits.argmax(-1, false).int64_value(&[])
+        );
+
+        let (distributed_decode_logits, decode_finisher) = run_two_backend_reserved_local_decode(
+            &mut backends,
+            request_id,
+            decode_token,
+            prompt.len() as i64,
+            1,
+            &decode_assignees,
+        );
+        let reference_decode_logits = reference
+            .forward(
+                &Tensor::from_slice(&[decode_token]).unsqueeze(0),
+                &mut reference_caches,
+            )
+            .unwrap()
+            .squeeze();
+        assert_eq!(
+            distributed_decode_logits
+                .squeeze()
+                .argmax(-1, false)
+                .int64_value(&[]),
+            reference_decode_logits.argmax(-1, false).int64_value(&[])
+        );
+
+        let (left, right) = backends.split_at_mut(1);
+        let (result0, result1) = std::thread::scope(|scope| {
+            let worker0 = scope.spawn(|| {
+                left[0].run_stationary_continuation(
+                    request_id,
+                    &continuation_prompt,
+                    &continuation_positions,
+                    &capacity_tickets,
+                    decode_finisher,
+                )
+            });
+            let worker1 = scope.spawn(|| {
+                right[0].run_stationary_continuation(
+                    request_id,
+                    &continuation_prompt,
+                    &continuation_positions,
+                    &capacity_tickets,
+                    decode_finisher,
+                )
+            });
+            (worker0.join().unwrap(), worker1.join().unwrap())
+        });
+        assert!(result0.unwrap().is_none());
+        let continuation_logits =
+            Tensor::from_slice(&result1.unwrap().expect("final finisher must return logits"));
+
+        reference.set_prefill_position_ids(&continuation_positions, device);
+        let reference_continuation_logits = reference
+            .forward(
+                &Tensor::from_slice(&continuation_prompt).unsqueeze(0),
+                &mut reference_caches,
+            )
+            .unwrap()
+            .select(1, continuation_prompt.len() as i64 - 1)
+            .squeeze();
+        let max_diff = (&continuation_logits - &reference_continuation_logits)
+            .abs()
+            .max()
+            .double_value(&[]);
+        let mean_diff = (&continuation_logits - &reference_continuation_logits)
+            .abs()
+            .mean(Kind::Float)
+            .double_value(&[]);
+        let reference_token = reference_continuation_logits
+            .argmax(-1, false)
+            .int64_value(&[]);
+        let driver_token = continuation_logits.argmax(-1, false).int64_value(&[]);
+        println!(
+            "real stationary continuation driver: max_diff={max_diff:.6}, mean_diff={mean_diff:.6}, tokens={driver_token}/{reference_token}"
+        );
+        assert_eq!(reference_token, driver_token);
+        assert!(
+            mean_diff < 0.1,
+            "driver continuation mean logits diff: {mean_diff}"
+        );
+        assert!(
+            max_diff < 0.75,
+            "driver continuation max logits diff: {max_diff}"
+        );
+
+        let domain_totals = (0..domains)
+            .map(|domain| {
+                let context = backends[domain].request_contexts.get(&request_id).unwrap();
+                (0..layers)
+                    .map(|layer_idx| {
+                        let Some(KvCacheImpl::ReservedPositioned(shard)) =
+                            &context.kv_caches[layer_idx]
+                        else {
+                            panic!("worker {domain} layer {layer_idx} did not use reserved KV");
+                        };
+                        assert_eq!(shard.committed_len(), shard.reserved_capacity());
+                        shard.committed_len()
+                    })
+                    .sum::<usize>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(domain_totals, vec![54, 162]);
+
+        for layer_idx in 0..layers {
+            let mut positions = Vec::new();
+            for backend in &backends {
+                let context = backend.request_contexts.get(&request_id).unwrap();
+                let Some(KvCacheImpl::ReservedPositioned(shard)) = &context.kv_caches[layer_idx]
+                else {
+                    panic!("layer {layer_idx} did not use reserved KV");
                 };
                 positions.extend_from_slice(shard.positions());
             }

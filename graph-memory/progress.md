@@ -2,6 +2,262 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### 6b.0 Rust completions/SSE 内部合同验证通过
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@4784acf`
+
+实现提交：4784acf，仅在 rust/src/api/server.rs 增加四个 Axum Router::oneshot 合同测试，生产 handler 无行为修改。
+
+验证：
+1. LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib:/opt/homebrew/opt/libomp/lib cargo test --manifest-path rust/Cargo.toml --features tch-backend --lib
+   结果：129 passed；0 failed；5 ignored；包含 4 个 api::server::tests。
+2. LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib:/opt/homebrew/opt/libomp/lib cargo clippy --manifest-path rust/Cargo.toml --features tch-backend --all-targets --message-format short
+   结果：exit 0；warning 均来自本节点未修改的既有文件。
+3. rustfmt --edition 2021 --check rust/src/api/server.rs；git diff --check
+   结果：exit 0。
+
+覆盖：request_id/prompt/max_tokens/temperature/top_p 到 InferenceJob 的映射；非流式 id/object/model/choices/usage/finish_reason；流式 JSON token events、稳定 completion id、finish_reason 与 [DONE]；coordinator queue 关闭返回 503；缺失 prompt 在 enqueue 前返回 422。
+
+证据边界：这是进程内 Axum router + 模拟 coordinator channel 的合同测试，不启动真实 TCP socket，不经 curl 或 vLLM CLI，不加载模型，不运行 worker/GPU/QUIC/三机，不验证并发、容量 admission、request release 或性能。因为现有 handler 已满足合同，本节点没有生产缺陷修复，也没有预期的 RED 行为改动；价值是把既有 wire semantics 固化为回归。
+
+_updated: 2026-08-11 19:31:56_
+### vLLM bench serve 可将 HCP 当作 OpenAI-compatible 黑盒服务
+
+type: `belief` · status: `held` · confidence: 0.95 · importance: 0.9 · source: `https://docs.vllm.ai/en/latest/cli/bench/serve/`
+
+官方 bench 文档将目标抽象为 serving endpoint/client protocol，并提供 request-rate、max-concurrency、streaming 与 TTFT/TPOT/ITL/E2EL/goodput 等测量；它不要求被测 endpoint 内部运行 vLLM engine。HCP 当前 API 已接近该合同，但需用实际 client 做线级验证。
+
+_updated: 2026-08-11 17:49:40_
+### 一期 request_id 的 phase/control 语义与 Q-ring wire packet 语义分离
+
+type: `lesson` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `git-history-and-6a2-audit-20260812`
+
+[2026-08-12] `request_id` 在 HCP 一期不同层次的语义不能混用：
+
+1. `FrozenKvAssigneeSchedule::new(capacity_tickets, request_id, ...)` 使用 `request_id` 计算稳定 phase，目的是让不同 request 的 KV assignee 初始相位分散；这是 request-aware placement/scheduling metadata。
+2. coordinator 的 `WorkerCommand::DecodeBatch` 携带 `(request_id, token)` 列表，worker 的 `RequestContext` 也按 request_id 隔离 KV 与 global horizon；这是控制面和 backend state。
+3. decode `RingPacket` 从引入 Q-ring 的 commit `c4a3e7f` 起就只有 `layer_idx, q, o, lse, scale`；self-driving `SelfDrivingPacket` 也只有 layer/activation/route fields。单请求设计中，packet 身份由 per-layer transport FIFO、ring round 和 layer route 隐式确定。
+
+因此当前缺口不是一期实现被回退或删除，而是“无 wire request_id 的单请求数据面”被扩展到多请求 DecodeBatch 后暴露了调度顺序依赖。6a.2 只证明同一 request 顺序下正确；后续若需要 worker 独立重排，才应单独评估为 RingPacket 增加 request_id/step metadata，或继续把全局 FIFO 作为明确合同。
+
+_updated: 2026-08-11 17:25:35_
+### [2026-08-12] 6a.2 N=2 Q-ring unequal-prefix request isolation oracle 通过
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@3b9d912`
+
+实现提交 `3b9d912`。focused test `test_decode_qring_request_isolation_with_unequal_prefixes` 通过：
+
+1. 两个 request A/B 使用长度 4/6 的不同 prompt；两个 worker 各自保留不均等 prefix shard（A 为 1:3，B 为 2:4），每层使用 ReservedPositioned KV。
+2. prefill 通过真实双向 TCP KV transport；同一复合 transport 同时提供 mpsc Q-ring packet rendezvous，避免替换 transport 时重置 attention phase。
+3. prefill 后显式同步两个 worker 的 request global horizon；两个 worker 以相同 `[A,B]` 顺序交错执行 3 轮 `decode_batch`。
+4. 两个 request 的 prefill tail logits、每轮 decode logits 与完全独立 reference 的 max diff < 1e-3，greedy argmax token 逐轮一致。
+5. 每层 KV position 精确匹配 prefix + `global_position % 2` growth 归属；最终 request horizon 分别为 7/9。
+
+验证：`LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib:/opt/homebrew/opt/libomp/lib cargo test --manifest-path rust/Cargo.toml --features tch-backend --lib` -> 125 passed, 0 failed, 5 ignored；focused test 通过；`cargo clippy --features tch-backend --all-targets --message-format short` exit 0；rustfmt 与 `git diff --check` 通过。
+
+边界：CPU float32 synthetic 2-layer/2-domain；Q-ring packet 当前没有 request_id，因此证据只覆盖所有 worker 遵守相同 request FIFO 顺序的调度合同；不证明不同 worker request 顺序、QUIC、MPS/CUDA/HIP、HTTP、吞吐或故障恢复。
+
+_updated: 2026-08-11 16:58:49_
+### [2026-08-12] 多请求 Q-ring 前必须同步 request horizon，且 packet FIFO 顺序是当前合同
+
+type: `lesson` · status: `held` · confidence: 1.0 · importance: 0.9 · source: `hetero-cp-ringattn@3b9d912`
+
+6a.2 的两次诊断形成可复用约束：
+1. 分片 prefill 后各 worker 的 `global_seq_len` 可能只是本地 chunk 末端；decode 前必须由 coordinator 对每个 request 广播全局 horizon，否则不同 worker 为同一 token 生成不同 position_ids/Q。
+2. `RingPacket` 当前不携带 request_id；在不改 wire contract 的前提下，所有 worker 必须按同一 request 顺序进入每层 Q-ring，per-layer FIFO 才能保持 packet 与 request 对齐。
+3. `setup_kv_transports()` 会通过 `set_distributed()` 重置 attention phase；测试或 runtime 不能在 prefill 后直接替换 transport 并假设 Q-ring gate 仍打开。
+
+_updated: 2026-08-11 16:58:49_
+### 6a.1 不等长 prompt 独立参考 oracle 通过
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@fe3aedc`
+
+[2026-08-11] 实现提交 fe3aedc 将原有 decode_batch isolation 测试改为真正独立参考：
+- mixed backend 先后 prefill request A/B，prompt 长度分别为 8/12；
+- ref-A、ref-B 使用两个完全独立的相同权重 backend；
+- prefill global length、初始 logits、首步与后续 4 轮 decode logits 均逐 request 对比；
+- greedy argmax token 每轮与独立参考一致，定向测试 1 passed, 0 failed；
+- rustfmt --edition 2021 --check rust/src/worker_sdk/tch_backend.rs 与 git diff --check 均 exit 0。
+边界：这是 CPU、float32、num_domains=1、2 layers、synthetic weights 的请求隔离证据；不证明 N=2/N=3 Q-ring、MPS/CUDA/HIP、QUIC、HTTP、吞吐、capacity admission 或共享 layer state 在 ring path 下安全。N=2 Q-ring 仍是下一节点。
+
+_updated: 2026-08-11 15:38:57_
+### 二期基础推理服务 benchmark 选型研究
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 0.95 · source: `official-source-and-code-audit-2026-08-11`
+
+[2026-08-11] 调研可用于 HCP 整体推理服务的公开 benchmark，并按系统 correctness、在线 serving、多轮会话和长上下文能力分层评估。结论：当前最小接入候选是 vLLM bench serve；AIPerf 更全面但适合后续 trace/multi-turn 阶段；RULER 用于长期长上下文能力评估；MLPerf/LongBench v2 不作为当前二期门槛。边界：本节点只完成官方资料与现有 API 合同审计，尚未运行任何外部 benchmark，也不证明 HCP 与这些客户端已经线级兼容。
+
+_updated: 2026-08-11 13:19:55_
+### 公开推理 benchmark 官方资料与 HCP API 合同审计
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `official-source-and-code-audit-2026-08-11`
+
+[2026-08-11] 官方来源审计：
+1. vLLM bench serve 支持 /v1/completions、request-rate、max-concurrency、random/ShareGPT/timed_trace/prefix_repetition，以及 TTFT/TPOT/ITL/E2EL percentiles 和 goodput。
+2. NVIDIA GenAI-Perf 已公告逐步停止开发并推荐 AIPerf；AIPerf 支持 OpenAI completions、streaming、concurrency/request-rate/trace replay、multi-turn、prefill concurrency 与 telemetry。
+3. AIPerf multi-turn 每轮发送客户端累积的完整 history；它不等价于服务端 request-local KV continuation。
+4. MLPerf Inference 提供模型/数据集/LoadGen 标准，当前 LLM 项包括 Llama、DeepSeek 等，接入成本和模型约束远大于二期最小服务验证。
+5. RULER 是可配置的合成长上下文能力测试；LongBench v2 是 503 道、8K 到 2M words 的现实多任务质量评估。二者主要测模型有效上下文能力，不单独证明分布式 runtime correctness。
+6. HCP 代码已有 completions SSE 和 [DONE]，但每次 HTTP 自动分配 request_id 且完成即释放，因此可先尝试 vLLM serving 客户端，stateful continuation 仍需独立验收。
+来源：
+- https://docs.vllm.ai/en/latest/cli/bench/serve/
+- https://github.com/ai-dynamo/aiperf
+- https://github.com/ai-dynamo/aiperf/blob/main/docs/tutorials/openai-text-endpoints.md
+- https://github.com/ai-dynamo/aiperf/blob/main/docs/tutorials/multi-turn.md
+- https://github.com/mlcommons/inference
+- https://github.com/NVIDIA/RULER
+- https://github.com/THUDM/LongBench
+边界：这是文档与静态代码审计，未安装或运行 vLLM/AIPerf/MLPerf/RULER，未验证线级兼容、真实三机性能或任何吞吐优势。
+
+_updated: 2026-08-11 13:19:55_
+### 多请求 service 仍共享 request-sensitive layer state
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@d1e536a-code-audit`
+
+2026-08-11 多请求 service 代码审计确认旧 risk 仍成立：
+1. rust/src/worker_sdk/tch_backend.rs 的 RequestContext 只含 kv_caches/global_seq_len/is_prefill_done；decode_request 只 restore/save 后两者。
+2. do_prefill 会按本请求 seq_offset 调用每层 attention.set_distributed，并在 ring backend 中维护 prefill_kv_len/is_prefill_done/seq_offset 等字段；下一请求 prefill 可覆盖这些共享字段。
+3. rust/src/distributed/coordinator.rs 已将 active HashMap 中的 request_tokens 复制为同一 DecodeBatch 顺序广播给所有 worker；WorkerBackend 默认 decode_batch 按该顺序逐个 decode_request，因此 wire 顺序一致，但不自动隔离层内状态。
+4. 现有 tch_backend::test_decode_batch_isolation 只使用两个相同 seq_len=12 的 prompt、num_domains=1；它证明 KV map 不串扰，却不能暴露不同 prefix length/offset 的 layer-state 串扰。
+5. 旧 scripts/test_http_api_concurrent_3domain_cross_node.sh 只断言两个响应文本非空，无单请求 reference、token equality、cache release 或 per-request phase evidence。
+边界：这是静态代码与既有测试覆盖审计，尚未新增不等长 RED 测试，也未测量实际错误幅度；因此风险升级为下一 correctness 节点的 blocker，而不是声称已经观察到跨机错误输出。
+
+_updated: 2026-08-11 12:00:12_
+### 4b byte admission 经 N=3 Mac+CUDA+HIP production QUIC 验证通过
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `reports/routeb-byte-admission-n3-20260811-180836@hetero-cp-ringattn-795d7ce`
+
+795d7ce 的 route-B KV byte admission 经 Mac MPS + white CUDA + pearl HIP 三机 production QUIC 复验通过，artifact 为 reports/routeb-byte-admission-n3-20260811-180836/。
+1. 版本与环境：本地、white、pearl 均为 4654a4b（实现 SHA 795d7ce）；远端只经 git pull --ff-only 同步并 release build。inventory 当前 endpoint：white 100.118.253.68、pearl 100.111.242.55；Mac 实时 utun4 地址 100.121.35.138。三机 config SHA256 一致。
+2. 实际 handshake：Mac=8192 MB、white=21793 MB、pearl=15013 MB，均非 u64::MAX。Prefill dispatch 前日志为 required=[36864,49152,36864]、budget=[8589934592,22851616768,15742271488]、bytes_per_token_per_layer=512、status=accepted；每一 domain required<=budget。
+3. 四进程 exit 文件均为 0；generated IDs=[198,15,15]。三个 worker 各 starter/middle/finisher=8/8/8、send/recv=16/16；全局为 24/24/24、48/48=24*(3-1)，N=3 neighbor-only 数据流未变。
+4. 同既有三 MPS golden 的分阶段验收：prefill argmax 198/198、mean=0.035258、max=0.187500，strict pass；stationary continuation argmax 15/15、mean=0.030063、max=0.203125，strict pass；legacy decode argmax 6667/6667、top5=5/5、max=0.648438，mean=0.107887 仅诊断，按既有 phase-specific 决策 guarded pass。
+5. 新 run 与旧 ccc838c 正式三机 production 的 prefill/decode/continuation f32le SHA256 逐文件完全相同，证明 admission 接线没有改变数值数据流。通用统一 mean 脚本仍因 legacy decode 返回 1；专用 phase-2 byte-admission acceptance 返回 PASS，符合已记录路线 B，不是新放宽。
+6. 运行后本地与远端无残留 distributed worker 进程或 33300-33303 UDP listener。
+证据边界：单请求、N=3、24 层、m=4、Qwen2-0.5B BF16、Tailscale QUIC correctness；required bytes 仅是 persistent K/V tensor payload bound，不含 allocator rounding、positions metadata、activation/workspace、多请求并发、性能、N>3 或故障恢复。
+
+_updated: 2026-08-11 10:21:36_
+### Mac GUI Tailscale 正常时 CLI symlink 仍可能丢失 bundle identity
+
+type: `lesson` · status: `held` · confidence: 1.0 · importance: 0.8 · source: `local-environment-observation-20260811`
+
+[2026-08-11] Mac GUI Tailscale 网络正常但 /usr/local/bin/tailscale 便利链接不可直接使用。
+症状：执行 tailscale ip -4 稳定触发 Tailscale/BundleIdentifiers.swift 的 unknown bundleIdentifier fatal error。
+根因：Mac 只有 io.tailscale.ipn.macsys 1.102.2 GUI/Network Extension；/usr/local/bin/tailscale 是 root-owned symlink，指向 /Applications/Tailscale.app/Contents/MacOS/Tailscale。当前版本通过该 symlink 启动时 bundle identity 解析失败，并非隧道或第二套 daemon 冲突。
+验证：network extension activated/enabled，utun4 UP 且路由覆盖 100.64/10，white/pearl SSH 正常；直接执行真实路径 /Applications/Tailscale.app/Contents/MacOS/Tailscale ip -4 返回当前地址。
+处理：HCP 操作可直接调用真实 app executable，或从目标路由的 utun interface 查询 source address；不要安装并启动第二套 Homebrew tailscaled。未修改 /usr/local 或系统配置；若以后修便利命令，root-owned 路径须由用户手动处理。
+边界：这是当前 Mac 安装状态的环境事实，不代表所有 macOS Tailscale 分发版都有同一 symlink 行为，也不把本次易变 IP 固化为项目 endpoint。
+
+_updated: 2026-08-11 10:21:36_
+### 4b coordinator KV byte admission 本地 RED/GREEN 与完整回归通过
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@795d7ce`
+
+提交 795d7ce 完成 route-B coordinator 的本地 byte admission 接线：
+1. capacity_mb_to_bytes 以 1 MiB=1024*1024 bytes checked 转换；u64::MAX 返回 UnknownCapacity，其他乘法溢出返回 CapacityUnitOverflow。
+2. ModelConfig::kv_element_size_bytes 与 LlamaModel 当前 dtype 选择一致：float16/bfloat16=2 bytes，缺失/其他=4 bytes。
+3. run_continuation_e2e 拆分 capacity_tickets 与 worker_capacity_mb；前者只冻结 assignee schedule，后者只作为真实预算。admission 位于首个 WorkerCommand::Prefill 发送循环之前，并输出 required/budget/bytes_per_token_per_layer。
+4. TDD RED：新增测试首次编译失败，明确缺少 conversion、UnknownCapacity/CapacityUnitOverflow 与 dtype helper；GREEN：capacity_mb_to_bytes 聚焦 2/2、kv_element_size 聚焦 1/1。
+5. 完整验证：LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib:/opt/homebrew/opt/libomp/lib HCP_ENABLE_TORCH=1 cargo test --manifest-path rust/Cargo.toml --features tch-backend -> 124 passed, 0 failed, 5 ignored；doc tests 0 failed, 3 ignored。
+6. 静态验证：同环境 cargo clippy --manifest-path rust/Cargo.toml --features tch-backend --all-targets --message-format short -> exit 0，仅既有 warnings；rustfmt --edition 2021 --check 三个改动文件与 git diff --check 均 exit 0。
+证据边界：这是 Mac 本地编译、单元与 synthetic 回归；未运行真实 Qwen production continuation，未证明 Mac MPS + white CUDA + pearl HIP 三机 handshake 均非 unknown，也未重新证明 48/48 hops 与跨硬件 logits 门。4b task 因此保持 active，下一节点是三机 production QUIC 复验。
+
+_updated: 2026-08-10 13:18:32_
+### 4a 冻结 KV placement 纯 byte admission 合同通过
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@e610d2a`
+
+实现提交 e610d2a 仅修改 rust/src/capacity.rs，新增冻结 KV placement 的纯 byte admission 合同。
+1. 数学合同：每个 layer-token 的 persistent payload = 2(K/V)*num_kv_heads*head_dim*element_size_bytes；逐 domain required bytes 为该 domain 所有 layer capacities 之和乘上述单位字节。所有乘加与 u64 转换均 checked。
+2. 24 层 1:3:2、Qwen2-0.5B 几何（2 KV heads、head_dim=64、BF16=2 bytes）不写死派生总数：exact-fit 通过；domain 1 少 1 byte 稳定返回 CapacityExceeded，且 validator 不擅自重平衡冻结 placement。
+3. 结构守护：domain/budget 数不一致、layer layout 不一致、零 KV 几何与算术溢出均返回结构化错误。
+4. TDD RED：正确的 tch-backend 构建中，focused test 因 admit_reserved_kv_bytes/KvByteAdmissionError 不存在而编译失败；GREEN 后 focused 4 passed、0 failed。
+5. 新鲜完整验证：LIBTORCH=/Users/stark_sim/libtorch DYLD_LIBRARY_PATH=/Users/stark_sim/libtorch/lib:/opt/homebrew/opt/libomp/lib HCP_ENABLE_TORCH=1 cargo test --manifest-path rust/Cargo.toml --features tch-backend -> library 121 passed、0 failed、5 ignored；所有 bin tests 0 failed；doc tests 0 failed、3 ignored。cargo clippy --features tch-backend --all-targets --message-format short exit 0，只有既有 warnings，capacity.rs 无诊断。rustfmt --check capacity.rs 与 git diff --check exit 0。
+边界：这是本地 Mac 上的纯整数 payload admission 与 crate 回归，不接 coordinator/runtime/wire，不读取真实 worker budget，不分配 tensor，不证明 allocator rounding、positions metadata、activation/workspace、多请求占用或物理 OOM 安全，也不是三机运行证据。
+
+_updated: 2026-08-10 08:52:49_
+### 当前完整 crate 测试必须显式启用 tch-backend
+
+type: `lesson` · status: `held` · confidence: 1.0 · importance: 0.8 · source: `hetero-cp-ringattn@e610d2a`
+
+症状：尝试用 cargo test --no-default-features 运行纯 capacity 测试时，编译在 distributed/coordinator.rs 失败，报 attention/self_driving 模块不存在。影响：测试未到达新 admission RED，容易被误判成新代码回归。根因：当前 coordinator 无条件引用 model::attention::strategy 和 model::self_driving，而这两个模块在 model/mod.rs 受 tch-backend feature gate；因此仓库当前不支持 no-default-features 的完整 crate test。最小对照：同一工作树改用项目规定的 LIBTORCH+HCP_ENABLE_TORCH=1、--features tch-backend 后，测试到达预期 missing-symbol RED，GREEN 后 focused/full 均通过。处理：本节点不顺手修 feature gating；当前 Rust 验证命令显式启用 tch-backend。预防：在 feature-gating 被单独修复前，不以 --no-default-features 作为 capacity-only 测试捷径。边界：这是当前 crate 构建图事实，不说明 admission 依赖 libtorch，也不拒绝未来增加真正的 pure-core test target。
+
+_updated: 2026-08-10 08:52:49_
+### 二期 4a：冻结 KV placement 的纯 byte admission 合同
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@e610d2a`
+
+二期第 4 项拆分的 4a 小节点：只建立冻结 KV placement 的纯字节 admission 合同。输入每 domain×layer 的 reserved token capacities、KV heads、head dim、element bytes 与逐 domain KV byte budget；输出精确 K/V tensor payload required bytes。拒绝 domain/budget 数不一致、layer layout 不一致、零几何、算术溢出和任一 domain required>budget。验收使用 24 层、1:3:2 不均等 capacities 验证 exact-fit 和 one-byte-short rejection，并覆盖结构错误与溢出。边界：本节点不接 coordinator/runtime/wire，不导入 main 的 placement/ledger WIP，不新增多请求 ledger、workspace、速率 planner，也不声称 payload bytes 足以证明物理 allocator 永不 OOM。
+
+_updated: 2026-08-10 08:52:49_
+### phase-2 分阶段门禁确认 N=3 production QUIC 出口
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@ccc838c+run-20260809-222750`
+
+在 reports/routeb-production-n3-ccc838c-20260809-222750 的原始 f32 logits、meta、exit 文件和 worker 日志上执行新鲜阶段化验收，结果 PHASE2_STAGE_ACCEPTANCE: PASS。
+1. golden 与 production meta 完全一致：request_id=75、domains=3、layers=24、capacity_tickets=[8192,21913,14525]、prefix_splits=[1,1,2]、continuation offsets=[[2],[0,1],[3]]、starter=2、generated=[198,15,15]。
+2. prefill：argmax 198/198，mean=0.035258，max=0.187500，通过 tie-aware+mean<0.1+max<0.75。
+3. stationary continuation：argmax 15/15，mean=0.030063，max=0.203125，通过同一严格门。
+4. 未改动的 legacy decode：argmax 6667/6667、top-5 overlap=5/5、max=0.648438<0.75，mean=0.107887 仅作诊断，符合用户选择的路线 B。
+5. mixed 三机与 local golden 共 8 个 exit 文件全部为 0；三个 production worker 日志各有且仅有一条 stationary stats。验证从 meta 的 layers/domains 推导 expected_hops=layers*(domains-1)=48，全局 starter/middle/finisher=24/24/24、send/recv=48/48。
+验证边界：单请求、N=3、24 层、m=4、Qwen2-0.5B BF16、Mac MPS+white CUDA+pearl HIP、Tailscale QUIC correctness；不证明性能、多请求、N>3、故障恢复或 byte-level admission。新鲜命令是对既有正式 run artifact 的重新验收，不是一次新的跨机推理运行。
+
+_updated: 2026-08-10 03:30:34_
+### zsh wrapper 不得用只读 status 参数保存退出码
+
+type: `lesson` · status: `held` · confidence: 1.0 · importance: 0.85 · source: `local-zsh+run-20260809-222750`
+
+症状：第一次正式报告 reports/routeb-production-n3-ccc838c-20260809-220748 已产生推理输出，但本地 zsh wrapper 在保存退出码时使用变量名 status，导致 zsh: read-only variable: status，报告缺少可信 exit 文件。影响：推理结果本身可观察，但进程级成功条件无法作为正式证据，必须重跑为 222750 报告。根因：status 是 zsh 的只读特殊参数，wrapper 把常见 shell 变量名误当成普通可写变量。最小复现：zsh -c 'status=0' 稳定 exit 1；替换为 command_status 后相同检查 exit 0。解决：正式 222750 wrapper 使用非保留变量并持久保存 coordinator/Mac/white/pearl 精确退出码，四端均为 0。预防：zsh 实验 wrapper 禁止用 status 保存退出码，优先使用 command_status/exit_code；缺少 exit 文件的 run 不能作为正式 evidence。边界：这是 shell wrapper 证据完整性规则，不涉及 Rust runtime 或 QUIC 数据面正确性。
+
+_updated: 2026-08-10 03:30:34_
+### 统一三阶段 mean 门修订为 phase-2 分阶段验收
+
+type: `revision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-confirmed-2026-08-10`
+
+用户选择路线 B，修订 phase-2 stationary continuation 的数值出口：旧决策要求 prefill/decode/continuation 三阶段统一通过 mean<0.1；新决策改为按阶段判定，目标 prefill/continuation 保持原严格门，未改动的 legacy decode 用 argmax/top-k/max 守护且 mean 仅诊断。该修订只作用于 phase-2 出口，不覆盖 phase-1 通用合同或 compare_route_b_dumps.py。
+
+_updated: 2026-08-10 03:30:34_
+### N=3 production QUIC observability 通过，legacy decode mean guard 边界暴露
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@ccc838c+run-20260809-222750`
+
+提交 ccc838c 为 test-only production continuation E2E 增加三阶段 raw logits/meta 导出、request_id/capacity tickets golden 对齐参数，以及每 worker stationary 角色/send/recv 汇总。
+正式三机 production QUIC：Mac domain0(MPS)+coordinator -> white domain1(CUDA) -> pearl domain2(HIP) -> Mac，request_id=75，Qwen2-0.5B BF16，24 层，m=4，splits=[1,1,2]，实际 tickets=[8192,21913,14525]，offsets=[[2],[0,1],[3]]，starter=2。coordinator/Mac/white/pearl wrapper exit 均为 0，generated=[198,15,15]。三个 worker 各统计 starter/middle/finisher=8/8/8、send/recv=16/16；全局 send=recv=48=24*(3-1)，直接证明每层 N-1=2 hops 且三节点均承担 middle relay。
+同 request/tickets/splits 的三 MPS production WorkerRuntime+QUIC golden 四进程 exit 均为 0。mixed vs golden：prefill argmax 198/198、mean=0.035258、max=0.187500；stationary continuation argmax 15/15、mean=0.030063、max=0.203125，均通过 tie-aware+mean<0.1+max<0.75；legacy decode argmax 6667/6667、max=0.648438，但 mean=0.107887 高于现有 0.1 guard，整体通用 compare 脚本因此严格 FAIL。decode top-k overlap 为 5/5、9/10、48/50、95/100。
+可复现性与输入一致性：两次 mixed 三机 run 三阶段 logits 逐位一致；两次本地 production golden 逐位一致；三机 model.safetensors SHA256 均为 9cd8fc8c...；config 原文件仅 white 格式不同，jq 规范化后三机 SHA256 均为 32b95f05...。
+边界：这是单请求、N=3、24 层、m=4、Qwen2-0.5B BF16、Tailscale QUIC correctness 证据，不含性能、多请求、N>3、故障恢复或 byte-level admission。stationary continuation 的目标阶段已通过原数值门；legacy decode mean guard 是否作为本任务阻塞项需要显式决策，不能由该证据自动放宽。
+
+_updated: 2026-08-09 18:23:35_
+### legacy decode mean guard 不再阻塞 phase-2 stationary continuation
+
+type: `risk` · status: `resolved` · confidence: 1.0 · importance: 0.95 · source: `user-confirmed-2026-08-10`
+
+正式 N=3 production mixed-hardware run 的 legacy decode 与同 production-path 三 MPS golden 稳定得到 mean=0.107887，高于通用 0.1 guard；argmax exact、max=0.648438<0.75、top-5=5/5，且两侧各自重复运行逐位确定。目标 stationary continuation 自身 mean=0.030063/max=0.203125 严格通过。
+用户于 2026-08-10 选择路线 B 后，本风险对 phase-2 stationary continuation 出口已解除：legacy decode mean 保留为诊断，tie-aware argmax、top-5 和 max 继续作为守护；不新增 decode 数值修复任务。边界：这不是对通用 mean 门的全局放宽。
+
+_updated: 2026-08-10 03:30:34_
+### 三机 production QUIC 可观测性与同配置 golden 门禁
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@ccc838c`
+
+为三机 production QUIC stationary continuation E2E 补最小 test-only 可观测性并执行分阶段数值门禁。验收：1) coordinator 导出 prefill last、第一次 legacy decode、stationary continuation last 三份 f32 logits 和场景 meta；2) 每个 worker 汇总 starter/middle/finisher 角色数与 send/recv 数，三机总发送与总接收均为 24*(3-1)=48；3) Mac/white/pearl/coordinator 持久保存精确 exit code 且全部为 0；4) 同 request_id、capacity tickets、prefix splits 的 local golden 下，prefill 与 stationary continuation 保持 tie-aware + mean<0.1 + max<0.75；5) 未改动的 legacy decode baseline 以 tie-aware argmax、top-5 overlap=5/5、max<0.75 守护，mean 只记录为诊断。边界：这是 phase-2 stationary continuation 出口的阶段化验收，不改 phase-1 通用数值合同、compare_route_b_dumps.py、wire、packet、schedule、KV 归属、数值流程或 byte-level admission。
+
+_updated: 2026-08-10 03:30:34_
+### N=2 production QUIC 足以完成二期拓扑出口
+
+type: `belief` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@45f2f54`
+
+二期第 5 项曾因 Mac MPS + white CUDA 的 N=2 production-path QUIC E2E 通过而被标记完成。该证据确实证明跨机 QUIC、runtime/coordinator 命令和异构双 worker 数值正确，但 N=2 时 predecessor 与 successor 是同一 peer，无法区分 neighbor-only ring 与普通点对点直连，因此不足以完成拓扑出口。
+
+_updated: 2026-08-09 09:43:14_
+### 二期第 5 项：三机 production QUIC neighbor-only E2E
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@ccc838c+run-20260809-222750`
+
+把二期 production path 的跨机验证从 N=2 扩展为 N=3：Mac 运行 coordinator + domain0 worker(MPS)，white 运行 domain1 worker(CUDA)，pearl 运行 domain2 worker(HIP/ROCm)。三个 worker 的数据面只能连接 predecessor/successor，StationaryContinuation packet 必须经过 middle worker 逐跳到 finisher；coordinator 仅广播命令与收集唯一 logits，不参与模型计算或 worker 间数据转发。
+验收：真实 Qwen2-0.5B 请求完成 prefill -> decode -> stationary continuation -> 后续 decode；三端正常退出；generated tokens 与同场景 golden/tie-aware 数值判据一致；日志证明每个 worker 只有 neighbor data-plane 连接且 packet 为 N-1=2 hops；记录 capacity tickets、prefix splits、offsets、finisher 与 KV totals。边界：单请求 correctness，不含性能、多请求、故障恢复或 byte-level admission。
+
+_updated: 2026-08-10 03:30:34_
 ### m>1 stationary LayerPacket 单层合同验证完成
 
 type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@5777d51`

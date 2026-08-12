@@ -55,6 +55,9 @@ pub use model::{KvCacheImpl, LlamaModel, ModelConfig, ModelError, ModelWeights};
 pub use worker_sdk::tch_backend::RequestContext;
 #[cfg(feature = "tch-backend")]
 pub use worker_sdk::{TchWorkerBackend, WorkerBackend};
+// experimental: raised for route_b_cross_node_smoke (--transport quic)
+#[cfg(feature = "tch-backend")]
+pub use distributed::transport::quic::{create_endpoint, QuicKvTransport};
 
 pub use cli::{CliArgs, parse_cli_args, next_cli_value};
 pub use error::{RingError, Tolerance, ToleranceTier};
