@@ -1,19 +1,23 @@
 #!/bin/bash
 # Phase-3 7a: drive the HCP Rust service with the real `vllm bench serve`
-# black-box client (white venv-bench), N=2 then N=3.
+# black-box client (white venv-bench), across three topologies:
 #
-# Topology N=2: white (worker 0, CUDA) + pearl (worker 1, HIP),
-#   coordinator on Mac (control plane only, no model compute).
-# Topology N=3: Mac MPS worker 0 + white worker 1 + pearl worker 2
-#   (same as phase-2 6d).
+#   n2  — white (worker 0, CUDA) + pearl (worker 1, HIP), coordinator and
+#         bench on white; fully LAN-resident, driven by
+#         scripts/phase3_7a_n2_driver.sh on white.
+#   n3  — Mac MPS worker 0 + white worker 1 + pearl worker 2, coordinator
+#         on Mac (phase-2 6d topology; Mac network segments in-path).
+#   n3l — white (worker 0, CUDA) + pearl (worker 1, HIP) + laptop (worker 2,
+#         CUDA), coordinator + bench on white; no Mac in the service path,
+#         driven by scripts/phase3_7a_n3l_driver.sh on white.
 #
-# Ladder per topology (client on white -> Mac Tailscale HTTP :8082):
+# Ladder per topology (client on white -> coordinator HTTP :8082):
 #   L1: request-rate=1,   num-prompts=8
 #   L2: request-rate=inf, max-concurrency=2, num-prompts=8
 #   L3: request-rate=inf, max-concurrency=4, num-prompts=16
 #
-# Validates per topology: bench JSON failed==0 with TTFT/TPOT/ITL/E2EL
-# present, HCP trace record counts, reserved==released, hop formulas
+# Validates per topology: bench JSON failed==0 with TTFT/TPOT/ITL present,
+# HCP trace record counts, reserved==released, hop formulas
 # (prefill = L*(N-1), decode = steps*L*(N-1)), and /metrics totals.
 # This is a service-metric baseline, NOT a performance claim; no vLLM
 # baseline comparison is performed in this node.
@@ -175,6 +179,7 @@ stop_stack() {
     jobs -p | xargs -r kill 2>/dev/null || true
     ssh -o ConnectTimeout=10 "${WHITE_SSH}" "pkill -f 'hcp-ringattn-rust.*distributed-role' || true" 2>/dev/null || true
     ssh -o ConnectTimeout=10 "${PEARL_SSH}" "pkill -f 'hcp-ringattn-rust.*distributed-role' || true" 2>/dev/null || true
+    ssh -o ConnectTimeout=10 stark@100.96.154.1 "pkill -f 'hcp-ringattn-rust.*distributed-role' || true" 2>/dev/null || true
     sleep 3
 }
 
@@ -352,6 +357,48 @@ fetch_results n3
 validate_phase n3 32 48 "${TRACE_N3}" local
 stop_stack
 echo "=== N=3 PHASE PASSED ==="
+fi
+
+# =====================================================================
+# Phase N=3L: white + pearl + laptop (no Mac in the service path).
+# Same role split as the N=2 driver: everything runs from white; the Mac
+# only launches the driver, polls STATUS, and fetches artifacts.
+# =====================================================================
+if [[ " ${PHASES} " == *" n3l "* ]]; then
+echo ""
+echo "########## Phase N=3L: white + pearl + laptop (no Mac) ##########"
+N3L_STATE_DIR="/tmp/hcp-n3l-${RUN_ID}"
+ssh -n -f -o ConnectTimeout=20 "${WHITE_SSH}" "mkdir -p ${N3L_STATE_DIR} && setsid bash $(shell_quote "${WHITE_REPO_DIR}")/scripts/phase3_7a_n3l_driver.sh ${RUN_ID} > ${N3L_STATE_DIR}/driver.log 2>&1 </dev/null"
+echo "N=3L driver launched on white; polling STATUS..."
+
+n3l_status=""
+for i in $(seq 1 120); do
+    sleep 60
+    n3l_status=$(ssh -o ConnectTimeout=20 "${WHITE_SSH}" "cat ${N3L_STATE_DIR}/STATUS 2>/dev/null" 2>/dev/null || true)
+    if [ -n "${n3l_status}" ]; then
+        break
+    fi
+    echo "  ... still running (poll $i)"
+done
+if [ "${n3l_status}" != "DONE" ]; then
+    echo "ERROR: N=3L driver finished with STATUS='${n3l_status}'" >&2
+    ssh -o ConnectTimeout=20 "${WHITE_SSH}" "tail -40 ${N3L_STATE_DIR}/driver.log" 2>/dev/null || true
+    exit 1
+fi
+echo "N=3L driver DONE; fetching artifacts..."
+
+mkdir -p "${REPORT_DIR}/bench-n3l"
+scp -q -o ConnectTimeout=20 "${WHITE_SSH}:${N3L_STATE_DIR}/bench/"*.json "${REPORT_DIR}/bench-n3l/"
+scp -q -o ConnectTimeout=20 "${WHITE_SSH}:${N3L_STATE_DIR}/trace-n3l.jsonl" "${REPORT_DIR}/trace-n3l.jsonl"
+scp -q -o ConnectTimeout=20 "${WHITE_SSH}:${N3L_STATE_DIR}/metrics-n3l.json" "${REPORT_DIR}/metrics-n3l.json"
+scp -q -o ConnectTimeout=20 "${WHITE_SSH}:${N3L_STATE_DIR}/coordinator-n3l.log" "${REPORT_DIR}/coordinator-n3l.log"
+scp -q -o ConnectTimeout=20 "${WHITE_SSH}:${N3L_STATE_DIR}/driver.log" "${REPORT_DIR}/driver-n3l.log" || true
+scp -q -o ConnectTimeout=20 "${WHITE_SSH}:${N3L_STATE_DIR}/worker0-white-n3l.log" "${REPORT_DIR}/worker0-white-n3l.log" || true
+scp -q -o ConnectTimeout=20 "${WHITE_SSH}:${N3L_STATE_DIR}/worker1-pearl-n3l.log" "${REPORT_DIR}/worker1-pearl-n3l.log" || true
+scp -q -o ConnectTimeout=20 "${WHITE_SSH}:${N3L_STATE_DIR}/worker2-laptop-n3l.log" "${REPORT_DIR}/worker2-laptop-n3l.log" || true
+validate_phase n3l 32 48 "${REPORT_DIR}/trace-n3l.jsonl" file
+stop_stack
+echo "=== N=3L PHASE PASSED ==="
 fi
 
 echo ""
