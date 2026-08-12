@@ -247,11 +247,12 @@ impl QuicKvTransport {
 /// 把 KV block 写入网络，实现计算-通信重叠。
 #[cfg(feature = "tch-backend")]
 async fn send_task_loop(mut send: SendStream, mut cmd_rx: mpsc::Receiver<SendCmd>) {
+    let stream_id = send.id();
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             SendCmd::Data(frame) => {
                 if let Err(e) = send.write_all(&frame).await {
-                    eprintln!("[quic send_task] write_all failed: {e}");
+                    eprintln!("[quic send_task] write_all failed (stream {stream_id:?}): {e}");
                     break;
                 }
             }
@@ -263,6 +264,8 @@ async fn send_task_loop(mut send: SendStream, mut cmd_rx: mpsc::Receiver<SendCmd
         }
     }
     // channel 关闭或出错，优雅退出。recv_task 会自行处理 stream 的另一端。
+    // SendStream 在此 drop；记录退出原因以便诊断意外的 stream 关闭。
+    eprintln!("[quic send_task] exiting (stream {stream_id:?}): send channel closed");
 }
 
 /// 【Recv Task】从 QUIC recv stream 读取 frame，反序列化后推入 channel。
@@ -271,17 +274,24 @@ async fn send_task_loop(mut send: SendStream, mut cmd_rx: mpsc::Receiver<SendCmd
 /// 等待接收 peer 消息（KV block 或 Q-ring packet），一有数据就推入 channel 供 poll 消费。
 #[cfg(feature = "tch-backend")]
 async fn recv_task_loop(mut recv: RecvStream, msg_tx: mpsc::Sender<RingMessage>, device: Device) {
+    let stream_id = recv.id();
     let mut handshake_done = false;
     loop {
         match recv_frame_from_stream(&mut recv, &mut handshake_done, device).await {
             Ok(Some(msg)) => {
                 if msg_tx.send(msg).await.is_err() {
+                    eprintln!(
+                        "[quic recv_task] exiting (stream {stream_id:?}): message channel closed (receiver dropped)"
+                    );
                     break; // 主线程已 drop recv_rx，不需要继续接收
                 }
             }
-            Ok(None) => break, // stream 正常关闭（peer 发送了 FIN）
+            Ok(None) => {
+                eprintln!("[quic recv_task] exiting (stream {stream_id:?}): peer sent FIN (stream closed cleanly)");
+                break; // stream 正常关闭（peer 发送了 FIN）
+            }
             Err(e) => {
-                eprintln!("[quic recv_task] error: {e}");
+                eprintln!("[quic recv_task] error (stream {stream_id:?}): {e}");
                 break;
             }
         }
