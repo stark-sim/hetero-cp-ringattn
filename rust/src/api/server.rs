@@ -79,8 +79,15 @@ async fn completions_handler(
         }
         state.queued_counter.fetch_add(1, Ordering::SeqCst);
 
+        // Count streaming completions toward /metrics completed_requests when
+        // the terminal chunk (finish_reason set) is emitted, matching the
+        // non-streaming path.
+        let completed_counter = state.completed_counter.clone();
         let stream = UnboundedReceiverStream::new(chunk_rx)
             .map(move |chunk| {
+                if chunk.finish_reason.is_some() {
+                    completed_counter.fetch_add(1, Ordering::SeqCst);
+                }
                 let resp = CompletionStreamResponse {
                     id: format!("hcp-completion-{request_id}"),
                     object: "text_completion".to_string(),
@@ -321,6 +328,9 @@ mod tests {
         coordinator.await.unwrap();
         assert_eq!(state.request_counter.load(Ordering::SeqCst), 1);
         assert_eq!(state.failed_counter.load(Ordering::SeqCst), 0);
+        // Streaming completions must count toward /metrics completed_requests,
+        // same as the non-streaming path.
+        assert_eq!(state.completed_counter.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
