@@ -88,9 +88,11 @@ cd "${REPO_ROOT}/rust"
 cargo build --features tch-backend --release 2>&1 | tail -2
 
 echo "=== Preflight: remote builds (white + pearl) ==="
-white_build="cd $(shell_quote "${WHITE_REPO_DIR}") && git pull --ff-only 2>&1 | tail -1 && cd rust && PATH=/home/stark/.cargo/bin:\$PATH LIBTORCH=/home/stark/libtorch LD_LIBRARY_PATH=/home/stark/libtorch/lib cargo build --features tch-backend --release 2>&1 | tail -2"
+# Remote repos must track main explicitly: they were found checked out on the
+# stale codex branch, silently missing main-only commits ("Already up to date").
+white_build="cd $(shell_quote "${WHITE_REPO_DIR}") && git checkout main 2>&1 | tail -1 && git pull --ff-only origin main 2>&1 | tail -1 && cd rust && PATH=/home/stark/.cargo/bin:\$PATH LIBTORCH=/home/stark/libtorch LD_LIBRARY_PATH=/home/stark/libtorch/lib cargo build --features tch-backend --release 2>&1 | tail -2"
 run_remote_white "${white_build}" 2>&1 | tail -3
-pearl_build="cd $(shell_quote "${PEARL_REPO_DIR}") && git pull --ff-only 2>&1 | tail -1 && cd rust && PATH=/home/stark/.cargo/bin:\$PATH LIBTORCH=/home/stark/libtorch LD_LIBRARY_PATH=/home/stark/libtorch/lib cargo build --features tch-backend --release 2>&1 | tail -2"
+pearl_build="cd $(shell_quote "${PEARL_REPO_DIR}") && git checkout main 2>&1 | tail -1 && git pull --ff-only origin main 2>&1 | tail -1 && cd rust && PATH=/home/stark/.cargo/bin:\$PATH LIBTORCH=/home/stark/libtorch LD_LIBRARY_PATH=/home/stark/libtorch/lib cargo build --features tch-backend --release 2>&1 | tail -2"
 run_remote_pearl "${pearl_build}" 2>&1 | tail -3
 
 echo "=== Preflight: bench client on white ==="
