@@ -2,6 +2,45 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 三期 7a N=3 异构(white+pearl+laptop,无 Mac)vllm bench 全绿
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `reports/routeb-p3-bench-20260813-042241`
+
+报告 reports/routeb-p3-bench-20260813-042241(main@7c917d3):coordinator+bench+worker0(RTX 4090 CUDA)在 white,worker1(RX 9060 XT HIP)在 pearl,worker2(RTX 4060 CUDA)在 laptop;white↔pearl 裸 LAN,pearl→laptop→white 走 Tailscale DERP 中继。
+1. 三档 0 失败:L1(rate=1)8/8 TTFT 355s TPOT 28.6s;L2(mc=2)8/8 TPOT 14.1s;L3(mc=4)16/16 TPOT 28.4s;全程约 70 分钟连续运行无连接死亡。
+2. HCP 双平面:trace 32 条,id 集合 1..32,error=null,reserved==released,prefill_hops=48=L*(N-1),decode_hops=steps*48;/metrics total=completed=32 failed=0。
+3. 中继链路慢(~1s/hop,TPOT 14-28s)但稳定;数字为服务口径,无 baseline 对照,不作性能宣称。
+4. laptop 环境从零配齐(rust 1.97.1 rsproxy 镜像、libtorch 2.11.0+cu130 由 white 推送、模型由 white 推送、release build),已具备第三节点常驻能力。
+
+_updated: 2026-08-12 21:38:59_
+### 三期 7a N=2(white CUDA + pearl HIP)vllm bench serve 全绿
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `reports/routeb-p3-bench-20260812-215948`
+
+报告 reports/routeb-p3-bench-20260812-215948(main@f85750f 二进制,white 驱动 LAN 常驻拓扑:coordinator+worker0 在 white,worker1 在 pearl,bench client 打 white 127.0.0.1):
+1. wire 兼容:vllm 0.27.1 bench serve(venv-bench)三档负载全程 0 失败,SSE/TTFT/TPOT/ITL/throughput 均正常导出;无 ignore_eos 崩塌,无 SSE 兼容问题,零 Rust 兼容修改需求。
+2. 负载阶梯:L1(rate=1)8/8 TTFT 17.1s TPOT 1.50s ITL 1.36s;L2(mc=2)8/8 TTFT 2.7s TPOT 0.74s;L3(mc=4)16/16 TTFT 4.7s TPOT 1.44s。
+3. HCP 双平面:trace 32 条,request_id 集合 1..32 完整,error=null,reserved==released,prefill_hops=24=L*(N-1),decode_hops=steps*24;/metrics total=completed=32 failed=0 active=0。
+4. 过程中修复的四个真实缺陷(均已单独 commit):worker 空闲 600s 命令读超时 panic(d964454)、streaming /v1/completions 不计 completed_requests(90eb7b2)、远端分支漂移致旧二进制(863e58a)、ssh 通道被 daemon 占住导致编排挂起(02cda92)。
+证据边界:LAN 常驻 N=2 拓扑(4ms 直连),不证明跨互联网段稳定性;数字为服务口径数据,无 vLLM baseline 对照,不作性能宣称;不测并发>4 与长上下文能力。
+
+_updated: 2026-08-12 14:11:58_
+### 三期 7a:用 vllm bench serve 黑盒驱动 HCP(N=2 white+pearl → N=3 +Mac)
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@phase3-7a-plan`
+
+动机剖析六问：
+1. 问题：二期只证明 HCP 服务本体 readiness,从未被真实主流 benchmark 客户端驱动；wire 兼容仅在内部 Axum router 合同测试中固化,无第三方 parser 线级验证,也无标准口径(TTFT/TPOT/ITL/E2EL)数据。
+2. 现状：/v1/completions 非流式/流式、SSE [DONE]、usage/error 合同测试(6b.0,进程内模拟 coordinator channel);6c.1/6d 用 curl/native client 验证稳定性。不足:内部 client 与被测服务共享同一假设,无法戳破 wire 语义偏差;CompletionRequest 无 deny_unknown_fields,ignore_eos 等字段被静默丢弃。
+3. 终态:white 独立 venv 的 vllm bench serve 三档负载(rate=1、concurrency=2、4)对 N=2(white CUDA + pearl HIP,coordinator Mac 纯控制面)与 N=3(+Mac MPS worker0)均 0 失败,导出 TTFT/TPOT/ITL/E2EL/throughput;HCP trace 双平面断言(reserved==released、prefill_hops=L*(N-1)、decode_hops=steps*L*(N-1));报告存 reports/routeb-p3-bench-<ts>/;graph evidence。
+4. 他者：vllm bench serve 是官方黑盒 serving benchmark,抽象为 OpenAI-compatible endpoint,不要求被测端运行 vLLM engine(belief,confidence 0.95);AIPerf 运行栈重且 multi-turn 全历史重发不能证明 HCP 原地 continuation(已有决策排除);MLPerf 是提交制,现阶段不适用。
+5. 本方案：HCP 作为黑盒 endpoint 不改架构;venv 装 vllm 仅作 client;以 scripts/test_phase2_6d_n3_service.sh 为模板起 N=2→N=3 栈;L1 作 wire 探针,兼容修复仅在证据触发时做(候选:SSE 帧格式、ignore_eos 字段,serde default 保持行为零变化);vLLM baseline 对照拆为下一独立节点。
+6. 为什么：复用官方 client 保证指标口径与主流可比,真实第三方 parser 能戳破内部测试共享假设;不选 AIPerf/自写 client 的理由同前;baseline 对照拆分是为控制单节点范围与调试环长度。
+必要性审计：唯一必要性声称="必须用真实第三方 client 验证 wire 兼容",分类为工程必要性(自写 client 与被测方共享假设是已知测试反模式),工具选型依据官方 docs/repo(primary source),非某实现习惯。
+VERDICT: IMPLEMENT(计划已经用户批准:bench 宿主=white 独立 venv;拓扑=先 N=2 white+pearl 再 N=3 +Mac;baseline 对照不做)。
+边界：不改 vLLM engine/plugin;不改 HCP core 数学;不测并发>4、不测长上下文能力、不作异构性能宣称;continuation 原地 KV 复用归 continuation-oracle 节点。
+
+_updated: 2026-08-12 10:31:53_
 ### 路线 B 二期：工程性能力（中）
 
 type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@795d7ce`
@@ -1869,15 +1908,43 @@ type: `task` · status: `superseded` · confidence: 1.0 · importance: 0.94 · s
 _updated: 2026-08-11 19:10:38_
 ### 三期：vLLM bench serve 实测与 vLLM 生态接入
 
-type: `task` · status: `deferred` · confidence: 1.0 · importance: 0.9 · source: `user-correction-20260812`
+type: `task` · status: `active` · confidence: 1.0 · importance: 0.9 · source: `user-correction-20260812`
 
 二期 Rust readiness 完成后：
 1. 用实际 `vllm bench serve` 驱动 HCP endpoint，按真实 parser/metric 差异做最小兼容；
 2. 建立受控 vLLM baseline 对照；
 3. 再评估 vLLM backend/plugin、paged KV 或其他生态接口。
 该阶段不得反向改写已验证的 HCP core 数学，生态接入与 benchmark 对照分别独立节点。
+[2026-08-13 更新] 第 1 步(实际 vllm bench serve 驱动 HCP endpoint)完成:N=2(white+pearl LAN)与 N=3(white+pearl+laptop)拓扑均三档 0 失败,最小兼容仅两处 metrics/robustness 修复(d964454、90eb7b2)。第 2 步(受控 vLLM baseline 对照)与第 3 步(生态评估)待立项。
 
-_updated: 2026-08-11 19:10:38_
+_updated: 2026-08-12 21:38:59_
+### N=3 Mac 拓扑两次被 Mac 侧网络事件杀死(环境性阻断)
+
+type: `evidence` · status: `verified` · confidence: 0.95 · importance: 0.9 · source: `reports/routeb-p3-bench-20260812-221130`
+
+报告 routeb-p3-bench-20260812-221130 与重试:Mac 拓扑(coordinator+worker0 MPS 在 Mac)L1/L2 曾 8/8 通过(TPOT 21-42s),但两次运行均在中途因 Mac 侧 Tailscale/UDP 连接死亡而全灭(一次伴随 Mac↔双机 ssh 同时断开=主机级网络事件)。诊断为环境性(Mac 网络当夜不稳定),非 HCP 协议缺陷;同拓扑在 6d(20260812 早晨)曾通过。替代:N=3L(laptop 替换 Mac)已全绿。Mac 拓扑可待网络恢复后复跑。
+
+_updated: 2026-08-12 21:38:59_
+### 三期:ring/coordinator 连接重连与故障恢复
+
+type: `task` · status: `pending` · confidence: 1.0 · importance: 0.9 · source: `hetero-cp-ringattn@phase3-7a-incidents`
+
+7a 一晚五次连接死亡全部服务级致命:worker ring decode 遇死连接即 panic(worker.rs:273),coordinator↔worker 连接死亡即全服务不可用。当前只有"优雅退出",没有重连/重建。需要:(a) worker ring transport 死亡不 panic,转为请求级错误+服务存活;(b) coordinator↔worker 断线重连;(c) ring 连接重建(peer 重拨)。动机证据:reports/routeb-p3-bench-2026081{2-221130,3-040806}、white tailscaled disco churn 日志。优先级高于性能优化——没有它,任何跨网段长 bench/服务都会被单次抖动清零。
+
+_updated: 2026-08-12 21:38:59_
+### N=2 white+pearl bench 中 white worker ring decode packet stream closed panic
+
+type: `risk` · status: `resolved` · confidence: 0.9 · importance: 0.9 · source: `reports/routeb-p3-bench-20260812-185407`
+
+首次 vllm bench serve 实测(reports/routeb-p3-bench-20260812-185407)发现:
+1. wire 兼容性本身通过:L1 8/8 成功,SSE/TTFT/TPOT/ITL 均可被 vllm 0.27.1 client 解析;无 ignore_eos 崩塌(输出长度符合 random-output-len 采样)。
+2. 阻断缺陷:L2 中途(request 14/15 decode 阶段)white(CUDA, worker 0)panic: worker.rs:273 "decode_batch failed: decode forward failed: Backend error: ring decode: packet stream closed";white 进程死亡导致 coordinator 后续全部 prefill/decode 失败(connection lost),L3 16/16 全失败。
+3. 已排除:QUIC idle timeout(max_idle_timeout=3600s, keep-alive 1s);transport 生命周期(setup_kv_transports 仅启动时调用一次,prefill 传 None 保留);ReleaseRequest 只清 per-request KV cache;recv_task 无 error 日志(排除了带日志的 Err 分支)。
+4. 盲区:recv_task_loop 两个静默 break 路径(peer FIN / msg_tx closed)与 send_task_loop 静默退出;commit 1e5bd59 已加 stream id + 退出原因日志。
+5. 另观察到负载下时延极大(跨 VPN ring hop recv 33-191ms/层;8 并发 TPOT 均值 30s)与 DecodeBatch 中 request 14 token 15 重复出现(logits 未推进的重发表象),根因待查。
+正在复现取证(PHASES=n2 插桩跑)。
+
+_updated: 2026-08-12 14:11:58_
 ### 跨设备 BF16 验证的 argmax 判据必须容忍精确平局翻转
 
 type: `belief` · status: `held` · confidence: 0.98 · importance: 0.9 · source: `hetero-cp-ringattn@9ab909b`
