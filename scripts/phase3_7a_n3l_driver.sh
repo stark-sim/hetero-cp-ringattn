@@ -82,6 +82,10 @@ sleep 3
 # ssh -n -f returns right after remote launch; remote setsid detaches the
 # daemon so a later channel drop cannot SIGHUP it.
 log "launching worker 1 (pearl, HIP) via ssh"
+# pearl is on the same LAN as white: reach the coordinator over the raw LAN
+# socket (proven stable in the N=2 phase), not via a Tailscale IP — white's
+# tailscaled was seen removing DERP routes on disco-key churn tonight, which
+# kills QUIC connections addressed through Tailscale IPs.
 ssh -n -f -o ConnectTimeout=15 "${PEARL_SSH}" "mkdir -p '${STATE_DIR}' && cd '${PEARL_REPO}' && \
   setsid env LD_PRELOAD=/home/stark/libtorch/lib/libtorch_hip.so HCP_TCH_DEVICE=cuda:0 LD_LIBRARY_PATH=/home/stark/libtorch/lib \
   ./rust/target/release/hcp-ringattn-rust \
@@ -90,7 +94,7 @@ ssh -n -f -o ConnectTimeout=15 "${PEARL_SSH}" "mkdir -p '${STATE_DIR}' && cd '${
     --model-dir '${PEARL_MODEL}' \
     --listen-addr 0.0.0.0:${W1_PORT} \
     --next-peer-addr ${LAPTOP_TS}:${W2_PORT} \
-    --coordinator-addr ${WHITE_TS}:${COORD_PORT} \
+    --coordinator-addr ${WHITE_LAN}:${COORD_PORT} \
     --num-domains 3 \
     >'${STATE_DIR}/worker1-pearl-n3l.log' 2>&1 </dev/null" || fail "pearl worker launch ssh failed"
 
