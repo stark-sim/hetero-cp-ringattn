@@ -42,6 +42,11 @@ if [ -z "${MAC_ADDR}" ]; then
 fi
 WHITE_ADDR="${WHITE_ADDR:-${WHITE_HOST}}"
 PEARL_ADDR="${PEARL_ADDR:-${PEARL_HOST}}"
+# white/pearl sit on the same LAN; using LAN addresses keeps the N=2 service
+# path (coordinator, ring, bench) entirely off the flaky cross-internet
+# Tailscale segment from the Mac.
+WHITE_LAN="${WHITE_LAN:-192.168.8.172}"
+PEARL_LAN="${PEARL_LAN:-192.168.8.176}"
 
 MAC_MODEL_DIR="${MAC_MODEL_DIR:-/Users/stark_sim/models/qwen2-0.5b}"
 WHITE_MODEL_DIR="${WHITE_MODEL_DIR:-~/models/Qwen2-0.5B}"
@@ -99,11 +104,13 @@ echo "=== Preflight: bench client on white ==="
 run_remote_white "${BENCH_VLLM} --version && mkdir -p ${REMOTE_RESULT_DIR}"
 
 # === Cleanup ===
+# N=2 runs coordinator + worker on white as detached daemons (setsid), so the
+# pkill patterns must cover both roles; N=3 coordinator/Mac worker are local jobs.
 cleanup() {
     echo "=== Cleaning up ==="
     jobs -p | xargs -r kill 2>/dev/null || true
-    ssh -o ConnectTimeout=10 "${WHITE_SSH}" "pkill -f 'hcp-ringattn-rust.*distributed-role worker' || true" 2>/dev/null || true
-    ssh -o ConnectTimeout=10 "${PEARL_SSH}" "pkill -f 'hcp-ringattn-rust.*distributed-role worker' || true" 2>/dev/null || true
+    ssh -o ConnectTimeout=10 "${WHITE_SSH}" "pkill -f 'hcp-ringattn-rust.*distributed-role' || true" 2>/dev/null || true
+    ssh -o ConnectTimeout=10 "${PEARL_SSH}" "pkill -f 'hcp-ringattn-rust.*distributed-role' || true" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
@@ -166,22 +173,87 @@ wait_health() { # expected_workers
 
 stop_stack() {
     jobs -p | xargs -r kill 2>/dev/null || true
-    ssh -o ConnectTimeout=10 "${WHITE_SSH}" "pkill -f 'hcp-ringattn-rust.*distributed-role worker' || true" 2>/dev/null || true
-    ssh -o ConnectTimeout=10 "${PEARL_SSH}" "pkill -f 'hcp-ringattn-rust.*distributed-role worker' || true" 2>/dev/null || true
+    ssh -o ConnectTimeout=10 "${WHITE_SSH}" "pkill -f 'hcp-ringattn-rust.*distributed-role' || true" 2>/dev/null || true
+    ssh -o ConnectTimeout=10 "${PEARL_SSH}" "pkill -f 'hcp-ringattn-rust.*distributed-role' || true" 2>/dev/null || true
     sleep 3
 }
 
+# === N=2 LAN-resident daemon launchers (white coordinator + workers) ===
+# Daemons run under setsid nohup with remote-side logs so a Mac ssh drop
+# cannot take the service down mid-bench.
+launch_n2_coordinator_white() { # remote_state_dir
+    local cmd="cd $(shell_quote "${WHITE_REPO_DIR}") && mkdir -p $1 && \
+      setsid nohup env LD_LIBRARY_PATH=/home/stark/libtorch/lib \
+      ./rust/target/release/hcp-ringattn-rust \
+        --distributed-role coordinator \
+        --model-dir ${WHITE_MODEL_DIR} \
+        --num-domains 2 \
+        --listen-addr 0.0.0.0:${COORD_PORT} \
+        --http-addr 0.0.0.0:${HTTP_PORT} \
+        --trace-jsonl $1/trace-n2.jsonl \
+        >$1/coordinator-n2.log 2>&1 < /dev/null &"
+    run_remote_white "${cmd}"
+    sleep 2
+}
+
+launch_n2_white_worker() { # remote_state_dir
+    local cmd="cd $(shell_quote "${WHITE_REPO_DIR}") && \
+      setsid nohup env HCP_TCH_DEVICE=cuda:0 LD_LIBRARY_PATH=/home/stark/libtorch/lib \
+      ./rust/target/release/hcp-ringattn-rust \
+        --distributed-role worker \
+        --domain-id 0 \
+        --model-dir ${WHITE_MODEL_DIR} \
+        --listen-addr 0.0.0.0:${W0_PORT} \
+        --next-peer-addr ${PEARL_LAN}:${W1_PORT} \
+        --coordinator-addr ${WHITE_LAN}:${COORD_PORT} \
+        --num-domains 2 \
+        >$1/worker0-white-n2.log 2>&1 < /dev/null &"
+    run_remote_white "${cmd}"
+    sleep 5
+}
+
+launch_n2_pearl_worker() { # remote_state_dir
+    local cmd="cd $(shell_quote "${PEARL_REPO_DIR}") && \
+      setsid nohup env LD_PRELOAD=/home/stark/libtorch/lib/libtorch_hip.so HCP_TCH_DEVICE=cuda:0 LD_LIBRARY_PATH=/home/stark/libtorch/lib \
+      ./rust/target/release/hcp-ringattn-rust \
+        --distributed-role worker \
+        --domain-id 1 \
+        --model-dir ${PEARL_MODEL_DIR} \
+        --listen-addr 0.0.0.0:${W1_PORT} \
+        --next-peer-addr ${WHITE_LAN}:${W0_PORT} \
+        --coordinator-addr ${WHITE_LAN}:${COORD_PORT} \
+        --num-domains 2 \
+        >$1/worker1-pearl-n2.log 2>&1 < /dev/null &"
+    run_remote_pearl "${cmd}"
+    sleep 5
+}
+
+wait_health_white() { # expected_workers remote_state_dir
+    echo "Waiting 30s for workers to connect and load model..."
+    sleep 30
+    local health
+    health=$(run_remote_white "curl -s --max-time 10 http://127.0.0.1:${HTTP_PORT}/health" || echo '{}')
+    echo "$health"
+    local connected
+    connected=$(echo "$health" | python3 -c "import json,sys; print(json.load(sys.stdin).get('workers_connected',0))" 2>/dev/null || echo 0)
+    if [ "$connected" -ne "$1" ]; then
+        echo "ERROR: expected $1 workers connected, got $connected" >&2
+        run_remote_white "tail -30 $2/coordinator-n2.log" || true
+        exit 1
+    fi
+}
+
 # === Bench ladder ===
-run_bench() { # label num_prompts rate max_concurrency
-    local label=$1 np=$2 rate=$3 mc=$4
+run_bench() { # label num_prompts rate max_concurrency base_url
+    local label=$1 np=$2 rate=$3 mc=$4 base_url=$5
     local mc_arg=""
     if [ "$mc" -gt 0 ]; then
         mc_arg="--max-concurrency $mc"
     fi
-    echo "=== bench ${label}: num_prompts=${np} rate=${rate} max_concurrency=${mc} ==="
+    echo "=== bench ${label}: num_prompts=${np} rate=${rate} max_concurrency=${mc} url=${base_url} ==="
     run_remote_white "${BENCH_VLLM} bench serve \
         --backend openai \
-        --base-url http://${MAC_ADDR}:${HTTP_PORT} \
+        --base-url ${base_url} \
         --endpoint /v1/completions \
         --model ${BENCH_MODEL_NAME} \
         --tokenizer ${WHITE_MODEL_DIR} \
@@ -198,10 +270,10 @@ run_bench() { # label num_prompts rate max_concurrency
         --result-filename ${label}.json" 2>&1 | tail -40
 }
 
-run_ladder() { # phase_tag
-    run_bench "$1-l1" 8 1 0
-    run_bench "$1-l2" 8 inf 2
-    run_bench "$1-l3" 16 inf 4
+run_ladder() { # phase_tag base_url
+    run_bench "$1-l1" 8 1 0 "$2"
+    run_bench "$1-l2" 8 inf 2 "$2"
+    run_bench "$1-l3" 16 inf 4 "$2"
 }
 
 fetch_results() { # phase_tag
@@ -211,11 +283,15 @@ fetch_results() { # phase_tag
 }
 
 # === Validation ===
-validate_phase() { # phase_tag expected_total_requests hops_per_iter trace_file coord_log
-    local tag=$1 total=$2 hops=$3 trace=$4
+validate_phase() { # phase_tag expected_total_requests hops_per_iter trace_file metrics_source(local|white)
+    local tag=$1 total=$2 hops=$3 trace=$4 msrc=$5
     echo ""
     echo "=== Validation ${tag} ==="
-    curl -s --max-time 10 "http://localhost:${HTTP_PORT}/metrics" > "${REPORT_DIR}/metrics-${tag}.json"
+    if [ "$msrc" = "white" ]; then
+        run_remote_white "curl -s --max-time 10 http://127.0.0.1:${HTTP_PORT}/metrics" > "${REPORT_DIR}/metrics-${tag}.json"
+    else
+        curl -s --max-time 10 "http://localhost:${HTTP_PORT}/metrics" > "${REPORT_DIR}/metrics-${tag}.json"
+    fi
     python3 - "${REPORT_DIR}" "${tag}" "${total}" "${hops}" "${trace}" <<'PY'
 import json, sys, glob
 
@@ -263,20 +339,27 @@ PY
 }
 
 # =====================================================================
-# Phase N=2: white (worker 0, CUDA) + pearl (worker 1, HIP)
+# Phase N=2: white (worker 0, CUDA) + pearl (worker 1, HIP),
+# coordinator + bench client also on white => entire service path on the
+# white/pearl LAN, immune to Mac-side network flaps. The Mac orchestrates
+# via short ssh calls only.
 # =====================================================================
 PHASES="${PHASES:-n2 n3}"
 echo ""
-echo "########## Phase N=2: white + pearl ##########"
-TRACE_N2="${REPORT_DIR}/trace-n2.jsonl"
-launch_coordinator 2 "${TRACE_N2}" "${REPORT_DIR}/coordinator-n2.log"
-launch_white_worker_full 0 "${W0_PORT}" "${PEARL_ADDR}" "${W1_PORT}" 2 "${REPORT_DIR}/worker0-white-n2.log"
-launch_pearl_worker_full 1 "${W1_PORT}" "${WHITE_ADDR}" "${W0_PORT}" 2 "${REPORT_DIR}/worker1-pearl-n2.log"
-wait_health 2
+echo "########## Phase N=2: white + pearl (LAN-resident) ##########"
+N2_STATE_DIR="/tmp/hcp-n2-${RUN_ID}"
+launch_n2_coordinator_white "${N2_STATE_DIR}"
+launch_n2_white_worker "${N2_STATE_DIR}"
+launch_n2_pearl_worker "${N2_STATE_DIR}"
+wait_health_white 2 "${N2_STATE_DIR}"
 
-run_ladder n2
+run_ladder n2 "http://127.0.0.1:${HTTP_PORT}"
 fetch_results n2
-validate_phase n2 32 24 "${TRACE_N2}"
+scp -q -o ConnectTimeout=15 "${WHITE_SSH}:${N2_STATE_DIR}/trace-n2.jsonl" "${REPORT_DIR}/trace-n2.jsonl"
+scp -q -o ConnectTimeout=15 "${WHITE_SSH}:${N2_STATE_DIR}/coordinator-n2.log" "${REPORT_DIR}/coordinator-n2.log"
+scp -q -o ConnectTimeout=15 "${WHITE_SSH}:${N2_STATE_DIR}/worker0-white-n2.log" "${REPORT_DIR}/worker0-white-n2.log" || true
+scp -q -o ConnectTimeout=15 "${PEARL_SSH}:${N2_STATE_DIR}/worker1-pearl-n2.log" "${REPORT_DIR}/worker1-pearl-n2.log" || true
+validate_phase n2 32 24 "${REPORT_DIR}/trace-n2.jsonl" white
 stop_stack
 echo "=== N=2 PHASE PASSED ==="
 
@@ -300,9 +383,9 @@ launch_pearl_worker_full 2 "${W2_PORT}" "${MAC_ADDR}" "${W0_PORT}" 3 "${REPORT_D
     >"${REPORT_DIR}/worker0-mac-n3.log" 2>&1 &
 wait_health 3
 
-run_ladder n3
+run_ladder n3 "http://${MAC_ADDR}:${HTTP_PORT}"
 fetch_results n3
-validate_phase n3 32 48 "${TRACE_N3}"
+validate_phase n3 32 48 "${TRACE_N3}" local
 stop_stack
 echo "=== N=3 PHASE PASSED ==="
 fi
