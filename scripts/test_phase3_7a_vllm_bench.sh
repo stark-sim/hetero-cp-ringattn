@@ -289,6 +289,7 @@ PY
 # the stack and ladder; the Mac polls STATUS and fetches artifacts.
 # =====================================================================
 PHASES="${PHASES:-n2 n3}"
+if [[ " ${PHASES} " == *" n2 "* ]]; then
 echo ""
 echo "########## Phase N=2: white + pearl (LAN-resident, white-driven) ##########"
 N2_STATE_DIR="/tmp/hcp-n2-${RUN_ID}"
@@ -324,6 +325,7 @@ scp -q -o ConnectTimeout=20 "${WHITE_SSH}:${N2_STATE_DIR}/worker1-pearl-n2.log" 
 validate_phase n2 32 24 "${REPORT_DIR}/trace-n2.jsonl" file
 stop_stack
 echo "=== N=2 PHASE PASSED ==="
+fi
 
 # =====================================================================
 # Phase N=3: Mac MPS worker 0 + white worker 1 + pearl worker 2
