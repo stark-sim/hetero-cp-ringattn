@@ -178,70 +178,10 @@ stop_stack() {
     sleep 3
 }
 
-# === N=2 LAN-resident daemon launchers (white coordinator + workers) ===
-# Daemons run under setsid nohup with remote-side logs so a Mac ssh drop
-# cannot take the service down mid-bench.
-launch_n2_coordinator_white() { # remote_state_dir
-    local cmd="cd $(shell_quote "${WHITE_REPO_DIR}") && mkdir -p $1 && \
-      setsid nohup env LD_LIBRARY_PATH=/home/stark/libtorch/lib \
-      ./rust/target/release/hcp-ringattn-rust \
-        --distributed-role coordinator \
-        --model-dir ${WHITE_MODEL_DIR} \
-        --num-domains 2 \
-        --listen-addr 0.0.0.0:${COORD_PORT} \
-        --http-addr 0.0.0.0:${HTTP_PORT} \
-        --trace-jsonl $1/trace-n2.jsonl \
-        >$1/coordinator-n2.log 2>&1 < /dev/null &"
-    run_remote_white "${cmd}"
-    sleep 2
-}
-
-launch_n2_white_worker() { # remote_state_dir
-    local cmd="cd $(shell_quote "${WHITE_REPO_DIR}") && \
-      setsid nohup env HCP_TCH_DEVICE=cuda:0 LD_LIBRARY_PATH=/home/stark/libtorch/lib \
-      ./rust/target/release/hcp-ringattn-rust \
-        --distributed-role worker \
-        --domain-id 0 \
-        --model-dir ${WHITE_MODEL_DIR} \
-        --listen-addr 0.0.0.0:${W0_PORT} \
-        --next-peer-addr ${PEARL_LAN}:${W1_PORT} \
-        --coordinator-addr ${WHITE_LAN}:${COORD_PORT} \
-        --num-domains 2 \
-        >$1/worker0-white-n2.log 2>&1 < /dev/null &"
-    run_remote_white "${cmd}"
-    sleep 5
-}
-
-launch_n2_pearl_worker() { # remote_state_dir
-    local cmd="cd $(shell_quote "${PEARL_REPO_DIR}") && \
-      setsid nohup env LD_PRELOAD=/home/stark/libtorch/lib/libtorch_hip.so HCP_TCH_DEVICE=cuda:0 LD_LIBRARY_PATH=/home/stark/libtorch/lib \
-      ./rust/target/release/hcp-ringattn-rust \
-        --distributed-role worker \
-        --domain-id 1 \
-        --model-dir ${PEARL_MODEL_DIR} \
-        --listen-addr 0.0.0.0:${W1_PORT} \
-        --next-peer-addr ${WHITE_LAN}:${W0_PORT} \
-        --coordinator-addr ${WHITE_LAN}:${COORD_PORT} \
-        --num-domains 2 \
-        >$1/worker1-pearl-n2.log 2>&1 < /dev/null &"
-    run_remote_pearl "${cmd}"
-    sleep 5
-}
-
-wait_health_white() { # expected_workers remote_state_dir
-    echo "Waiting 30s for workers to connect and load model..."
-    sleep 30
-    local health
-    health=$(run_remote_white "curl -s --max-time 10 http://127.0.0.1:${HTTP_PORT}/health" || echo '{}')
-    echo "$health"
-    local connected
-    connected=$(echo "$health" | python3 -c "import json,sys; print(json.load(sys.stdin).get('workers_connected',0))" 2>/dev/null || echo 0)
-    if [ "$connected" -ne "$1" ]; then
-        echo "ERROR: expected $1 workers connected, got $connected" >&2
-        run_remote_white "tail -30 $2/coordinator-n2.log" || true
-        exit 1
-    fi
-}
+# === N=2 note ===
+# The N=2 phase is driven entirely on white by scripts/phase3_7a_n2_driver.sh
+# (setsid daemons on the white/pearl LAN). The Mac only polls STATUS and
+# fetches artifacts, so Mac-side network drops cannot abort the bench.
 
 # === Bench ladder ===
 run_bench() { # label num_prompts rate max_concurrency base_url
@@ -289,6 +229,8 @@ validate_phase() { # phase_tag expected_total_requests hops_per_iter trace_file 
     echo "=== Validation ${tag} ==="
     if [ "$msrc" = "white" ]; then
         run_remote_white "curl -s --max-time 10 http://127.0.0.1:${HTTP_PORT}/metrics" > "${REPORT_DIR}/metrics-${tag}.json"
+    elif [ "$msrc" = "file" ]; then
+        : # metrics file already fetched into REPORT_DIR by the caller
     else
         curl -s --max-time 10 "http://localhost:${HTTP_PORT}/metrics" > "${REPORT_DIR}/metrics-${tag}.json"
     fi
@@ -341,25 +283,41 @@ PY
 # =====================================================================
 # Phase N=2: white (worker 0, CUDA) + pearl (worker 1, HIP),
 # coordinator + bench client also on white => entire service path on the
-# white/pearl LAN, immune to Mac-side network flaps. The Mac orchestrates
-# via short ssh calls only.
+# white/pearl LAN. The white-side driver (phase3_7a_n2_driver.sh) runs
+# the stack and ladder; the Mac polls STATUS and fetches artifacts.
 # =====================================================================
 PHASES="${PHASES:-n2 n3}"
 echo ""
-echo "########## Phase N=2: white + pearl (LAN-resident) ##########"
+echo "########## Phase N=2: white + pearl (LAN-resident, white-driven) ##########"
 N2_STATE_DIR="/tmp/hcp-n2-${RUN_ID}"
-launch_n2_coordinator_white "${N2_STATE_DIR}"
-launch_n2_white_worker "${N2_STATE_DIR}"
-launch_n2_pearl_worker "${N2_STATE_DIR}"
-wait_health_white 2 "${N2_STATE_DIR}"
+run_remote_white "mkdir -p ${N2_STATE_DIR} && setsid nohup bash $(shell_quote "${WHITE_REPO_DIR}")/scripts/phase3_7a_n2_driver.sh ${RUN_ID} > ${N2_STATE_DIR}/driver.log 2>&1 < /dev/null &"
+echo "N=2 driver launched on white; polling STATUS (Mac network drops tolerated)..."
 
-run_ladder n2 "http://127.0.0.1:${HTTP_PORT}"
-fetch_results n2
-scp -q -o ConnectTimeout=15 "${WHITE_SSH}:${N2_STATE_DIR}/trace-n2.jsonl" "${REPORT_DIR}/trace-n2.jsonl"
-scp -q -o ConnectTimeout=15 "${WHITE_SSH}:${N2_STATE_DIR}/coordinator-n2.log" "${REPORT_DIR}/coordinator-n2.log"
-scp -q -o ConnectTimeout=15 "${WHITE_SSH}:${N2_STATE_DIR}/worker0-white-n2.log" "${REPORT_DIR}/worker0-white-n2.log" || true
-scp -q -o ConnectTimeout=15 "${PEARL_SSH}:${N2_STATE_DIR}/worker1-pearl-n2.log" "${REPORT_DIR}/worker1-pearl-n2.log" || true
-validate_phase n2 32 24 "${REPORT_DIR}/trace-n2.jsonl" white
+n2_status=""
+for i in $(seq 1 90); do
+    sleep 60
+    n2_status=$(ssh -o ConnectTimeout=20 "${WHITE_SSH}" "cat ${N2_STATE_DIR}/STATUS 2>/dev/null" 2>/dev/null || true)
+    if [ -n "${n2_status}" ]; then
+        break
+    fi
+    echo "  ... still running (poll $i)"
+done
+if [ "${n2_status}" != "DONE" ]; then
+    echo "ERROR: N=2 driver finished with STATUS='${n2_status}'" >&2
+    ssh -o ConnectTimeout=20 "${WHITE_SSH}" "tail -40 ${N2_STATE_DIR}/driver.log" 2>/dev/null || true
+    exit 1
+fi
+echo "N=2 driver DONE; fetching artifacts..."
+
+mkdir -p "${REPORT_DIR}/bench-n2"
+scp -q -o ConnectTimeout=20 "${WHITE_SSH}:${N2_STATE_DIR}/bench/"*.json "${REPORT_DIR}/bench-n2/"
+scp -q -o ConnectTimeout=20 "${WHITE_SSH}:${N2_STATE_DIR}/trace-n2.jsonl" "${REPORT_DIR}/trace-n2.jsonl"
+scp -q -o ConnectTimeout=20 "${WHITE_SSH}:${N2_STATE_DIR}/metrics-n2.json" "${REPORT_DIR}/metrics-n2.json"
+scp -q -o ConnectTimeout=20 "${WHITE_SSH}:${N2_STATE_DIR}/coordinator-n2.log" "${REPORT_DIR}/coordinator-n2.log"
+scp -q -o ConnectTimeout=20 "${WHITE_SSH}:${N2_STATE_DIR}/driver.log" "${REPORT_DIR}/driver-n2.log" || true
+scp -q -o ConnectTimeout=20 "${WHITE_SSH}:${N2_STATE_DIR}/worker0-white-n2.log" "${REPORT_DIR}/worker0-white-n2.log" || true
+scp -q -o ConnectTimeout=20 "${WHITE_SSH}:${N2_STATE_DIR}/worker1-pearl-n2.log" "${REPORT_DIR}/worker1-pearl-n2.log" || true
+validate_phase n2 32 24 "${REPORT_DIR}/trace-n2.jsonl" file
 stop_stack
 echo "=== N=2 PHASE PASSED ==="
 
