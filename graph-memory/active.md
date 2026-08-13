@@ -1935,8 +1935,9 @@ type: `task` · status: `active` · confidence: 1.0 · importance: 0.9 · source
 3. 再评估 vLLM backend/plugin、paged KV 或其他生态接口。
 该阶段不得反向改写已验证的 HCP core 数学，生态接入与 benchmark 对照分别独立节点。
 [2026-08-13 更新] 第 1 步(实际 vllm bench serve 驱动 HCP endpoint)完成:N=2(white+pearl LAN)与 N=3(white+pearl+laptop)拓扑均三档 0 失败,最小兼容仅两处 metrics/robustness 修复(d964454、90eb7b2)。第 2 步(受控 vLLM baseline 对照)与第 3 步(生态评估)待立项。
+[2026-08-13 用户口径修正] 第 2 步 baseline 对照不得用单机 vLLM:HCP 是跨节点分布式,单机不可比;baseline 至少应为局域网内 vLLM 普通分布式推理(PP 流水线并行),使分布式的通信/调度开销在两侧同时存在。
 
-_updated: 2026-08-12 21:38:59_
+_updated: 2026-08-13 05:56:53_
 ### N=3 Mac 拓扑两次被 Mac 侧网络事件杀死(环境性阻断)
 
 type: `evidence` · status: `verified` · confidence: 0.95 · importance: 0.9 · source: `reports/routeb-p3-bench-20260812-221130`
