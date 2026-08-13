@@ -108,6 +108,9 @@ struct CoordinatorArgs {
     /// experimental (route-B observability, test-only): reproduce a remote
     /// handshake's capacity-weighted frozen schedule in a local golden.
     continuation_capacity_tickets: Option<Vec<u64>>,
+    /// Continuation positions a keep_kv service prefill reserves per session
+    /// for later append segments (service path; default 64).
+    session_continuation_tokens: usize,
     /// Optional JSONL path for per-request structured traces (6c.0). Absent
     /// disables tracing entirely; tracing never changes the inference result.
     trace_jsonl: Option<String>,
@@ -133,6 +136,7 @@ fn parse_args() -> CoordinatorArgs {
     let mut prompt_token_ids = None;
     let mut continuation_request_id = 1_u64;
     let mut continuation_capacity_tickets = None;
+    let mut session_continuation_tokens = 64usize;
     let mut trace_jsonl = None;
 
     let mut args = std::env::args().skip(1); // skip binary name
@@ -164,7 +168,9 @@ fn parse_args() -> CoordinatorArgs {
             "--capacity-aware" => capacity_aware = true,
             "--prompt-file" => prompt_file = Some(args.next().unwrap()),
             "--prompts-file" => prompts_file = Some(args.next().unwrap()),
-            "--export-logits" => export_logits_dir = Some(args.next().unwrap()),
+            "--export-logits" | "--export-logits-dir" => {
+                export_logits_dir = Some(args.next().unwrap())
+            }
             "--ring-strategy" => {
                 let s = args.next().unwrap();
                 ring_strategy = RingSchedulingStrategy::from_str(&s)
@@ -187,6 +193,9 @@ fn parse_args() -> CoordinatorArgs {
                     Some(s.split(',').map(|x| x.parse().unwrap()).collect());
             }
             "--trace-jsonl" => trace_jsonl = Some(args.next().unwrap()),
+            "--session-continuation-tokens" => {
+                session_continuation_tokens = args.next().unwrap().parse().unwrap();
+            }
             _ => eprintln!("[coordinator] unknown arg: {arg}"),
         }
     }
@@ -211,6 +220,7 @@ fn parse_args() -> CoordinatorArgs {
         prompt_token_ids,
         continuation_request_id,
         continuation_capacity_tickets,
+        session_continuation_tokens,
         trace_jsonl,
     }
 }
@@ -258,6 +268,28 @@ fn write_raw_logits_file(path: &Path, logits: &[f32]) -> Result<(), String> {
         file.write_all(&value.to_le_bytes())
             .map_err(|e| format!("failed to write logits: {e}"))?;
     }
+    Ok(())
+}
+
+/// Write a route-B dump directory: one `<name>.f32le` per artifact plus
+/// `meta.json`, creating `out_dir` if needed. Shared by the experimental CLI
+/// continuation path and the HTTP service path so both produce the layout
+/// compare_route_b_dumps.py consumes.
+fn export_logits_dump(
+    out_dir: &Path,
+    artifacts: &[(&str, &[f32])],
+    meta: &serde_json::Value,
+) -> Result<(), String> {
+    std::fs::create_dir_all(out_dir)
+        .map_err(|e| format!("failed to create logits export dir: {e}"))?;
+    for (name, logits) in artifacts {
+        write_raw_logits_file(&out_dir.join(format!("{name}.f32le")), logits)?;
+    }
+    std::fs::write(
+        out_dir.join("meta.json"),
+        serde_json::to_vec_pretty(meta).map_err(|e| format!("logits meta encode failed: {e}"))?,
+    )
+    .map_err(|e| format!("logits meta write failed: {e}"))?;
     Ok(())
 }
 
@@ -755,6 +787,8 @@ fn prefill_single_request(
     kv_ledger: &mut ActiveKvReservation,
     rt: &tokio::runtime::Runtime,
     strategy: RingSchedulingStrategy,
+    continuation_budget: usize,
+    export_logits_dir: Option<&str>,
 ) -> Result<ActiveRequest, String> {
     let eos_token = config.eos_token_id();
     let vocab_size = config.vocab_size;
@@ -836,11 +870,19 @@ fn prefill_single_request(
     // Byte-level KV admission: freeze this request's per-domain per-layer
     // reservation and prove it fits before any worker sees a Prefill command.
     // Unknown capacity, unit overflow, and one-byte-short all fail closed here.
+    // keep_kv requests additionally reserve per-domain continuation headroom
+    // for later append segments of the same session.
+    let continuation_headroom = if job.keep_kv {
+        session_continuation_headroom(worker_capacities, continuation_budget)
+    } else {
+        Vec::new()
+    };
     let reservation = service_layer_capacities(
         &chunk_sizes,
         seq_len as usize,
         job.max_tokens,
         config.num_layers,
+        &continuation_headroom,
     );
     let budget_bytes = match capacity_mb_to_bytes(worker_capacities) {
         Ok(bytes) => bytes,
@@ -1016,6 +1058,31 @@ fn prefill_single_request(
         }
     };
 
+    // Optional route-B dump export (test-only observability): same layout the
+    // experimental continuation E2E writes, one directory per request. Export
+    // failures are logged but never fail the request.
+    if let Some(dir) = export_logits_dir {
+        let out_dir = Path::new(dir).join(format!("request_{}", job.request_id));
+        let meta = serde_json::json!({
+            "mode": "service",
+            "device": "distributed-workers",
+            "request_id": job.request_id,
+            "session_id": job.session_id,
+            "keep_kv": job.keep_kv,
+            "domains": num_domains,
+            "layers": config.num_layers,
+            "prompt_tokens": prompt_tokens,
+            "prefill_argmax": first_token,
+        });
+        if let Err(e) = export_logits_dump(&out_dir, &[("prefill_last_logits", &logits_vec)], &meta)
+        {
+            eprintln!(
+                "[coordinator] request {} prefill logits export failed: {e}",
+                job.request_id
+            );
+        }
+    }
+
     let mut generated_ids: Vec<u32> = Vec::new();
     let mut finish_reason = None;
 
@@ -1039,6 +1106,169 @@ fn prefill_single_request(
         prompt_tokens,
         chunk_boundaries,
         generated_ids,
+        next_token: first_token,
+        finish_reason,
+        result_tx: job.tx,
+        stream_tx: job.stream_tx,
+    })
+}
+
+/// Send an error result back to the HTTP client of a job that never entered
+/// (or left) the scheduler, following the prefill error-path pattern.
+fn send_job_error(job: InferenceJob, message: &str) {
+    let _ = job.tx.send(InferenceResult {
+        text: format!("[error: {message}]"),
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        finish_reason: Some("error".to_string()),
+    });
+}
+
+/// Run one stationary continuation append for a live session and return an
+/// `ActiveRequest` (seeded with the first append token) that re-enters the
+/// regular decode batch under the session's original `request_id`, so the
+/// workers keep using the frozen KV context of that id.
+///
+/// On any failure the error result is sent via `job.tx` and `Err` is
+/// returned; the caller then releases the session KV and drops the session.
+#[allow(clippy::too_many_arguments)]
+fn append_continuation_request(
+    job: InferenceJob,
+    session: &SessionState,
+    tokenizer: &tokenizers::Tokenizer,
+    config: &ModelConfig,
+    worker_streams: &mut [(quinn::SendStream, quinn::RecvStream)],
+    capacity_tickets: &[u64],
+    rt: &tokio::runtime::Runtime,
+    export_logits_dir: Option<&str>,
+) -> Result<ActiveRequest, String> {
+    let eos_token = config.eos_token_id();
+
+    // Tokenize the append segment.
+    let encoding = match tokenizer.encode(job.prompt.as_str(), true) {
+        Ok(encoding) => encoding,
+        Err(e) => {
+            let message = format!("encode failed: {e}");
+            send_job_error(job, &message);
+            return Err(message);
+        }
+    };
+    let segment_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
+    let m = segment_ids.len();
+
+    // Fail closed when the segment plus its decode horizon exceeds the
+    // continuation headroom the keep_kv prefill reserved.
+    if !append_fits_capacity(session.continuation_capacity_remaining, m, job.max_tokens) {
+        let message = format!(
+            "append segment of {m} tokens with max_tokens {} exceeds session continuation capacity {}",
+            job.max_tokens, session.continuation_capacity_remaining
+        );
+        send_job_error(job, &message);
+        return Err(message);
+    }
+
+    // Frozen assignee schedule from the worker handshake tickets, identical
+    // derivation to the experimental continuation E2E.
+    let cont_schedule = match FrozenKvAssigneeSchedule::new(capacity_tickets, session.request_id, m)
+    {
+        Ok(schedule) => schedule,
+        Err(message) => {
+            send_job_error(job, &message);
+            return Err(message);
+        }
+    };
+    let starter_domain = match cont_schedule.assignee_for(m - 1, 0, 1) {
+        Some(domain) => domain,
+        None => {
+            let message = "continuation schedule has no starter".to_string();
+            send_job_error(job, &message);
+            return Err(message);
+        }
+    };
+    let position_ids = continuation_position_ids(session.global_seq_len, m);
+
+    let continuation_logits = match stationary_continuation(
+        session.request_id,
+        &segment_ids,
+        &position_ids,
+        capacity_tickets,
+        starter_domain,
+        config.num_layers,
+        worker_streams,
+        rt,
+    ) {
+        Ok(logits) => logits,
+        Err(e) => {
+            let message = format!("stationary continuation failed: {e}");
+            send_job_error(job, &message);
+            return Err(message);
+        }
+    };
+
+    let first_token = match sample_from_logits_vec(&continuation_logits, job.temperature, job.top_p)
+    {
+        Ok(t) => t,
+        Err(e) => {
+            let message = format!("sample_token failed: {e}");
+            send_job_error(job, &message);
+            return Err(message);
+        }
+    };
+
+    // Optional route-B dump export into the same per-request directory the
+    // session's prefill phase used; failures are logged, never fatal.
+    if let Some(dir) = export_logits_dir {
+        let out_dir = Path::new(dir).join(format!("request_{}", session.request_id));
+        let mut continuation_offsets = vec![Vec::new(); worker_streams.len()];
+        for offset in 0..m {
+            let domain = cont_schedule.assignee_for(offset, 0, 1).unwrap();
+            continuation_offsets[domain].push(offset);
+        }
+        let meta = serde_json::json!({
+            "mode": "service",
+            "device": "distributed-workers",
+            "request_id": session.request_id,
+            "append_request_id": job.request_id,
+            "session_id": job.session_id,
+            "domains": worker_streams.len(),
+            "layers": config.num_layers,
+            "tickets": capacity_tickets,
+            "capacity_tickets": capacity_tickets,
+            "starter_domain": starter_domain,
+            "continuation_offsets_by_domain": &continuation_offsets,
+            "continuation_base_position": session.global_seq_len,
+            "continuation_tokens": m,
+            "continuation_argmax": first_token,
+        });
+        if let Err(e) = export_logits_dump(
+            &out_dir,
+            &[("continuation_last_logits", &continuation_logits)],
+            &meta,
+        ) {
+            eprintln!(
+                "[coordinator] request {} continuation logits export failed: {e}",
+                session.request_id
+            );
+        }
+    }
+
+    let token = first_token as u32;
+    let finish_reason = if Some(token) == eos_token {
+        Some("stop".to_string())
+    } else {
+        None
+    };
+
+    Ok(ActiveRequest {
+        request_id: session.request_id,
+        prompt: job.prompt,
+        max_tokens: job.max_tokens,
+        temperature: job.temperature,
+        top_p: job.top_p,
+        prompt_ids: segment_ids,
+        prompt_tokens: m,
+        chunk_boundaries: vec![0, m],
+        generated_ids: vec![token],
         next_token: first_token,
         finish_reason,
         result_tx: job.tx,
@@ -1184,25 +1414,131 @@ fn reserved_layer_capacities(
 /// The request reserves its full decode horizon up front: the `prompt_len`
 /// prefix split by `chunk_sizes` plus every decode position in
 /// `[prompt_len, prompt_len + max_tokens)`, each owned by `position % domains`
-/// (the same keep rule the ring decode applies at attention/ring.rs). Route-B
-/// continuation offsets are deliberately absent — that path reserves separately.
+/// (the same keep rule the ring decode applies at attention/ring.rs).
+/// `continuation_headroom[d]` adds that many per-domain positions for later
+/// session append segments (keep_kv requests); pass an empty slice for the
+/// plain stateless path.
 fn service_layer_capacities(
     chunk_sizes: &[usize],
     prompt_len: usize,
     max_tokens: usize,
     layers: usize,
+    continuation_headroom: &[usize],
 ) -> Vec<Vec<usize>> {
     let domains = chunk_sizes.len();
     let decode_positions: Vec<i64> =
         (prompt_len as i64..(prompt_len + max_tokens) as i64).collect();
-    let no_continuation: Vec<Vec<usize>> = vec![Vec::new(); domains];
+    let continuation_offsets: Vec<Vec<usize>> = if continuation_headroom.is_empty() {
+        vec![Vec::new(); domains]
+    } else {
+        debug_assert_eq!(continuation_headroom.len(), domains);
+        continuation_headroom
+            .iter()
+            .map(|&headroom| (0..headroom).collect())
+            .collect()
+    };
     reserved_layer_capacities(
         chunk_sizes,
         &decode_positions,
-        &no_continuation,
+        &continuation_offsets,
         layers,
         domains,
     )
+}
+
+/// Conservative per-domain continuation headroom (in KV positions) reserved
+/// by a keep_kv prefill: for any append segment of `m <= budget` tokens, the
+/// frozen assignee schedule places at most `floor(budget * tickets_d / W) + 1`
+/// offsets on domain d, so this over-reserves by at most one position per
+/// domain. The tickets are the worker handshake capacity values, matching the
+/// schedule derivation the append path uses.
+fn session_continuation_headroom(capacity_tickets: &[u64], budget: usize) -> Vec<usize> {
+    let total: u128 = capacity_tickets.iter().map(|&t| t as u128).sum();
+    if total == 0 || budget == 0 {
+        return vec![0; capacity_tickets.len()];
+    }
+    capacity_tickets
+        .iter()
+        .map(|&tickets| ((budget as u128 * tickets as u128) / total) as usize + 1)
+        .collect()
+}
+
+/// Global position ids of an append segment: it continues right after the
+/// session's occupied KV positions (`global_seq_len .. global_seq_len + m`).
+fn continuation_position_ids(global_seq_len: usize, segment_len: usize) -> Vec<i64> {
+    (global_seq_len as i64..(global_seq_len + segment_len) as i64).collect()
+}
+
+/// An append fits the session's remaining continuation capacity when the
+/// segment plus its decode horizon (`max_tokens - 1` fed tokens) stays within
+/// the positions the keep_kv prefill reserved.
+fn append_fits_capacity(remaining: usize, segment_len: usize, max_tokens: usize) -> bool {
+    segment_len >= 1 && segment_len + max_tokens.saturating_sub(1) <= remaining
+}
+
+/// Live continuation session in the HTTP service loop: a completed keep_kv
+/// request whose KV is still resident on the workers under `request_id`.
+#[derive(Clone, Copy, Debug)]
+struct SessionState {
+    /// Worker-side request id the frozen KV is registered under.
+    request_id: u64,
+    /// KV positions occupied on the workers (prompt/segments + fed decode
+    /// tokens; the last sampled token is returned but never fed back).
+    global_seq_len: usize,
+    /// Last sampled token of the most recent phase.
+    last_token: i64,
+    /// Remaining continuation positions the reservation still covers.
+    continuation_capacity_remaining: usize,
+}
+
+/// Register a session after a keep_kv phase-1 request completes, or advance
+/// it after a keep_kv append completes. `consumed` is the completed phase's
+/// prompt/segment tokens plus its fed decode tokens
+/// (`prompt_tokens + generated_ids.len() - 1`).
+fn session_register_or_advance(
+    sessions: &mut HashMap<String, SessionState>,
+    session_id: &str,
+    request_id: u64,
+    consumed: usize,
+    last_token: i64,
+    continuation_budget: usize,
+) {
+    match sessions.get_mut(session_id) {
+        Some(session) => {
+            session.global_seq_len += consumed;
+            session.last_token = last_token;
+            session.continuation_capacity_remaining = session
+                .continuation_capacity_remaining
+                .saturating_sub(consumed);
+        }
+        None => {
+            sessions.insert(
+                session_id.to_string(),
+                SessionState {
+                    request_id,
+                    global_seq_len: consumed,
+                    last_token,
+                    continuation_capacity_remaining: continuation_budget,
+                },
+            );
+        }
+    }
+}
+
+/// Drop the session backed by `request_id` (append finished without keep_kv,
+/// or the append failed). Returns true if a session was removed.
+fn session_remove_by_request(
+    sessions: &mut HashMap<String, SessionState>,
+    request_id: u64,
+) -> bool {
+    let session_id = sessions
+        .iter()
+        .find(|(_, session)| session.request_id == request_id)
+        .map(|(id, _)| id.clone());
+    match session_id {
+        Some(id) => sessions.remove(&id).is_some(),
+        None => false,
+    }
 }
 
 /// Final finisher of a stationary continuation ring run: the finisher of the
@@ -1532,14 +1868,6 @@ fn run_continuation_e2e(
     }
     if let Some(dir) = export_logits_dir {
         let out_dir = Path::new(dir);
-        std::fs::create_dir_all(out_dir)
-            .map_err(|e| format!("failed to create continuation export dir: {e}"))?;
-        write_raw_logits_file(&out_dir.join("prefill_last_logits.f32le"), &prefill_logits)?;
-        write_raw_logits_file(&out_dir.join("decode_logits.f32le"), &decode_logits)?;
-        write_raw_logits_file(
-            &out_dir.join("continuation_last_logits.f32le"),
-            &continuation_logits,
-        )?;
         let meta = serde_json::json!({
             "mode": "production-quic",
             "device": "distributed-workers",
@@ -1558,12 +1886,15 @@ fn run_continuation_e2e(
             "continuation_argmax": continuation_argmax,
             "generated_ids": &generated_ids,
         });
-        std::fs::write(
-            out_dir.join("meta.json"),
-            serde_json::to_vec_pretty(&meta)
-                .map_err(|e| format!("continuation meta encode failed: {e}"))?,
-        )
-        .map_err(|e| format!("continuation meta write failed: {e}"))?;
+        export_logits_dump(
+            out_dir,
+            &[
+                ("prefill_last_logits", &prefill_logits),
+                ("decode_logits", &decode_logits),
+                ("continuation_last_logits", &continuation_logits),
+            ],
+            &meta,
+        )?;
         println!(
             "[coordinator] exported experimental continuation logits to {}",
             out_dir.display()
@@ -1837,6 +2168,14 @@ pub fn run() {
         args.num_domains,
     );
 
+    // Continuation session registry (route-B service path): session_id ->
+    // state of a completed keep_kv request whose KV stays resident on the
+    // workers. `session_bindings` maps a live worker-side request_id to its
+    // session_id while the request is in flight, so the completion path knows
+    // whether to release the KV or keep it for the session.
+    let mut sessions: HashMap<String, SessionState> = HashMap::new();
+    let mut session_bindings: HashMap<u64, String> = HashMap::new();
+
     // Iterative scheduling loop: each iteration may prefill new requests and/or
     // decode all active requests.  This replaces the request-level spawn_blocking
     // model with an iteration-level scheduler.
@@ -1869,35 +2208,118 @@ pub fn run() {
             if scheduler.can_admit() && !scheduler.pending_is_empty() {
                 if let Some(job) = scheduler.try_dequeue_pending() {
                     let job_request_id = job.request_id;
-                    match prefill_single_request(
-                        job,
-                        &tokenizer,
-                        &config,
-                        &mut guard,
-                        &args.chunk_sizes,
-                        args.capacity_aware,
-                        &worker_capacities,
-                        &mut kv_ledger,
-                        &rt,
-                        args.ring_strategy,
-                    ) {
-                        Ok(active_req) => {
-                            active_counter.fetch_add(1, Ordering::SeqCst);
-                            trace_sink.prefill_accepted(
-                                active_req.request_id,
-                                kv_ledger
-                                    .reserved_bytes(active_req.request_id)
-                                    .unwrap_or_default()
-                                    .to_vec(),
-                                active_req.prompt_tokens,
-                                active_req.max_tokens,
-                            );
-                            scheduler.add_active(active_req);
+                    if job.append {
+                        // Session continuation append (route-B service path).
+                        // Fail closed unless the service is otherwise idle:
+                        // interleaving an append with other requests is not
+                        // orchestrated yet.
+                        let session_id = job.session_id.clone().unwrap_or_default();
+                        if !scheduler.active_is_empty() || !scheduler.pending_is_empty() {
+                            let message =
+                                "append requires idle service (no other active or pending requests)"
+                                    .to_string();
+                            eprintln!("[coordinator] append rejected: {message}");
+                            send_job_error(job, &message);
+                            trace_sink.fail(job_request_id, message);
+                        } else if let Some(session) = sessions.get(&session_id).copied() {
+                            let keep_kv = job.keep_kv;
+                            match append_continuation_request(
+                                job,
+                                &session,
+                                &tokenizer,
+                                &config,
+                                &mut guard,
+                                &worker_capacities,
+                                &rt,
+                                args.export_logits_dir.as_deref(),
+                            ) {
+                                Ok(active_req) => {
+                                    active_counter.fetch_add(1, Ordering::SeqCst);
+                                    if keep_kv {
+                                        session_bindings
+                                            .insert(active_req.request_id, session_id.clone());
+                                    }
+                                    scheduler.add_active(active_req);
+                                }
+                                Err(e) => {
+                                    eprintln!("[coordinator] append failed: {e}");
+                                    // Failure path: leave no half-live KV.
+                                    // Release the session's worker state and
+                                    // ledger reservation, drop the session.
+                                    for (send, _recv) in guard.iter_mut() {
+                                        let cmd = WorkerCommand::ReleaseRequest {
+                                            request_id: session.request_id,
+                                        };
+                                        let _ = send_command_quic(send, &cmd, rt.handle());
+                                    }
+                                    kv_ledger.release(session.request_id);
+                                    session_remove_by_request(&mut sessions, session.request_id);
+                                    trace_sink.fail(job_request_id, e);
+                                    // Error result already sent via job.tx in
+                                    // append_continuation_request.
+                                }
+                            }
+                        } else {
+                            let message = format!("unknown or expired session_id '{session_id}'");
+                            eprintln!("[coordinator] append rejected: {message}");
+                            send_job_error(job, &message);
+                            trace_sink.fail(job_request_id, message);
                         }
-                        Err(e) => {
-                            eprintln!("[coordinator] prefill failed: {e}");
-                            trace_sink.fail(job_request_id, e);
-                            // Error result already sent via job.tx in prefill_single_request
+                    } else {
+                        let keep_kv = job.keep_kv;
+                        let session_id = job.session_id.clone();
+                        let duplicate_session = keep_kv
+                            && session_id
+                                .as_deref()
+                                .map(|id| sessions.contains_key(id))
+                                .unwrap_or(false);
+                        if duplicate_session {
+                            let message = format!(
+                                "session_id '{}' already has resident KV",
+                                session_id.as_deref().unwrap_or_default()
+                            );
+                            eprintln!("[coordinator] keep_kv rejected: {message}");
+                            send_job_error(job, &message);
+                            trace_sink.fail(job_request_id, message);
+                        } else {
+                            match prefill_single_request(
+                                job,
+                                &tokenizer,
+                                &config,
+                                &mut guard,
+                                &args.chunk_sizes,
+                                args.capacity_aware,
+                                &worker_capacities,
+                                &mut kv_ledger,
+                                &rt,
+                                args.ring_strategy,
+                                args.session_continuation_tokens,
+                                args.export_logits_dir.as_deref(),
+                            ) {
+                                Ok(active_req) => {
+                                    active_counter.fetch_add(1, Ordering::SeqCst);
+                                    trace_sink.prefill_accepted(
+                                        active_req.request_id,
+                                        kv_ledger
+                                            .reserved_bytes(active_req.request_id)
+                                            .unwrap_or_default()
+                                            .to_vec(),
+                                        active_req.prompt_tokens,
+                                        active_req.max_tokens,
+                                    );
+                                    if keep_kv {
+                                        if let Some(id) = session_id {
+                                            session_bindings.insert(active_req.request_id, id);
+                                        }
+                                    }
+                                    scheduler.add_active(active_req);
+                                }
+                                Err(e) => {
+                                    eprintln!("[coordinator] prefill failed: {e}");
+                                    trace_sink.fail(job_request_id, e);
+                                    // Error result already sent via job.tx in prefill_single_request
+                                }
+                            }
                         }
                     }
                 }
@@ -1932,8 +2354,13 @@ pub fn run() {
                             }
                         }
 
-                        // Release per-request state on workers for completed requests.
+                        // Release per-request state on workers for completed
+                        // requests — except session-bound ones, whose KV stays
+                        // resident for later append segments of the session.
                         for request_id in &completed {
+                            if session_bindings.contains_key(request_id) {
+                                continue;
+                            }
                             for (send, _recv) in guard.iter_mut() {
                                 let cmd = WorkerCommand::ReleaseRequest {
                                     request_id: *request_id,
@@ -1944,17 +2371,45 @@ pub fn run() {
                         for request_id in completed {
                             if let Some(req) = scheduler.remove_active(request_id) {
                                 active_counter.fetch_sub(1, Ordering::SeqCst);
-                                let released_bytes = kv_ledger
-                                    .reserved_bytes(request_id)
-                                    .unwrap_or_default()
-                                    .to_vec();
-                                // Free this request's KV byte reservation.
-                                kv_ledger.release(request_id);
-                                trace_sink.complete(
-                                    request_id,
-                                    req.finish_reason.clone(),
-                                    released_bytes,
-                                );
+                                if let Some(session_id) = session_bindings.remove(&request_id) {
+                                    // Session-bound completion: keep the
+                                    // worker KV and the ledger reservation;
+                                    // register the session (phase 1) or
+                                    // advance it (keep_kv append).
+                                    let consumed = req.prompt_tokens
+                                        + req.generated_ids.len().saturating_sub(1);
+                                    let last_token =
+                                        req.generated_ids.last().copied().unwrap_or(0) as i64;
+                                    session_register_or_advance(
+                                        &mut sessions,
+                                        &session_id,
+                                        request_id,
+                                        consumed,
+                                        last_token,
+                                        args.session_continuation_tokens,
+                                    );
+                                    trace_sink.complete(
+                                        request_id,
+                                        req.finish_reason.clone(),
+                                        Vec::new(),
+                                    );
+                                } else {
+                                    let released_bytes = kv_ledger
+                                        .reserved_bytes(request_id)
+                                        .unwrap_or_default()
+                                        .to_vec();
+                                    // Free this request's KV byte reservation.
+                                    kv_ledger.release(request_id);
+                                    trace_sink.complete(
+                                        request_id,
+                                        req.finish_reason.clone(),
+                                        released_bytes,
+                                    );
+                                    // A completed append without keep_kv ends
+                                    // the session it was riding on; for plain
+                                    // requests this is a no-op.
+                                    session_remove_by_request(&mut sessions, request_id);
+                                }
 
                                 if let Some(ref chunk_tx) = req.stream_tx {
                                     // Streaming: send final chunk with finish_reason.
@@ -1989,6 +2444,10 @@ pub fn run() {
                                 active_counter.fetch_sub(1, Ordering::SeqCst);
                                 // Free each failed request's KV byte reservation.
                                 kv_ledger.release(request_id);
+                                // Drop any session binding/state the failed
+                                // request was carrying.
+                                session_bindings.remove(&request_id);
+                                session_remove_by_request(&mut sessions, request_id);
                                 trace_sink.fail(request_id, format!("decode batch failed: {e}"));
                                 let _ = req.result_tx.send(InferenceResult {
                                     text: format!("[error: decode batch failed: {e}]"),
@@ -2281,7 +2740,7 @@ mod tests {
         // 2 domains, prompt 4 split [1,3], max_tokens=3 -> decode positions
         // 4,5,6 owned by p%2 = {0,1,0}. Per-layer capacities must match the
         // golden E2E shape minus the continuation offsets.
-        let capacities = service_layer_capacities(&[1, 3], 4, 3, 24);
+        let capacities = service_layer_capacities(&[1, 3], 4, 3, 24, &[]);
         assert_eq!(capacities.len(), 2);
         // domain 0: 1 prefix + {4,6} decode = 3; domain 1: 3 prefix + {5} = 4.
         assert!(capacities[0].iter().all(|&c| c == 3));
@@ -2293,7 +2752,7 @@ mod tests {
     #[test]
     fn service_layer_capacities_with_zero_max_tokens_reserve_prefix_only() {
         // No decode steps -> reservation is just the prompt prefix split.
-        let capacities = service_layer_capacities(&[1, 3], 4, 0, 24);
+        let capacities = service_layer_capacities(&[1, 3], 4, 0, 24, &[]);
         assert!(capacities[0].iter().all(|&c| c == 1));
         assert!(capacities[1].iter().all(|&c| c == 3));
     }
@@ -2302,11 +2761,91 @@ mod tests {
     fn service_layer_capacities_three_domains_cover_each_owner() {
         // 3 domains, prompt 6 split [2,2,2], max_tokens=4 -> decode positions
         // 6,7,8,9 owned by {0,1,2,0}.
-        let capacities = service_layer_capacities(&[2, 2, 2], 6, 4, 2);
+        let capacities = service_layer_capacities(&[2, 2, 2], 6, 4, 2, &[]);
         // domain 0: 2 + {6,9} = 4; domain 1: 2 + {7} = 3; domain 2: 2 + {8} = 3.
         assert!(capacities[0].iter().all(|&c| c == 4));
         assert!(capacities[1].iter().all(|&c| c == 3));
         assert!(capacities[2].iter().all(|&c| c == 3));
+    }
+
+    #[test]
+    fn service_layer_capacities_with_continuation_headroom_adds_per_domain_positions() {
+        // Same shape as the plain case plus headroom [2, 1]: each domain's
+        // per-layer capacity grows by exactly its headroom.
+        let plain = service_layer_capacities(&[1, 3], 4, 3, 24, &[]);
+        let with_headroom = service_layer_capacities(&[1, 3], 4, 3, 24, &[2, 1]);
+        assert!(with_headroom[0].iter().all(|&c| c == plain[0][0] + 2));
+        assert!(with_headroom[1].iter().all(|&c| c == plain[1][0] + 1));
+    }
+
+    #[test]
+    fn session_continuation_headroom_covers_frozen_schedule_counts() {
+        // The headroom must upper-bound the per-domain offset counts of the
+        // frozen assignee schedule for every append segment m <= budget.
+        let tickets = [1_u64, 3];
+        let budget = 8;
+        let headroom = session_continuation_headroom(&tickets, budget);
+        assert_eq!(headroom.len(), 2);
+        for m in 1..=budget {
+            let schedule = FrozenKvAssigneeSchedule::new(&tickets, 75, m).unwrap();
+            for (domain, &count) in schedule.counts().iter().enumerate() {
+                assert!(
+                    count <= headroom[domain],
+                    "m={m} domain {domain}: count {count} exceeds headroom {}",
+                    headroom[domain]
+                );
+            }
+        }
+        // Degenerate inputs reserve nothing.
+        assert_eq!(session_continuation_headroom(&tickets, 0), vec![0, 0]);
+        assert_eq!(session_continuation_headroom(&[0, 0], budget), vec![0, 0]);
+    }
+
+    #[test]
+    fn continuation_position_ids_start_at_global_seq_len() {
+        assert_eq!(continuation_position_ids(10, 4), vec![10, 11, 12, 13]);
+        assert!(continuation_position_ids(7, 0).is_empty());
+    }
+
+    #[test]
+    fn append_fits_capacity_checks_segment_plus_decode_horizon() {
+        // 10-token segment + 19 fed decode tokens = 29 <= 64.
+        assert!(append_fits_capacity(64, 10, 20));
+        // Exact fit is accepted.
+        assert!(append_fits_capacity(29, 10, 20));
+        // One position over is rejected.
+        assert!(!append_fits_capacity(28, 10, 20));
+        // Empty segments are rejected outright.
+        assert!(!append_fits_capacity(64, 0, 20));
+        // max_tokens = 1 consumes only the segment itself.
+        assert!(append_fits_capacity(10, 10, 1));
+        assert!(!append_fits_capacity(9, 10, 1));
+    }
+
+    #[test]
+    fn session_registry_register_advance_and_remove() {
+        let mut sessions: HashMap<String, SessionState> = HashMap::new();
+        // Phase 1 completes: prompt 4 tokens + 3 generated (2 fed) = 6.
+        session_register_or_advance(&mut sessions, "s1", 42, 6, 99, 64);
+        let session = sessions.get("s1").unwrap();
+        assert_eq!(session.request_id, 42);
+        assert_eq!(session.global_seq_len, 6);
+        assert_eq!(session.last_token, 99);
+        assert_eq!(session.continuation_capacity_remaining, 64);
+
+        // keep_kv append completes: segment 4 + 3 generated (2 fed) = 6 more.
+        session_register_or_advance(&mut sessions, "s1", 42, 6, 100, 64);
+        let session = sessions.get("s1").unwrap();
+        assert_eq!(session.global_seq_len, 12);
+        assert_eq!(session.last_token, 100);
+        assert_eq!(session.continuation_capacity_remaining, 58);
+
+        // Removal is keyed by the worker-side request id.
+        assert!(!session_remove_by_request(&mut sessions, 7));
+        assert!(session_remove_by_request(&mut sessions, 42));
+        assert!(sessions.is_empty());
+        // Repeated removal is a no-op.
+        assert!(!session_remove_by_request(&mut sessions, 42));
     }
 
     #[test]

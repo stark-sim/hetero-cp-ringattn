@@ -11,8 +11,8 @@
 //! - 所有 active 请求每 iteration 一起发送 DecodeBatch
 //! - 完成的请求立即移出，不影响其他请求
 
-use std::collections::{HashMap, VecDeque};
 use crate::api::types::{InferenceJob, InferenceResult};
+use std::collections::{HashMap, VecDeque};
 
 /// 一个处于 decode batch 中的活跃请求。
 pub struct ActiveRequest {
@@ -156,6 +156,9 @@ mod tests {
             max_tokens: 10,
             temperature: 0.0,
             top_p: 1.0,
+            session_id: None,
+            keep_kv: false,
+            append: false,
             tx,
             stream_tx: None,
         }
@@ -319,7 +322,8 @@ mod tests {
         assert!(scheduler.try_dequeue_pending().is_none()); // batch full
 
         // Simulate iteration: collect tokens from all active requests
-        let tokens: Vec<(u64, i64)> = scheduler.active_requests()
+        let tokens: Vec<(u64, i64)> = scheduler
+            .active_requests()
             .values()
             .map(|req| (req.request_id, req.next_token))
             .collect();

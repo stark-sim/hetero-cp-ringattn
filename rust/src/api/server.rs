@@ -55,6 +55,13 @@ async fn completions_handler(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    // Fail-closed session validation: append/keep_kv require a session_id.
+    // Session existence is enforced by the coordinator loop.
+    if let Err(message) = req.validate_session_fields() {
+        state.failed_counter.fetch_add(1, Ordering::SeqCst);
+        return Err((StatusCode::BAD_REQUEST, message));
+    }
+
     let model_name = req.model.unwrap_or_else(|| state.model_name.clone());
 
     if req.stream {
@@ -66,6 +73,9 @@ async fn completions_handler(
             max_tokens: req.max_tokens,
             temperature: req.temperature,
             top_p: req.top_p,
+            session_id: req.session_id.clone(),
+            keep_kv: req.keep_kv,
+            append: req.append,
             tx: oneshot::channel().0, // dummy oneshot for type compatibility
             stream_tx: Some(chunk_tx),
         };
@@ -118,6 +128,9 @@ async fn completions_handler(
         max_tokens: req.max_tokens,
         temperature: req.temperature,
         top_p: req.top_p,
+        session_id: req.session_id.clone(),
+        keep_kv: req.keep_kv,
+        append: req.append,
         tx,
         stream_tx: None,
     };
@@ -360,5 +373,66 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert!(jobs.try_recv().is_err());
         assert_eq!(state.request_counter.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn append_without_session_id_returns_bad_request() {
+        let (state, mut jobs) = test_state();
+        let response = build_router(state.clone())
+            .oneshot(completion_request(r#"{"prompt":"seg","append":true}"#))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert!(String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains("append=true requires session_id"));
+        // Rejected before enqueue; the request id was still consumed.
+        assert!(jobs.try_recv().is_err());
+        assert_eq!(state.request_counter.load(Ordering::SeqCst), 1);
+        assert_eq!(state.failed_counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn keep_kv_without_session_id_returns_bad_request() {
+        let (state, mut jobs) = test_state();
+        let response = build_router(state.clone())
+            .oneshot(completion_request(r#"{"prompt":"p","keep_kv":true}"#))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(jobs.try_recv().is_err());
+        assert_eq!(state.failed_counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn session_fields_are_propagated_to_the_job() {
+        let (state, mut jobs) = test_state();
+        let app = build_router(state.clone());
+        let coordinator = tokio::spawn(async move {
+            let job = jobs.recv().await.expect("handler must enqueue one job");
+            assert_eq!(job.session_id.as_deref(), Some("s1"));
+            assert!(job.keep_kv);
+            assert!(!job.append);
+            assert!(job
+                .tx
+                .send(InferenceResult {
+                    text: " ok".to_string(),
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    finish_reason: Some("length".to_string()),
+                })
+                .is_ok());
+        });
+
+        let response = app
+            .oneshot(completion_request(
+                r#"{"prompt":"p","session_id":"s1","keep_kv":true,"max_tokens":1}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        coordinator.await.unwrap();
+        assert_eq!(state.failed_counter.load(Ordering::SeqCst), 0);
     }
 }
