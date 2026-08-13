@@ -1727,6 +1727,19 @@ type: `decision` · status: `held` · confidence: 0.95 · importance: 0.96 · so
 结论：Node 4b DEFER multi-query continuation ring，只实现有证据的 KV-ring correctness；把 Q-ring 作为独立路线选择记忆，待 baseline 可运行后按 payload bytes 与实测带宽决定。VERDICT: DEFER。
 
 _updated: 2026-08-03 09:14:32_
+### [2026-08-13] N=2(white+pearl LAN)可记录性能基线建立:5 reps median,L1 TTFT 22.0s/TPOT 2.16s
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 0.95 · source: `hetero-cp-ringattn@phase3-8-perf-baseline`
+
+动机:LAN 单次方差 ~35%,单跑无法区分优化与噪声,后续方案比较需要稳定锚点。
+产物:scripts/phase3_8_perf_baseline_n2.sh(ffae66a,REPS 默认 5,复用 7a 驱动每 rep 重启完整 stack,正确性门控不过则整轮无效)+ docs/PHASE3_N2_PERF_BASELINE.md(2b1de31)+ reports/routeb-p3-baseline-20260813-175408/(raw 未入库)。
+配置锚点:commit 9b48d8f(三机核验)、Qwen2-0.5B BF16、vllm bench serve 0.27.1(random 32/16,seed 42)、L1(8 请求 rate=1)/L2(8 请求 mc=2)/L3(16 请求 mc=4)。
+5/5 reps 首次通过 0 重试,正确性全平(0 失败、hops 公式精确),方差纯在延迟/吞吐。
+median: L1 ttft 22.0s tpot 2.16s;L2 ttft 3.93s tpot 1.14s;L3 ttft 8.04s tpot 2.50s。spread:L1 最差(TTFT 47%),L2/L3 ~21-29%。
+重要观察:L1 TTFT 跨 rep 单调漂移(19.5s→29.8s)——不同时间窗口的 before/after reps 不可直接对比,要么交错要么重建基线。
+比较规则(已入库):同脚本同拓扑复跑,median 移出 min-max 带才算真实变化;大改进需重建基线替换表格。
+
+_updated: 2026-08-13 10:34:23_
 ### 6b.0 用 Axum 内部测试固化 Rust completions/SSE 合同
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `user-confirmed-fast-phase2-20260812`
