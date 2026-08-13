@@ -1969,6 +1969,13 @@ type: `task` · status: `superseded` · confidence: 1.0 · importance: 0.94 · s
 边界：这里测 HCP service，不把不同硬件总量的结果误称为算法公平 speedup；vLLM engine baseline 属后续受控对照。
 
 _updated: 2026-08-11 19:10:38_
+### 支线：white 双 network 模式恢复为 pearl 式单 networkd 管理模式
+
+type: `task` · status: `active` · confidence: 1.0 · importance: 0.9 · source: `user-direction-20260814`
+
+迁移磁盘配置已完成（NM masked、netplan 单 networkd、enp10s0 静态 192.168.100.1/24、wlp11s0 networkd 管理 STARK_1821），但收尾 apply 事故致节点失联，待物理重启后验证：单管理模式生效、有线 IP 稳定、Wi-Fi 恢复、tailscale 回归、更新 inventory。
+
+_updated: 2026-08-13 17:35:34_
 ### 三期 8:continuation 服务路径 E2E(HTTP session + golden + N=2 LAN 验证)
 
 type: `task` · status: `done` · confidence: 1.0 · importance: 0.9 · source: `hetero-cp-ringattn@phase3-8-plan`

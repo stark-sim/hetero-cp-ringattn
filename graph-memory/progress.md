@@ -2,6 +2,25 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### white 网络单模式化迁移事故：配置正确但执行不失联，双路径中断
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 0.95 · source: `white-netplan-unify-incident-20260814`
+
+[2026-08-14] white 网络单模式化迁移事故：目标态配置本身正确且部分已验证（enp10s0 静态 192.168.100.1/24 第一次 apply 后 pearl ping 0.13ms 全通），但收尾阶段的第二次 netplan apply 是在"正被重配的链路"（SSH 经 192.168.100.1）上前台执行，networkd 重启瞬断 SSH -> SIGHUP 可能在编排中途杀死 apply，且未武装第二个回滚看门狗。结果 white 双路径失联（tailscale 离线、pearl 侧 ARP INCOMPLETE 持续）。放大因素：1) netplan apply 在 NM 未 mask 时会复活 NM 抢回 wlp11s0，导致 Wi-Fi 实际管理者与预期相反；2) apply 前未重查接口实时管理者（nmcli 输出被断线吞掉后未补查）；3) enp10s0 长期处于双管理器争抢的 "configuring" 脏状态，apply 不是在干净运行时上执行。教训归并见 lesson-network-change-atomic-stable-path-20260814。恢复路径：磁盘已是目标态（NM 已 mask、单 networkd netplan），物理重启后应有线口必回，Wi-Fi 取决于 PSK 抽取正确性，可走 pearl 有线跳板修复。
+
+_updated: 2026-08-13 17:35:34_
+### 网络变更纪律：原子化执行 + 保住稳定路径再动不稳定路径
+
+type: `lesson` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `owner-confirmed-20260814`
+
+[2026-08-14] 网络配置变更纪律（源自 white 失联事故，owner 确认）：
+1. 原子化执行：任何会重启 networkd/NM/网卡的操作必须 nohup/setsid 脱离 SSH 会话执行，并武装超时自动回滚看门狗；绝不在"正被重配的链路"的会话前台执行网络变更。
+2. 保住稳定路径再动不稳定路径：存在已验证的不失联通道时（white↔pearl 直连有线 LAN 192.168.100.0/24），先确保该通道在新配置下生效并保持，再通过它（pearl 跳板 + agent forwarding）切换其他接口（如 Wi-Fi）的管理者；把失联窗口降至最低。本次本可以：有线静态 IP 生效后，先停 NM，再从 pearl 经有线跳板启动 networkd 的 wpa_supplicant 接管 Wi-Fi——全程不失联。
+3. 先 mask 再 apply：netplan apply 会复活未 mask 的 NetworkManager 并抢回设备；凡要废掉 NM，先 systemctl mask 再做任何 apply。
+4. apply 前重查实时管理者：任何输出被断线吞掉后必须补查（nmcli device status + networkctl），确认每个接口当前的实际管理者再动手。
+5. 变更后验证清单：接口 IP、默认路由、网关/互联网可达、tailscale、从对端节点 ping 直连 IP，全部通过才算完成。
+
+_updated: 2026-08-13 17:35:34_
 ### 6b.0 Rust completions/SSE 内部合同验证通过
 
 type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@4784acf`
