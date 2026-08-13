@@ -1215,6 +1215,11 @@ fn append_continuation_request(
         }
     };
 
+    println!(
+        "[coordinator] stationary continuation done: request_id={} segment_tokens={} base_position={} starter_domain={} first_token={}",
+        session.request_id, m, session.global_seq_len, starter_domain, first_token
+    );
+
     // Optional route-B dump export into the same per-request directory the
     // session's prefill phase used; failures are logged, never fatal.
     if let Some(dir) = export_logits_dir {
@@ -2239,6 +2244,24 @@ pub fn run() {
                                         session_bindings
                                             .insert(active_req.request_id, session_id.clone());
                                     }
+                                    // Trace the append phase under the
+                                    // session's worker-side request id:
+                                    // decode steps and completion are keyed by
+                                    // that id, and the phase-1 record was
+                                    // already emitted. The append's own job id
+                                    // entry is dropped (it would otherwise
+                                    // never complete).
+                                    trace_sink.in_flight.remove(&job_request_id);
+                                    trace_sink.enqueue(active_req.request_id);
+                                    trace_sink.prefill_accepted(
+                                        active_req.request_id,
+                                        kv_ledger
+                                            .reserved_bytes(active_req.request_id)
+                                            .unwrap_or_default()
+                                            .to_vec(),
+                                        active_req.prompt_tokens,
+                                        active_req.max_tokens,
+                                    );
                                     scheduler.add_active(active_req);
                                 }
                                 Err(e) => {
