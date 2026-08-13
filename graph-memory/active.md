@@ -2251,6 +2251,20 @@ type: `evidence` · status: `held` · confidence: 0.85 · importance: 0.9 · sou
 与 HCP 相关性：直接相关，可能缓解 pearl 等小/慢 domain 在 Phase 2 成为瓶颈的问题。
 
 _updated: 2026-06-29 06:06:09_
+### [2026-08-14] white<->pearl "LAN" 实为双端 WiFi:单流 TCP 上限 ~44 Mbit/s,N=2 基线数值为 WiFi-bound
+
+type: `evidence` · status: `verified` · confidence: 0.95 · importance: 0.85 · source: `hetero-cp-ringattn@phase3-8-network-metadata`
+
+动机:owner 指出 5-rep 基线不足以当基线——必须先知道这次走的链路性质与带宽上限。实测(2026-08-14):white 192.168.8.172 在 wlp11s0(WiFi6 5GHz ch48 80MHz,PHY rx 1080.6/tx 960.7 Mbit/s,信号 -32dBm),pearl 192.168.8.176 在 wlo1(链路质量 70/70,-38dBm,驱动不提供 PHY 速率)。iperf3 单流 5 次 10s:43.3-45.7 Mbit/s(~5.5 MB/s),每 10s 重传 800-1050 次;4 并发流 75.4-76.3 Mbit/s。RTT min 2.8/avg 4.3/max 6.7ms,0% 丢包。单流 goodput 仅为 PHY 的 ~4%,WiFi 半双工+干扰重传是主因。有线替代当前不可用:两台都有 2.5GbE(white enp10s0 无 IPv4;pearl enp8s0 在 192.168.100.2/24 直连子网)。结论:此前 N=2 基线(5 reps)所有 ring KV 流量都过这条 ~44 Mbit/s WiFi,数值是 WiFi-bound 而非 compute-bound;跨 rep 漂移与 ~35% 方差的主要嫌疑是 WiFi 波动。
+
+_updated: 2026-08-13 16:57:36_
+### [2026-08-14] 性能基线必须携带网络元数据:network.json 不等价则带不可比,链路变化必须重建基线
+
+type: `decision` · status: `active` · confidence: 0.9 · importance: 0.85 · source: `hetero-cp-ringattn@phase3-8-network-metadata`
+
+动机剖析六问:(1)问题:5-rep 基线无网络环境记录,WiFi 波动大,无法判定后续改动是优化还是链路噪声;(2)现状:基线脚本只记录 commit/拓扑/负载,假设 "LAN" 稳定,实际双端 WiFi 单流仅 ~44 Mbit/s;(3)终态:每次基线自动采集 network.json(链路状态+RTT+iperf3 上限)并折入 baseline.json,比较前先校验链路等价;(4)他人做法:HPC 基准惯例是记录拓扑/带宽/干扰条件(如 MLPerf 要求披露网络),不可比环境不重用在先带;(5)我们的方案:phase3_8_perf_baseline_n2.sh 在 rep 循环前一次性采集(iperf3 -1 one-shot 服务器+5s 客户端+ping 20),解析进 network.json;文档新增 Network environment 章节与比较规则第 2 条;(6)为什么自己的:vLLM 无此场景(其 bench 假设稳定环境),我们的异构 WiFi LAN 是特有变量。已落地 commit 253d642。5-rep 表标记 provisional;REPS=10 扩展复跑已启动(task bash-k9y33ccr),完成后替换表格数值。
+
+_updated: 2026-08-13 16:57:36_
 ### 6b.1：按真实 client 错误补最小 completions 合同
 
 type: `task` · status: `superseded` · confidence: 1.0 · importance: 0.85 · source: `user-confirmed-20260812`
