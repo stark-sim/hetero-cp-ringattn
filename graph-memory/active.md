@@ -2,6 +2,22 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 三期 8:HTTP 服务路径 continuation 两阶段 session E2E 证明(keep_kv/append)
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@phase3-8-plan`
+
+动机剖析六问:
+1. 问题:7a 证明 serving 接口与工程稳定性,但 bench 每请求独立完整 prefill+decode,continuation(历史 KV 原地冻结、新 segment 只传 activation)从未在真实服务路径被证明;现有证据全在合同级/CLI 实验级。
+2. 现状:worker 执行器完备(run_stationary_continuation 要求同 request_id 的 ReservedPositionedKvShard);coordinator stationary_continuation() 与 CLI run_continuation_e2e(--continuation-segment)跨机已通;golden 工具链(route_b_cross_node_smoke local + compare_route_b_dumps.py tie-aware)就绪。缺口全在服务化编排:API 无 session/append 字段、请求完成即 ReleaseRequest、服务 reservation 不含 continuation offsets、continuation 与 DecodeBatch 交错无编排、HTTP 不导 logits。
+3. 终态:HTTP 两阶段 session(请求1 keep_kv 保留 KV;请求2 同 session_id append 做 stationary continuation + 继续 decode),分布式 logits 对单机 contiguous golden 在既有 tie-aware 判据下通过;N=2(white CUDA + pearl HIP 裸 LAN)真实服务栈验证;trace 断言;graph evidence。
+4. 他者:vLLM prefix caching / SGLang radix cache 是中心 KV 池的缓存命中语义,依赖同构 CUDA + 中心 allocator,不证明 P2P ring positioned continuation;可复用 session 复用前缀的 API 语义,不能复用实现。
+5. 本方案:最小侵入接入 HTTP 服务路径——CompletionRequest 加 session_id/keep_kv/append(serde default 零行为变化);coordinator session registry + keep_kv 延迟 release + append fail-closed 编排(仅无其他 active 请求时接纳);--session-continuation-tokens 预 reserve 余量;--export-logits-dir 测试专用导出;golden 子模式参数化。
+6. 为什么:只有服务路径 E2E 能回答核心方案在目标 P2P ring 拓扑低成本环境的可行性——CLI 路径绕过 admission/ledger/scheduler/生命周期,恰是生产可信度关键;增量远小于重写,每步有既有 oracle 可回归。
+牺牲与边界:不做多请求并发 continuation 调度(fail-closed,后续节点);不做跨 session 前缀共享;不作性能宣称;三段以上 chaining 语义支持但只验证两阶段。
+备选否决:仅参数化 CLI run_continuation_e2e(方案 B)省一半工作量但不证明服务化编排,缺口主体仍在——用户已批准选 HTTP 方案。
+VERDICT: IMPLEMENT(计划已经用户批准,approach = HTTP 服务路径 session 化)。
+
+_updated: 2026-08-13 06:33:19_
 ### 路线 B 三期门禁通过,owner 确认 main-line 地位,codex 分支锚定里程碑继续探索
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@route-b-mainline-graduation`
@@ -1925,6 +1941,19 @@ type: `task` · status: `superseded` · confidence: 1.0 · importance: 0.94 · s
 边界：这里测 HCP service，不把不同硬件总量的结果误称为算法公平 speedup；vLLM engine baseline 属后续受控对照。
 
 _updated: 2026-08-11 19:10:38_
+### 三期 8:continuation 服务路径 E2E(HTTP session + golden + N=2 LAN 验证)
+
+type: `task` · status: `ongoing` · confidence: 1.0 · importance: 0.9 · source: `hetero-cp-ringattn@phase3-8-plan`
+
+实施步骤(按 commit 粒度):
+1. API + 编排:types.rs/server.rs 字段与 fail-closed 校验;coordinator session registry、keep_kv/append 编排、--session-continuation-tokens、--export-logits-dir;本地单测(141 绿基线不破)。
+2. golden 模式:route_b_cross_node_smoke.rs golden 子模式(--prompt-token-ids/--continuation-segment/--decode-steps/--out),与既有 local 模式互验。
+3. 驱动脚本 scripts/test_phase3_8_continuation_e2e.sh(以 phase3_7a_n2_driver.sh 为模板):N=2 white+pearl 裸 LAN,curl 两阶段 → logits dump → golden → compare_route_b_dumps.py → trace 断言(含 keep_kv 持有期 reserved==released);PHASES 预留 n3l。
+4. 7a 回归:PHASES=n2 scripts/test_phase3_7a_vllm_bench.sh 确认 bench 路径零回归。
+5. 收尾:docs/CONTINUATION_ROUTE_BOUNDARIES.md 更新(服务路径 continuation 纳入已证范围、注明并发排除边界);graph evidence + export。
+验证命令见 decision-phase3-8-continuation-service-e2e-20260813 与计划文件。
+
+_updated: 2026-08-13 06:33:19_
 ### 三期：vLLM bench serve 实测与 vLLM 生态接入
 
 type: `task` · status: `active` · confidence: 1.0 · importance: 0.9 · source: `user-correction-20260812`
