@@ -2,6 +2,21 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### [2026-08-13] 三期 8:服务路径 continuation 两阶段 E2E 通过(N=2 white CUDA + pearl HIP LAN,golden PASS)
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@phase3-8-e2e`
+
+报告 reports/routeb-p3-continuation-e2e-20260813-163228/(commits a652267 编排 + 53d08d5 trace + 8ae9242 golden + 1cea67c 驱动)。
+场景:prefix 16 tokens(keep_kv, id=1, max_tokens=2)→ append 5 tokens(" sunny morning in early spring", max_tokens=4),temperature=0。
+结果:
+- golden 对比 compare_route_b_dumps.py RESULT: PASS——prefill_last argmax 39698==39698(mean 0.029/max 0.219),continuation_last argmax 13==13(mean 0.048/max 0.313),均在既有 tie-aware 判据内,未调容差;
+- coordinator 日志确认 stationary continuation done: request_id=1 segment_tokens=5 base_position=17 starter_domain=0,位置推导与 golden 一致;
+- trace:phase-1 keep_kv 记录 released=[](KV 按设计持有),append 记录同 request_id reserved==released=[589824,430080],hops 公式(24/iter)成立;
+- 负例:未知 session append 返回错误并清理;metrics total=completed=3 failed=0。
+语义边界:append 仅服务空闲时受理(并发编排排除);服务路径只导出 prefill/continuation 两 artifact;correctness 证据,不含性能声明。
+这是 continuation 数学首次在完整服务化编排(admission/ledger/生命周期)下被真实分布式验证。
+
+_updated: 2026-08-13 09:15:32_
 ### 三期 8:HTTP 服务路径 continuation 两阶段 session E2E 证明(keep_kv/append)
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@phase3-8-plan`
@@ -1943,7 +1958,7 @@ type: `task` · status: `superseded` · confidence: 1.0 · importance: 0.94 · s
 _updated: 2026-08-11 19:10:38_
 ### 三期 8:continuation 服务路径 E2E(HTTP session + golden + N=2 LAN 验证)
 
-type: `task` · status: `ongoing` · confidence: 1.0 · importance: 0.9 · source: `hetero-cp-ringattn@phase3-8-plan`
+type: `task` · status: `done` · confidence: 1.0 · importance: 0.9 · source: `hetero-cp-ringattn@phase3-8-plan`
 
 实施步骤(按 commit 粒度):
 1. API + 编排:types.rs/server.rs 字段与 fail-closed 校验;coordinator session registry、keep_kv/append 编排、--session-continuation-tokens、--export-logits-dir;本地单测(141 绿基线不破)。
@@ -1952,8 +1967,18 @@ type: `task` · status: `ongoing` · confidence: 1.0 · importance: 0.9 · sourc
 4. 7a 回归:PHASES=n2 scripts/test_phase3_7a_vllm_bench.sh 确认 bench 路径零回归。
 5. 收尾:docs/CONTINUATION_ROUTE_BOUNDARIES.md 更新(服务路径 continuation 纳入已证范围、注明并发排除边界);graph evidence + export。
 验证命令见 decision-phase3-8-continuation-service-e2e-20260813 与计划文件。
+[2026-08-13 完成] 步骤 1-5 全部完成:API+编排 a652267、golden 8ae9242、驱动 1cea67c(+trace 修正 53d08d5)、N=2 LAN golden PASS(evidence-phase3-8-continuation-service-e2e-20260813)、7a 回归 0 失败(evidence-phase3-8-bench-regression-20260813)、边界文档 H 节 08bf761。
 
-_updated: 2026-08-13 06:33:19_
+_updated: 2026-08-13 09:15:32_
+### [2026-08-13] 三期 8 后 7a bench 回归通过;性能波动判定为环境性
+
+type: `evidence` · status: `verified` · confidence: 0.95 · importance: 0.9 · source: `hetero-cp-ringattn@phase3-8-regression`
+
+7a 回归(PHASES=n2,main tip 1cea67c,white+pearl LAN):三档 0 失败(8/8、8/8、16/16),metrics total=completed=32 failed=0,trace 32 条 reserved==released。报告 reports/routeb-p3-bench-20260813-164451/。
+性能观察与复跑:164451 运行 TTFT/TPOT 约为昨日基线 2x(l1 ttft 38.7s vs 17.1s);同代码复跑 170034 落在中间(l1 ttft 28.3s/tpot 2573ms,较 164451 快约 35%)——同代码两次运行即有 ~35% 方差,且该 bench 历史波动极大(185407 ttft 289s)。机制上 session 改动对无 session 请求仅 O(1) HashMap 查询,无引入 2x 均匀 slowdown 的路径。判定:环境性 LAN 波动,非代码回归。本节点 correctness 口径不含性能宣称,7a/三期 8 均不作性能结论。
+运维教训:子代理回合内启动的后台任务句柄对 parent 不可见(agent 结束后任务成 lost 状态);远端 setsid 模式本身不受影响,但子代理应报告远端 STATUS 目录路径而非本地 task id,便于 parent 直接核验。
+
+_updated: 2026-08-13 09:15:32_
 ### 三期：vLLM bench serve 实测与 vLLM 生态接入
 
 type: `task` · status: `active` · confidence: 1.0 · importance: 0.9 · source: `user-correction-20260812`
