@@ -6,6 +6,11 @@
 //! - `local`:  single-process golden with N in-process backends (mock ring),
 //!   reproducing the test scenario and all of its assertions, then dumping
 //!   logits + meta to `--out`.
+//! - `golden`: parameterizable contiguous single-node reference for the
+//!   service-path continuation E2E: `--prompt-token-ids` /
+//!   `--continuation-segment` / `--decode-steps` select the scenario, and the
+//!   reference logits are dumped to `--out/request_<id>/` in exactly the
+//!   layout the coordinator service path writes (see `run_golden`).
 //! - `server` / `client`: legacy N=2 pair mode (domain 1 / domain 0) over one
 //!   full-duplex TCP connection per layer.
 //! - `node`:  true N-domain ring topology. Each node only connects to its
@@ -260,6 +265,17 @@ fn parse_u64_list(value: &str, flag: &str) -> Result<Vec<u64>, String> {
         .collect()
 }
 
+fn parse_i64_list(value: &str, flag: &str) -> Result<Vec<i64>, String> {
+    value
+        .split(',')
+        .map(|item| {
+            item.trim()
+                .parse::<i64>()
+                .map_err(|e| format!("invalid {flag} value {value}: {e}"))
+        })
+        .collect()
+}
+
 fn default_model_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("HCP_ROUTE_B_MODEL_DIR") {
         if !dir.is_empty() {
@@ -285,6 +301,141 @@ fn write_tensor_f32le(path: &Path, tensor: &Tensor) -> Result<(), String> {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
     std::fs::write(path, bytes).map_err(|e| format!("write {} failed: {e}", path.display()))
+}
+
+// ===== Contiguous single-node reference (shared by `local` and `golden`) =====
+//
+// The reference mirrors the service-path two-phase session: prompt prefill,
+// `decode_steps` greedy legacy decode steps, then the continuation segment at
+// positions `prompt_len + decode_steps ..`. `local` interleaves these helpers
+// with its distributed assertions; `golden` chains them via
+// `run_contiguous_reference` and exports the same dump layout the coordinator
+// service path writes (`request_<id>/` with f32le artifacts + meta.json).
+
+/// Reference prefill: forward the whole prompt, return last-position logits
+/// and their argmax.
+fn reference_prefill(
+    model: &mut LlamaModel,
+    caches: &mut hcp_ringattn_rust::KvCaches,
+    prompt: &[i64],
+    device: Device,
+) -> Result<(Tensor, i64), String> {
+    let logits = model
+        .forward(
+            &Tensor::from_slice(prompt).unsqueeze(0).to_device(device),
+            caches,
+        )
+        .map_err(|e| format!("reference prefill forward failed: {e}"))?
+        .select(1, prompt.len() as i64 - 1)
+        .squeeze();
+    let argmax = logits.argmax(-1, false).int64_value(&[]);
+    Ok((logits, argmax))
+}
+
+/// Reference greedy decode: feed `first_token`, then each step's own argmax,
+/// for `steps` forwards. Returns the fed tokens plus the last step's logits
+/// and argmax (both `None` when `steps == 0`).
+fn reference_greedy_decode(
+    model: &mut LlamaModel,
+    caches: &mut hcp_ringattn_rust::KvCaches,
+    first_token: i64,
+    steps: usize,
+    device: Device,
+) -> Result<(Vec<i64>, Option<Tensor>, Option<i64>), String> {
+    let mut fed_tokens = Vec::with_capacity(steps);
+    let mut next_token = first_token;
+    let mut last_logits = None;
+    let mut last_argmax = None;
+    for _ in 0..steps {
+        let logits = model
+            .forward(
+                &Tensor::from_slice(&[next_token])
+                    .unsqueeze(0)
+                    .to_device(device),
+                caches,
+            )
+            .map_err(|e| format!("reference decode forward failed: {e}"))?
+            .squeeze();
+        fed_tokens.push(next_token);
+        last_argmax = Some(logits.argmax(-1, false).int64_value(&[]));
+        last_logits = Some(logits);
+        next_token = last_argmax.unwrap();
+    }
+    Ok((fed_tokens, last_logits, last_argmax))
+}
+
+/// Reference continuation: run the segment with explicit position ids
+/// `base_position .. base_position + segment.len()`, return the positions,
+/// the last-position logits, and their argmax.
+fn reference_continuation(
+    model: &mut LlamaModel,
+    caches: &mut hcp_ringattn_rust::KvCaches,
+    segment: &[i64],
+    base_position: i64,
+    device: Device,
+) -> Result<(Vec<i64>, Tensor, i64), String> {
+    let positions: Vec<i64> = (base_position..base_position + segment.len() as i64).collect();
+    model.set_prefill_position_ids(&positions, device);
+    let logits = model
+        .forward(
+            &Tensor::from_slice(segment).unsqueeze(0).to_device(device),
+            caches,
+        )
+        .map_err(|e| format!("reference continuation forward failed: {e}"))?
+        .select(1, segment.len() as i64 - 1)
+        .squeeze();
+    let argmax = logits.argmax(-1, false).int64_value(&[]);
+    Ok((positions, logits, argmax))
+}
+
+/// Full contiguous reference run used by `golden` mode: prefill -> greedy
+/// decode -> continuation. When `first_decode_token` is `None` the prefill
+/// argmax starts the decode chain (standalone golden); `local` passes the
+/// tie-aware distributed argmax instead.
+fn run_contiguous_reference(
+    model: &mut LlamaModel,
+    prompt: &[i64],
+    segment: &[i64],
+    decode_steps: usize,
+    first_decode_token: Option<i64>,
+    device: Device,
+) -> Result<ContiguousReference, String> {
+    let mut caches = model.create_kv_caches();
+    let (prefill_last_logits, prefill_argmax) =
+        reference_prefill(model, &mut caches, prompt, device)?;
+    let (decode_tokens, decode_logits, decode_argmax) = reference_greedy_decode(
+        model,
+        &mut caches,
+        first_decode_token.unwrap_or(prefill_argmax),
+        decode_steps,
+        device,
+    )?;
+    let base_position = (prompt.len() + decode_steps) as i64;
+    let (continuation_positions, continuation_last_logits, continuation_argmax) =
+        reference_continuation(model, &mut caches, segment, base_position, device)?;
+    Ok(ContiguousReference {
+        prefill_last_logits,
+        prefill_argmax,
+        decode_tokens,
+        decode_logits,
+        decode_argmax,
+        continuation_positions,
+        continuation_last_logits,
+        continuation_argmax,
+    })
+}
+
+/// Outputs of the contiguous reference run; see `run_contiguous_reference`.
+struct ContiguousReference {
+    prefill_last_logits: Tensor,
+    prefill_argmax: i64,
+    /// Tokens fed during the decode phase (length == decode_steps).
+    decode_tokens: Vec<i64>,
+    decode_logits: Option<Tensor>,
+    decode_argmax: Option<i64>,
+    continuation_positions: Vec<i64>,
+    continuation_last_logits: Tensor,
+    continuation_argmax: i64,
 }
 
 fn storage_snapshot(
@@ -1690,14 +1841,8 @@ fn run_local(
     }
 
     let mut reference_caches = reference.create_kv_caches();
-    let reference_prefill_logits = reference
-        .forward(
-            &Tensor::from_slice(&PROMPT).unsqueeze(0).to_device(device),
-            &mut reference_caches,
-        )
-        .unwrap()
-        .select(1, PROMPT.len() as i64 - 1)
-        .squeeze();
+    let (reference_prefill_logits, _) =
+        reference_prefill(&mut reference, &mut reference_caches, &PROMPT, device)?;
 
     // Sequential per-backend prefill; mock inboxes buffer the ring traffic and
     // causality lets early domains complete without future peer KV.
@@ -1740,15 +1885,14 @@ fn run_local(
         device,
     );
     assert_eq!(decode_handoffs, layers * (domains - 1));
-    let reference_decode_logits = reference
-        .forward(
-            &Tensor::from_slice(&[decode_token])
-                .unsqueeze(0)
-                .to_device(device),
-            &mut reference_caches,
-        )
-        .unwrap()
-        .squeeze();
+    let (_, reference_decode_logits, _) = reference_greedy_decode(
+        &mut reference,
+        &mut reference_caches,
+        decode_token,
+        1,
+        device,
+    )?;
+    let reference_decode_logits = reference_decode_logits.expect("one decode step produces logits");
     let distributed_decode_last = distributed_decode_logits.squeeze();
     let decode_max_diff = (&distributed_decode_last - &reference_decode_logits)
         .abs()
@@ -1829,17 +1973,13 @@ fn run_local(
         .select(1, CONTINUATION_PROMPT.len() as i64 - 1)
         .squeeze();
 
-    reference.set_prefill_position_ids(&scenario.continuation_positions, device);
-    let reference_continuation_logits = reference
-        .forward(
-            &Tensor::from_slice(&CONTINUATION_PROMPT)
-                .unsqueeze(0)
-                .to_device(device),
-            &mut reference_caches,
-        )
-        .unwrap()
-        .select(1, CONTINUATION_PROMPT.len() as i64 - 1)
-        .squeeze();
+    let (_, reference_continuation_logits, _) = reference_continuation(
+        &mut reference,
+        &mut reference_caches,
+        &CONTINUATION_PROMPT,
+        scenario.decode_position + 1,
+        device,
+    )?;
 
     let max_diff = (&distributed_continuation_last - &reference_continuation_logits)
         .abs()
@@ -1953,6 +2093,94 @@ fn run_local(
     Ok(())
 }
 
+/// `golden` mode: parameterizable contiguous single-node reference dump for
+/// the service-path continuation E2E. Computes the same reference `local`
+/// asserts against (via the shared helpers above) and exports it in exactly
+/// the layout the coordinator service path writes under --export-logits-dir:
+/// `<out>/request_<id>/{prefill_last_logits,continuation_last_logits}.f32le`
+/// plus meta.json (decode_logits.f32le is also exported; the comparator skips
+/// artifacts present in only one dump).
+///
+/// Pairing with a service-path dump — compare_route_b_dumps.py takes two dump
+/// dirs, each holding meta.json + artifacts:
+///   python3 scripts/compare_route_b_dumps.py \
+///     <service-export-dir>/request_<id> <golden-out>/request_<id>
+/// `--request-id` must match the service phase-1 request id (the coordinator
+/// HTTP counter starts at 1, hence the default of 1).
+///
+/// Mapping a service session to this scenario: run the phase-1 request with
+/// temperature=0; `--decode-steps` equals its fed decode tokens, i.e.
+/// max_tokens - 1 (the last sampled token is returned to the client but never
+/// fed back); `--continuation-segment` is the tokenized append segment. The
+/// canonical scenario (the hardcoded local/node one) is:
+///   --prompt-token-ids 151644,9707,0,16 --continuation-segment 11,13,17,19 \
+///   --decode-steps 1
+fn run_golden(
+    device: Device,
+    request_id: u64,
+    prompt: &[i64],
+    segment: &[i64],
+    decode_steps: usize,
+    model_dir: &Path,
+    out_dir: &Path,
+) -> Result<(), String> {
+    if prompt.is_empty() {
+        return Err("golden mode requires a non-empty --prompt-token-ids".to_string());
+    }
+    if segment.is_empty() {
+        return Err("golden mode requires a non-empty --continuation-segment".to_string());
+    }
+    let config = ModelConfig::from_file(model_dir.join("config.json"))
+        .map_err(|e| format!("load config failed: {e}"))?;
+    let weights = ModelWeights::from_dir(model_dir, device)
+        .map_err(|e| format!("load weights failed: {e}"))?;
+    let mut model = LlamaModel::from_weights(config, &weights, device, 1)
+        .map_err(|e| format!("build model failed: {e}"))?;
+    let reference =
+        run_contiguous_reference(&mut model, prompt, segment, decode_steps, None, device)?;
+
+    let dump_dir = out_dir.join(format!("request_{request_id}"));
+    std::fs::create_dir_all(&dump_dir)
+        .map_err(|e| format!("create {} failed: {e}", dump_dir.display()))?;
+    write_tensor_f32le(
+        &dump_dir.join("prefill_last_logits.f32le"),
+        &reference.prefill_last_logits,
+    )?;
+    if let Some(ref logits) = reference.decode_logits {
+        write_tensor_f32le(&dump_dir.join("decode_logits.f32le"), logits)?;
+    }
+    write_tensor_f32le(
+        &dump_dir.join("continuation_last_logits.f32le"),
+        &reference.continuation_last_logits,
+    )?;
+    let meta = serde_json::json!({
+        "mode": "golden-contiguous",
+        "device": format!("{device:?}"),
+        "request_id": request_id,
+        "prompt_token_ids": prompt,
+        "continuation_segment": segment,
+        "decode_steps": decode_steps,
+        "decode_tokens": reference.decode_tokens,
+        "continuation_positions": reference.continuation_positions,
+        "decode_token": reference.decode_tokens.first().copied(),
+        "prefill_argmax": reference.prefill_argmax,
+        "decode_argmax": reference.decode_argmax,
+        "continuation_argmax": reference.continuation_argmax,
+    });
+    std::fs::write(
+        dump_dir.join("meta.json"),
+        serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("write meta.json failed: {e}"))?;
+    println!(
+        "[route-b smoke] golden reference done: request_id={request_id} decode_tokens={:?} continuation_argmax={} out={}",
+        reference.decode_tokens,
+        reference.continuation_argmax,
+        dump_dir.display()
+    );
+    Ok(())
+}
+
 struct Cli {
     mode: String,
     device: Device,
@@ -1965,19 +2193,32 @@ struct Cli {
     peer: Option<String>,
     out: PathBuf,
     model_dir: PathBuf,
+    /// golden mode: raw prompt token ids (bypasses the tokenizer).
+    prompt_token_ids: Option<Vec<i64>>,
+    /// golden mode: continuation segment token ids.
+    continuation_segment: Option<Vec<i64>>,
+    /// golden mode: greedy decode steps between prefill and continuation
+    /// (service path: the phase-1 request's max_tokens - 1).
+    decode_steps: Option<usize>,
+    /// golden mode: request id used for the `request_<id>` dump directory;
+    /// must match the service phase-1 request id (HTTP counter starts at 1).
+    request_id: u64,
 }
 
 fn parse_cli() -> Result<Cli, String> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let Some(mode) = args.first().cloned() else {
         return Err(
-            "usage: route_b_cross_node_smoke <local|server|client|node> [--domain D] [--domains N] [--tickets t0,t1,...] [--prefix-splits s0,s1,...] [--device cpu|mps|cuda:N] [--bind host:port] [--peer host:port] --out <dir> [--model-dir <dir>]"
+            "usage: route_b_cross_node_smoke <local|server|client|node|golden> [--domain D] [--domains N] [--tickets t0,t1,...] [--prefix-splits s0,s1,...] [--device cpu|mps|cuda:N] [--bind host:port] [--peer host:port] --out <dir> [--model-dir <dir>]; golden mode: --prompt-token-ids <csv> --continuation-segment <csv> [--decode-steps n] [--request-id id]"
                 .to_string(),
         );
     };
-    if !matches!(mode.as_str(), "local" | "server" | "client" | "node") {
+    if !matches!(
+        mode.as_str(),
+        "local" | "server" | "client" | "node" | "golden"
+    ) {
         return Err(format!(
-            "invalid mode {mode}: expected local|server|client|node"
+            "invalid mode {mode}: expected local|server|client|node|golden"
         ));
     }
     let mut device = Device::Cpu;
@@ -1990,6 +2231,10 @@ fn parse_cli() -> Result<Cli, String> {
     let mut peer = None;
     let mut out = None;
     let mut model_dir = default_model_dir();
+    let mut prompt_token_ids = None;
+    let mut continuation_segment = None;
+    let mut decode_steps = None;
+    let mut request_id = 1_u64;
     let mut index = 1;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -2019,6 +2264,24 @@ fn parse_cli() -> Result<Cli, String> {
             "--peer" => peer = Some(value.clone()),
             "--out" => out = Some(PathBuf::from(value)),
             "--model-dir" => model_dir = PathBuf::from(value),
+            "--prompt-token-ids" => {
+                prompt_token_ids = Some(parse_i64_list(value, "--prompt-token-ids")?)
+            }
+            "--continuation-segment" => {
+                continuation_segment = Some(parse_i64_list(value, "--continuation-segment")?)
+            }
+            "--decode-steps" => {
+                decode_steps = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|e| format!("invalid --decode-steps {value}: {e}"))?,
+                )
+            }
+            "--request-id" => {
+                request_id = value
+                    .parse::<u64>()
+                    .map_err(|e| format!("invalid --request-id {value}: {e}"))?
+            }
             _ => return Err(format!("unknown flag {flag}")),
         }
         index += 2;
@@ -2036,12 +2299,33 @@ fn parse_cli() -> Result<Cli, String> {
         peer,
         out,
         model_dir,
+        prompt_token_ids,
+        continuation_segment,
+        decode_steps,
+        request_id,
     })
 }
 
 fn main() -> Result<(), String> {
     let cli = parse_cli()?;
     match cli.mode.as_str() {
+        "golden" => {
+            let prompt = cli
+                .prompt_token_ids
+                .ok_or_else(|| "golden mode requires --prompt-token-ids <csv>".to_string())?;
+            let segment = cli
+                .continuation_segment
+                .ok_or_else(|| "golden mode requires --continuation-segment <csv>".to_string())?;
+            run_golden(
+                cli.device,
+                cli.request_id,
+                &prompt,
+                &segment,
+                cli.decode_steps.unwrap_or(1),
+                &cli.model_dir,
+                &cli.out,
+            )
+        }
         "local" => {
             let domains = cli.domains.unwrap_or(DEFAULT_TICKETS.len());
             let tickets = cli.tickets.unwrap_or_else(|| DEFAULT_TICKETS.to_vec());
