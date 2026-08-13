@@ -74,6 +74,27 @@
 - N=3 异构 Mac MPS + white CUDA(RTX 4090)+ pearl HIP(RX 9060 XT)经 coordinator/生产 QUIC neighbor-only ring 处理真实 Qwen2-0.5B 多请求(4 请求 0 错误,不等长 prompt 6/13/40/49 tokens);
 - trace 断言:prefill_hops=48=L*(N-1)、decode_hops=steps*48、reserved==released 全部成立。
 
+## H. 三期服务路径 continuation(session 两阶段,a652267/53d08d5)
+
+三期 8 把 stationary continuation 从 CLI 实验路径接入 HTTP 服务路径,Continuation 的服务化编排(admission/ledger/生命周期)首次被真实验证:
+
+| 资产 | 位置 | 说明 |
+|---|---|---|
+| session API 字段 | `rust/src/api/types.rs` | `session_id` / `keep_kv` / `append`,全部 `#[serde(default)]`,缺省行为零变化(vllm bench serve 不受影响) |
+| fail-closed 校验 | `rust/src/api/server.rs` | append 无 session_id、keep_kv 无 session_id → HTTP 400 |
+| session registry + append 编排 | `rust/src/distributed/coordinator.rs` | keep_kv 请求完成时持有 KV(跳过 ReleaseRequest/ledger release);append 复用 session 原 request_id 上的冻结 KV 执行 `StationaryContinuation` 并继续 decode;未知 session / 服务非空闲 / 超容量均 fail-closed |
+| continuation reservation 余量 | 同上 | `--session-continuation-tokens`(默认 64),按 `floor(budget*tickets_d/W)+1` 上界预 reserve |
+| 服务路径 logits 导出 | 同上 | `--export-logits-dir`,写 `request_<id>/prefill_last_logits.f32le` + `continuation_last_logits.f32le` |
+| contiguous golden 导出 | `rust/src/bin/route_b_cross_node_smoke.rs` `golden` 模式 | 参数化 prompt/segment/decode-steps,与 `local` 模式共享同一 reference 实现 |
+| E2E 驱动 | `scripts/test_phase3_8_continuation_e2e.sh` | N=2 white CUDA + pearl HIP 裸 LAN,curl 两阶段 + golden 对比 + trace 断言 |
+
+语义边界(显式排除):
+
+- **不做多请求并发 continuation 调度**:append 仅在服务无其他 active/pending 请求时受理,否则返回错误;并发交错编排留待后续节点;
+- **不做跨 session 前缀 KV 共享**;三段以上 chaining 语义支持但只验证两阶段;
+- trace 口径:keep_kv 的 phase-1 记录 `released_bytes==[]`(KV 按设计持有),释放落在同 request_id 的 append 记录上;
+- 全部为 correctness 证据,**不含性能声明**。
+
 ## E. 组合接缝(供路线间结合)
 
 - **路线 A/C(KV-ring 变体)**:共享 A 类全部基建;continuation 可按 segment 大小静态选择 ring 或 packet(大 m/T 时 KV-ring 的 query 并行与紧凑 payload 仍可能占优;不引入动态 planner);
@@ -106,3 +127,4 @@
 | (二期) per-request JSONL trace | evidence-phase2-rust-6c0-observability-20260812 | 78be1d0 |
 | (二期) native 服务稳定性基线 | evidence-phase2-rust-6c1-native-baseline-20260812 | f249d90 |
 | (二期) N=3 异构真实 Qwen 服务闭环 | evidence-phase2-rust-6d-n3-service-20260812 | 9a42934 |
+| (三期) 服务路径 continuation 两阶段 E2E(N=2 LAN + golden PASS) | evidence-phase3-8-continuation-service-e2e-20260813 | a652267/53d08d5/1cea67c |
