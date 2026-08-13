@@ -2,6 +2,25 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 路线 B 三期门禁通过,owner 确认 main-line 地位,codex 分支锚定里程碑继续探索
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@route-b-mainline-graduation`
+
+【里程碑整合记录】
+触发:用户(owner)于 2026-08-13 确认「目前是个里程碑,可以合并到 main」,要求按 route-experimentation skill 整合 codex 线与 main 线。
+Git 事实:codex/route-b-continuation-stationary-packet 自二期 merge commit 547e970 起已完全包含于 main,无分叉;本次将 codex 分支 fast-forward 至 main tip a6a4d47 并推送 origin,作为继续探索的新锚点(原分支保留,不删除)。
+三期门禁(decision-route-milestone-gating-20260809)达成状态:
+1. 核心可行性(大):synthetic correctness、真实模型、跨设备数值验证(Mac MPS + white CUDA + pearl HIP 三节点真 ring)全部通过——evidence-route-b-three-node-ring-mac-white-pearl-20260809 等。
+2. 工程能力(中):m>1 wire codec、coordinator 控制面、byte admission、N=3 production QUIC 跨机 E2E 通过,二期已合 main——evidence-route-b-phase2-merge-verification-20260812。
+3. 生态能力(小)首个证据:7a 用官方 vllm bench serve 黑盒驱动 HCP endpoint,N=2(white+pearl LAN)与 N=3L(white+pearl+laptop)三档 0 失败,标准口径 TTFT/TPOT/ITL 导出——evidence-phase3-7a-n2-vllm-bench-green-20260812、evidence-phase3-7a-n3l-vllm-bench-green-20260813。
+按 skill「Milestone-Gated Graduation」:路线 B 的 main-line candidacy 由 owner 确认,显式标记。
+其他路线状态(保留分支/ revisit trigger,不随本次毕业改变):
+- multi-query Q/O/LSE accumulator ring:DEFER(decision-continuation-multi-query-ring-deferred-20260803),revisit trigger = baseline 可运行后按 payload bytes 与实测带宽比较。
+- vLLM block-ring plugin 路线(hyp-block-kv-vllm):独立假设节点,pearl 单进程 PoC 已过,跨节点 PoC 未完成,与 main 线互不阻塞。
+已知边界:Mac 拓扑当夜环境性阻断(evidence-phase3-7a-n3-mac-env-blocked-20260813)催生 task-phase3-ring-reconnect-resilience-20260813(优先级高于性能);vLLM baseline 对照与生态评估(task-phase3-vllm-bench-and-ecosystem-20260812 第 2、3 步)仍待立项。
+VERDICT: 路线 B 毕业为 main 线;后续探索(重连容错、continuation oracle、baseline 对照)从 a6a4d47 锚点继续。
+
+_updated: 2026-08-13 03:45:46_
 ### 三期 7a N=3 异构(white+pearl+laptop,无 Mac)vllm bench 全绿
 
 type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `reports/routeb-p3-bench-20260813-042241`
