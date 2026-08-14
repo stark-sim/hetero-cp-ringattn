@@ -67,3 +67,38 @@ HCP admission：60 accepted / **0 rejected**（预算账面足够，全部放行
 ```bash
 bash scripts/phase3_10_kv_wall_scan.sh   # ~50min，顺序跑 HCP 侧 + PD 侧
 ```
+
+
+---
+
+## 7. 跟进：admission 修复验证 + 8k 变体（2026-08-14 晚）
+
+**修复落地**：`--activation-reserve-mb`（默认 1536 MiB）在握手后从源头扣减
+`worker_capacities`（commit `ec59df8`；首次尝试只扣了 HTTP ledger 而 per-request
+准入路径从原始容量建账，重跑证实无效后改为源头扣减）。
+
+**30k 重跑**（`routeb-p3-kvwall-20260814-232932`）：预算正确缩到 [15586, 8406] MiB，
+但 mc=16 仍 OOM（15/16）、mc=32 全灭——**1.5GB 余量盖不住 30k prefill 的激活峰值**。
+根因深一层：HCP ring 的 attention 每跳物化全量 [heads, shard, kv_len] 分数矩阵
+（无 online/chunked softmax），30k 时 shard=15k 的分数矩阵 bf16 约 7.5GB/跳——
+**激活工作区（非 KV 字节）才是 30k 下的真实约束**。这是 A 类工程债：
+online/chunked attention 正是 ring-attention 论文的标准轮子，HCP 尚未实现。
+
+**8k 变体**（`routeb-p3-kvwall-20260815-000103`，mc 8/16/32/64，max-batch-size 64）：
+
+| mc | HCP 完成 | HCP p99 TTFT | HCP TPOT | vLLM PD 完成 | PD p99 TTFT | PD TPOT |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 8/8 | 113.1s | — | 8/8 | 12.4s | — |
+| 16 | 16/16 | 229.9s | — | 16/16 | 24.2s | — |
+| 32 | 32/32 | 465.7s | — | 32/32 | 47.9s | — |
+| 64 | **64/64** | 946.3s | 14.5s | 64/64 | 95.3s | 0.36s |
+
+- **双方 120/120 全完成**。8k 下 HCP 的 KV 账面墙 ≈ 55 并发会话/域预算（pearl 8.36GB ÷
+  150MB），但准入节奏（prefill 串行、短输出快速释放）使在册并发从未触顶——账本健康、零 OOM。
+- vLLM 侧 64×8k=524k tokens 远超其 229.5k-token 池 → 排队加深（p99 48s→95s），依然零 preemption。
+- HCP mc=64 的 TPOT 14.5s/token（vLLM 0.36s）——这是 A 类引擎差距在高并发下的真实体感。
+
+**今日可辩护的能力结论**：
+1. HCP N=2 聚合 KV 账面 28.4GB vs vLLM PD decode 池 7.88GiB（2.7x），机制真实且入账正确；
+2. 8k 下 HCP 全量通过 mc≤64（聚合在册 KV 峰值超 vLLM 硬池上限）；
+3. 30k 下 HCP 的兑现被激活工作区卡住——修复路径明确（online attention），属于生态轮子线。

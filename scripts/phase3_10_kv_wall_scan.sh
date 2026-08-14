@@ -151,7 +151,7 @@ print(f"wrote {out}")
 print("")
 print("=== WALL TABLE ===")
 print(f"{'mc':>4} | {'HCP done/total':>14} {'HCP TTFT p99 s':>14} | {'PD done/total':>13} {'PD TTFT p99 s':>13} {'PD preempts':>11}")
-for mc in (4, 8, 16, 32):
+for mc in sorted(set(hcp) | set(pd)):
     h, p = hcp.get(mc, {}), pd.get(mc, {})
     print(f"{mc:>4} | {str(h.get('completed'))+'/'+str(h.get('num_prompts')):>14} {h.get('p99_ttft_ms',0)/1000:>13.1f}s | {str(p.get('completed'))+'/'+str(p.get('num_prompts')):>13} {p.get('p99_ttft_ms',0)/1000:>12.1f}s {preemptions.get(mc, 0):>11}")
 print(f"HCP admissions: {admissions}")

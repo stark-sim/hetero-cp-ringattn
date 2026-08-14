@@ -2,6 +2,27 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### admission 预留激活工作区余量（修复 KV 墙 OOM）
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `phase3-10-kv-wall-scan-20260814`
+
+修 admission 激活余量：让 HCP 的 fail-closed 拒绝发生在正确位置。1. 问题：KV byte admission 账面放行超出可执行容量的负载（phase3-10 mc16/32 OOM 崩溃实证）。2. 现状：admission 预算=握手时各域空闲 VRAM，仅扣 KV 字节；prefill 激活工作区（logits/attention 中间量）未入账，pearl 16GB 卡被 KV 压到 36MB 空闲后 OOM。3. 终态：预算=空闲VRAM-KV-激活工作区估计（按模型 config+当前 in-flight prefill 数）或至少固定安全余量（约2GB/域）；mc=32 重跑=16 完成+16 status=rejected，无 worker panic。4. 他者：vLLM 的做法是 KV 池在启动时按 gpu_memory_utilization 预分配固定大小，激活余量在池外天然保留；块不够时准入排队。5. 本方案：worker 握手 capacity 上报或 coordinator 入账时扣除激活余量；拒绝路径已有（status=rejected），只需预算正确。6. 为什么：这是 ring 聚合容量优势（2.7x 账面）能否兑现的闸门；崩溃式触墙违背 fail-closed 设计承诺。VERDICT: IMPLEMENT。 [2026-08-15 收尾：机制已落地并于 8k 验证；30k 场景的激活峰值超出任何合理固定余量，转入 task-phase3-online-attention-workspace-20260815]
+
+_updated: 2026-08-14 16:43:02_
+### admission 修复验证 + 8k 墙扫描：120/120 全绿；30k 真约束=激活工作区
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `phase3-10-fix-validation-20260815`
+
+admission 激活余量修复落地并验证（commit ec59df8，源头扣减 worker_capacities；首版只扣 HTTP ledger 被重跑证伪后修正）。30k 重跑（routeb-p3-kvwall-20260814-232932）：预算正确缩至 [15586,8406] MiB 但仍 OOM——1.5GB 余量盖不住 30k prefill 激活峰值；根因深一层：ring 每跳物化全量 [heads, shard, kv_len] 分数矩阵（无 online softmax），30k 时约 7.5GB/跳 bf16——激活工作区而非 KV 字节是 30k 的真实约束。8k 变体（routeb-p3-kvwall-20260815-000103，mc 8/16/32/64）：HCP 120/120 全完成零 OOM，账本健康（reserved==released 全等）；vLLM PD 同样 120/120 但 64x8k=524k tokens 超其 229.5k 硬池，排队加深（p99 TTFT 48->95s）零 preemption。HCP mc=64 TPOT 14.5s vs vLLM 0.36s——A 类引擎差距的高并发体感。结论：能力账（2.7x 聚合）机制真实且入账正确；30k 兑现被激活工作区卡住，路径=online attention 轮子。VERDICT: VERIFIED。
+
+_updated: 2026-08-14 16:43:02_
+### online/chunked attention：消除 O(shard^2) 激活工作区（解锁 30k 容量兑现）
+
+type: `task` · status: `pending` · confidence: 1.0 · importance: 1.0 · source: `phase3-10-fix-validation-20260815`
+
+实现 online/chunked attention（flash 式分块+在线 softmax），消除 O(shard^2) 激活工作区。1. 问题：ring 每跳物化全量分数矩阵，30k 长上下文下激活峰值 ~7.5GB/跳，使 KV 账面容量（2.7x 优势）无法兑现。2. 现状：attention.rs 第六步 scores=q.matmul(k^T) 全量物化；PROJ_CHUNK_SIZE 只分块投影，不分块注意力。3. 终态：注意力按 (q_chunk x kv_chunk) 分块 + 在线 softmax 累加，激活峰值与 shard 长度解耦（有界工作区）；    验证：30k mc=16 重跑 16/16 无 OOM，mc=32 = 16 完成 + 16 fail-closed 拒绝；数值对照不回归（argmax 一致、漂移不超管线固有值）。4. 他者：flash-attention/online softmax 是所有主流引擎的标准轮子；ring-attention 论文本身即基于分块在线累加。5. 本方案：在 tch_backend/attention 路径实现分块在线 softmax（Rust/tch-rs 手写，或评估复用 flash-attn kernel 绑定——属 wheel-reuse 评估的交集）。6. 为什么：这是把 KV 容量账面优势变成可兑现服务能力的闸门；属 (A) 类轮子但直接解锁 (B) 类核心主张的实测。VERDICT: IMPLEMENT（优先级高于其他生态轮子，因为它解锁核心验证）。
+
+_updated: 2026-08-14 16:43:02_
 ### 三期战略框架：可复用轮子(A) vs HCP 架构核心(B)，对比必须分类标注
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `owner-strategy-2026-08-14-core-vs-wheels`
@@ -21,13 +42,6 @@ _updated: 2026-08-14 14:00:14_
 type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `phase3-10-kv-wall-scan-20260814`
 
 KV 容量墙扫描完成（routeb-p3-kvwall-20260814-211513，Qwen2.5-3B，30k prompts，mc 4/8/16/32）。地面真值：vLLM PD decode 池 7.88GiB=229504 tokens（自报 max concurrency 7.00x @32k）；HCP ring 聚合预算 17.99+10.42GB≈28.4GB（账面约 19 并发 30k 会话，理论容量比 2.7x）。结果：mc4 双方 4/4；mc8 双方 8/8；mc16 HCP 14/16 vs PD 16/16；mc32 HCP 0/32 vs PD 32/32。意外一：vLLM 触墙是准入排队而非 preemption（num_preemptions 全程 0），p99 TTFT 53->408s 线性排队，60/60 全完成——低而稳的软墙。意外二：HCP admission 只记 KV 字节不预留激活工作区，mc16 时 pearl KV 分配压满 16GB 后 172MB 激活分配 OOM 崩溃（worker panic->级联），mc32 全灭——账面容量优势当前无法兑现，墙以崩溃形式出现。报告：docs/PHASE3_KV_WALL_SCAN.md。VERDICT: VERIFIED——能力维对照完成并产出一个真实工程缺口。
-
-_updated: 2026-08-14 14:00:14_
-### admission 预留激活工作区余量（修复 KV 墙 OOM）
-
-type: `task` · status: `pending` · confidence: 1.0 · importance: 1.0 · source: `phase3-10-kv-wall-scan-20260814`
-
-修 admission 激活余量：让 HCP 的 fail-closed 拒绝发生在正确位置。1. 问题：KV byte admission 账面放行超出可执行容量的负载（phase3-10 mc16/32 OOM 崩溃实证）。2. 现状：admission 预算=握手时各域空闲 VRAM，仅扣 KV 字节；prefill 激活工作区（logits/attention 中间量）未入账，pearl 16GB 卡被 KV 压到 36MB 空闲后 OOM。3. 终态：预算=空闲VRAM-KV-激活工作区估计（按模型 config+当前 in-flight prefill 数）或至少固定安全余量（约2GB/域）；mc=32 重跑=16 完成+16 status=rejected，无 worker panic。4. 他者：vLLM 的做法是 KV 池在启动时按 gpu_memory_utilization 预分配固定大小，激活余量在池外天然保留；块不够时准入排队。5. 本方案：worker 握手 capacity 上报或 coordinator 入账时扣除激活余量；拒绝路径已有（status=rejected），只需预算正确。6. 为什么：这是 ring 聚合容量优势（2.7x 账面）能否兑现的闸门；崩溃式触墙违背 fail-closed 设计承诺。VERDICT: IMPLEMENT。
 
 _updated: 2026-08-14 14:00:14_
 ### 三期 A：受控 vLLM PD 对照基线（无 Ray，交错 10+10 reps）
