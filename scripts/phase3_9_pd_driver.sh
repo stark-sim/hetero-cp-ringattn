@@ -33,9 +33,10 @@ mkdir -p "${RESULT_DIR}"
 log() { echo "[pd-driver $(date +%H:%M:%S)] $*"; }
 
 cleanup() {
-    pkill -f 'vllm serve' 2>/dev/null || true
-    pkill -f 'disagg_proxy' 2>/dev/null || true
-    ssh -o ConnectTimeout=10 "${PEARL_SSH}" "pkill -f 'vllm serve' || true" 2>/dev/null || true
+    pkill -f 'vllm ser[v]e' 2>/dev/null || true
+    pkill -f 'disagg_pro[x]y' 2>/dev/null || true
+    pkill -f 'distributed-rol[e]' 2>/dev/null || true
+    ssh -o ConnectTimeout=10 "${PEARL_SSH}" "pkill -f 'vllm ser[v]e' || true; pkill -f 'distributed-rol[e]' || true" 2>/dev/null || true
 }
 trap cleanup EXIT
 

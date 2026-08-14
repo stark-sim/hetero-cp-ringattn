@@ -65,8 +65,8 @@ run_remote_white() {
 
 cleanup() {
     echo "=== Cleanup ==="
-    ssh -o ConnectTimeout=10 "${WHITE_SSH}" "pkill -f 'hcp-ringattn-rust.*distributed-role' || true; pkill -f 'vllm serve' || true; pkill -f disagg_proxy || true" 2>/dev/null || true
-    ssh -o ConnectTimeout=10 "${PEARL_SSH}" "pkill -f 'hcp-ringattn-rust.*distributed-role' || true; pkill -f 'vllm serve' || true" 2>/dev/null || true
+    ssh -o ConnectTimeout=10 "${WHITE_SSH}" "pkill -f 'hcp-ringattn-rust.*distributed-rol[e]' || true; pkill -f 'vllm ser[v]e' || true; pkill -f 'disagg_pro[x]y' || true" 2>/dev/null || true
+    ssh -o ConnectTimeout=10 "${PEARL_SSH}" "pkill -f 'hcp-ringattn-rust.*distributed-rol[e]' || true; pkill -f 'vllm ser[v]e' || true" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
@@ -245,9 +245,11 @@ run_hcp_rep_once() { # rep_label run_suffix
 
     echo "=== ${rep_label} (${suffix}) start=$(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
     date -u +%Y-%m-%dT%H:%M:%SZ > "${REPORT_DIR}/${rep_label}.start"
-    ssh -o ConnectTimeout=15 "${WHITE_SSH}" "pkill -f 'hcp-ringattn-rust.*distributed-role' || true" 2>/dev/null || true
-    ssh -o ConnectTimeout=15 "${PEARL_SSH}" "pkill -f 'hcp-ringattn-rust.*distributed-role' || true" 2>/dev/null || true
+    ssh -o ConnectTimeout=15 "${WHITE_SSH}" "pkill -f 'hcp-ringattn-rust.*distributed-rol[e]' || true; pkill -f 'vllm ser[v]e' || true; pkill -f 'disagg_pro[x]y' || true" 2>/dev/null || true
+    ssh -o ConnectTimeout=15 "${PEARL_SSH}" "pkill -f 'hcp-ringattn-rust.*distributed-rol[e]' || true; pkill -f 'vllm ser[v]e' || true" 2>/dev/null || true
     sleep 3
+    ssh -o ConnectTimeout=20 "${WHITE_SSH}" 'for _ in $(seq 1 12); do u=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1); [ "$u" -lt 1000 ] && exit 0; sleep 5; done; exit 1' || { echo "  white VRAM not freed before hcp rep"; return 1; }
+    ssh -o ConnectTimeout=20 "${PEARL_SSH}" 'for _ in $(seq 1 12); do u=$(rocm-smi --showmeminfo vram 2>/dev/null | grep -oE "Used Memory \(B\): [0-9]+" | grep -oE "[0-9]+" | head -1); [ -n "$u" ] && [ "$u" -lt 500000000 ] && exit 0; sleep 5; done; exit 1' || { echo "  pearl VRAM not freed before hcp rep"; return 1; }
 
     ssh -n -f -o ConnectTimeout=20 "${WHITE_SSH}" "mkdir -p ${state_dir} && setsid env WHITE_LAN=${WHITE_DATA_IP} PEARL_LAN=${PEARL_DATA_IP} PEARL_SSH=stark@${PEARL_DATA_IP} bash ~/${WHITE_REPO_DIR}/scripts/phase3_7a_n2_driver.sh ${rep_run_id} > ${state_dir}/driver.log 2>&1 </dev/null"
     echo "  hcp driver launched on white (state: ${state_dir}); polling STATUS..."
