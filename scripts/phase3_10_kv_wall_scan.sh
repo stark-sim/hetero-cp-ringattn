@@ -22,6 +22,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 WHITE_SSH="${WHITE_SSH:-stark@100.118.253.68}"
 EXPECTED_COMMIT="${EXPECTED_COMMIT:-$(cd "${REPO_ROOT}" && git rev-parse HEAD)}"
 LEVELS="${LEVELS:-4 8 16 32}"
+INPUT_LEN="${INPUT_LEN:-30720}"
+MAX_BATCH="${MAX_BATCH:-16}"
 
 RUN_ID="routeb-p3-kvwall-$(date +%Y%m%d-%H%M%S)"
 REPORT_DIR="${REPO_ROOT}/reports/${RUN_ID}"
@@ -59,7 +61,7 @@ run_driver() { # side label
     local state_dir="/tmp/kvwall-${side}-${RUN_ID}"
     local out_dir="${REPORT_DIR}/${side}"
     echo "=== ${side} side: launching driver on white ==="
-    ssh -n -f -o ConnectTimeout=20 "${WHITE_SSH}" "mkdir -p ${state_dir} && setsid env LEVELS='${LEVELS}' bash ~/hetero-cp-ringattn/scripts/phase3_10_kv_wall_${side}_driver.sh ${RUN_ID} > ${state_dir}/driver.log 2>&1 </dev/null"
+    ssh -n -f -o ConnectTimeout=20 "${WHITE_SSH}" "mkdir -p ${state_dir} && setsid env LEVELS='${LEVELS}' INPUT_LEN='${INPUT_LEN}' MAX_BATCH='${MAX_BATCH}' bash ~/hetero-cp-ringattn/scripts/phase3_10_kv_wall_${side}_driver.sh ${RUN_ID} > ${state_dir}/driver.log 2>&1 </dev/null"
     local status=""
     for _ in $(seq 1 90); do
         sleep 60
