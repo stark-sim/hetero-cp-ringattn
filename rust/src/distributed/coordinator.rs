@@ -119,6 +119,16 @@ struct CoordinatorArgs {
     /// capacity-wall experiments) to let the ring hold more concurrent
     /// sessions when aggregate VRAM allows.
     max_batch_size: usize,
+    /// Per-domain activation workspace reserve (MiB) subtracted from each
+    /// worker's reported capacity before KV admission accounting.
+    /// Rationale: the admission ledger books KV bytes only, but prefill also
+    /// needs transient activation memory (attention scores, logits chunks).
+    /// Without a reserve, accepted load can OOM the worker before the KV
+    /// budget is reached (observed in phase3-10: pearl OOM at mc=16 with
+    /// 30k prompts despite admission accepting all 60 requests).
+    /// Default 1536 MiB covers one serialized prefill's workspace for the
+    /// models in scope; 0 disables the reserve (historical behavior).
+    activation_reserve_mb: u64,
 }
 
 fn parse_args() -> CoordinatorArgs {
@@ -144,6 +154,7 @@ fn parse_args() -> CoordinatorArgs {
     let mut session_continuation_tokens = 64usize;
     let mut trace_jsonl = None;
     let mut max_batch_size = 4usize;
+    let mut activation_reserve_mb = 1536u64;
 
     let mut args = std::env::args().skip(1); // skip binary name
     while let Some(arg) = args.next() {
@@ -206,6 +217,13 @@ fn parse_args() -> CoordinatorArgs {
                     .parse()
                     .expect("invalid --max-batch-size")
             }
+            "--activation-reserve-mb" => {
+                activation_reserve_mb = args
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .expect("invalid --activation-reserve-mb")
+            }
             "--session-continuation-tokens" => {
                 session_continuation_tokens = args.next().unwrap().parse().unwrap();
             }
@@ -236,6 +254,7 @@ fn parse_args() -> CoordinatorArgs {
         session_continuation_tokens,
         trace_jsonl,
         max_batch_size,
+        activation_reserve_mb,
     }
 }
 
@@ -2175,7 +2194,20 @@ pub fn run() {
     println!("[coordinator] entering HTTP iterative scheduling mode (max_batch_size={max_batch_size}). Press Ctrl+C to exit.");
 
     // Active-request KV byte ledger for the whole HTTP service lifetime.
-    let kv_budgets = capacity_mb_to_bytes(&worker_capacities)
+    // Subtract a per-domain activation reserve from the reported capacities:
+    // the ledger books KV bytes only, but prefill needs transient activation
+    // workspace — without the reserve, accepted load OOMs the worker before
+    // the KV budget is reached (phase3-10 wall-scan evidence: pearl OOM at
+    // mc=16 with 30k prompts despite all 60 requests admitted).
+    let admission_capacities: Vec<u64> = worker_capacities
+        .iter()
+        .map(|&c| c.saturating_sub(args.activation_reserve_mb))
+        .collect();
+    println!(
+        "[coordinator] KV admission budgets (capacity - {} MiB activation reserve): {:?} MiB",
+        args.activation_reserve_mb, admission_capacities
+    );
+    let kv_budgets = capacity_mb_to_bytes(&admission_capacities)
         .expect("worker capacities must be convertible to byte budgets");
     let mut kv_ledger = ActiveKvReservation::new(kv_budgets);
 
