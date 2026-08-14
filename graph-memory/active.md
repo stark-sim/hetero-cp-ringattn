@@ -2,16 +2,9 @@
 
 当前活跃的任务、决策、风险和假设。
 
-### 审计二期缺口并重排 white 离线期间的三期计划
-
-type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-14`
-
-审计路线 B 二期 benchmark-readiness 的剩余缺口，并把三期从宽泛生态目标细化为可独立验证的任务图。当前 white 因网络迁移事故暂时离线，因此计划必须区分：Mac 本地立即可做、pearl/laptop 经即时 inventory 门禁后可做、white 恢复后才能完成的真实异构门禁。产出应包含二期已充分完成项、按严重度排序的不足、每个三期节点的目标/输入/产出/验证门槛/依赖/失败判据/commit 边界，以及需要 owner 确认的 material trade-off。此节点只做审计与规划，不启动远程实验或实现。
-
-_updated: 2026-08-14 03:42:43_
 ### 三期按证据依赖而非 white 可用性串行推进
 
-type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-14`
+type: `decision` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-14`
 
 动机剖析六问：
 1. 问题：二期已以 benchmark-readiness 名义完成并合入 main，但其明确不含性能结论；三期已完成 vllm bench 黑盒与 continuation 服务路径 E2E，却仍有生态能力、placement/ledger、故障恢复和可比性能等开放面。white 临时离线使原先依赖 N=2/N=3 真实异构节点的顺序需要重排。
@@ -21,6 +14,63 @@ type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · sour
 5. 本方案：先独立审计二期边界和现有三期证据，再按本地、当前在线节点、white 恢复后三类重排任务；每个节点坚持最小可证伪产出与单独 commit 边界，远程执行前重新读取 infrastructure inventory 并做只读可达性门禁。
 6. 为什么：继续按原硬件顺序会让 white 离线把全部三期串行阻塞；直接跳到实现又会重复二期已完成能力或把 WiFi 环境噪声误当算法结论。按依赖和证据类型拆分，既保持推进，也避免把环境性事实混入方案判断。
 VERDICT: PLAN_AND_AUDIT；实现与远程实验等待具体节点确认。
+
+_updated: 2026-08-14 05:45:45_
+### 二期缺口按 bounded reconnect、session ownership、wired baseline 重排
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-14-phase2-gaps`
+
+动机剖析六问：
+1. 问题：上一轮把连接恢复、session KV、性能环境和地址默认值都列为三期缺口，但优先级与目标部署假设不够准确。
+2. 现状：HCP 节点是专供设备，正常情况下应持续在线；同时支持 LAN/VPN，短时网络抖动客观存在。white 已恢复且与 pearl 建立 2.5GbE 直连。keep_kv session 当前强持有分布式 KV；地址默认值仍能服务当前 N=2/N=3 harness。
+3. 终态：连接只在严格预算内恢复短时波动，超预算立即失败而不等待离线节点；session KV 采用可回收 ownership；性能在 2.5GbE 上重新建多轮基线；地址发现留到 N 增长时与 neighbor-only 部分可见拓扑一起设计。
+4. 他者：vLLM 普通请求完成后释放 request block ownership；prefix caching 使完成块以 ref_cnt=0 进入 LRU free queue，可在内存压力下立即覆盖，而不是被 application session 永久 pin；运行中 ref_cnt>0 的块受保护，并提供 reset_prefix_cache/sleep 等运维清理。
+5. 本方案：bounded retry + fail-fast topology unavailable；HCP idle session 进入分布式 LRU eviction 候选，append 执行期间 pin，显式 release/admin reset，压力驱逐后 append 返回 session miss；有线 baseline 记录 network.json 并跑 10 reps。
+6. 为什么：长时间等待离线节点违背专供设备假设并拖垮请求尾延迟；固定 TTL 不是 vLLM 的核心机制，pressure-evictable ownership 更贴近真实内存管理；当前地址抽象尚未面对 N 节点部分可见图，过早泛化收益不足。
+VERDICT: REPRIORITIZE。先完成 wired baseline 与 session ownership 设计，reconnect 仅实现短时 bounded recovery。
+
+_updated: 2026-08-14 05:45:45_
+### 连接恢复只覆盖短时 LAN/VPN 抖动，超预算 fail-fast
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-14-phase2-gaps`
+
+部署假设：所有 worker 是专供且理应持续在线，不为长时间离线节点保留请求或无限等待。恢复合同：连接/stream 异常后在可配置的 attempt+wall-clock 双预算内重拨；退避必须有上限；预算耗尽后当前请求失败、KV/ledger 恰好释放一次、拓扑标记 unavailable，新请求 fail-closed，worker 后续重新注册可恢复服务。固定 N ring 不在请求中途缩容。默认次数与总时长不在本决策中拍死，由本地 fault injection 和 2.5GbE/VPN 抖动数据确定；目标是秒级而非分钟级。
+
+_updated: 2026-08-14 05:45:45_
+### HCP idle session KV 改为可驱逐 ownership，不永久 pin
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-14-phase2-gaps`
+
+vLLM 对照结论：请求完成时 scheduler free request ownership；启用 automatic prefix caching 时，完整缓存块保留 block hash，但 ref_cnt 降为 0 并进入 LRU free queue，既可命中复用，也可在下一次分配时被立即驱逐；活跃请求 touch 后 ref_cnt>0 并移出 free queue。该机制不依赖 TTL；另有 reset_prefix_cache 和 sleep(level>=1) 清空 KV。
+HCP 采用对应边界而非照搬中心 block pool：keep_kv 完成后的 session 标记 idle+evictable，进入 coordinator 维护的分布式 LRU；append/continued decode 期间 pin，不可驱逐；admission 空间不足时按 LRU 原子驱逐 idle session，并向所有 domains 发送 ReleaseRequest，ledger exactly-once release；被驱逐 session 的 append 返回明确 session miss/expired，客户端可重新 prefill。补充显式 release 与 admin reset。TTL 仅作为可选部署上限，不作为主要正确性机制；不做跨 session prefix sharing。
+
+_updated: 2026-08-14 05:45:45_
+### white-pearl 2.5GbE 直连门禁通过：2.35 Gbit/s、0 retransmit
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-14-phase2-gaps`
+
+2026-08-14 inventory 与实机验证：white enp10s0=192.168.100.1/24，pearl enp8s0=192.168.100.2/24；两端 ethtool 均为 2500Mb/s Full、link detected yes，路由明确走直连接口。双向 10-packet RTT：white→pearl avg 0.167ms，pearl→white avg 0.116ms，0% loss。iperf3 单流 5x10s receiver 全部 2.35 Gbit/s，sender 2.35-2.36 Gbit/s，全部 0 retransmit；4 streams receiver 2.35 Gbit/s、0 retransmit。相对旧 WiFi 单流约 44 Mbit/s 提升约 53x，链路波动显著收窄，满足重建性能基线的网络门禁。
+
+_updated: 2026-08-14 05:45:45_
+### 在 white-pearl 2.5GbE 上重建 10-rep N=2 vllm bench 基线
+
+type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-14-phase2-gaps`
+
+使用 phase3_8_perf_baseline_n2.sh，数据面固定 192.168.100.1↔192.168.100.2，REPS=10；每 rep 新建 coordinator/workers，L1/L2/L3 correctness gate 全过才进入统计。network.json 必须记录 2.5GbE 接口、RTT、iperf goodput/retransmits；控制脚本保存 sha256 与未提交 diff。旧 WiFi 表只保留历史环境证据，不与本轮数值合并。当前运行中。
+
+_updated: 2026-08-14 05:45:45_
+### 当前地址默认值不列为二期缺口，N 增长时统一设计 neighbor-only 寻址
+
+type: `decision` · status: `deferred` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-14-phase2-gaps`
+
+当前 N=2/N=3 harness 的地址默认值可接受，不为通用化单独立项。未来 N 增长时，ring 上相邻节点可达但非相邻节点可能互相不可见，不能假设 coordinator 能把全体 endpoint 当作全互联地址表。届时把节点身份、控制面注册地址、每节点 predecessor/successor 可达 endpoint、NAT/VPN/LAN 多地址选择和 ring epoch 一起设计；当前只允许运行时显式覆盖数据面地址以选择 2.5GbE，不改变拓扑模型。
+
+_updated: 2026-08-14 05:45:45_
+### 审计二期缺口并重排 white 离线期间的三期计划
+
+type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-14`
+
+审计路线 B 二期 benchmark-readiness 的剩余缺口，并把三期从宽泛生态目标细化为可独立验证的任务图。当前 white 因网络迁移事故暂时离线，因此计划必须区分：Mac 本地立即可做、pearl/laptop 经即时 inventory 门禁后可做、white 恢复后才能完成的真实异构门禁。产出应包含二期已充分完成项、按严重度排序的不足、每个三期节点的目标/输入/产出/验证门槛/依赖/失败判据/commit 边界，以及需要 owner 确认的 material trade-off。此节点只做审计与规划，不启动远程实验或实现。
 
 _updated: 2026-08-14 03:42:43_
 ### [2026-08-13] 三期 8:服务路径 continuation 两阶段 E2E 通过(N=2 white CUDA + pearl HIP LAN,golden PASS)
