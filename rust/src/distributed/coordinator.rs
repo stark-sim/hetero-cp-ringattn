@@ -2031,10 +2031,21 @@ pub fn run() {
         ));
     }
     worker_handshakes.sort_by_key(|(domain_id, _, _, _)| *domain_id);
+    // Subtract the per-domain activation reserve at the single source so that
+    // EVERY downstream accounting path (KV admission ledger, capacity-aware
+    // sharding, continuation tickets) sees reserve-adjusted capacities.
+    // Rationale: admission books KV bytes only, but prefill needs transient
+    // activation workspace — without the reserve, accepted load OOMs the
+    // worker before the KV budget is reached (phase3-10 wall-scan evidence:
+    // pearl OOM at mc=16 with 30k prompts despite all 60 requests admitted).
     let worker_capacities: Vec<u64> = worker_handshakes
         .iter()
-        .map(|(_, cap, _, _)| *cap)
+        .map(|(_, cap, _, _)| cap.saturating_sub(args.activation_reserve_mb))
         .collect();
+    println!(
+        "[coordinator] worker capacities after {} MiB activation reserve: {:?} MiB",
+        args.activation_reserve_mb, worker_capacities
+    );
     let worker_streams: Vec<(quinn::SendStream, quinn::RecvStream)> = worker_handshakes
         .into_iter()
         .map(|(_, _, send, recv)| (send, recv))
@@ -2194,20 +2205,9 @@ pub fn run() {
     println!("[coordinator] entering HTTP iterative scheduling mode (max_batch_size={max_batch_size}). Press Ctrl+C to exit.");
 
     // Active-request KV byte ledger for the whole HTTP service lifetime.
-    // Subtract a per-domain activation reserve from the reported capacities:
-    // the ledger books KV bytes only, but prefill needs transient activation
-    // workspace — without the reserve, accepted load OOMs the worker before
-    // the KV budget is reached (phase3-10 wall-scan evidence: pearl OOM at
-    // mc=16 with 30k prompts despite all 60 requests admitted).
-    let admission_capacities: Vec<u64> = worker_capacities
-        .iter()
-        .map(|&c| c.saturating_sub(args.activation_reserve_mb))
-        .collect();
-    println!(
-        "[coordinator] KV admission budgets (capacity - {} MiB activation reserve): {:?} MiB",
-        args.activation_reserve_mb, admission_capacities
-    );
-    let kv_budgets = capacity_mb_to_bytes(&admission_capacities)
+    // worker_capacities is already activation-reserve-adjusted at the source
+    // (right after the handshake), so all accounting paths agree.
+    let kv_budgets = capacity_mb_to_bytes(&worker_capacities)
         .expect("worker capacities must be convertible to byte budgets");
     let mut kv_ledger = ActiveKvReservation::new(kv_budgets);
 
