@@ -35,6 +35,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 WHITE_SSH="${WHITE_SSH:-stark@100.118.253.68}"
 PEARL_SSH="${PEARL_SSH:-stark@100.111.242.55}"
+WHITE_DATA_IP="${WHITE_DATA_IP:-192.168.100.1}"
+PEARL_DATA_IP="${PEARL_DATA_IP:-192.168.100.2}"
 WHITE_REPO_DIR="${WHITE_REPO_DIR:-hetero-cp-ringattn}"
 PEARL_REPO_DIR="${PEARL_REPO_DIR:-hetero-cp-ringattn}"
 
@@ -44,6 +46,8 @@ EXPECTED_COMMIT="${EXPECTED_COMMIT:-$(cd "${REPO_ROOT}" && git rev-parse HEAD)}"
 RUN_ID="routeb-p3-baseline-$(date +%Y%m%d-%H%M%S)"
 REPORT_DIR="${REPO_ROOT}/reports/${RUN_ID}"
 mkdir -p "${REPORT_DIR}"
+shasum -a 256 "$0" > "${REPORT_DIR}/controller_script.sha256"
+git -C "${REPO_ROOT}" diff -- "$0" > "${REPORT_DIR}/controller_script.diff"
 
 # Per-level load params (identical to the 7a N=2 ladder).
 L1_PARAMS="num_prompts=8 request_rate=1 max_concurrency=none"
@@ -94,42 +98,40 @@ pearl_build="cd $(shell_quote "${PEARL_REPO_DIR}") && cd rust && PATH=/home/star
 ssh -o ConnectTimeout=30 "${PEARL_SSH}" "bash -lc $(shell_quote "${pearl_build}")" 2>&1 | tail -2
 
 # === Network metadata ===
-# This baseline is only comparable against runs on an equivalent link. The
-# 192.168.8.x path between white and pearl is WiFi (wlp11s0 / wlo1), so
-# record interface/PHY state, RTT, and the measured TCP goodput ceiling
-# (iperf3, one-shot) before the rep loop; the aggregate step folds
-# network.json into baseline.json.
+# This baseline is only comparable against runs on an equivalent link. Record
+# the actual routed interface, RTT, and measured TCP goodput before the rep
+# loop; the aggregate step folds network.json into baseline.json.
 echo "=== Network metadata (link info + RTT + iperf3 ceiling) ==="
 NET_DIR="${REPORT_DIR}/network"
 mkdir -p "${NET_DIR}"
 
-ssh -o ConnectTimeout=20 "${WHITE_SSH}" '
-    dev=$(ip -4 route get 192.168.8.176 | sed -n "s/.*dev \([^ ]*\).*/\1/p" | head -1)
-    echo "egress_dev=${dev}"
-    ip -4 addr show "${dev}" | grep inet || true
-    iw dev "${dev}" link 2>/dev/null || { echo "(no iw link info)"; cat /proc/net/wireless; }
-' > "${NET_DIR}/white-link.txt" 2>&1 || true
+ssh -o ConnectTimeout=20 "${WHITE_SSH}" "
+    dev=\$(ip -4 route get ${PEARL_DATA_IP} | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1)
+    echo \"egress_dev=\${dev}\"
+    ip -4 addr show \"\${dev}\" | grep inet || true
+    ethtool \"\${dev}\" 2>/dev/null | grep -E 'Speed:|Duplex:|Link detected:' || true
+" > "${NET_DIR}/white-link.txt" 2>&1 || true
 
-ssh -o ConnectTimeout=20 "${PEARL_SSH}" '
-    dev=$(ip -4 route get 192.168.8.172 | sed -n "s/.*dev \([^ ]*\).*/\1/p" | head -1)
-    echo "egress_dev=${dev}"
-    ip -4 addr show "${dev}" | grep inet || true
-    iw dev "${dev}" link 2>/dev/null || { echo "(no iw link info)"; cat /proc/net/wireless; }
-' > "${NET_DIR}/pearl-link.txt" 2>&1 || true
+ssh -o ConnectTimeout=20 "${PEARL_SSH}" "
+    dev=\$(ip -4 route get ${WHITE_DATA_IP} | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1)
+    echo \"egress_dev=\${dev}\"
+    ip -4 addr show \"\${dev}\" | grep inet || true
+    ethtool \"\${dev}\" 2>/dev/null | grep -E 'Speed:|Duplex:|Link detected:' || true
+" > "${NET_DIR}/pearl-link.txt" 2>&1 || true
 
-ssh -o ConnectTimeout=20 "${WHITE_SSH}" 'ping -c 20 -i 0.2 192.168.8.176' \
+ssh -o ConnectTimeout=20 "${WHITE_SSH}" "ping -c 20 -i 0.2 ${PEARL_DATA_IP}" \
     > "${NET_DIR}/ping-white-to-pearl.txt" 2>&1 || true
 
 # iperf3 one-shot server on pearl (-1: exit after first test), 5s client on white.
-ssh -o ConnectTimeout=20 "${PEARL_SSH}" 'pkill iperf3 2>/dev/null; sleep 1; nohup iperf3 -s -B 192.168.8.176 -p 5201 -1 >/tmp/hcp-iperf3-baseline.log 2>&1 & sleep 2; ss -tln | grep -q 5201' || true
-ssh -o ConnectTimeout=30 "${WHITE_SSH}" 'iperf3 -c 192.168.8.176 -p 5201 -t 5' \
+ssh -o ConnectTimeout=20 "${PEARL_SSH}" "pkill iperf3 2>/dev/null; sleep 1; nohup iperf3 -s -B ${PEARL_DATA_IP} -p 5201 -1 >/tmp/hcp-iperf3-baseline.log 2>&1 & sleep 2; ss -tln | grep -q 5201" || true
+ssh -o ConnectTimeout=30 "${WHITE_SSH}" "iperf3 -c ${PEARL_DATA_IP} -p 5201 -t 5" \
     > "${NET_DIR}/iperf3-white-to-pearl.txt" 2>&1 || true
 ssh -o ConnectTimeout=20 "${PEARL_SSH}" 'pkill iperf3 2>/dev/null || true' || true
 
-python3 - "${NET_DIR}" <<'NETPY'
+python3 - "${NET_DIR}" "${WHITE_DATA_IP}" "${PEARL_DATA_IP}" <<'NETPY'
 import json, re, sys, os
 
-net_dir = sys.argv[1]
+net_dir, white_data_ip, pearl_data_ip = sys.argv[1:]
 def read(name):
     try:
         return open(os.path.join(net_dir, name)).read()
@@ -141,6 +143,8 @@ iperf = read("iperf3-white-to-pearl.txt")
 out = {
     "purpose": "baseline comparability metadata: ring traffic crosses this link; only compare against baselines with an equivalent network block",
     "captured_at": "baseline start (before rep loop)",
+    "white_data_ip": white_data_ip,
+    "pearl_data_ip": pearl_data_ip,
     "white_link": read("white-link.txt"),
     "pearl_link": read("pearl-link.txt"),
     "ping_white_to_pearl_raw": ping,
@@ -150,13 +154,16 @@ m = re.search(r"rtt min/avg/max/mdev = ([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+) ms", 
 if m:
     out["rtt_ms"] = {"min": float(m.group(1)), "avg": float(m.group(2)),
                      "max": float(m.group(3)), "mdev": float(m.group(4))}
-m = re.search(r"([\d.]+) Mbits/sec\s+receiver", iperf)
+def to_mbps(value, unit):
+    return float(value) * {"K": 0.001, "M": 1.0, "G": 1000.0}[unit]
+
+m = re.search(r"([\d.]+) ([KMG])bits/sec\s+receiver", iperf)
 if m:
-    out["iperf3_tcp_goodput_mbps_receiver"] = float(m.group(1))
-m = re.search(r"([\d.]+) Mbits/sec\s+(\d+)\s+sender", iperf)
+    out["iperf3_tcp_goodput_mbps_receiver"] = to_mbps(m.group(1), m.group(2))
+m = re.search(r"([\d.]+) ([KMG])bits/sec\s+(\d+)\s+sender", iperf)
 if m:
-    out["iperf3_tcp_goodput_mbps_sender"] = float(m.group(1))
-    out["iperf3_retransmits"] = int(m.group(2))
+    out["iperf3_tcp_goodput_mbps_sender"] = to_mbps(m.group(1), m.group(2))
+    out["iperf3_retransmits"] = int(m.group(3))
 json.dump(out, open(os.path.join(net_dir, "..", "network.json"), "w"), indent=2)
 print("network metadata: rtt_ms=%s goodput_mbps=%s retr=%s" %
       (out.get("rtt_ms"), out.get("iperf3_tcp_goodput_mbps_receiver"),
@@ -221,7 +228,7 @@ run_rep_once() { # rep_label run_suffix
 
     # ssh -n -f returns right after launching the driver; the driver owns the
     # full N=2 lifecycle on white even if the Mac goes away.
-    ssh -n -f -o ConnectTimeout=20 "${WHITE_SSH}" "mkdir -p ${state_dir} && setsid bash ~/${WHITE_REPO_DIR}/scripts/phase3_7a_n2_driver.sh ${rep_run_id} > ${state_dir}/driver.log 2>&1 </dev/null"
+    ssh -n -f -o ConnectTimeout=20 "${WHITE_SSH}" "mkdir -p ${state_dir} && setsid env WHITE_LAN=${WHITE_DATA_IP} PEARL_LAN=${PEARL_DATA_IP} bash ~/${WHITE_REPO_DIR}/scripts/phase3_7a_n2_driver.sh ${rep_run_id} > ${state_dir}/driver.log 2>&1 </dev/null"
     echo "  driver launched on white (state: ${state_dir}); polling STATUS..."
 
     local status=""
@@ -327,8 +334,8 @@ baseline = {
         "git_commit": commit,
         "topology": {
             "coordinator": "white (also worker 0 + bench client)",
-            "worker0": "white stark@100.118.253.68 (LAN 192.168.8.172), RTX 4090, CUDA, domain 0",
-            "worker1": "pearl stark@100.111.242.55 (LAN 192.168.8.176), RX 9060 XT, HIP (libtorch_hip LD_PRELOAD), domain 1",
+            "worker0": "white ${WHITE_SSH} (data ${WHITE_DATA_IP}), RTX 4090, CUDA, domain 0",
+            "worker1": "pearl ${PEARL_SSH} (data ${PEARL_DATA_IP}), RX 9060 XT, HIP (libtorch_hip LD_PRELOAD), domain 1",
             "mac": "control-only (launch/poll/fetch); not in the service path",
         },
         "network": network,
