@@ -2,6 +2,27 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 审计二期缺口并重排 white 离线期间的三期计划
+
+type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-14`
+
+审计路线 B 二期 benchmark-readiness 的剩余缺口，并把三期从宽泛生态目标细化为可独立验证的任务图。当前 white 因网络迁移事故暂时离线，因此计划必须区分：Mac 本地立即可做、pearl/laptop 经即时 inventory 门禁后可做、white 恢复后才能完成的真实异构门禁。产出应包含二期已充分完成项、按严重度排序的不足、每个三期节点的目标/输入/产出/验证门槛/依赖/失败判据/commit 边界，以及需要 owner 确认的 material trade-off。此节点只做审计与规划，不启动远程实验或实现。
+
+_updated: 2026-08-14 03:42:43_
+### 三期按证据依赖而非 white 可用性串行推进
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-14`
+
+动机剖析六问：
+1. 问题：二期已以 benchmark-readiness 名义完成并合入 main，但其明确不含性能结论；三期已完成 vllm bench 黑盒与 continuation 服务路径 E2E，却仍有生态能力、placement/ledger、故障恢复和可比性能等开放面。white 临时离线使原先依赖 N=2/N=3 真实异构节点的顺序需要重排。
+2. 现状：二期提供 admission、active reservation、FIFO decode、observability、native baseline 与 N=3 服务正确性；三期已有 7a vllm bench、8 continuation E2E 和 5-rep N=2 基线，但最新证据判定该基线受约 44 Mbit/s 双端 WiFi 链路约束，网络元数据不等价时不可比较。white 的单 networkd 迁移待物理恢复验证。
+3. 终态：形成一份证据化缺口清单与依赖有向的三期执行计划；不依赖 white 的节点可以立即启动，依赖真实异构链路的节点有明确恢复门禁，所有性能结论都先通过网络等价性门禁。
+4. 他者：vLLM 等 serving 生态通常把协议兼容、请求调度/batching、KV placement、故障处理和 benchmark 方法拆成独立层，并通过标准客户端与可复现环境分别验收；不能用一次端到端成功替代每层门禁。
+5. 本方案：先独立审计二期边界和现有三期证据，再按本地、当前在线节点、white 恢复后三类重排任务；每个节点坚持最小可证伪产出与单独 commit 边界，远程执行前重新读取 infrastructure inventory 并做只读可达性门禁。
+6. 为什么：继续按原硬件顺序会让 white 离线把全部三期串行阻塞；直接跳到实现又会重复二期已完成能力或把 WiFi 环境噪声误当算法结论。按依赖和证据类型拆分，既保持推进，也避免把环境性事实混入方案判断。
+VERDICT: PLAN_AND_AUDIT；实现与远程实验等待具体节点确认。
+
+_updated: 2026-08-14 03:42:43_
 ### [2026-08-13] 三期 8:服务路径 continuation 两阶段 E2E 通过(N=2 white CUDA + pearl HIP LAN,golden PASS)
 
 type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@phase3-8-e2e`
@@ -1971,11 +1992,11 @@ type: `task` · status: `superseded` · confidence: 1.0 · importance: 0.94 · s
 _updated: 2026-08-11 19:10:38_
 ### 支线：white 双 network 模式恢复为 pearl 式单 networkd 管理模式
 
-type: `task` · status: `active` · confidence: 1.0 · importance: 0.9 · source: `user-direction-20260814`
+type: `task` · status: `completed` · confidence: 1.0 · importance: 0.9 · source: `user-direction-20260814`
 
-迁移磁盘配置已完成（NM masked、netplan 单 networkd、enp10s0 静态 192.168.100.1/24、wlp11s0 networkd 管理 STARK_1821），但收尾 apply 事故致节点失联，待物理重启后验证：单管理模式生效、有线 IP 稳定、Wi-Fi 恢复、tailscale 回归、更新 inventory。
+[2026-08-14 完成] white 从双 network 模式（netplan 全局 renderer NetworkManager + networkd 并存争抢）恢复为 pearl 式单 systemd-networkd 模式：两接口显式 renderer: networkd，NetworkManager 已 purge。有线 enp10s0 静态 192.168.100.1/24 稳定（networkd 直配），Wi-Fi wlp11s0 networkd+netplan-wpa-wlp11s0 DHCP。证据见 ev-white-single-networkd-done-20260814。重启持久性验证待做。
 
-_updated: 2026-08-13 17:35:34_
+_updated: 2026-08-14 04:30:16_
 ### 三期 8:continuation 服务路径 E2E(HTTP session + golden + N=2 LAN 验证)
 
 type: `task` · status: `done` · confidence: 1.0 · importance: 0.9 · source: `hetero-cp-ringattn@phase3-8-plan`

@@ -2,6 +2,13 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### white 单 networkd 模式迁移完成，NM 已 purge，根因是 /usr/lib 全局 renderer 默认值
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 0.95 · source: `white-netplan-unify-fix-20260814`
+
+[2026-08-14] white 单 networkd 模式迁移完成（NM 已 purge）。根因：/usr/lib/netplan 出厂默认文件设全局 renderer: NetworkManager，/etc/netplan 设备配置未显式声明 renderer，导致 enp10s0/wlp11s0 全部渲染给 NM——mask NM 后无人配 IP，这就是重启失联需人工 ip addr add 的原因。修复按 owner 指定顺序：1) wlp11s0 显式 renderer: networkd，验证 DHCP 192.168.8.173、网关/互联网通、tailscale 回归；2) enp10s0 显式 renderer: networkd，静态 192.168.100.1/24 由 networkd 配出，pearl 双向 ping 0.15ms；3) purge network-manager 及 6 个插件包（模拟确认不拖桌面依赖）。终态：netplan generate OK，两接口均 networkd 管理（10-netplan-*.network 生效），netplan-wpa-wlp11s0.service active，kubelet/tailscaled active。全程经 pearl 有线跳板 + tailscale 双路径，apply 均 nohup 脱离会话，零失联。待办：重启持久性验证。
+
+_updated: 2026-08-14 04:30:16_
 ### white 网络单模式化迁移事故：配置正确但执行不失联，双路径中断
 
 type: `evidence` · status: `verified` · confidence: 1.0 · importance: 0.95 · source: `white-netplan-unify-incident-20260814`
