@@ -2,6 +2,27 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 三期 A 补：KV 容量墙对照实验（长 context x 并发扫描）
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-14-kv-wall-boundary`
+
+三期 A 补：KV 容量墙对照实验（context x concurrency 扫描）。动机剖析六问：1. 问题：PD bench（32-token 输入）只测引擎开销，完全没碰 HCP 存在的理由——异构合作缓解 KV 显存压力；需要量化两栈的 KV 容量天花板差异。2. 现状：N=2 有线基线 + PD 对照 harness 就绪；HCP N=3 16k-token ring E2E 已证；vLLM PD 的 KV 全在 decode 节点（pearl 16GB，池约 13GB），HCP N=2 分片后聚合约 2x。3. 终态：input_len 长 context（如 4k/16k/64k）x 并发档位递增的扫描曲线：vLLM PD 侧观测到 KV 池耗尽后的 preemption/延迟崩塌点，HCP 侧观测到 fail-closed 拒绝点；两曲线并排，容量天花板比值可读出；过墙行为差异（preempt vs reject）明确记录。4. 他者：vLLM 触墙行为是 preemption（recompute 模式）——块池耗尽时换出重算，TTFT 尾部爆炸；HCP 是 byte-level admission fail-closed——直接拒绝。两者都是合法策略，比较的是墙的位置不是策略优劣。5. 本方案：复用 phase3_9 交错 harness 形态；每档先单发 sanity 再 ramp；vLLM 侧从 /metrics 或日志抓 preemption 计数，HCP 侧从 metrics failed/admission 拒绝计数；记录每档 VRAM 占用与 KV 池水位。6. 为什么：这是唯一能在当前硬件（16+24GB）上把蓝图主张（显存墙->可调度问题）变成可测量曲线的方法；单机绳长上限内两栈都能跑满，唯有并发长 context 能把墙逼出来。VERDICT: IMPLEMENT，排在 phase3-9 交错基线完成之后（避免 GPU 争用）。
+
+_updated: 2026-08-14 14:00:14_
+### KV 墙扫描：vLLM 软墙排队 60/60，HCP 账面 2.7x 优势但 admission 缺激活余量致 OOM
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `phase3-10-kv-wall-scan-20260814`
+
+KV 容量墙扫描完成（routeb-p3-kvwall-20260814-211513，Qwen2.5-3B，30k prompts，mc 4/8/16/32）。地面真值：vLLM PD decode 池 7.88GiB=229504 tokens（自报 max concurrency 7.00x @32k）；HCP ring 聚合预算 17.99+10.42GB≈28.4GB（账面约 19 并发 30k 会话，理论容量比 2.7x）。结果：mc4 双方 4/4；mc8 双方 8/8；mc16 HCP 14/16 vs PD 16/16；mc32 HCP 0/32 vs PD 32/32。意外一：vLLM 触墙是准入排队而非 preemption（num_preemptions 全程 0），p99 TTFT 53->408s 线性排队，60/60 全完成——低而稳的软墙。意外二：HCP admission 只记 KV 字节不预留激活工作区，mc16 时 pearl KV 分配压满 16GB 后 172MB 激活分配 OOM 崩溃（worker panic->级联），mc32 全灭——账面容量优势当前无法兑现，墙以崩溃形式出现。报告：docs/PHASE3_KV_WALL_SCAN.md。VERDICT: VERIFIED——能力维对照完成并产出一个真实工程缺口。
+
+_updated: 2026-08-14 14:00:14_
+### admission 预留激活工作区余量（修复 KV 墙 OOM）
+
+type: `task` · status: `pending` · confidence: 1.0 · importance: 1.0 · source: `phase3-10-kv-wall-scan-20260814`
+
+修 admission 激活余量：让 HCP 的 fail-closed 拒绝发生在正确位置。1. 问题：KV byte admission 账面放行超出可执行容量的负载（phase3-10 mc16/32 OOM 崩溃实证）。2. 现状：admission 预算=握手时各域空闲 VRAM，仅扣 KV 字节；prefill 激活工作区（logits/attention 中间量）未入账，pearl 16GB 卡被 KV 压到 36MB 空闲后 OOM。3. 终态：预算=空闲VRAM-KV-激活工作区估计（按模型 config+当前 in-flight prefill 数）或至少固定安全余量（约2GB/域）；mc=32 重跑=16 完成+16 status=rejected，无 worker panic。4. 他者：vLLM 的做法是 KV 池在启动时按 gpu_memory_utilization 预分配固定大小，激活余量在池外天然保留；块不够时准入排队。5. 本方案：worker 握手 capacity 上报或 coordinator 入账时扣除激活余量；拒绝路径已有（status=rejected），只需预算正确。6. 为什么：这是 ring 聚合容量优势（2.7x 账面）能否兑现的闸门；崩溃式触墙违背 fail-closed 设计承诺。VERDICT: IMPLEMENT。
+
+_updated: 2026-08-14 14:00:14_
 ### 三期 A：受控 vLLM PD 对照基线（无 Ray，交错 10+10 reps）
 
 type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-14-pd-baseline`
@@ -21,13 +42,6 @@ _updated: 2026-08-14 12:23:41_
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-14-kv-wall-boundary`
 
 owner 裁决（2026-08-14）：三期 A 对照实验必须区分两个维度，互不替代：(a) 引擎开销对照：同负载（小 context）下 HCP vs vLLM PD 的延迟/吞吐——vLLM PD 更快是预期结果，量化的是 HCP 执行器成熟度差距；(b) 能力对照：KV 容量墙——vLLM PD 把单请求全量 KV 压在 decode 单节点（天花板=单节点 VRAM 池，触墙表现为 preemption/重排队），HCP ring 把每请求 KV 分片到全环（天花板=聚合 VRAM，触墙表现为 fail-closed admission 拒绝）；ring attention 的核心价值是 (b) 的长上下文支撑能力，(a) 的数字不得脱离该边界被引用。docs/PHASE3_N2_PERF_BASELINE.md 与 phase3-9 comparison.json 必须携带此边界声明。
-
-_updated: 2026-08-14 11:50:19_
-### 三期 A 补：KV 容量墙对照实验（长 context x 并发扫描）
-
-type: `task` · status: `pending` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-14-kv-wall-boundary`
-
-三期 A 补：KV 容量墙对照实验（context x concurrency 扫描）。动机剖析六问：1. 问题：PD bench（32-token 输入）只测引擎开销，完全没碰 HCP 存在的理由——异构合作缓解 KV 显存压力；需要量化两栈的 KV 容量天花板差异。2. 现状：N=2 有线基线 + PD 对照 harness 就绪；HCP N=3 16k-token ring E2E 已证；vLLM PD 的 KV 全在 decode 节点（pearl 16GB，池约 13GB），HCP N=2 分片后聚合约 2x。3. 终态：input_len 长 context（如 4k/16k/64k）x 并发档位递增的扫描曲线：vLLM PD 侧观测到 KV 池耗尽后的 preemption/延迟崩塌点，HCP 侧观测到 fail-closed 拒绝点；两曲线并排，容量天花板比值可读出；过墙行为差异（preempt vs reject）明确记录。4. 他者：vLLM 触墙行为是 preemption（recompute 模式）——块池耗尽时换出重算，TTFT 尾部爆炸；HCP 是 byte-level admission fail-closed——直接拒绝。两者都是合法策略，比较的是墙的位置不是策略优劣。5. 本方案：复用 phase3_9 交错 harness 形态；每档先单发 sanity 再 ramp；vLLM 侧从 /metrics 或日志抓 preemption 计数，HCP 侧从 metrics failed/admission 拒绝计数；记录每档 VRAM 占用与 KV 池水位。6. 为什么：这是唯一能在当前硬件（16+24GB）上把蓝图主张（显存墙->可调度问题）变成可测量曲线的方法；单机绳长上限内两栈都能跑满，唯有并发长 context 能把墙逼出来。VERDICT: IMPLEMENT，排在 phase3-9 交错基线完成之后（避免 GPU 争用）。
 
 _updated: 2026-08-14 11:50:19_
 ### 三期对照基线采用 vLLM PD 分离形态（无 Ray），取代 PP 口径
