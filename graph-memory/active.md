@@ -2,18 +2,39 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 三期 A：受控 vLLM PD 对照基线（无 Ray，交错 10+10 reps）
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-14-pd-baseline`
+
+三期 A：受控 vLLM PD 对照基线（无 Ray）。步骤：0. 尖峰：两端装 nixl，PD pair 起在 192.168.100.x，单请求 curl 验证 token 合理 + KV 确实跨有线（日志+接口字节计数）；不可行则带证据回来定备选（moriio/lmcache/PP+Ray）。1. vLLM 侧 ladder 单跑 sanity（L1/L2/L3 32 prompts 全完成）。2. 交错战役：单一 harness 逐 rep 交替 HCP 栈(phase3_7a_n2_driver) 与 vLLM PD 栈，各 10 reps；每 rep 全新栈；HCP rep 过 7a 门禁，vLLM rep 过 32/32+指标 sane 门禁；战役级 network.json。3. 聚合：side-by-side 表（中位/min/max/spread），按 docs 比较规则出结论；graph evidence；docs 更新。commit 边界：step0 证据独立 commit；harness 脚本独立 commit；结论+docs+graph 收尾 commit。
+
+_updated: 2026-08-14 12:23:41_
+### 三期A交错对照：HCP N=2 vs vLLM PD 10+10 rep 全绿，开销维差距量化
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `phase3-9-interleaved-baseline-20260814`
+
+三期 A 受控对照完成：routeb-p3-pd-baseline-20260814-194248，10+10 交错 rep 全 PASS（无重试触发）。median 对照（HCP/PD）：L1 TTFT 333.6/49.3ms TPOT 72.6/8.3ms 吞吐 15.1/17.2 tok/s；L2 TTFT 150.8/30.5ms TPOT 57.4/8.6ms 吞吐 31.0/191.4 tok/s；L3 TTFT 282.6/33.6ms TPOT 114.9/8.7ms 吞吐 30.3/355.5 tok/s。HCP 离散 1-10%、PD 离散 0.2-9.5%，HCP 落在自身 20-rep 基线 min-max 带内。网络门等价：RTT 0.193ms、iperf3 2350Mbps、0 重传。解读：同负载开销维 vLLM PD 快 5-13x 属引擎成熟度差距（连续批处理是最大单项，并发吞吐差 6-11x）；L1 单流吞吐持平（0.88x）给出干净的每 token 固定开销读数。边界：此结果仅覆盖引擎开销维；KV 容量能力维由 task-phase3-kv-wall-capacity-20260814 承接（3B 模型）。完整报告：docs/PHASE3_VLLM_PD_COMPARISON.md；真源 comparison.json 在 reports/routeb-p3-pd-baseline-20260814-194248/。VERDICT: VERIFIED — 交错、双门、网络等价门、20/20 PASS。
+
+_updated: 2026-08-14 12:23:41_
+### 三期对照分两层：引擎开销对照与 KV 容量能力对照互不替代
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-14-kv-wall-boundary`
+
+owner 裁决（2026-08-14）：三期 A 对照实验必须区分两个维度，互不替代：(a) 引擎开销对照：同负载（小 context）下 HCP vs vLLM PD 的延迟/吞吐——vLLM PD 更快是预期结果，量化的是 HCP 执行器成熟度差距；(b) 能力对照：KV 容量墙——vLLM PD 把单请求全量 KV 压在 decode 单节点（天花板=单节点 VRAM 池，触墙表现为 preemption/重排队），HCP ring 把每请求 KV 分片到全环（天花板=聚合 VRAM，触墙表现为 fail-closed admission 拒绝）；ring attention 的核心价值是 (b) 的长上下文支撑能力，(a) 的数字不得脱离该边界被引用。docs/PHASE3_N2_PERF_BASELINE.md 与 phase3-9 comparison.json 必须携带此边界声明。
+
+_updated: 2026-08-14 11:50:19_
+### 三期 A 补：KV 容量墙对照实验（长 context x 并发扫描）
+
+type: `task` · status: `pending` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-14-kv-wall-boundary`
+
+三期 A 补：KV 容量墙对照实验（context x concurrency 扫描）。动机剖析六问：1. 问题：PD bench（32-token 输入）只测引擎开销，完全没碰 HCP 存在的理由——异构合作缓解 KV 显存压力；需要量化两栈的 KV 容量天花板差异。2. 现状：N=2 有线基线 + PD 对照 harness 就绪；HCP N=3 16k-token ring E2E 已证；vLLM PD 的 KV 全在 decode 节点（pearl 16GB，池约 13GB），HCP N=2 分片后聚合约 2x。3. 终态：input_len 长 context（如 4k/16k/64k）x 并发档位递增的扫描曲线：vLLM PD 侧观测到 KV 池耗尽后的 preemption/延迟崩塌点，HCP 侧观测到 fail-closed 拒绝点；两曲线并排，容量天花板比值可读出；过墙行为差异（preempt vs reject）明确记录。4. 他者：vLLM 触墙行为是 preemption（recompute 模式）——块池耗尽时换出重算，TTFT 尾部爆炸；HCP 是 byte-level admission fail-closed——直接拒绝。两者都是合法策略，比较的是墙的位置不是策略优劣。5. 本方案：复用 phase3_9 交错 harness 形态；每档先单发 sanity 再 ramp；vLLM 侧从 /metrics 或日志抓 preemption 计数，HCP 侧从 metrics failed/admission 拒绝计数；记录每档 VRAM 占用与 KV 池水位。6. 为什么：这是唯一能在当前硬件（16+24GB）上把蓝图主张（显存墙->可调度问题）变成可测量曲线的方法；单机绳长上限内两栈都能跑满，唯有并发长 context 能把墙逼出来。VERDICT: IMPLEMENT，排在 phase3-9 交错基线完成之后（避免 GPU 争用）。
+
+_updated: 2026-08-14 11:50:19_
 ### 三期对照基线采用 vLLM PD 分离形态（无 Ray），取代 PP 口径
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-14-pd-baseline`
 
 动机剖析六问：1. 问题：HCP 已有 20-rep 有线稳定基线但无主流引擎对照，绝对值无法回答 P2P ring 开销高低；核心论点（高速互联必要性）缺比较证据。2. 现状：vLLM 两端同 commit(3f99883d9) 源码构建就位（white vllm-v1/cu131，pearl vllm-rocm/rocm713）；但该 checkout 跨节点 executor 只有 Ray（uniproc/multiproc 均单机）。3. 终态：同链路、同模型(Qwen2-0.5B bf16)、同负载阶梯(L1/L2/L3)、同客户端(vllm bench serve)、同统计纪律(10 reps + network.json 门禁)下 vLLM PD 与 HCP N=2 并排性能表；为消除时间窗混杂，HCP/vLLM 逐 rep 交错采集；结论落 docs + graph。4. 他者：vLLM 官方跨节点形态：PP/TP 需 Ray（进程编排层，与张量通信无关）；PD 分离不需 Ray——两个 vllm serve + ~200 行 round-robin 转发 proxy（无调度逻辑），KV 走官方 connector（nixl/lmcache/mooncake/moriio）。graph 既有记录：vLLM 官方长上下文分布路线即 disaggregated prefill。5. 本方案：采用 PD 分离作为对照形态——white=prefill(kv_both/producer)+pearl=decode(consumer)，proxy+bench client 在 white，全部端口钉在 192.168.100.x；step0 尖峰验证 connector 在 CUDA-ROCm 有线上可行（nixl 优先，UCX host-staging 可绕开 NCCL-RCCL 线协议风险；备选 moriio/lmcache）。6. 为什么：owner 第一性原理裁决——HCP 的调度面源于 KV ring 合作复杂，比较对象不应被强加额外调度面；无必要时勿增实体（不引 Ray）。且 HCP 是 context parallel（全量权重+KV 过网），PP 是层切分，PD 才是同构对照：比较变为 KV 过网两实现——整段一次搬移 vs 分层 ring 流水。VERDICT: IMPLEMENT（owner 在 ask_user_question 中确认 PD 形态，取代其早前 PP 口径）
-
-_updated: 2026-08-14 09:15:44_
-### 三期 A：受控 vLLM PD 对照基线（无 Ray，交错 10+10 reps）
-
-type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-14-pd-baseline`
-
-三期 A：受控 vLLM PD 对照基线（无 Ray）。步骤：0. 尖峰：两端装 nixl，PD pair 起在 192.168.100.x，单请求 curl 验证 token 合理 + KV 确实跨有线（日志+接口字节计数）；不可行则带证据回来定备选（moriio/lmcache/PP+Ray）。1. vLLM 侧 ladder 单跑 sanity（L1/L2/L3 32 prompts 全完成）。2. 交错战役：单一 harness 逐 rep 交替 HCP 栈(phase3_7a_n2_driver) 与 vLLM PD 栈，各 10 reps；每 rep 全新栈；HCP rep 过 7a 门禁，vLLM rep 过 32/32+指标 sane 门禁；战役级 network.json。3. 聚合：side-by-side 表（中位/min/max/spread），按 docs 比较规则出结论；graph evidence；docs 更新。commit 边界：step0 证据独立 commit；harness 脚本独立 commit；结论+docs+graph 收尾 commit。
 
 _updated: 2026-08-14 09:15:44_
 ### 在 white-pearl 2.5GbE 上重建 10-rep N=2 vllm bench 基线
