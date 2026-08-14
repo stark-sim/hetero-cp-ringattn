@@ -149,17 +149,17 @@ out = {
     "ping_white_to_pearl_raw": ping,
     "iperf3_white_to_pearl_raw": iperf,
 }
-m = re.search(r"rtt min/avg/max/mdev = ([d.]+)/([d.]+)/([d.]+)/([d.]+) ms", ping)
+m = re.search(r"rtt min/avg/max/mdev = ([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+) ms", ping)
 if m:
     out["rtt_ms"] = {"min": float(m.group(1)), "avg": float(m.group(2)),
                      "max": float(m.group(3)), "mdev": float(m.group(4))}
 def to_mbps(value, unit):
     return float(value) * {"K": 0.001, "M": 1.0, "G": 1000.0}[unit]
 
-m = re.search(r"([d.]+) ([KMG])bits/secs+receiver", iperf)
+m = re.search(r"([\d.]+) ([KMG])bits/sec\s+receiver", iperf)
 if m:
     out["iperf3_tcp_goodput_mbps_receiver"] = to_mbps(m.group(1), m.group(2))
-m = re.search(r"([d.]+) ([KMG])bits/secs+(d+)s+sender", iperf)
+m = re.search(r"([\d.]+) ([KMG])bits/sec\s+(\d+)\s+sender", iperf)
 if m:
     out["iperf3_tcp_goodput_mbps_sender"] = to_mbps(m.group(1), m.group(2))
     out["iperf3_retransmits"] = int(m.group(3))
@@ -249,7 +249,7 @@ run_hcp_rep_once() { # rep_label run_suffix
     ssh -o ConnectTimeout=15 "${PEARL_SSH}" "pkill -f 'hcp-ringattn-rust.*distributed-role' || true" 2>/dev/null || true
     sleep 3
 
-    ssh -n -f -o ConnectTimeout=20 "${WHITE_SSH}" "mkdir -p ${state_dir} && setsid env WHITE_LAN=${WHITE_DATA_IP} PEARL_LAN=${PEARL_DATA_IP} bash ~/${WHITE_REPO_DIR}/scripts/phase3_7a_n2_driver.sh ${rep_run_id} > ${state_dir}/driver.log 2>&1 </dev/null"
+    ssh -n -f -o ConnectTimeout=20 "${WHITE_SSH}" "mkdir -p ${state_dir} && setsid env WHITE_LAN=${WHITE_DATA_IP} PEARL_LAN=${PEARL_DATA_IP} PEARL_SSH=stark@${PEARL_DATA_IP} bash ~/${WHITE_REPO_DIR}/scripts/phase3_7a_n2_driver.sh ${rep_run_id} > ${state_dir}/driver.log 2>&1 </dev/null"
     echo "  hcp driver launched on white (state: ${state_dir}); polling STATUS..."
 
     local status=""
@@ -290,7 +290,7 @@ run_pd_rep_once() { # rep_label run_suffix
     echo "=== ${rep_label} (${suffix}) start=$(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
     date -u +%Y-%m-%dT%H:%M:%SZ > "${REPORT_DIR}/${rep_label}.start"
 
-    ssh -n -f -o ConnectTimeout=20 "${WHITE_SSH}" "mkdir -p ${state_dir} && setsid env WHITE_LAN=${WHITE_DATA_IP} PEARL_LAN=${PEARL_DATA_IP} bash ~/${WHITE_REPO_DIR}/scripts/phase3_9_pd_driver.sh ${rep_run_id} > ${state_dir}/driver.log 2>&1 </dev/null"
+    ssh -n -f -o ConnectTimeout=20 "${WHITE_SSH}" "mkdir -p ${state_dir} && setsid env WHITE_LAN=${WHITE_DATA_IP} PEARL_LAN=${PEARL_DATA_IP} PEARL_SSH=stark@${PEARL_DATA_IP} bash ~/${WHITE_REPO_DIR}/scripts/phase3_9_pd_driver.sh ${rep_run_id} > ${state_dir}/driver.log 2>&1 </dev/null"
     echo "  pd driver launched on white (state: ${state_dir}); polling STATUS..."
 
     local status=""
