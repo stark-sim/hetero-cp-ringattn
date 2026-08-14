@@ -2,6 +2,32 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 在 white-pearl 2.5GbE 上重建 10-rep N=2 vllm bench 基线
+
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-14-phase2-gaps`
+
+使用 phase3_8_perf_baseline_n2.sh，数据面固定 192.168.100.1↔192.168.100.2，REPS=10；每 rep 新建 coordinator/workers，L1/L2/L3 correctness gate 全过才进入统计。network.json 必须记录 2.5GbE 接口、RTT、iperf goodput/retransmits；控制脚本保存 sha256 与未提交 diff。旧 WiFi 表只保留历史环境证据，不与本轮数值合并。已完成：两轮独立 10-rep 全 PASS，见 evidence-phase3-wired-n2-baseline-20rep-20260814。
+
+_updated: 2026-08-14 08:16:47_
+### white-pearl 2.5GbE N=2 10-rep vllm bench 基线全绿
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@wired-n2-baseline-20260814`
+
+Run reports/routeb-p3-baseline-20260814-134121/ on main e07be07; white and pearl both synced to the same commit. N=2 topology: coordinator+worker0+vllm bench client on white RTX4090 CUDA, worker1 on pearl RX9060XT HIP; ring data path explicitly 192.168.100.1(enp10s0)↔192.168.100.2(enp8s0), both 2500Mb/s full duplex. network.json: RTT min/avg/max=0.108/0.172/0.241ms, iperf sender=2360Mbps receiver=2350Mbps, retransmits=0. REPS=10; every rep first-attempt PASS, each with 32/32 requests, trace ids/hops exact, reserved==released, metrics failed=0.
+Aggregate median(min,max,spread):
+L1 TTFT 334.44ms(324.03,342.06,5.4%), TPOT 69.94ms(68.98,72.48,5.0%), ITL 73.88ms(72.84,76.62,5.1%), output 15.18tok/s(15.10,15.22,0.8%).
+L2 TTFT 149.92ms(145.86,158.77,8.6%), TPOT 55.79ms(54.93,56.20,2.3%), ITL 51.65ms(50.67,51.82,2.2%), output 31.68tok/s(31.31,32.31,3.2%).
+L3 TTFT 279.81ms(275.51,297.45,7.8%), TPOT 112.18ms(111.03,117.25,5.5%), ITL 106.49ms(104.84,110.68,5.5%), output 31.02tok/s(29.94,31.21,4.1%).
+Relative to superseded WiFi medians, wired is 26-66x lower TTFT, 20-31x lower TPOT and 10-23x higher output throughput; this is network-environment evidence, not algorithmic speedup. Current comparison baseline requires equivalent 2.5GbE network.json and at least 10 reps. Controller script sha256 and uncommitted diff are stored in the report.
+
+_updated: 2026-08-14 08:16:47_
+### benchmark 网络解析必须支持单位缩放且元数据同源
+
+type: `lesson` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@wired-n2-baseline-20260814`
+
+Incident: first wired baseline attempt produced network.json goodput=None even though raw iperf showed 2.35 Gbits/sec. Root cause: parser only matched Mbits/sec, a hidden assumption that held on the old 44 Mbit/s WiFi link but failed once the link crossed 1 Gbit/s. A second metadata check found aggregate topology strings still hard-coded to old 192.168.8.x even though the actual ring used 192.168.100.x. Resolution: normalize K/M/Gbits/sec to Mbps, preserve retransmits, parameterize data IPs, derive topology metadata from the same variables, save controller script hash+diff, abort/restart before collecting the ten-rep record. How to apply: benchmark environment metadata must be generated from the same runtime parameters as the workload and parsers must handle unit scaling; validate network.json before entering the repetition loop or accepting a baseline.
+
+_updated: 2026-08-14 08:16:47_
 ### 三期按证据依赖而非 white 可用性串行推进
 
 type: `decision` · status: `superseded` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-14`
@@ -50,13 +76,6 @@ _updated: 2026-08-14 05:45:45_
 type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-14-phase2-gaps`
 
 2026-08-14 inventory 与实机验证：white enp10s0=192.168.100.1/24，pearl enp8s0=192.168.100.2/24；两端 ethtool 均为 2500Mb/s Full、link detected yes，路由明确走直连接口。双向 10-packet RTT：white→pearl avg 0.167ms，pearl→white avg 0.116ms，0% loss。iperf3 单流 5x10s receiver 全部 2.35 Gbit/s，sender 2.35-2.36 Gbit/s，全部 0 retransmit；4 streams receiver 2.35 Gbit/s、0 retransmit。相对旧 WiFi 单流约 44 Mbit/s 提升约 53x，链路波动显著收窄，满足重建性能基线的网络门禁。
-
-_updated: 2026-08-14 05:45:45_
-### 在 white-pearl 2.5GbE 上重建 10-rep N=2 vllm bench 基线
-
-type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-14-phase2-gaps`
-
-使用 phase3_8_perf_baseline_n2.sh，数据面固定 192.168.100.1↔192.168.100.2，REPS=10；每 rep 新建 coordinator/workers，L1/L2/L3 correctness gate 全过才进入统计。network.json 必须记录 2.5GbE 接口、RTT、iperf goodput/retransmits；控制脚本保存 sha256 与未提交 diff。旧 WiFi 表只保留历史环境证据，不与本轮数值合并。当前运行中。
 
 _updated: 2026-08-14 05:45:45_
 ### 当前地址默认值不列为二期缺口，N 增长时统一设计 neighbor-only 寻址

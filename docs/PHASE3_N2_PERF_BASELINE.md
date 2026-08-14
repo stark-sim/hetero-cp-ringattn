@@ -1,12 +1,17 @@
 # Phase-3 N=2 Performance Baseline (white + pearl, 2.5GbE)
 
-Date: 2026-08-14. Current run:
-`reports/routeb-p3-baseline-20260814-134121/` (raw report is not committed).
-Produced by `scripts/phase3_8_perf_baseline_n2.sh` with `REPS=10`.
+Date: 2026-08-14. Two independent 10-repetition runs (raw reports are not
+committed), both produced by `scripts/phase3_8_perf_baseline_n2.sh` with
+`REPS=10`:
 
-This is the current N=2 comparison baseline. It supersedes the 2026-08-13
-WiFi-bound five-repetition table for performance comparisons. The old run is
-retained below only as network-environment evidence.
+- run 1: `reports/routeb-p3-baseline-20260814-134121/` (05:41Z, commit `e07be07`)
+- run 2: `reports/routeb-p3-baseline-20260814-155401/` (07:54Z, commit `79cb7a7`,
+  after an unattended white reboot that verified network boot persistence)
+
+Together they form the current N=2 comparison baseline (20 repetitions per
+load level). They supersede the 2026-08-13 WiFi-bound five-repetition table
+for performance comparisons. The old run is retained below only as
+network-environment evidence.
 
 ## Result validity
 
@@ -91,6 +96,34 @@ media, routed interfaces, and a similar RTT/goodput range.
 
 The result is materially more stable than the old WiFi run: the widest metric
 spread is now 8.6%, versus 21-47% for latency metrics on WiFi.
+
+## Reproducibility across independent runs (20 reps pooled)
+
+Run 2 repeated the full 10-rep ladder on a fresh time window (and after an
+unattended white reboot in between). All 10 run-2 repetitions passed on the
+first attempt under the same correctness gates, with an equivalent network
+gate (RTT avg 0.185 ms, iperf3 receiver 2.35 Gbit/s, 0 retransmits).
+
+Cross-run median deltas (run 2 vs run 1) stay inside +/-1.4% for every metric
+at every level:
+
+| Level / metric | Run 1 median | Run 2 median | Delta | Pooled 20-rep median | Pooled min-max spread |
+|---|---:|---:|---:|---:|---:|
+| L1 TTFT (ms) | 334.44 | 333.75 | -0.21% | 334.22 | 5.4% |
+| L1 TPOT (ms) | 69.94 | 70.66 | +1.02% | 70.37 | 5.0% |
+| L1 ITL (ms) | 73.88 | 74.58 | +0.94% | 74.38 | 5.2% |
+| L1 output tok/s | 15.18 | 15.12 | -0.34% | 15.16 | 0.8% |
+| L2 TTFT (ms) | 149.92 | 151.98 | +1.37% | 151.26 | 10.0% |
+| L2 TPOT (ms) | 55.79 | 55.82 | +0.07% | 55.82 | 2.3% |
+| L2 ITL (ms) | 51.65 | 51.56 | -0.16% | 51.59 | 2.4% |
+| L2 output tok/s | 31.68 | 31.52 | -0.49% | 31.62 | 3.2% |
+| L3 TTFT (ms) | 279.81 | 277.75 | -0.73% | 279.09 | 8.0% |
+| L3 TPOT (ms) | 112.18 | 113.35 | +1.04% | 112.43 | 5.6% |
+| L3 ITL (ms) | 106.49 | 107.90 | +1.32% | 106.94 | 5.5% |
+| L3 output tok/s | 31.02 | 30.64 | -1.21% | 30.84 | 4.4% |
+
+The baseline is therefore reproducible across time windows and node reboots:
+per-run medians move by at most ~1.4%, far inside the per-run min-max band.
 
 ## Comparison rule
 
