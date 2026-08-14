@@ -114,6 +114,11 @@ struct CoordinatorArgs {
     /// Optional JSONL path for per-request structured traces (6c.0). Absent
     /// disables tracing entirely; tracing never changes the inference result.
     trace_jsonl: Option<String>,
+    /// HTTP iterative-scheduling batch cap (concurrent requests in flight).
+    /// Default 4 preserves the historical behavior; raise it (e.g. for KV
+    /// capacity-wall experiments) to let the ring hold more concurrent
+    /// sessions when aggregate VRAM allows.
+    max_batch_size: usize,
 }
 
 fn parse_args() -> CoordinatorArgs {
@@ -138,6 +143,7 @@ fn parse_args() -> CoordinatorArgs {
     let mut continuation_capacity_tickets = None;
     let mut session_continuation_tokens = 64usize;
     let mut trace_jsonl = None;
+    let mut max_batch_size = 4usize;
 
     let mut args = std::env::args().skip(1); // skip binary name
     while let Some(arg) = args.next() {
@@ -193,6 +199,13 @@ fn parse_args() -> CoordinatorArgs {
                     Some(s.split(',').map(|x| x.parse().unwrap()).collect());
             }
             "--trace-jsonl" => trace_jsonl = Some(args.next().unwrap()),
+            "--max-batch-size" => {
+                max_batch_size = args
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .expect("invalid --max-batch-size")
+            }
             "--session-continuation-tokens" => {
                 session_continuation_tokens = args.next().unwrap().parse().unwrap();
             }
@@ -222,6 +235,7 @@ fn parse_args() -> CoordinatorArgs {
         continuation_capacity_tickets,
         session_continuation_tokens,
         trace_jsonl,
+        max_batch_size,
     }
 }
 
@@ -2156,7 +2170,7 @@ pub fn run() {
         });
     });
 
-    let max_batch_size = 4usize;
+    let max_batch_size = args.max_batch_size;
     let mut scheduler = BatchScheduler::new(max_batch_size);
     println!("[coordinator] entering HTTP iterative scheduling mode (max_batch_size={max_batch_size}). Press Ctrl+C to exit.");
 
