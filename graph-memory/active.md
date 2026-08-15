@@ -2,6 +2,15 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### N=2 裁决：Q-ring 与自驱动环打平，需 N=3 才能区分；N=3 网络前提待确认
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `decode-route-n2-experiment-20260815`
+
+N=2 裁决（2026-08-15）：Q-ring 与自驱动环在 N=2 上性能打平（99-99.5%），无显著差异。这符合理论：N=2 通信字节打平（99.7%），自驱动省冗余 forward 被单请求串行化抵消。
+【意义】N=2 无法区分两条路线 → 需要 N=3 才能验证自驱动环升级（通信省 33.6%、串行延迟劣势 N-1=2 跳）。
+【N=3 前提问题】laptop 无 192.168.100.x 有线直连（仅 tailscale WiFi RTT 138-306ms），加 laptop 会让其两条链路延迟淹没路线差异；需确认：a) 给 laptop 接有线到 white/pearl 交换机，或 b) 接受 tailscale 链路（N=3 只测通信量差异、不测延迟），或 c) 换第三台有线节点。
+
+_updated: 2026-08-15 12:02:37_
 ### decode 路线裁定：Q-ring（KV 不动）为默认，legacy KV-resend 退役
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `code-verification-decode-routes-20260815`
@@ -2017,6 +2026,18 @@ type: `decision` · status: `held` · confidence: 0.95 · importance: 0.96 · so
 结论：Node 4b DEFER multi-query continuation ring，只实现有证据的 KV-ring correctness；把 Q-ring 作为独立路线选择记忆，待 baseline 可运行后按 payload bytes 与实测带宽决定。VERDICT: DEFER。
 
 _updated: 2026-08-03 09:14:32_
+### N=2 实测：Q-ring vs 自驱动环 decode 打平（white 40.7 vs 40.4ms）
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `decode-route-n2-experiment-20260815`
+
+N=2 white(CUDA 4090)+pearl(HIP 9060XT) 2.5GbE LAN 实测对照（commit dd0f809，Qwen2-0.5B，m=1 段，4 次重复 cmp2-cmp5）：
+1. 口径修正：ring_decode 事件只含 attention 环（不含 MLP），已新增 decode_forward_full 事件（完整 forward）与 stationary_continuation total_ms（完整段 forward）对齐。
+2. 每 token 完整 forward（24 层）中位数：white Q-ring 40.7ms vs 自驱动环 40.4ms（99.3%）；pearl Q-ring 40.2ms vs 自驱动 39.6ms（98.5%）。两次路线在噪声内打平。
+3. 通信字节（理论）：N=2 时 Q-ring 16512B/token/layer vs 自驱动 16456B（99.7%）——打平；N=3 时 49536 vs 32912（自驱动省 33.6%）；N=4 时省 50.2%。
+4. 计算：自驱动省去 N-1 份完整 forward（MLP 占 84%），但单请求下串行化（单 packet N-1 跳 + finisher 集中 MLP）抵消了计算节省，N=2 净效应为打平。
+5. 网络现状：laptop 不在 192.168.100.x 有线网，到 white/pearl 走 tailscale WiFi RTT 138-306ms；N=3 若加 laptop 其两条链路 RTT 会淹没路线差异。
+
+_updated: 2026-08-15 12:02:37_
 ### decode 双路线对照测试通过：Q-ring 通信 O(d) 恒定，legacy O(T×d) 线性增长
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `code-verification-decode-routes-20260815`
