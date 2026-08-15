@@ -12,7 +12,11 @@
 #[cfg(feature = "tch-backend")]
 pub mod block;
 #[cfg(feature = "tch-backend")]
+pub mod block_transport;
+#[cfg(feature = "tch-backend")]
 pub mod mock;
+#[cfg(feature = "tch-backend")]
+pub mod serialized_block;
 #[cfg(feature = "tch-backend")]
 pub mod tcp;
 #[cfg(feature = "tch-backend")]
@@ -21,10 +25,17 @@ pub mod r#trait;
 #[cfg(feature = "tch-backend")]
 pub use block::{KvBlock, RingPacket, SelfDrivingPacket};
 #[cfg(feature = "tch-backend")]
+pub use block_transport::{
+    BlockDesc, BlockHandle, KvBlockTransport, RemoteBlockDesc, TransferCompletion,
+};
+#[cfg(feature = "tch-backend")]
 #[allow(unused_imports)]
 pub use mock::{LinkedMockKvTransport, MockKvTransport};
 #[cfg(feature = "tch-backend")]
 pub use r#trait::{KvTransport, RingMessage};
+#[cfg(feature = "tch-backend")]
+#[allow(unused_imports)]
+pub use serialized_block::SerializedBlockTransport;
 #[cfg(feature = "tch-backend")]
 #[allow(unused_imports)]
 pub use tcp::TcpKvTransport;
@@ -196,9 +207,7 @@ mod tests {
             let mut transport: Box<dyn KvTransport> =
                 Box::new(TcpKvTransport::new(stream, device).unwrap());
             assert!(transport.supports_self_driving_packets());
-            transport
-                .submit_send_self_driving_packet(&packet)
-                .unwrap();
+            transport.submit_send_self_driving_packet(&packet).unwrap();
             transport.flush_send().unwrap();
         });
 
@@ -213,7 +222,11 @@ mod tests {
         for (name, actual, wanted) in [
             ("residual", &received.residual, &expected.residual),
             ("normalized", &received.normalized, &expected.normalized),
-            ("position_ids", &received.position_ids, &expected.position_ids),
+            (
+                "position_ids",
+                &received.position_ids,
+                &expected.position_ids,
+            ),
             ("q", &received.q, &expected.q),
             (
                 "attention_output",
