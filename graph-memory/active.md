@@ -2,6 +2,17 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### N=4 双机模拟裁决：通信优势可证，延迟需真 4 节点验证
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `decode-route-n4-emulation-20260815`
+
+N=4 双机模拟裁决（2026-08-15）：
+1. 通信量：SD 省 50.3% wire bytes 稳定可证（与理论一致）。
+2. 延迟：双机模拟被同机共享 GPU 串行化污染（SD 每层 4 domain 接力 vs Q-ring 并行 partial），数据不稳定（-11% 到 +80%），不作方案裁决依据。
+3. 干净验证 N=4 延迟需真 4 节点（每 worker 独立 GPU/进程），当前资源（white+pearl+laptop）只有 3 台物理机；可用 laptop 补齐 4 节点（3 台机器 4 worker，一台跑 2 个），或接受"延迟靠理论外推、通信量靠实测"的分层结论。
+4. 与 N=2/N=3 合成：N=2 打平（通信 99.7%）、N=3 SD 省 33.8%（tailscale 延迟被 RTT 主导）、N=4 SD 省 50.3%（延迟待干净验证）——通信优势随 N 单调扩大，延迟依赖网络体制。
+
+_updated: 2026-08-15 12:50:24_
 ### 低 RTT 理论外推：N=3/4 有线下 SD 延迟省 ~2.5x + 带宽省 33-50%
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `decode-route-low-rtt-theory-20260815`
@@ -2362,6 +2373,17 @@ type: `task` · status: `superseded` · confidence: 1.0 · importance: 0.94 · s
 边界：这里测 HCP service，不把不同硬件总量的结果误称为算法公平 speedup；vLLM engine baseline 属后续受控对照。
 
 _updated: 2026-08-11 19:10:38_
+### N=4 双机模拟：SD 省 50.3% 通信，延迟被同机共享 GPU 串行化污染
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 0.92 · source: `decode-route-n4-emulation-20260815`
+
+N=4 双机模拟实测（commit b40b351，white 托管 domain 0,1 + pearl 托管 domain 2,3，ring 0->1->2->3->0，跨机有线 RTT 0.19ms，同机 LAN IP RTT 0.03ms，Qwen2-0.5B）：
+1. 通信量（稳定可证）：Q-ring 10920B/layer/node（3 packets x 3640B）vs SD 5424B/layer/node（0.75 sends x 7232B），SD 省 50.3%，与理论一致。
+2. 延迟：n4cmp1 SD 快 11%（90.2 vs 79.9ms），但 n4cmp2/3/4 SD 慢 30-80%（116-145ms）。不稳定。
+3. 逐阶段：SD recv_wait 达 101-118ms/token，远超网络理论（3 hops x ~0.2ms）；同机双 domain 共享 GPU 与进程，SD 每层需 4 domain 串行接力被共享 GPU 争用放大。
+4. 结论：N=4 双机模拟混入"同机共享 GPU 串行化"，延迟不可用于方案裁决；通信量优势（SD 省 50.3%）稳定。
+
+_updated: 2026-08-15 12:50:24_
 ### K5 广义化：同构 TP 集群抽象为 ring 上的 worker（L3 编排层愿景，待验证）
 
 type: `task` · status: `pending` · confidence: 1.0 · importance: 0.9 · source: `owner-first-principles-20260815-heterogeneous-selling-point`
