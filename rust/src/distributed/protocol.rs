@@ -44,6 +44,22 @@ pub enum WorkerCommand {
         capacity_tickets: Vec<u64>,
         starter_domain: usize,
     },
+    /// Mainline self-driving decode step for a specific request: one token is
+    /// driven through every layer as a single packet (N-1 hops per layer) with
+    /// per-layer KV assignees drawn from the request's frozen decode schedule.
+    /// `token_offset` is the 0-based decode step within the request's decode
+    /// horizon (`decode_horizon` tokens total); the frozen plan spans
+    /// `decode_horizon * layers` units so growth KV stays capacity-balanced
+    /// across the whole decode phase.
+    StationaryDecode {
+        request_id: u64,
+        token: i64,
+        position: i64,
+        capacity_tickets: Vec<u64>,
+        starter_domain: usize,
+        token_offset: usize,
+        decode_horizon: usize,
+    },
     /// Synchronize global sequence length before decode.
     SyncGlobalSeqLen { request_id: u64, len: usize },
     /// Release per-request state (KV cache, past_key_values, etc.) for a completed request.
@@ -116,6 +132,45 @@ pub fn validate_stationary_continuation(
     if starter_domain >= domains {
         return Err(format!(
             "stationary continuation starter {starter_domain} out of {domains} domains"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate the frozen-plan fields of a `StationaryDecode` command.
+/// Pure and transport-free so both coordinator (before broadcast) and every
+/// worker (before execution) can run the same check.
+pub fn validate_stationary_decode(
+    domains: usize,
+    capacity_tickets: &[u64],
+    starter_domain: usize,
+    token_offset: usize,
+    decode_horizon: usize,
+) -> Result<(), String> {
+    if domains == 0 {
+        return Err("stationary decode requires at least one domain".to_string());
+    }
+    if capacity_tickets.len() != domains {
+        return Err(format!(
+            "stationary decode tickets/domains mismatch: {} vs {}",
+            capacity_tickets.len(),
+            domains
+        ));
+    }
+    if capacity_tickets.iter().all(|&t| t == 0) {
+        return Err("stationary decode tickets must not be all zero".to_string());
+    }
+    if starter_domain >= domains {
+        return Err(format!(
+            "stationary decode starter {starter_domain} out of {domains} domains"
+        ));
+    }
+    if decode_horizon == 0 {
+        return Err("stationary decode horizon must be non-zero".to_string());
+    }
+    if token_offset >= decode_horizon {
+        return Err(format!(
+            "stationary decode token_offset {token_offset} out of horizon {decode_horizon}"
         ));
     }
     Ok(())
@@ -585,6 +640,55 @@ mod tests {
             panic!("expected StationaryContinuationDone ack");
         };
         assert_eq!(logits_bytes, None);
+    }
+
+    #[test]
+    fn stationary_decode_roundtrips_bincode_and_validates() {
+        let cmd = WorkerCommand::StationaryDecode {
+            request_id: 76,
+            token: 42,
+            position: 7,
+            capacity_tickets: vec![1, 2, 3],
+            starter_domain: 2,
+            token_offset: 3,
+            decode_horizon: 8,
+        };
+        let bytes = serialize(&cmd).unwrap();
+        let decoded: WorkerCommand = deserialize(&bytes).unwrap();
+        let WorkerCommand::StationaryDecode {
+            request_id,
+            token,
+            position,
+            capacity_tickets,
+            starter_domain,
+            token_offset,
+            decode_horizon,
+        } = decoded
+        else {
+            panic!("expected StationaryDecode command");
+        };
+        assert_eq!(request_id, 76);
+        assert_eq!(token, 42);
+        assert_eq!(position, 7);
+        assert_eq!(capacity_tickets, vec![1, 2, 3]);
+        assert_eq!(starter_domain, 2);
+        assert_eq!(token_offset, 3);
+        assert_eq!(decode_horizon, 8);
+
+        let ok = validate_stationary_decode(3, &[1, 2, 3], 2, 3, 8);
+        assert!(ok.is_ok());
+        // tickets/domains mismatch
+        assert!(validate_stationary_decode(2, &[1, 2, 3], 1, 0, 8).is_err());
+        // all-zero tickets
+        assert!(validate_stationary_decode(2, &[0, 0], 1, 0, 8).is_err());
+        // starter out of range
+        assert!(validate_stationary_decode(2, &[1, 3], 2, 0, 8).is_err());
+        // zero horizon
+        assert!(validate_stationary_decode(2, &[1, 3], 1, 0, 0).is_err());
+        // token_offset out of horizon
+        assert!(validate_stationary_decode(2, &[1, 3], 1, 8, 8).is_err());
+        // zero domains
+        assert!(validate_stationary_decode(0, &[], 0, 0, 8).is_err());
     }
 
     #[test]

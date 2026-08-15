@@ -173,6 +173,34 @@ pub trait WorkerBackend: Send {
         Err("stationary continuation not supported by this backend".to_string())
     }
 
+    /// experimental: mainline per-token self-driving decode step.
+    ///
+    /// Drives one token through every layer as a single packet with per-layer
+    /// frozen assignees; returns the logits on the final finisher domain,
+    /// `None` elsewhere. Default returns an error (backends without reserved
+    /// positioned KV keep their existing decode behavior).
+    fn decode_stationary_step(
+        &mut self,
+        request_id: u64,
+        token: i64,
+        position: i64,
+        capacity_tickets: &[u64],
+        starter_domain: usize,
+        token_offset: usize,
+        decode_horizon: usize,
+    ) -> Result<Option<Vec<f32>>, String> {
+        let _ = (
+            request_id,
+            token,
+            position,
+            capacity_tickets,
+            starter_domain,
+            token_offset,
+            decode_horizon,
+        );
+        Err("stationary decode not supported by this backend".to_string())
+    }
+
     /// 上报本节点的可用计算资源（显存或内存），单位 MB。
     ///
     /// Coordinator 用此信息做 capacity-aware 分片。

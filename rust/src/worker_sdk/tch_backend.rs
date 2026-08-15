@@ -20,6 +20,7 @@
 use crate::model::cache::{KvCacheImpl, KvCaches};
 use crate::model::model::LlamaModel;
 use crate::model::self_driving::{
+    process_layer_packet_with_reserved_history,
     process_layer_packet_with_reserved_history_for_positions, project_final_logits,
     stationary_layer_starters, FrozenKvAssigneeSchedule, LayerPacket, LayerStepOutcome,
     ReservedPositionedKvShard,
@@ -606,6 +607,282 @@ impl TchWorkerBackend {
             .map_err(|e| format!("stationary continuation logits to vec failed: {e}"))?;
         Ok(Some(values))
     }
+
+    /// Mainline per-token self-driving decode step (the merged decode route).
+    ///
+    /// Drives ONE token through every layer as a single packet: the packet
+    /// starts at the layer's starter domain, visits every domain in successor
+    /// order, and finishes one hop before the starter. Each layer's KV
+    /// assignee comes from the request's frozen decode schedule (spanning
+    /// `decode_horizon * layers` units, per-(token,layer) assignees), so
+    /// growth KV stays capacity-balanced across the whole decode horizon.
+    /// Historical KV never moves; only the layer's assignee appends the new
+    /// token's K/V.
+    ///
+    /// Returns the logits as `Some(Vec<f32>)` on the final finisher domain,
+    /// `None` on every other domain. The request's `global_seq_len` is
+    /// advanced to `position + 1` on every domain.
+    pub fn decode_stationary_step(
+        &mut self,
+        request_id: u64,
+        token: i64,
+        position: i64,
+        capacity_tickets: &[u64],
+        starter_domain: usize,
+        token_offset: usize,
+        decode_horizon: usize,
+    ) -> Result<Option<Vec<f32>>, String> {
+        let domains = self.model.num_domains;
+        crate::distributed::protocol::validate_stationary_decode(
+            domains,
+            capacity_tickets,
+            starter_domain,
+            token_offset,
+            decode_horizon,
+        )?;
+        let layers = self.model.config.num_layers;
+        let sd_start = std::time::Instant::now();
+
+        // Frozen decode plan: per-(token, layer) assignees over the horizon.
+        let schedule =
+            FrozenKvAssigneeSchedule::new(capacity_tickets, request_id, decode_horizon * layers)?;
+        let layer_assignees = (0..layers)
+            .map(|layer_idx| {
+                schedule
+                    .assignee_for(token_offset, layer_idx, layers)
+                    .ok_or_else(|| {
+                        format!("decode schedule has no assignee for step {token_offset} layer {layer_idx}")
+                    })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        // Per-layer starters: layer 0 starts at starter_domain; every later
+        // layer's starter is the previous layer's finisher.
+        let starters = stationary_layer_starters(starter_domain, layers, domains)?;
+
+        // Admission: on layers where this domain is the assignee, the new
+        // token's K/V must fit the reserved positioned slab.
+        {
+            let context = self
+                .request_contexts
+                .get(&request_id)
+                .ok_or_else(|| format!("request {request_id} not found"))?;
+            for (layer_idx, cache) in context.kv_caches.iter().enumerate() {
+                if layer_assignees[layer_idx] != self.domain_id {
+                    continue;
+                }
+                let Some(KvCacheImpl::ReservedPositioned(shard)) = cache else {
+                    return Err(format!("request {request_id} layer {layer_idx} does not have reserved positioned KV"));
+                };
+                if shard.committed_len() + 1 > shard.reserved_capacity() {
+                    return Err(format!(
+                        "request {request_id} layer {layer_idx} decode step {token_offset} exceeds reserved capacity: committed {} + 1 > {}",
+                        shard.committed_len(),
+                        shard.reserved_capacity()
+                    ));
+                }
+            }
+        }
+
+        let position_tensor = Tensor::from_slice(&[position])
+            .unsqueeze(0)
+            .to_device(self.device);
+        let mut hidden_states = if starters[0] == self.domain_id {
+            let input = Tensor::from_slice(&[token])
+                .unsqueeze(0)
+                .to_device(self.device);
+            Some(Tensor::embedding(
+                &self.model.embedding,
+                &input,
+                -1,
+                false,
+                false,
+            ))
+        } else {
+            None
+        };
+
+        let mut final_finisher = starter_domain;
+        let mut starter_layers = 0_usize;
+        let mut middle_layers = 0_usize;
+        let mut finisher_layers = 0_usize;
+        let mut sends = 0_usize;
+        let mut recvs = 0_usize;
+        let mut sd_recv_wait_ms = 0.0_f64;
+        let mut sd_process_ms = 0.0_f64;
+        let mut sd_send_ms = 0.0_f64;
+        for (layer_idx, &starter) in starters.iter().enumerate() {
+            let finisher = (starter + domains - 1) % domains;
+            final_finisher = finisher;
+            if starter == self.domain_id {
+                let packet = LayerPacket::start(
+                    &mut self.model.layers[layer_idx],
+                    hidden_states
+                        .as_ref()
+                        .ok_or("stationary decode starter is missing hidden states")?,
+                    &position_tensor,
+                    self.domain_id,
+                    layer_assignees[layer_idx],
+                    domains,
+                )
+                .map_err(|e| format!("stationary decode layer {layer_idx} start failed: {e}"))?;
+                let process_start = std::time::Instant::now();
+                let outcome = {
+                    let context = self.request_contexts.get_mut(&request_id).unwrap();
+                    let Some(KvCacheImpl::ReservedPositioned(shard)) =
+                        &mut context.kv_caches[layer_idx]
+                    else {
+                        return Err(format!("request {request_id} layer {layer_idx} does not have reserved positioned KV"));
+                    };
+                    process_layer_packet_with_reserved_history(
+                        &mut self.model.layers[layer_idx],
+                        packet,
+                        shard,
+                    )
+                    .map_err(|e| {
+                        format!("stationary decode layer {layer_idx} starter step failed: {e}")
+                    })?
+                };
+                sd_process_ms += process_start.elapsed().as_secs_f64() * 1000.0;
+                let LayerStepOutcome::Forward(next_packet) = outcome else {
+                    return Err(format!("stationary decode layer {layer_idx} starter finished a {domains}-domain route"));
+                };
+                let wire = next_packet
+                    .into_self_driving_packet(layer_idx)
+                    .map_err(|e| {
+                        format!("stationary decode layer {layer_idx} wire encode failed: {e}")
+                    })?;
+                let transport =
+                    self.model.layers[layer_idx]
+                        .kv_transport_mut()
+                        .ok_or_else(|| {
+                            format!("stationary decode layer {layer_idx} has no KV transport")
+                        })?;
+                let send_start = std::time::Instant::now();
+                transport.submit_send_self_driving_packet(&wire)?;
+                transport.flush_send()?;
+                sd_send_ms += send_start.elapsed().as_secs_f64() * 1000.0;
+                starter_layers += 1;
+                sends += 1;
+            } else {
+                let recv_start = std::time::Instant::now();
+                let wire = {
+                    let transport =
+                        self.model.layers[layer_idx]
+                            .kv_transport_mut()
+                            .ok_or_else(|| {
+                                format!("stationary decode layer {layer_idx} has no KV transport")
+                            })?;
+                    transport.recv_self_driving_packet()?.ok_or_else(|| {
+                        format!("stationary decode layer {layer_idx} predecessor closed")
+                    })?
+                };
+                sd_recv_wait_ms += recv_start.elapsed().as_secs_f64() * 1000.0;
+                recvs += 1;
+                let packet = LayerPacket::from_self_driving_packet(wire).map_err(|e| {
+                    format!("stationary decode layer {layer_idx} wire decode failed: {e}")
+                })?;
+                let process_start = std::time::Instant::now();
+                let outcome = {
+                    let context = self.request_contexts.get_mut(&request_id).unwrap();
+                    let Some(KvCacheImpl::ReservedPositioned(shard)) =
+                        &mut context.kv_caches[layer_idx]
+                    else {
+                        return Err(format!("request {request_id} layer {layer_idx} does not have reserved positioned KV"));
+                    };
+                    process_layer_packet_with_reserved_history(
+                        &mut self.model.layers[layer_idx],
+                        packet,
+                        shard,
+                    )
+                    .map_err(|e| {
+                        format!("stationary decode layer {layer_idx} ring step failed: {e}")
+                    })?
+                };
+                sd_process_ms += process_start.elapsed().as_secs_f64() * 1000.0;
+                if finisher == self.domain_id {
+                    let LayerStepOutcome::Finished {
+                        hidden_states: next_hidden,
+                        ..
+                    } = outcome
+                    else {
+                        return Err(format!("stationary decode layer {layer_idx} finisher forwarded a {domains}-domain route"));
+                    };
+                    hidden_states = Some(next_hidden);
+                    finisher_layers += 1;
+                } else {
+                    let LayerStepOutcome::Forward(next_packet) = outcome else {
+                        return Err(format!("stationary decode layer {layer_idx} middle domain finished a {domains}-domain route"));
+                    };
+                    let wire = next_packet
+                        .into_self_driving_packet(layer_idx)
+                        .map_err(|e| {
+                            format!("stationary decode layer {layer_idx} wire encode failed: {e}")
+                        })?;
+                    let transport =
+                        self.model.layers[layer_idx]
+                            .kv_transport_mut()
+                            .ok_or_else(|| {
+                                format!("stationary decode layer {layer_idx} has no KV transport")
+                            })?;
+                    let send_start = std::time::Instant::now();
+                    transport.submit_send_self_driving_packet(&wire)?;
+                    transport.flush_send()?;
+                    sd_send_ms += send_start.elapsed().as_secs_f64() * 1000.0;
+                    middle_layers += 1;
+                    sends += 1;
+                }
+            }
+        }
+
+        // HCP_PERF_LOG timing event (same JSONL shape as ring_decode and
+        // stationary_continuation) so a single N=2/N=3 run can compare the
+        // merged mainline decode against the legacy Q-ring path.
+        if let Ok(path) = std::env::var("HCP_PERF_LOG") {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let ts = format!("{}.{:03}Z", now.as_secs(), now.subsec_millis());
+            let line = format!(
+                "{{\"ts\":\"{ts}\",\"event\":\"stationary_decode\",\"domain\":{},\"request_id\":{request_id},\"token\":{token},\"position\":{position},\"layers\":{layers},\"domains\":{domains},\"token_offset\":{token_offset},\"decode_horizon\":{decode_horizon},\"sends\":{sends},\"recvs\":{recvs},\"hops_per_layer\":{},\"recv_wait_ms\":{:.3},\"process_ms\":{:.3},\"send_ms\":{:.3},\"total_ms\":{:.3}}}\n",
+                self.domain_id,
+                domains - 1,
+                sd_recv_wait_ms,
+                sd_process_ms,
+                sd_send_ms,
+                sd_start.elapsed().as_secs_f64() * 1000.0
+            );
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = f.write_all(line.as_bytes());
+            }
+        }
+
+        println!("[TchWorkerBackend] stationary decode stats: request_id={request_id} domain={} token_offset={token_offset} layers={layers} domains={domains} starter_layers={starter_layers} middle_layers={middle_layers} finisher_layers={finisher_layers} sends={sends} recvs={recvs} expected_hops_per_layer={}",
+            self.domain_id,
+            domains - 1,
+        );
+
+        // Every domain resyncs the request horizon to the new position.
+        {
+            let context = self.request_contexts.get_mut(&request_id).unwrap();
+            context.global_seq_len = position as usize + 1;
+        }
+
+        if final_finisher != self.domain_id {
+            return Ok(None);
+        }
+        let hidden = hidden_states.ok_or("stationary decode finisher has no hidden states")?;
+        let logits = project_final_logits(&self.model, &hidden);
+        let last = logits.select(1, 0).squeeze();
+        let values: Vec<f32> = Vec::try_from(&last.contiguous())
+            .map_err(|e| format!("stationary decode logits to vec failed: {e}"))?;
+        Ok(Some(values))
+    }
 }
 
 impl WorkerBackend for TchWorkerBackend {
@@ -744,6 +1021,30 @@ impl WorkerBackend for TchWorkerBackend {
             position_ids,
             capacity_tickets,
             starter_domain,
+        )
+    }
+
+    // experimental: mainline per-token self-driving decode step; delegates to
+    // the inherent implementation.
+    fn decode_stationary_step(
+        &mut self,
+        request_id: u64,
+        token: i64,
+        position: i64,
+        capacity_tickets: &[u64],
+        starter_domain: usize,
+        token_offset: usize,
+        decode_horizon: usize,
+    ) -> Result<Option<Vec<f32>>, String> {
+        TchWorkerBackend::decode_stationary_step(
+            self,
+            request_id,
+            token,
+            position,
+            capacity_tickets,
+            starter_domain,
+            token_offset,
+            decode_horizon,
         )
     }
 
@@ -2820,6 +3121,246 @@ mod tests {
             .unwrap_err();
     }
 
+    /// The production `decode_stationary_step` driver on a mock ring, synthetic
+    /// config: reserved prefill then two per-token self-driving decode steps
+    /// driven by the new mainline method, compared against the single-node
+    /// contiguous reference (same golden scenario family as the continuation
+    /// driver test above).
+    #[test]
+    fn decode_stationary_step_driver_matches_reference_on_mock_ring() {
+        let device = Device::Cpu;
+        let config = ModelConfig {
+            architectures: Some(vec!["LlamaForCausalLM".to_string()]),
+            hidden_size: 32,
+            num_layers: 24,
+            num_heads: 4,
+            num_kv_heads: Some(1),
+            intermediate_size: 64,
+            vocab_size: 100,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-6,
+            tie_word_embeddings: false,
+            torch_dtype: Some("float32".to_string()),
+            hidden_act: "silu".to_string(),
+            max_position_embeddings: Some(128),
+            attention_dropout: 0.0,
+            bos_token_id: None,
+            eos_token_id: None,
+            use_cache: true,
+            sliding_window: None,
+            use_sliding_window: None,
+            partial_rotary_factor: 1.0,
+        };
+        let weights = create_synthetic_weights(&config, device);
+        let mut reference = LlamaModel::from_weights(config.clone(), &weights, device, 1).unwrap();
+        let layers = config.num_layers;
+        let domains = 2_usize;
+        let mut backends = (0..domains)
+            .map(|domain| {
+                TchWorkerBackend::from_model(
+                    LlamaModel::from_weights(config.clone(), &weights, device, domains).unwrap(),
+                    device,
+                    domain,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut per_backend: Vec<Vec<Box<dyn KvTransport>>> =
+            (0..domains).map(|_| Vec::with_capacity(layers)).collect();
+        for _ in 0..layers {
+            for (domain, endpoint) in
+                crate::model::transport::LinkedMockKvTransport::create_ring(domains)
+                    .into_iter()
+                    .enumerate()
+            {
+                per_backend[domain].push(Box::new(endpoint));
+            }
+        }
+        for (domain, transports) in per_backend.into_iter().enumerate() {
+            backends[domain].setup_kv_transports(transports);
+        }
+
+        let request_id = 82_u64;
+        let prompt = [3_i64, 5, 7, 9];
+        let capacity_tickets = [1_u64, 3];
+        let prefix_splits = [1_usize, 3];
+        let decode_tokens = 2_usize;
+        let decode_horizon = decode_tokens;
+
+        // Frozen decode plan spanning decode_horizon * layers units: per-layer
+        // assignees for each decode step (same derivation the worker uses).
+        let decode_schedule =
+            FrozenKvAssigneeSchedule::new(&capacity_tickets, request_id, decode_horizon * layers)
+                .unwrap();
+        let assignees: Vec<Vec<usize>> = (0..decode_tokens)
+            .map(|token_offset| {
+                (0..layers)
+                    .map(|layer_idx| {
+                        decode_schedule
+                            .assignee_for(token_offset, layer_idx, layers)
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let capacities = (0..domains)
+            .map(|domain| {
+                (0..layers)
+                    .map(|layer_idx| {
+                        prefix_splits[domain]
+                            + assignees
+                                .iter()
+                                .filter(|token_assignees| token_assignees[layer_idx] == domain)
+                                .count()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        let mut reference_caches = reference.create_kv_caches();
+        let reference_prefill_logits = reference
+            .forward(
+                &Tensor::from_slice(&prompt).unsqueeze(0),
+                &mut reference_caches,
+            )
+            .unwrap()
+            .select(1, prompt.len() as i64 - 1)
+            .squeeze();
+        backends[0]
+            .prefill_request_with_reservation(
+                request_id,
+                &prompt[..1],
+                0,
+                Some(&[0]),
+                Some(&capacities[0]),
+            )
+            .unwrap();
+        let (prefill_logits1, _) = backends[1]
+            .prefill_request_with_reservation(
+                request_id,
+                &prompt[1..],
+                1,
+                Some(&[1, 2, 3]),
+                Some(&capacities[1]),
+            )
+            .unwrap();
+        let mut token = Tensor::from_slice(&prefill_logits1)
+            .argmax(-1, false)
+            .int64_value(&[]);
+        assert_eq!(
+            token,
+            reference_prefill_logits.argmax(-1, false).int64_value(&[]),
+        );
+
+        let mut starter = 1_usize;
+        for token_offset in 0..decode_tokens {
+            let position = (prompt.len() + token_offset) as i64;
+            let (left, right) = backends.split_at_mut(1);
+            let (result0, result1) = std::thread::scope(|scope| {
+                let worker0 = scope.spawn(|| {
+                    left[0].decode_stationary_step(
+                        request_id,
+                        token,
+                        position,
+                        &capacity_tickets,
+                        starter,
+                        token_offset,
+                        decode_horizon,
+                    )
+                });
+                let worker1 = scope.spawn(|| {
+                    right[0].decode_stationary_step(
+                        request_id,
+                        token,
+                        position,
+                        &capacity_tickets,
+                        starter,
+                        token_offset,
+                        decode_horizon,
+                    )
+                });
+                (worker0.join().unwrap(), worker1.join().unwrap())
+            });
+            let logits0 = result0.unwrap();
+            let logits1 = result1.unwrap();
+            assert!(logits0.is_none(), "non-finisher must not return logits");
+            let logits = logits1.expect("final finisher must return logits");
+
+            // Compare against the contiguous reference.
+            let reference_logits = reference
+                .forward(
+                    &Tensor::from_slice(&[token]).unsqueeze(0),
+                    &mut reference_caches,
+                )
+                .unwrap()
+                .squeeze();
+            let max_diff = (Tensor::from_slice(&logits) - &reference_logits)
+                .abs()
+                .max()
+                .double_value(&[]);
+            let distributed_token = Tensor::from_slice(&logits)
+                .argmax(-1, false)
+                .int64_value(&[]);
+            let reference_token = reference_logits.argmax(-1, false).int64_value(&[]);
+            println!("mock decode step {token_offset}: max_diff={max_diff:.6}, tokens={distributed_token}/{reference_token}");
+            assert_eq!(distributed_token, reference_token);
+            assert!(
+                max_diff < 1e-3,
+                "decode step {token_offset} max diff: {max_diff}"
+            );
+
+            // Growth KV: each (token, layer) appended exactly on its assignee.
+            for layer_idx in 0..layers {
+                let mut positions = Vec::new();
+                for domain in 0..domains {
+                    let context = backends[domain].request_contexts.get(&request_id).unwrap();
+                    let Some(KvCacheImpl::ReservedPositioned(shard)) =
+                        &context.kv_caches[layer_idx]
+                    else {
+                        panic!("worker {domain} layer {layer_idx} did not use reserved KV");
+                    };
+                    let growth = (0..=token_offset)
+                        .filter(|&t| assignees[t][layer_idx] == domain)
+                        .count();
+                    assert_eq!(
+                        shard.committed_len(),
+                        prefix_splits[domain] + growth,
+                        "layer {layer_idx} domain {domain} committed mismatch at step {token_offset}"
+                    );
+                    assert!(shard.committed_len() <= shard.reserved_capacity());
+                    positions.extend_from_slice(shard.positions());
+                }
+                positions.sort_unstable();
+                let expected = (0..=position).collect::<Vec<_>>();
+                assert_eq!(positions, expected);
+            }
+
+            token = distributed_token;
+            // Next starter = this step's final finisher (producer rotation):
+            // starters rotate by (domains - 1) per layer, so the last layer's
+            // finisher is (starter + layers * (domains - 1)) % domains.
+            starter = (starter + layers * (domains - 1)) % domains;
+        }
+
+        // The request horizon advanced on every domain.
+        for backend in &backends {
+            let context = backend.request_contexts.get(&request_id).unwrap();
+            assert_eq!(
+                context.global_seq_len,
+                (prompt.len() + decode_tokens) as usize
+            );
+        }
+
+        // Validation rejects malformed decode steps before touching state.
+        backends[0]
+            .decode_stationary_step(request_id, 1, 0, &capacity_tickets, 1, 0, 0)
+            .unwrap_err();
+        backends[0]
+            .decode_stationary_step(request_id, 1, 0, &capacity_tickets, 5, 0, 4)
+            .unwrap_err();
+        backends[0]
+            .decode_stationary_step(999, 1, 0, &capacity_tickets, 1, 0, 4)
+            .unwrap_err();
+    }
     /// Real-weight 97ca355 scenario: prefill [1,3] split + one local decode
     /// step + continuation via the production driver, compared against the
     /// contiguous reference with the golden tolerances.

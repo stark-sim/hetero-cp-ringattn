@@ -910,13 +910,25 @@ fn prefill_single_request(
     } else {
         Vec::new()
     };
-    let reservation = service_layer_capacities(
+    let reservation = match service_layer_capacities_sd(
+        worker_capacities,
+        job.request_id,
         &chunk_sizes,
-        seq_len as usize,
         job.max_tokens,
         config.num_layers,
         &continuation_headroom,
-    );
+    ) {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            let _ = job.tx.send(InferenceResult {
+                text: format!("[error: SD KV byte admission failed: {error}]"),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                finish_reason: Some("error".to_string()),
+            });
+            return Err(format!("SD service KV byte admission failed: {error}"));
+        }
+    };
     let budget_bytes = match capacity_mb_to_bytes(worker_capacities) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -1140,6 +1152,11 @@ fn prefill_single_request(
         chunk_boundaries,
         generated_ids,
         next_token: first_token,
+        // Mainline self-driving decode: the first fed decode token sits at
+        // prompt_tokens (position right after the prompt); the starter is
+        // request-scoped for spread, correctness is starter-agnostic.
+        next_position: prompt_tokens as i64,
+        next_starter: (job.request_id as usize) % worker_streams.len(),
         finish_reason,
         result_tx: job.tx,
         stream_tx: job.stream_tx,
@@ -1297,6 +1314,11 @@ fn append_continuation_request(
         None
     };
 
+    // The appended request continues decode under the session's request id:
+    // the next fed decode token sits right after the continuation segment, and
+    // the next self-driving starter is the continuation's final finisher.
+    let next_finisher =
+        continuation_final_finisher(starter_domain, config.num_layers, worker_streams.len())?;
     Ok(ActiveRequest {
         request_id: session.request_id,
         prompt: job.prompt,
@@ -1308,6 +1330,8 @@ fn append_continuation_request(
         chunk_boundaries: vec![0, m],
         generated_ids: vec![token],
         next_token: first_token,
+        next_position: (session.global_seq_len + m) as i64,
+        next_starter: next_finisher,
         finish_reason,
         result_tx: job.tx,
         stream_tx: job.stream_tx,
@@ -1331,10 +1355,105 @@ fn batch_request_tokens(scheduler: &BatchScheduler) -> Vec<(u64, i64)> {
     request_tokens
 }
 
-/// Execute one decode iteration for all active requests in the scheduler.
+/// Execute one decode iteration for all active requests in the scheduler,
+/// driving each request through the mainline self-driving decode ring
+/// (merged 2026-08-16). Every active request takes one StationaryDecode step
+/// (single packet, N-1 hops per layer) with its frozen per-(token,layer)
+/// assignee schedule; the coordinator collects the finisher's logits and
+/// samples the next token per request.
 ///
 /// Returns the list of request IDs that have completed (EOS or max_tokens).
+#[allow(clippy::too_many_arguments)]
 fn decode_iteration(
+    scheduler: &mut BatchScheduler,
+    worker_streams: &mut [(quinn::SendStream, quinn::RecvStream)],
+    capacity_tickets: &[u64],
+    layers: usize,
+    eos_token: Option<u32>,
+    vocab_size: usize,
+    rt: &tokio::runtime::Runtime,
+) -> Result<Vec<u64>, String> {
+    let domains = worker_streams.len();
+    let mut request_ids: Vec<u64> = scheduler.active_request_ids();
+    request_ids.sort_unstable();
+
+    let mut completed = Vec::new();
+    for request_id in request_ids {
+        // Snapshot the per-request decode context before borrowing the stream.
+        let (token, position, token_offset, decode_horizon, starter_domain) = {
+            let req = match scheduler.get_active_mut(request_id) {
+                Some(r) => r,
+                None => continue, // request may have already been removed
+            };
+            // generated_ids already contains the first sampled token, so the
+            // 0-based decode step offset is len - 1 (0 for the first fed token).
+            let token_offset = req.generated_ids.len().saturating_sub(1);
+            (
+                req.next_token,
+                req.next_position,
+                token_offset,
+                req.max_tokens,
+                req.next_starter,
+            )
+        };
+
+        let logits_vec = stationary_decode(
+            request_id,
+            token,
+            position,
+            capacity_tickets,
+            starter_domain,
+            token_offset,
+            decode_horizon,
+            layers,
+            worker_streams,
+            rt,
+        )?;
+        if logits_vec.len() != vocab_size {
+            eprintln!(
+                "[coordinator] request {request_id} logits size mismatch: expected {vocab_size}, got {}",
+                logits_vec.len()
+            );
+            continue;
+        }
+
+        let req = match scheduler.get_active_mut(request_id) {
+            Some(r) => r,
+            None => continue,
+        };
+        let next_token = match sample_from_logits_vec(&logits_vec, req.temperature, req.top_p) {
+            Ok(t) => t as u32,
+            Err(e) => {
+                eprintln!("[coordinator] request {request_id} sample_token failed: {e}");
+                continue;
+            }
+        };
+
+        req.generated_ids.push(next_token);
+        req.next_token = next_token as i64;
+        req.next_position = position + 1;
+        // The next step starts at this step's final finisher (producer
+        // rotation), matching the golden self-driving decode reference.
+        req.next_starter = continuation_final_finisher(starter_domain, layers, domains)?;
+
+        if Some(next_token) == eos_token {
+            req.finish_reason = Some("stop".to_string());
+            completed.push(request_id);
+        } else if req.generated_ids.len() >= req.max_tokens {
+            req.finish_reason = Some("length".to_string());
+            completed.push(request_id);
+        }
+    }
+
+    Ok(completed)
+}
+
+/// Legacy Q-ring decode iteration (pre-merge mainline decode): broadcasts one
+/// DecodeBatch to every worker and adopts worker 0's logits. Kept as a
+/// historical fallback only; the mainline serving loop uses the self-driving
+/// ring (StationaryDecode) above.
+#[allow(clippy::too_many_arguments)]
+fn decode_iteration_legacy(
     scheduler: &mut BatchScheduler,
     worker_streams: &mut [(quinn::SendStream, quinn::RecvStream)],
     eos_token: Option<u32>,
@@ -1482,6 +1601,52 @@ fn service_layer_capacities(
         layers,
         domains,
     )
+}
+
+/// Per-domain per-layer reserved KV capacities for the mainline self-driving
+/// decode route (merged 2026-08-16).
+///
+/// Decode growth KV is owned by the request's frozen decode schedule spanning
+/// `max_tokens * layers` units: for decode step `t` at layer `l`, the owner
+/// is `schedule.assignee_for(t, l, layers)`. Each domain reserves, per layer,
+/// its prefix split plus the number of (token_offset, layer) pairs assigned to
+/// it over the whole decode horizon (plus continuation headroom for keep_kv
+/// sessions). This is the same derivation the golden decode reference uses
+/// (per-(token,layer) assignees), so the worker's reserved positioned slab
+/// exactly covers every decode step's growth.
+fn service_layer_capacities_sd(
+    capacity_tickets: &[u64],
+    request_id: u64,
+    chunk_sizes: &[usize],
+    max_tokens: usize,
+    layers: usize,
+    continuation_headroom: &[usize],
+) -> Result<Vec<Vec<usize>>, String> {
+    let domains = chunk_sizes.len();
+    if capacity_tickets.len() != domains {
+        return Err(format!(
+            "SD decode reservation tickets/domains mismatch: {} vs {}",
+            capacity_tickets.len(),
+            domains
+        ));
+    }
+    let schedule =
+        FrozenKvAssigneeSchedule::new(capacity_tickets, request_id, max_tokens * layers)?;
+    Ok((0..domains)
+        .map(|domain| {
+            (0..layers)
+                .map(|layer_idx| {
+                    let owned = (0..max_tokens)
+                        .filter(|&token_offset| {
+                            schedule.assignee_for(token_offset, layer_idx, layers) == Some(domain)
+                        })
+                        .count();
+                    let headroom = continuation_headroom.get(domain).copied().unwrap_or(0);
+                    chunk_sizes[domain] + owned + headroom
+                })
+                .collect()
+        })
+        .collect())
 }
 
 /// Conservative per-domain continuation headroom (in KV positions) reserved
@@ -1659,6 +1824,81 @@ fn stationary_continuation(
         }
     }
     logits.ok_or_else(|| "finisher continuation logits missing".to_string())
+}
+
+/// Broadcast one StationaryDecode command and collect the finisher's logits;
+/// every non-finisher worker must acknowledge with `None`. This is the
+/// mainline per-token self-driving decode driver (merged 2026-08-16).
+#[allow(clippy::too_many_arguments)]
+fn stationary_decode(
+    request_id: u64,
+    token: i64,
+    position: i64,
+    capacity_tickets: &[u64],
+    starter_domain: usize,
+    token_offset: usize,
+    decode_horizon: usize,
+    layers: usize,
+    worker_streams: &mut [(quinn::SendStream, quinn::RecvStream)],
+    rt: &tokio::runtime::Runtime,
+) -> Result<Vec<f32>, String> {
+    let domains = worker_streams.len();
+    crate::distributed::protocol::validate_stationary_decode(
+        domains,
+        capacity_tickets,
+        starter_domain,
+        token_offset,
+        decode_horizon,
+    )?;
+    let cmd = WorkerCommand::StationaryDecode {
+        request_id,
+        token,
+        position,
+        capacity_tickets: capacity_tickets.to_vec(),
+        starter_domain,
+        token_offset,
+        decode_horizon,
+    };
+    for (send, _recv) in worker_streams.iter_mut() {
+        send_command_quic(send, &cmd, rt.handle())
+            .map_err(|e| format!("send StationaryDecode failed: {e}"))?;
+    }
+    let finisher = continuation_final_finisher(starter_domain, layers, domains)?;
+    let mut logits = None;
+    for (domain, (_send, recv)) in worker_streams.iter_mut().enumerate() {
+        let resp = recv_response_quic(recv, rt.handle())
+            .map_err(|e| format!("recv StationaryDecodeDone failed: {e}"))?;
+        match resp {
+            WorkerResponse::StationaryContinuationDone { logits_bytes, .. } => {
+                if domain == finisher {
+                    let bytes = logits_bytes.ok_or_else(|| {
+                        format!("finisher domain {domain} returned no decode logits")
+                    })?;
+                    logits = Some(
+                        bytes
+                            .chunks_exact(4)
+                            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                            .collect::<Vec<f32>>(),
+                    );
+                } else if logits_bytes.is_some() {
+                    return Err(format!(
+                        "non-finisher domain {domain} returned decode logits"
+                    ));
+                }
+            }
+            WorkerResponse::Error { message, .. } => {
+                return Err(format!(
+                    "worker {domain} stationary decode error: {message}"
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "unexpected response from worker {domain}: {resp:?}"
+                ));
+            }
+        }
+    }
+    logits.ok_or_else(|| "finisher decode logits missing".to_string())
 }
 
 /// experimental (route-B 2c, test-only) E2E: reserved prefill -> one legacy
@@ -2402,7 +2642,26 @@ pub fn run() {
                     .into_iter()
                     .map(|(request_id, _)| request_id)
                     .collect();
-                match decode_iteration(&mut scheduler, &mut guard, eos_token, vocab_size, &rt) {
+                // Mainline decode route (merged 2026-08-16): self-driving ring
+                // by default; set HCP_RING_DECODE_SD=0 to restore the legacy
+                // Q-ring DecodeBatch path (historical fallback only).
+                let sd_decode = std::env::var("HCP_RING_DECODE_SD")
+                    .map(|v| v != "0")
+                    .unwrap_or(true);
+                let decode_result = if sd_decode {
+                    decode_iteration(
+                        &mut scheduler,
+                        &mut guard,
+                        &worker_capacities,
+                        config.num_layers,
+                        eos_token,
+                        vocab_size,
+                        &rt,
+                    )
+                } else {
+                    decode_iteration_legacy(&mut scheduler, &mut guard, eos_token, vocab_size, &rt)
+                };
+                match decode_result {
                     Ok(completed) => {
                         trace_sink.decode_step(&batch_ids);
                         // Emit streaming chunks for all active requests.
@@ -2663,6 +2922,8 @@ mod tests {
             chunk_boundaries: vec![0, 1],
             generated_ids: vec![10],
             next_token,
+            next_position: 0,
+            next_starter: 0,
             finish_reason: None,
             result_tx: tx,
             stream_tx: None,
@@ -2845,6 +3106,78 @@ mod tests {
         let with_headroom = service_layer_capacities(&[1, 3], 4, 3, 24, &[2, 1]);
         assert!(with_headroom[0].iter().all(|&c| c == plain[0][0] + 2));
         assert!(with_headroom[1].iter().all(|&c| c == plain[1][0] + 1));
+    }
+
+    #[test]
+    fn service_layer_capacities_sd_covers_frozen_decode_assignees() {
+        // Golden shape: tickets [1,3], request 82, 2 decode tokens, 24 layers.
+        // Per-(token, layer) assignees from the horizon schedule decide each
+        // domain's per-layer growth; every layer's capacity must be exactly
+        // prefix + owned (token, layer) pairs.
+        let tickets = [1_u64, 3];
+        let request_id = 82_u64;
+        let chunk_sizes = [1_usize, 3];
+        let max_tokens = 2_usize;
+        let layers = 24_usize;
+        let capacities = service_layer_capacities_sd(
+            &tickets,
+            request_id,
+            &chunk_sizes,
+            max_tokens,
+            layers,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(capacities.len(), 2);
+        assert_eq!(capacities[0].len(), layers);
+        assert_eq!(capacities[1].len(), layers);
+
+        let schedule =
+            FrozenKvAssigneeSchedule::new(&tickets, request_id, max_tokens * layers).unwrap();
+        for layer_idx in 0..layers {
+            let owned0 = (0..max_tokens)
+                .filter(|&t| schedule.assignee_for(t, layer_idx, layers) == Some(0))
+                .count();
+            let owned1 = (0..max_tokens)
+                .filter(|&t| schedule.assignee_for(t, layer_idx, layers) == Some(1))
+                .count();
+            assert_eq!(capacities[0][layer_idx], chunk_sizes[0] + owned0);
+            assert_eq!(capacities[1][layer_idx], chunk_sizes[1] + owned1);
+            assert_eq!(owned0 + owned1, max_tokens);
+        }
+        // Sum over layers: total reserved = prefix per layer + horizon units.
+        let total0: usize = capacities[0].iter().sum();
+        let total1: usize = capacities[1].iter().sum();
+        assert_eq!(
+            total0 + total1,
+            layers * (chunk_sizes[0] + chunk_sizes[1]) + max_tokens * layers
+        );
+
+        // Headroom adds per-domain per-layer positions (keep_kv sessions).
+        let with_headroom = service_layer_capacities_sd(
+            &tickets,
+            request_id,
+            &chunk_sizes,
+            max_tokens,
+            layers,
+            &[2, 1],
+        )
+        .unwrap();
+        for layer_idx in 0..layers {
+            assert_eq!(with_headroom[0][layer_idx], capacities[0][layer_idx] + 2);
+            assert_eq!(with_headroom[1][layer_idx], capacities[1][layer_idx] + 1);
+        }
+
+        // Validation: tickets/domains mismatch rejected.
+        assert!(service_layer_capacities_sd(
+            &[1],
+            request_id,
+            &chunk_sizes,
+            max_tokens,
+            layers,
+            &[]
+        )
+        .is_err());
     }
 
     #[test]

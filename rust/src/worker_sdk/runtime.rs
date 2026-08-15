@@ -249,6 +249,41 @@ impl WorkerRuntime {
                     send_response_quic(&mut self.coord_send, &resp, &rt_handle)
                         .map_err(|e| format!("send StationaryContinuationDone failed: {e}"))?;
                 }
+                WorkerCommand::StationaryDecode {
+                    request_id,
+                    token,
+                    position,
+                    capacity_tickets,
+                    starter_domain,
+                    token_offset,
+                    decode_horizon,
+                } => {
+                    let resp = match self.backend.decode_stationary_step(
+                        request_id,
+                        token,
+                        position,
+                        &capacity_tickets,
+                        starter_domain,
+                        token_offset,
+                        decode_horizon,
+                    ) {
+                        Ok(logits) => WorkerResponse::StationaryContinuationDone {
+                            request_id,
+                            logits_bytes: logits.map(|values| {
+                                values
+                                    .iter()
+                                    .flat_map(|&v| v.to_le_bytes())
+                                    .collect::<Vec<u8>>()
+                            }),
+                        },
+                        Err(message) => WorkerResponse::Error {
+                            request_id,
+                            message,
+                        },
+                    };
+                    send_response_quic(&mut self.coord_send, &resp, &rt_handle)
+                        .map_err(|e| format!("send StationaryDecodeDone failed: {e}"))?;
+                }
                 WorkerCommand::Shutdown => {
                     println!("[worker {domain_id}] shutting down");
                     break;
