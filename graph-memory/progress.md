@@ -2,6 +2,29 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### NIXL S2 真实验证：pearl(ROCm) 手写 FFI 链接 + agent 创建 + UCX backend 实例化 + VRAM block 注册 + metadata 拉取全通过
+
+type: `evidence` · status: `verified` · confidence: 0.95 · importance: 0.95 · source: `hetero-cp-ringattn@106d2e2`
+
+NIXL block-direct transport S2 在 pearl(ROCm) 真实运行时验证通过（commit 106d2e2）。
+
+验证链路（在 pearl 上）：
+1. git pull --ff-only 同步到 106d2e2。
+2. cargo build --features tch-backend,nixl-backend --bin nixl-probe 真实链接成功（NIXL_LD 指向 /home/stark/build/nixl-1.4.0/build/src 的 bindings/core/infra/utils/serdes/utils/stream/utils/common/plugins/ucx）。
+3. 运行探针（LD_PRELOAD=/home/stark/libtorch/lib/libtorch_hip.so + NIXL_PLUGIN_DIR=.../plugins/ucx + HCP_TCH_DEVICE=cuda:0）输出：
+   - agent created: hcp-probe-agent
+   - registered block id=0 len=96 addr=125726875451392
+   - local metadata bytes=686
+   - OK
+
+过程中定位的三个真实障碍（已修复，均 commit）：
+a) 手写 extern "C" 而非 bindgen nixl-sys——nixl-sys 的 bindgen 在 white/pearl 都缺 clang-dev（white 无 clang 二进制、pearl 的 ROCm libclang 版本串 23.0git 不被 bindgen 识别），装 clang-dev 需 sudo；手写 FFI 绑定官方 libnixl_capi.so（稳定 C ABI，正是 bindgen 的对象）绕开该依赖。
+b) 裸 agent 报 "no available backends for mem type VRAM_SEG"——官方示例 single_process_example.rs 显示必须 create_backend("UCX") + opt_args_add_backend，并把 opt_args 传入 register_mem；已补齐插件发现/get_plugin_params/create_backend/opt_args_add_backend FFI，register/deregister/create_xfer_req/post_xfer_req 全部携带 opt_args，Drop 逆序销毁 backend/opt_args/agent。
+c) 运行时需 NIXL_PLUGIN_DIR 指向 plugins/ucx（否则插件发现报目录不存在）；VRAM 注册需 LD_PRELOAD=libtorch_hip.so 否则 tch 返回 host 指针被 UCX 拒为 host。
+
+证据边界：这是单主机、单 block、register+local_metadata 的运行时正确性验证（pearl ROCm 单机）。不覆盖跨机 CUDA↔ROCm 的 register→transfer→poll 全生命周期、不覆盖双 agent metadata 交换（side channel）、不覆盖 prefill KV ring 接线（S3）或 paged-KV 化（S4）。white(CUDA) 端未跑（其 libnixl_capi.so 在 conda 轮内，路径不同，待 S3 时统一）。
+
+_updated: 2026-08-15 19:28:43_
 ### NIXL block-direct transport S1+S2：KvBlockTransport trait + fallback（Mac 绿）+ NixlBlockTransport FFI（Mac 类型检查，远端 smoke 待做）
 
 type: `evidence` · status: `verified` · confidence: 0.9 · importance: 0.9 · source: `hetero-cp-ringattn@358c4c5`

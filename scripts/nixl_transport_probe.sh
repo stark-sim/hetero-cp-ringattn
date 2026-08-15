@@ -1,35 +1,46 @@
 #!/usr/bin/env bash
-# NIXL block transport probe (form-B S2) — register → transfer → poll on two
-# CUDA/ROCm hosts. Remote verification for NixlBlockTransport that cannot run
-# on the Mac (no UCX/CUDA/ROCm).
+# NIXL block transport probe (form-B S2) — register → metadata smoke on CUDA/ROCm.
+# Remote verification for NixlBlockTransport (cannot run on Mac: no UCX/CUDA/ROCm).
 #
-#   --build   compile with nixl-backend on the current host (NIXL_PREFIX points
-#             at a build tree whose libnixl_capi.so is in the loader path).
-#   --probe   (placeholder) minimal register→transfer→poll smoke.
+# Usage on pearl (ROCm):
+#   scripts/nixl_transport_probe.sh --build
+#   scripts/nixl_transport_probe.sh --run
+#
+# Environment (pearl, ROCm):
+#   NIXL_PREFIX     /home/stark/build/nixl-1.4.0 (source build tree)
+#   LD_PRELOAD      /home/stark/libtorch/lib/libtorch_hip.so (HIP device)
+#   NIXL_PLUGIN_DIR <build>/src/plugins/ucx  (UCX plugin .so dir)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 NIXL_PREFIX="${NIXL_PREFIX:-/home/stark/build/nixl-1.4.0}"
-NIXL_LIB_PATH="${NIXL_LIB_PATH:-${NIXL_PREFIX}/build/src/bindings:${NIXL_PREFIX}/build/src/core:${NIXL_PREFIX}/build/src/infra}"
+NIXL_BUILD="$NIXL_PREFIX/build/src"
+NIXL_LD="$NIXL_BUILD/bindings:$NIXL_BUILD/core:$NIXL_BUILD/infra:$NIXL_BUILD/utils/serdes:$NIXL_BUILD/utils/stream:$NIXL_BUILD/utils/common:$NIXL_BUILD/plugins/ucx"
+PLUGIN_DIR="${NIXL_PLUGIN_DIR:-$NIXL_BUILD/plugins/ucx}"
+HIP_PRELOAD="${HCP_HIP_PRELOAD:-/home/stark/libtorch/lib/libtorch_hip.so}"
 
-mode="${1:---build}"
+mode="${1:---run}"
 case "$mode" in
   --build)
-    echo "[nixl-probe] building with nixl-backend (NIXL_PREFIX=$NIXL_PREFIX)"
-    NIXL_PREFIX="$NIXL_PREFIX" \
-      LD_LIBRARY_PATH="$NIXL_LIB_PATH:${LD_LIBRARY_PATH:-}" \
-      PATH="/home/stark/.cargo/bin:$PATH" \
+    echo "[nixl-probe] build with nixl-backend (NIXL_PREFIX=$NIXL_PREFIX)"
+    PATH="/home/stark/.cargo/bin:$PATH" \
       LIBTORCH="/home/stark/libtorch" \
-      cargo build --features tch-backend,nixl-backend --lib
+      LIBRARY_PATH="$NIXL_LD:/home/stark/libtorch/lib:${LIBRARY_PATH:-}" \
+      LD_LIBRARY_PATH="$NIXL_LD:/home/stark/libtorch/lib:${LD_LIBRARY_PATH:-}" \
+      cargo build --features tch-backend,nixl-backend --bin nixl-probe
     echo "[nixl-probe] build OK"
     ;;
-  --probe)
-    echo "[nixl-probe] probe not yet wired (S2 remote smoke)."
-    echo "  Once a probe binary exists: cargo run --features tch-backend,nixl-backend --bin nixl-probe -- <peer-agent> <local-block-bytes>"
-    exit 0
+  --run)
+    echo "[nixl-probe] run register->metadata smoke on this host"
+    LD_PRELOAD="$HIP_PRELOAD" \
+      LD_LIBRARY_PATH="$NIXL_LD:/home/stark/libtorch/lib:${LD_LIBRARY_PATH:-}" \
+      NIXL_PLUGIN_DIR="$PLUGIN_DIR" \
+      HCP_TCH_DEVICE=cuda:0 \
+      ./rust/target/debug/nixl-probe
+    echo "[nixl-probe] run OK"
     ;;
   *)
-    echo "usage: $0 [--build|--probe]" >&2
+    echo "usage: $0 [--build|--run]" >&2
     exit 2
     ;;
 esac
