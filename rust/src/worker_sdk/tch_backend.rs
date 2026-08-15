@@ -671,10 +671,31 @@ impl WorkerBackend for TchWorkerBackend {
         let input = Tensor::from_slice(&[token])
             .unsqueeze(0)
             .to_device(self.device);
+        let decode_fwd_start = std::time::Instant::now();
         let logits = self
             .model
             .forward(&input, &mut ctx.kv_caches)
             .map_err(|e| format!("decode forward failed: {e}"))?;
+        // Full Q-ring decode forward timing (embed + 24x(norm+attn+mlp) + lm head).
+        if let Ok(path) = std::env::var("HCP_PERF_LOG") {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let ts = format!("{}.{:03}Z", now.as_secs(), now.subsec_millis());
+            let line = format!(
+                "{{\"ts\":\"{ts}\",\"event\":\"decode_forward_full\",\"domain\":{},\"request_id\":{request_id},\"token\":{token},\"total_ms\":{:.3}}}\n",
+                self.domain_id,
+                decode_fwd_start.elapsed().as_secs_f64() * 1000.0
+            );
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = f.write_all(line.as_bytes());
+            }
+        }
 
         // Save model state back to the request's context after forward.
         ctx.global_seq_len = self.model.global_seq_len;
