@@ -6,9 +6,42 @@
 
 type: `task` · status: `rejected` · confidence: 1.0 · importance: 1.0 · source: `hcp-core-review-keypoints-round2-20260815`
 
-K8【量化路径缺失】hyp-net-speed 已实测 7B bf16 装不进 pearl 16GB（分布式 7B 无量化路径不可行）；route B 权重按层切分可缓解权重侧，但权重量化与 KV 量化从未立项。KV 量化（如 FP8 KV cache）直接放大 HCP 的容量主张（B 类核心：同显存装更长上下文），是主流现成轮子（vLLM 已支持）。待分析：量化在 HCP 路线的位置——KV 量化对容量账的倍数效应、跨平台 kernel 支持（CUDA/ROCm/MPS 一致性）、与在线 softmax 合并路径的数值兼容性。 [2026-08-15 用户裁决：去掉。量化对所有推理框架通用，不能显示 HCP 特定优势，不构成探究点。记录此否决以避免重复提出。]
+K8【量化路径缺失】hyp-net-speed 已实测 7B bf16 装不进 pearl 16GB（分布式 7B 无量化路径不可行）；route B 权重仍由每个 worker 完整复制（非按层切分），权重量化与 KV 量化从未立项。KV 量化（如 FP8 KV cache）直接放大 HCP 的容量主张（B 类核心：同显存装更长上下文），是主流现成轮子（vLLM 已支持）。待分析：量化在 HCP 路线的位置——KV 量化对容量账的倍数效应、跨平台 kernel 支持（CUDA/ROCm/MPS 一致性）、与在线 softmax 合并路径的数值兼容性。 [2026-08-15 用户裁决：去掉。量化对所有推理框架通用，不能显示 HCP 特定优势，不构成探究点。记录此否决以避免重复提出。]
 
-_updated: 2026-08-15 05:20:30_
+_updated: 2026-08-15 10:02:42_
+### 三期战略框架：可复用轮子(A) vs HCP 架构核心(B)，对比必须分类标注
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `owner-strategy-2026-08-14-core-vs-wheels`
+
+owner 战略框架（2026-08-14）：三期对比与建设必须区分两层——(A) 可复用工程轮子：排队、连续批处理、激活余量入账、cudagraph 等推理框架工程特性。    这些不是任何一方的架构属性：HCP 可以自己实现（生态完善工作），也可以走复用 vLLM 轮子的路线    （把 vLLM 当执行引擎/组件嵌入 HCP 拓扑）。因此开销维差距（phase3-9 的 5-13x）是可关闭的工程债，    不构成对 HCP 架构的否定。(B) HCP 架构核心（真正的差异化，必须聚焦验证与放大）：    1) 异构线性网络拓扑（CUDA+ROCm 混编入环）；    2) 长上下文无限合作（KV 分片随 N 聚合扩展，phase3-10 实测账面 28.4GB vs PD 单点池 7.88GiB = 2.7x）；    3) KV 搬运量大幅减少（PD 把全量 KV ~1.09GB/请求从 prefill 整包搬运到 decode；       HCP 每域 KV 留在本域，admission 实测每域 543MB/请求且无需跨机整包转移）。比较纪律：任何方案对比必须显式标注每个差异点属于 (A) 还是 (B)；(A) 类差距只记录量级与关闭成本，不作为架构裁决依据；(B) 类指标才是 HCP 的胜负手。三期生态完善的内涵由此明确：补齐/复用 (A) 类轮子（含评估 vLLM 轮子复用路线），让 (B) 类优势可测量地呈现。
+
+[2026-08-15 修订] 上述 (B) 三点原为平行差异化；第一性原理重推后重排为"手段→卖点→目标"链条：异构线性拓扑=卖点本身（唯一差异化）、长上下文无限合作=目标（所有 CP 共享，非 HCP 独有卖点）、KV 搬运量减少=手段优势（P2P ring 的后果，非独立卖点）。详见 revision-phase3-selling-point-heterogeneity-20260815 与 decision-hcp-first-principles-value-20260815。
+
+_updated: 2026-08-15 10:02:16_
+### 第一性原理重推：卖点=异构支持，手段=P2P ring，目标=长上下文 KV 容量
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `owner-first-principles-20260815-heterogeneous-selling-point`
+
+owner 第一性原理重推（2026-08-15，全局校准）。此前把"手段"当"卖点"、把"待验证扩展"当"核心"，本轮纠偏后固化：
+
+【卖点 = 异构支持（唯一差异化）】HCP 真正的卖点是异构支持：不同厂商/代际/容量的加速卡（4090+5090、CUDA+ROCm+MPS）现在无法在同构 collective 栈下合作，HCP 让它们聚合成一个 context-capacity pool。遇到同构设备时用同构已有轮子（vLLM/TRT-LLM/NCCL），HCP 不抢这个——异构无法合作才是要解决的痛点。
+
+【手段 = P2P ring（不依赖厂商 collective 栈）】这是实现异构支持的技术机制，不是卖点本身。硬件自由与网络自由是同一件事：网卡/互联演进复杂且强绑定硬件平台，P2P ring 绕开厂商 collective 栈（NCCL/RCCL/InfiniBand），从 2.5GbE 到 CXL 都能跑——下限低到普通以太网，上限能白吃 CXL 带宽。
+
+【目标 = 长上下文 KV 容量】异构支持所服务的首要目的：KV 随上下文线性增长、单机装不下。这是异构合作的主要目的，也是 ring-attn 的核心（无限上下文）。链条：手段(P2P ring) → 卖点(异构支持) → 目标(长上下文 KV 容量)，三者非并列。
+
+【PD 分离 = 阶段隔离，正交于异构】PD 解决 prefill/decode 阶段隔离，不解决异构——最多做到"prefill 集群异构 + decode 集群异构"，每个集群内部仍须同构（内部靠 NCCL/RDMA）。故 PD 与 HCP 正交，不构成竞争。
+
+【三层工程角色（从异构核心出发，递进）】
+- L1 vLLM 插件：把异构 ring KV 塞进 vLLM，复用轮子最多，但受 vLLM 内部同构 NCCL 假设约束，异构可能打折。
+- L2 独立推理引擎：当前实验推进形态，验证最自由，但 scheduler/KV/kernel 全自写，可复用轮子最少。
+- L3 编排层（愿景待验证）：1~N 同构卡组成一个 worker，m 个异构 worker 编排；同构算子库 + CP 长上下文 + 权重太大由 worker 内 TP/PP 分摊，优势最全。但"不一定可行"，必须与 dynamo 比存在必要性——dynamo 已做编排层，HCP 编排层须证明独特价值。
+
+【route A/B 澄清】route A/B 都是 ring-attn 且权重全复制在每个 worker（非"权重分片"两套架构）；区别仅 continuation 数据流：A=KV 动 query 不动，B=KV 原地 activation 动。"权重按层分片"是会话级误读，graph 本无此陈述（decision-hcp-fabric-agnostic 已写明"模型权重仍由每个 worker 完整持有"）。
+
+【对探究点的修正】K5（TP 集群广义化）从"主链/最好"降为"L3 愿景待验证"，须补与 dynamo 比存在必要性维度；K4（NIXL）是 P2P 传输手段的候选实现，服务于"网络自由=手段"，非独立卖点。
+
+_updated: 2026-08-15 09:59:43_
 ### K7 调度策略线收口：Striped/ZigZag 与异构不均分的兼容性
 
 type: `task` · status: `pending` · confidence: 1.0 · importance: 1.0 · source: `hcp-core-review-keypoints-round2-20260815`
@@ -65,13 +98,6 @@ type: `task` · status: `pending` · confidence: 1.0 · importance: 1.0 · sourc
 K4【传输层解绑】QUIC 不是 HCP 绑定的传输；NIXL 已在 vLLM PD 栈证明可做 CUDA<->ROCm 异构传输（UCX 1.19.1 --with-rocm + nixl rocm wheel + rixl shim，white/pearl 实测链通）。待评估：NIXL 是否适合作为 HCP ring 的传输轮子（语义匹配：block 级 KV 传输 vs HCP 的 micro KV block / (Q,O,LSE) 小包；性能：vs QUIC 用户态逐跳开销）。
 
 _updated: 2026-08-15 04:54:23_
-### K5 广义化：同构 TP 集群抽象为 ring 上的 worker
-
-type: `task` · status: `pending` · confidence: 1.0 · importance: 1.0 · source: `hcp-core-review-keypoints-20260815`
-
-K5【HCP 广义化方向】最好的广义化方式：把抽象提升到"同构 TP 集群作为 ring 上的一个 worker"，使不同同构集群之间也能合作。待分析：worker 抽象边界（域内黑盒原则 bp-plugin-architecture 已支持域内替换为 vLLM/TRT-LLM/MLX）、环协议对"集群 worker"的适配、capacity 表征。
-
-_updated: 2026-08-15 04:54:23_
 ### K6 核心方案隐患清单存档（S1-S5 + P 类）
 
 type: `analysis` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `hcp-core-review-keypoints-20260815`
@@ -121,13 +147,6 @@ type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · sou
 修 admission 激活余量：让 HCP 的 fail-closed 拒绝发生在正确位置。1. 问题：KV byte admission 账面放行超出可执行容量的负载（phase3-10 mc16/32 OOM 崩溃实证）。2. 现状：admission 预算=握手时各域空闲 VRAM，仅扣 KV 字节；prefill 激活工作区（logits/attention 中间量）未入账，pearl 16GB 卡被 KV 压到 36MB 空闲后 OOM。3. 终态：预算=空闲VRAM-KV-激活工作区估计（按模型 config+当前 in-flight prefill 数）或至少固定安全余量（约2GB/域）；mc=32 重跑=16 完成+16 status=rejected，无 worker panic。4. 他者：vLLM 的做法是 KV 池在启动时按 gpu_memory_utilization 预分配固定大小，激活余量在池外天然保留；块不够时准入排队。5. 本方案：worker 握手 capacity 上报或 coordinator 入账时扣除激活余量；拒绝路径已有（status=rejected），只需预算正确。6. 为什么：这是 ring 聚合容量优势（2.7x 账面）能否兑现的闸门；崩溃式触墙违背 fail-closed 设计承诺。VERDICT: IMPLEMENT。 [2026-08-15 收尾：机制已落地并于 8k 验证；30k 场景的激活峰值超出任何合理固定余量，转入 task-phase3-online-attention-workspace-20260815]
 
 _updated: 2026-08-14 16:43:02_
-### 三期战略框架：可复用轮子(A) vs HCP 架构核心(B)，对比必须分类标注
-
-type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `owner-strategy-2026-08-14-core-vs-wheels`
-
-owner 战略框架（2026-08-14）：三期对比与建设必须区分两层——(A) 可复用工程轮子：排队、连续批处理、激活余量入账、cudagraph 等推理框架工程特性。    这些不是任何一方的架构属性：HCP 可以自己实现（生态完善工作），也可以走复用 vLLM 轮子的路线    （把 vLLM 当执行引擎/组件嵌入 HCP 拓扑）。因此开销维差距（phase3-9 的 5-13x）是可关闭的工程债，    不构成对 HCP 架构的否定。(B) HCP 架构核心（真正的差异化，必须聚焦验证与放大）：    1) 异构线性网络拓扑（CUDA+ROCm 混编入环）；    2) 长上下文无限合作（KV 分片随 N 聚合扩展，phase3-10 实测账面 28.4GB vs PD 单点池 7.88GiB = 2.7x）；    3) KV 搬运量大幅减少（PD 把全量 KV ~1.09GB/请求从 prefill 整包搬运到 decode；       HCP 每域 KV 留在本域，admission 实测每域 543MB/请求且无需跨机整包转移）。比较纪律：任何方案对比必须显式标注每个差异点属于 (A) 还是 (B)；(A) 类差距只记录量级与关闭成本，不作为架构裁决依据；(B) 类指标才是 HCP 的胜负手。三期生态完善的内涵由此明确：补齐/复用 (A) 类轮子（含评估 vLLM 轮子复用路线），让 (B) 类优势可测量地呈现。
-
-_updated: 2026-08-14 14:30:23_
 ### 三期 A 补：KV 容量墙对照实验（长 context x 并发扫描）
 
 type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `user-direction-2026-08-14-kv-wall-boundary`
@@ -1985,6 +2004,17 @@ type: `decision` · status: `held` · confidence: 0.95 · importance: 0.96 · so
 结论：Node 4b DEFER multi-query continuation ring，只实现有证据的 KV-ring correctness；把 Q-ring 作为独立路线选择记忆，待 baseline 可运行后按 payload bytes 与实测带宽决定。VERDICT: DEFER。
 
 _updated: 2026-08-03 09:14:32_
+### 修订核心清单：异构=卖点，长上下文=目标，KV 搬运减少=手段优势（非平行差异化）
+
+type: `revision` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `owner-first-principles-20260815-heterogeneous-selling-point`
+
+修订 decision-phase3-core-vs-reusable-wheels-20260814 的 (B) 核心清单：原清单把三点并列（异构线性拓扑、长上下文无限合作、KV 搬运量减少），本轮第一性原理重推后重排为"手段→卖点→目标"链条，三点不再是平行差异化：
+1) 异构线性拓扑 = 卖点本身（异构支持，唯一差异化）；
+2) 长上下文无限合作 = 目标（异构支持所服务的首要目的，与所有 CP 共享）；
+3) KV 搬运量减少 = 手段优势（P2P ring 的后果，非独立卖点）。
+卖点收窄为"异构支持"；手段(P2P ring 不依赖厂商 collective 栈)与目标(长上下文 KV 容量)分别落位，不再与卖点并列。三层工程角色（L1 插件/L2 独立引擎/L3 编排层愿景）为本修订新增维度。
+
+_updated: 2026-08-15 09:59:43_
 ### [2026-08-13] N=2(white+pearl LAN)可记录性能基线建立:5 reps median,L1 TTFT 22.0s/TPOT 2.16s
 
 type: `evidence` · status: `verified` · confidence: 1.0 · importance: 0.95 · source: `hetero-cp-ringattn@phase3-8-perf-baseline`
@@ -2227,6 +2257,13 @@ type: `task` · status: `superseded` · confidence: 1.0 · importance: 0.94 · s
 边界：这里测 HCP service，不把不同硬件总量的结果误称为算法公平 speedup；vLLM engine baseline 属后续受控对照。
 
 _updated: 2026-08-11 19:10:38_
+### K5 广义化：同构 TP 集群抽象为 ring 上的 worker（L3 编排层愿景，待验证）
+
+type: `task` · status: `pending` · confidence: 1.0 · importance: 0.9 · source: `owner-first-principles-20260815-heterogeneous-selling-point`
+
+K5【HCP 广义化方向 — L3 编排层愿景，待验证】广义化的一种候选形态：把抽象提升到"同构 TP 集群作为 ring 上的一个 worker"，使不同同构集群之间也能合作。定位修正（2026-08-15）：这是 L3 编排层愿景，不一定可行，必须与 dynamo 比"存在必要性"（dynamo 已做编排层，HCP 编排层须证明独特价值：异构 worker 之间的 CP 序列分布是 dynamo 未覆盖的空档）。待分析：worker 抽象边界（域内黑盒原则 bp-plugin-architecture 已支持域内替换为 vLLM/TRT-LLM/MLX）、环协议对"集群 worker"的适配、capacity 表征、与 dynamo 的定位差异。
+
+_updated: 2026-08-15 09:59:43_
 ### 评估复用 vLLM 轮子路线（书面评估先行）
 
 type: `task` · status: `pending` · confidence: 1.0 · importance: 0.9 · source: `owner-strategy-2026-08-14-core-vs-wheels`
