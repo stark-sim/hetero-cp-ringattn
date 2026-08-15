@@ -90,6 +90,13 @@ pub struct NixlBlockTransport {
     wire_recv: u64,
 }
 
+// SAFETY: All NIXL handles (Agent/Backend/OptArgs/RegistrationHandle/
+// XferRequest) are owned exclusively by this struct and accessed from the
+// single worker thread that owns it. This mirrors nixl-sys's own unsafe
+// Send/Sync impls for Backend and XferRequest.
+#[cfg(feature = "nixl-backend")]
+unsafe impl Send for NixlBlockTransport {}
+
 #[cfg(feature = "nixl-backend")]
 impl NixlBlockTransport {
     /// The agent name this transport registered under.
@@ -197,7 +204,11 @@ impl KvBlockTransport for NixlBlockTransport {
             .ok_or_else(|| format!("local block {} not registered", local.id))?;
 
         let mut local_dlist = XferDescList::new(MemType::Vram).map_err(map_err)?;
-        local_dlist.add_desc(local_desc.addr as usize, local_desc.len as usize, local_desc.dev_id);
+        local_dlist.add_desc(
+            local_desc.addr as usize,
+            local_desc.len as usize,
+            local_desc.dev_id,
+        );
         let mut remote_dlist = XferDescList::new(MemType::Vram).map_err(map_err)?;
         remote_dlist.add_desc(
             remote.desc.addr as usize,
