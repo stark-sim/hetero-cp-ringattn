@@ -15,9 +15,9 @@
 //! - `smoke`: correctness 验证基础设施
 
 mod api;
+mod capacity;
 mod cli;
 mod compute_runtime;
-mod capacity;
 mod distributed;
 mod error;
 #[cfg(feature = "tch-backend")]
@@ -35,19 +35,22 @@ mod worker_sdk;
 
 // experimental: raised for route_b_cross_node_smoke (bin targets are separate
 // crates and cannot see pub(crate) items; only re-exports, no behavior change)
+#[cfg(feature = "nixl-backend")]
+pub use distributed::transport::nixl::NixlBlockTransport;
 #[cfg(feature = "tch-backend")]
 pub use model::cache::KvCaches;
 #[cfg(feature = "tch-backend")]
 pub use model::layers::DecoderLayer;
 #[cfg(feature = "tch-backend")]
 pub use model::self_driving::{
-    FrozenKvAssigneeSchedule, LayerPacket, LayerStepOutcome, ReservedPositionedKvShard,
     process_layer_packet_with_reserved_history,
     process_layer_packet_with_reserved_history_for_positions, project_final_logits,
+    FrozenKvAssigneeSchedule, LayerPacket, LayerStepOutcome, ReservedPositionedKvShard,
 };
 #[cfg(feature = "tch-backend")]
 pub use model::transport::{
-    KvBlock, KvTransport, LinkedMockKvTransport, RingPacket, SelfDrivingPacket, TcpKvTransport,
+    KvBlock, KvBlockTransport, KvTransport, LinkedMockKvTransport, RingPacket, SelfDrivingPacket,
+    TcpKvTransport,
 };
 #[cfg(feature = "tch-backend")]
 pub use model::{KvCacheImpl, LlamaModel, ModelConfig, ModelError, ModelWeights};
@@ -59,20 +62,20 @@ pub use worker_sdk::{TchWorkerBackend, WorkerBackend};
 #[cfg(feature = "tch-backend")]
 pub use distributed::transport::quic::{create_endpoint, QuicKvTransport};
 
-pub use cli::{CliArgs, parse_cli_args, next_cli_value};
+pub use cli::{next_cli_value, parse_cli_args, CliArgs};
 pub use error::{RingError, Tolerance, ToleranceTier};
-pub use report::*;
-pub use smoke::*;
-#[cfg(feature = "tch-backend")]
-pub use transport_smoke::run_self_driving_quic_smoke;
-pub use smoke::reference_algo::*;
-pub use smoke::correctness::*;
-pub use smoke::bridges::*;
 pub use remote::*;
+pub use report::*;
 use serde::Serialize;
+pub use smoke::bridges::*;
+pub use smoke::correctness::*;
+pub use smoke::reference_algo::*;
+pub use smoke::*;
 use std::env;
 use std::fs;
 use std::path::Path;
+#[cfg(feature = "tch-backend")]
+pub use transport_smoke::run_self_driving_quic_smoke;
 
 fn torch_device_success_code(requested_device: &str) -> Option<i32> {
     match requested_device {
@@ -134,16 +137,12 @@ fn run(stress_test: bool, tolerance_tier: ToleranceTier) -> Result<Report, RingE
     let torch_query_chunk_bridge = torch_query_chunk_bridge_report(cp_ring_smoke.payload_blocks());
     let torch_query_output_bridge =
         torch_query_output_bridge_report(cp_ring_smoke.payload_blocks());
-    let tch_payload_block_bridge =
-        tch_payload_block_bridge_report(cp_ring_smoke.payload_blocks());
+    let tch_payload_block_bridge = tch_payload_block_bridge_report(cp_ring_smoke.payload_blocks());
     let tch_payload_online_bridge =
         tch_payload_online_bridge_report(cp_ring_smoke.payload_blocks());
-    let tch_payload_chunk_bridge =
-        tch_payload_chunk_bridge_report(cp_ring_smoke.payload_blocks());
-    let tch_query_chunk_bridge =
-        tch_query_chunk_bridge_report(cp_ring_smoke.payload_blocks());
-    let tch_query_output_bridge =
-        tch_query_output_bridge_report(cp_ring_smoke.payload_blocks());
+    let tch_payload_chunk_bridge = tch_payload_chunk_bridge_report(cp_ring_smoke.payload_blocks());
+    let tch_query_chunk_bridge = tch_query_chunk_bridge_report(cp_ring_smoke.payload_blocks());
+    let tch_query_output_bridge = tch_query_output_bridge_report(cp_ring_smoke.payload_blocks());
     let status = if failed == 0
         && protocol_smoke.status == "pass"
         && cp_ring_smoke.status == "pass"
@@ -215,10 +214,12 @@ pub fn run_cli() -> Result<(), RingError> {
     #[cfg(feature = "tch-backend")]
     if let Some(ref model_dir) = args.infer_model_dir {
         let prompt = if let Some(ref path) = args.infer_prompt_file {
-            std::fs::read_to_string(path)
-                .map_err(|e| RingError::InvalidCli(format!("cannot read --infer-prompt-file {path}: {e}")))?
+            std::fs::read_to_string(path).map_err(|e| {
+                RingError::InvalidCli(format!("cannot read --infer-prompt-file {path}: {e}"))
+            })?
         } else {
-            args.infer_prompt.unwrap_or_else(|| "Hello, how are you?".to_string())
+            args.infer_prompt
+                .unwrap_or_else(|| "Hello, how are you?".to_string())
         };
         println!("[infer] prompt length: {} chars", prompt.len());
 
@@ -228,20 +229,31 @@ pub fn run_cli() -> Result<(), RingError> {
                 .map(|_| String::new())
         } else if let Some(ref export_dir) = args.export_hidden_states_dir {
             infer::run_inference_and_export_hidden_states(
-                model_dir, &prompt, args.infer_max_tokens,
-                args.infer_temperature, args.infer_top_p,
-                args.infer_num_domains, export_dir,
+                model_dir,
+                &prompt,
+                args.infer_max_tokens,
+                args.infer_temperature,
+                args.infer_top_p,
+                args.infer_num_domains,
+                export_dir,
             )
         } else if let Some(ref export_dir) = args.export_logits_dir {
             infer::run_inference_and_export_logits(
-                model_dir, &prompt, args.infer_max_tokens,
-                args.infer_temperature, args.infer_top_p,
-                args.infer_num_domains, export_dir,
+                model_dir,
+                &prompt,
+                args.infer_max_tokens,
+                args.infer_temperature,
+                args.infer_top_p,
+                args.infer_num_domains,
+                export_dir,
             )
         } else {
             infer::run_inference(
-                model_dir, &prompt, args.infer_max_tokens,
-                args.infer_temperature, args.infer_top_p,
+                model_dir,
+                &prompt,
+                args.infer_max_tokens,
+                args.infer_temperature,
+                args.infer_top_p,
                 args.infer_num_domains,
             )
         };
@@ -253,7 +265,9 @@ pub fn run_cli() -> Result<(), RingError> {
     }
     #[cfg(not(feature = "tch-backend"))]
     if args.infer_model_dir.is_some() {
-        return Err(RingError::InvalidCli("tch-backend feature required for inference".to_string()));
+        return Err(RingError::InvalidCli(
+            "tch-backend feature required for inference".to_string(),
+        ));
     }
 
     if let Some(ref role) = args.distributed_role {
@@ -281,16 +295,11 @@ pub fn run_cli() -> Result<(), RingError> {
             torch_payload_chunk_bridge_report(cp_node.payload_blocks());
         let torch_query_chunk_bridge = torch_query_chunk_bridge_report(cp_node.payload_blocks());
         let torch_query_output_bridge = torch_query_output_bridge_report(cp_node.payload_blocks());
-        let tch_payload_block_bridge =
-            tch_payload_block_bridge_report(cp_node.payload_blocks());
-        let tch_payload_online_bridge =
-            tch_payload_online_bridge_report(cp_node.payload_blocks());
-        let tch_payload_chunk_bridge =
-            tch_payload_chunk_bridge_report(cp_node.payload_blocks());
-        let tch_query_chunk_bridge =
-            tch_query_chunk_bridge_report(cp_node.payload_blocks());
-        let tch_query_output_bridge =
-            tch_query_output_bridge_report(cp_node.payload_blocks());
+        let tch_payload_block_bridge = tch_payload_block_bridge_report(cp_node.payload_blocks());
+        let tch_payload_online_bridge = tch_payload_online_bridge_report(cp_node.payload_blocks());
+        let tch_payload_chunk_bridge = tch_payload_chunk_bridge_report(cp_node.payload_blocks());
+        let tch_query_chunk_bridge = tch_query_chunk_bridge_report(cp_node.payload_blocks());
+        let tch_query_output_bridge = tch_query_output_bridge_report(cp_node.payload_blocks());
         let tch_compute_output_checksum = cp_node.compute_output_checksum();
         let status = if cp_node.status == "pass"
             && torch_payload_block_bridge.status != "fail"

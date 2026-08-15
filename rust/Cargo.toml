@@ -37,6 +37,11 @@ rand = "0.8"
 name = "quic-echo-server"
 path = "src/bin/quic_echo_server.rs"
 
+[[bin]]
+name = "nixl-probe"
+path = "src/bin/nixl_probe.rs"
+required-features = ["nixl-backend"]
+
 
 
 [build-dependencies]

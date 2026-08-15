@@ -204,6 +204,11 @@ pub struct NixlBlockTransport {
 
 #[cfg(feature = "nixl-backend")]
 impl NixlBlockTransport {
+    /// The agent name this transport registered under.
+    pub fn agent_name(&self) -> &str {
+        &self.agent_name
+    }
+
     /// Create a NIXL agent with a unique name.
     pub fn new(name: &str) -> Result<Self, String> {
         let c_name =
