@@ -2,6 +2,17 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### N=4 进程版裁决：进程隔离仍受 2 GPU 争用，延迟不可裁决；通信优势稳定
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `decode-route-n4-process-20260815`
+
+N=4 进程版裁决（2026-08-15）：
+1. 通信量：SD 省 50.3% 稳定可证（线程版/进程版/理论三方一致）。
+2. 延迟：进程隔离消除了线程模型污染，但 2 台物理机 4 进程仍争用 2 块 GPU——SD 串行接力对 GPU 争用敏感，结果 -5% 到 +10% 波动，不能裁决。
+3. 干净测量 N=4 延迟必须 4 块独立 GPU（当前 white/pearl/laptop 只有 3 台，laptop 8GB 可作第 4 节点但 GPU 仍与他人共享场景不同）。
+4. 综上：跨 N=2/3/4 的可靠结论是——通信优势随 N 单调扩大（0.7%/33.8%/50.3%），延迟优劣取决于网络体制（RTT 主导时打平/微差，计算主导时理论 SD 优），但 N=4 延迟的干净实测仍缺失。
+
+_updated: 2026-08-15 13:01:59_
 ### N=4 双机模拟裁决：通信优势可证，延迟需真 4 节点验证
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `decode-route-n4-emulation-20260815`
@@ -2373,6 +2384,18 @@ type: `task` · status: `superseded` · confidence: 1.0 · importance: 0.94 · s
 边界：这里测 HCP service，不把不同硬件总量的结果误称为算法公平 speedup；vLLM engine baseline 属后续受控对照。
 
 _updated: 2026-08-11 19:10:38_
+### N=4 进程版实测：SD 通信省 50.3% 稳定，延迟 -5%~+10% 波动（2 GPU 争用）
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 0.92 · source: `decode-route-n4-process-20260815`
+
+N=4 进程版实测（commit d951d8f 后，4 个独立 --domain-id 进程：white 跑 d0/d2、pearl 跑 d1/d3，ring white->pearl->white->pearl->white，每跳跨机有线 0.19ms，Qwen2-0.5B）：
+1. n4p1：SD 快 7.8-10.4%（white d0 154.6 vs 167.6ms，pearl d1 151.3 vs 168.9ms）。
+2. n4p2：SD 慢 1.6-4.8%（white 175.3 vs 167.2ms）。
+3. n4p3：SD 慢 0.1-5.0%（white 179.9 vs 171.4ms）。
+4. 结论：即使进程隔离（每进程独立 GPU 上下文），两台物理机各跑 2 进程时，4 个 worker 仍争用 2 块 GPU 的算力；SD 每层 3 跳串行接力对 GPU 调度争用敏感，Q-ring 4 进程并行算 partial 对争用相对不敏感——延迟在 -5% 到 +10% 间波动，无法裁决。
+5. 通信量仍稳定：SD 省 50.3% wire bytes（与线程版、理论一致）。
+
+_updated: 2026-08-15 13:01:59_
 ### N=4 双机模拟：SD 省 50.3% 通信，延迟被同机共享 GPU 串行化污染
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 0.92 · source: `decode-route-n4-emulation-20260815`
