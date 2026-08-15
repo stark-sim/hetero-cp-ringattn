@@ -96,6 +96,26 @@ struct NixlXferReqOpaque {
 struct NixlOptArgsOpaque {
     _private: [u8; 0],
 }
+#[cfg(feature = "nixl-backend")]
+#[repr(C)]
+struct NixlStringListOpaque {
+    _private: [u8; 0],
+}
+#[cfg(feature = "nixl-backend")]
+#[repr(C)]
+struct NixlMemListOpaque {
+    _private: [u8; 0],
+}
+#[cfg(feature = "nixl-backend")]
+#[repr(C)]
+struct NixlParamsOpaque {
+    _private: [u8; 0],
+}
+#[cfg(feature = "nixl-backend")]
+#[repr(C)]
+struct NixlBackendOpaque {
+    _private: [u8; 0],
+}
 
 #[cfg(feature = "nixl-backend")]
 type NixlAgent = *mut NixlAgentOpaque;
@@ -107,12 +127,46 @@ type NixlXferDlist = *mut NixlXferDlistOpaque;
 type NixlXferReq = *mut NixlXferReqOpaque;
 #[cfg(feature = "nixl-backend")]
 type NixlOptArgs = *mut NixlOptArgsOpaque;
+#[cfg(feature = "nixl-backend")]
+type NixlStringList = *mut NixlStringListOpaque;
+#[cfg(feature = "nixl-backend")]
+type NixlMemList = *mut NixlMemListOpaque;
+#[cfg(feature = "nixl-backend")]
+type NixlParams = *mut NixlParamsOpaque;
+#[cfg(feature = "nixl-backend")]
+type NixlBackend = *mut NixlBackendOpaque;
 
 #[cfg(feature = "nixl-backend")]
 #[link(name = "nixl_capi")]
 extern "C" {
     fn nixl_capi_create_agent(name: *const c_char, agent: *mut NixlAgent) -> c_int;
     fn nixl_capi_destroy_agent(agent: NixlAgent) -> c_int;
+
+    fn nixl_capi_get_available_plugins(agent: NixlAgent, plugins: *mut NixlStringList) -> c_int;
+    fn nixl_capi_destroy_string_list(list: NixlStringList) -> c_int;
+    fn nixl_capi_string_list_size(list: NixlStringList, size: *mut usize) -> c_int;
+    fn nixl_capi_string_list_get(
+        list: NixlStringList,
+        index: usize,
+        str: *mut *const c_char,
+    ) -> c_int;
+
+    fn nixl_capi_get_plugin_params(
+        agent: NixlAgent,
+        plugin_name: *const c_char,
+        mems: *mut NixlMemList,
+        params: *mut NixlParams,
+    ) -> c_int;
+    fn nixl_capi_destroy_mem_list(list: NixlMemList) -> c_int;
+    fn nixl_capi_destroy_params(params: NixlParams) -> c_int;
+    fn nixl_capi_create_backend(
+        agent: NixlAgent,
+        plugin_name: *const c_char,
+        params: NixlParams,
+        backend: *mut NixlBackend,
+    ) -> c_int;
+    fn nixl_capi_destroy_backend(backend: NixlBackend) -> c_int;
+    fn nixl_capi_opt_args_add_backend(args: NixlOptArgs, backend: NixlBackend) -> c_int;
 
     fn nixl_capi_create_reg_dlist(mem_type: c_int, dlist: *mut NixlRegDlist) -> c_int;
     fn nixl_capi_destroy_reg_dlist(dlist: NixlRegDlist) -> c_int;
@@ -195,6 +249,12 @@ fn status_ok(status: c_int, what: &str) -> Result<(), String> {
 pub struct NixlBlockTransport {
     agent_name: String,
     agent: NixlAgent,
+    /// The UCX backend instantiated at construction. register_mem / transfers
+    /// are scoped to this backend via opt_args so VRAM registration succeeds.
+    backend: NixlBackend,
+    /// opt_args carrying the backend handle, reused by register_mem and the
+    /// transfer request lifecycle.
+    opt_args: NixlOptArgs,
     next_block_id: u64,
     blocks: HashMap<u64, BlockDesc>,
     pending: Vec<(u64, NixlXferReq)>,
@@ -209,7 +269,10 @@ impl NixlBlockTransport {
         &self.agent_name
     }
 
-    /// Create a NIXL agent with a unique name.
+    /// Create a NIXL agent with a unique name, and instantiate the UCX
+    /// backend so VRAM registration succeeds. The official example
+    /// (examples/rust/single_process_example.rs) shows this is required: a bare
+    /// agent has "no available backends for mem type 'VRAM_SEG'".
     pub fn new(name: &str) -> Result<Self, String> {
         let c_name =
             std::ffi::CString::new(name).map_err(|e| format!("invalid agent name: {e}"))?;
@@ -219,9 +282,78 @@ impl NixlBlockTransport {
         if agent.is_null() {
             return Err("nixl_capi_create_agent returned null agent".to_string());
         }
+
+        // Discover plugins and confirm UCX is available.
+        let mut plugins: NixlStringList = std::ptr::null_mut();
+        status_ok(
+            unsafe { nixl_capi_get_available_plugins(agent, &mut plugins) },
+            "nixl_capi_get_available_plugins",
+        )?;
+        let mut plugin_count: usize = 0;
+        let _ = unsafe { nixl_capi_string_list_size(plugins, &mut plugin_count) };
+        let mut found_ucx = false;
+        for idx in 0..plugin_count {
+            let mut plugin_ptr: *const c_char = std::ptr::null();
+            if unsafe { nixl_capi_string_list_get(plugins, idx, &mut plugin_ptr) }
+                == NixlStatus::Success as i32
+                && !plugin_ptr.is_null()
+            {
+                let plugin = unsafe { std::ffi::CStr::from_ptr(plugin_ptr) }.to_string_lossy();
+                if plugin == "UCX" {
+                    found_ucx = true;
+                }
+            }
+        }
+        unsafe { nixl_capi_destroy_string_list(plugins) };
+        if !found_ucx {
+            unsafe { nixl_capi_destroy_agent(agent) };
+            return Err("NIXL UCX backend not available".to_string());
+        }
+
+        // Instantiate the UCX backend with default plugin params.
+        let ucx = std::ffi::CString::new("UCX").map_err(|e| format!("invalid plugin name: {e}"))?;
+        let mut mems: NixlMemList = std::ptr::null_mut();
+        let mut params: NixlParams = std::ptr::null_mut();
+        status_ok(
+            unsafe { nixl_capi_get_plugin_params(agent, ucx.as_ptr(), &mut mems, &mut params) },
+            "nixl_capi_get_plugin_params",
+        )?;
+        let mut backend: NixlBackend = std::ptr::null_mut();
+        let backend_status =
+            unsafe { nixl_capi_create_backend(agent, ucx.as_ptr(), params, &mut backend) };
+        unsafe {
+            nixl_capi_destroy_mem_list(mems);
+            nixl_capi_destroy_params(params);
+        }
+        status_ok(backend_status, "nixl_capi_create_backend")?;
+        if backend.is_null() {
+            unsafe { nixl_capi_destroy_agent(agent) };
+            return Err("nixl_capi_create_backend returned null backend".to_string());
+        }
+
+        // opt_args carrying the backend; register_mem / transfers reference it.
+        let mut opt_args: NixlOptArgs = std::ptr::null_mut();
+        status_ok(
+            unsafe { nixl_capi_create_opt_args(&mut opt_args) },
+            "nixl_capi_create_opt_args",
+        )?;
+        let add_status = unsafe { nixl_capi_opt_args_add_backend(opt_args, backend) };
+        if add_status != NixlStatus::Success as i32 {
+            unsafe {
+                nixl_capi_destroy_opt_args(opt_args);
+                nixl_capi_destroy_backend(backend);
+                nixl_capi_destroy_agent(agent);
+            }
+            return Err(format!(
+                "nixl_capi_opt_args_add_backend failed: {add_status}"
+            ));
+        }
+
         Ok(Self {
             agent_name: name.to_string(),
             agent,
+            backend,
+            opt_args,
             next_block_id: 0,
             blocks: HashMap::new(),
             pending: Vec::new(),
@@ -248,7 +380,7 @@ impl NixlBlockTransport {
             unsafe { nixl_capi_destroy_reg_dlist(dlist) };
             return Err(format!("nixl_capi_reg_dlist_add_desc failed: {status}"));
         }
-        let status = unsafe { nixl_capi_register_mem(self.agent, dlist, std::ptr::null_mut()) };
+        let status = unsafe { nixl_capi_register_mem(self.agent, dlist, self.opt_args) };
         if status != NixlStatus::Success as i32 {
             unsafe { nixl_capi_destroy_reg_dlist(dlist) };
             return Err(format!("nixl_capi_register_mem failed: {status}"));
@@ -269,6 +401,9 @@ unsafe impl Send for NixlBlockTransport {}
 impl Drop for NixlBlockTransport {
     fn drop(&mut self) {
         unsafe {
+            // Destroy in reverse-construction order: backend -> opt_args -> agent.
+            let _ = nixl_capi_destroy_backend(self.backend);
+            let _ = nixl_capi_destroy_opt_args(self.opt_args);
             let _ = nixl_capi_destroy_agent(self.agent);
         }
     }
@@ -315,7 +450,7 @@ impl KvBlockTransport for NixlBlockTransport {
                 desc.meta.len(),
             )
         };
-        let status = unsafe { nixl_capi_deregister_mem(self.agent, dlist, std::ptr::null_mut()) };
+        let status = unsafe { nixl_capi_deregister_mem(self.agent, dlist, self.opt_args) };
         unsafe { nixl_capi_destroy_reg_dlist(dlist) };
         status_ok(status, "nixl_capi_deregister_mem")
     }
@@ -398,7 +533,7 @@ impl KvBlockTransport for NixlBlockTransport {
                 remote_dlist,
                 remote_agent.as_ptr(),
                 &mut req,
-                std::ptr::null_mut(),
+                self.opt_args,
             )
         };
         unsafe {
@@ -407,7 +542,7 @@ impl KvBlockTransport for NixlBlockTransport {
         }
         status_ok(status, "nixl_capi_create_xfer_req")?;
 
-        let status = unsafe { nixl_capi_post_xfer_req(self.agent, req, std::ptr::null_mut()) };
+        let status = unsafe { nixl_capi_post_xfer_req(self.agent, req, self.opt_args) };
         if status != NixlStatus::Success as i32 && status != NixlStatus::InProg as i32 {
             unsafe { nixl_capi_destroy_xfer_req(req) };
             return Err(format!("nixl_capi_post_xfer_req failed: {status}"));
