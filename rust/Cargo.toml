@@ -7,6 +7,10 @@ build = "build.rs"
 [features]
 default = ["tch-backend"]
 tch-backend = ["dep:tch", "dep:half"]
+# NIXL block-direct transport (form-B third transport). Off by default: links
+# libnixl_capi.so, only buildable on CUDA/ROCm hosts with NIXL installed
+# (white/pearl), never on the Mac.
+nixl-backend = []
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
