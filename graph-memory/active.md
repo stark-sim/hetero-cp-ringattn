@@ -2,6 +2,19 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### decode 路线裁定：Q-ring（KV 不动）为默认，legacy KV-resend 退役
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `code-verification-decode-routes-20260815`
+
+decode 路线裁定（2026-08-15，代码实证）：HCP decode 走 Q-ring（KV 不动），legacy KV-resend 是历史回退。
+【代码事实】两条 decode 路线在 ring.rs 里不是权重分片差异（权重全复制是两者共同前提），而是环上传输对象差异：
+- route A（legacy KV-resend，HCP_RING_DECODE_RING=0）：decode 时把本地 prefill KV 分区作为 KV block 绕环重发，每个节点全量 append 每个 decode token 的 growth KV（KV 冗余复制到每个节点）。通信 O(T×d)，随上下文线性增长。
+- route B（Q-ring，HCP_RING_DECODE_RING=1，默认）：ring_decode_attention 环上只流 (Q,O,LSE) 小包，KV 原地；growth KV 只保留 p%N 份额。通信 O(d)，与历史无关。
+【三期实测归属】phase3-9/10 走的是 WorkerCommand::Prefill/Decode + ring_decode_attention Q-ring（KV 不动），worker 日志实证为 DecodeBatch 命令 + HCP_RING_DECODE_RING 默认 1。即三期一直在跑 KV 不动的路线，与 07-28 裁定不冲突。
+【实测数据】N=2、prefill_len=7、4-step decode、bf16：legacy max_diff 2.4e-6（cache 8/7 全量复制），Q-ring max_diff 3.3e-6（cache 6/5 p%N 份额）；通信 legacy 896B/token/layer（4k context 时 512KB）vs Q-ring 恒定 144B/token/layer。
+【裁决】decode 默认走 Q-ring（KV 不动）是唯一能支撑长上下文的方向；legacy KV-resend 应退役（通信随上下文线性增长，与长上下文目标直接冲突），仅保留测试证明回退行为。StationaryContinuation 自驱动环是 route B 的升级形态（在 Q-ring 上进一步消除全节点冗余 forward），目前仅接入 continuation 命令，应作为 decode 的下一步优化方向，双线合并=Q-ring 为基线 + 自驱动环为升级路径。
+
+_updated: 2026-08-15 11:05:14_
 ### 【已否决】K8 量化路径：通用轮子，对 HCP 无特定优势
 
 type: `task` · status: `rejected` · confidence: 1.0 · importance: 1.0 · source: `hcp-core-review-keypoints-round2-20260815`
@@ -2004,6 +2017,17 @@ type: `decision` · status: `held` · confidence: 0.95 · importance: 0.96 · so
 结论：Node 4b DEFER multi-query continuation ring，只实现有证据的 KV-ring correctness；把 Q-ring 作为独立路线选择记忆，待 baseline 可运行后按 payload bytes 与实测带宽决定。VERDICT: DEFER。
 
 _updated: 2026-08-03 09:14:32_
+### decode 双路线对照测试通过：Q-ring 通信 O(d) 恒定，legacy O(T×d) 线性增长
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `code-verification-decode-routes-20260815`
+
+commit 7447580 新增对照测试 test_decode_route_comparison_legacy_kv_resend_vs_qring（ring.rs），同一 N=2、prefill_len=7、4-step decode 场景量化两条 decode 路线：
+1. legacy KV-resend（decode_ring=false）：max_diff 2.40e-6 vs full-KV 参考；cache0.len=8 cache1.len=7（prefill 4/3 + 全部 4 个 growth token 复制到每节点）——KV 动。
+2. Q-ring（decode_ring=true，默认）：max_diff 3.34e-6 vs 参考；cache0.len=6 cache1.len=5（prefill 4/3 + p%N 份额 2 个 growth）——KV 不动。
+3. 理论通信（bf16，每 token 每层）：legacy=2×prefill_len×kv_heads×head_dim×2B（4k context 时 512KB，随上下文线性增长）；Q-ring=2×kv_heads×head_dim×2B + heads×4（恒定 144B）。
+15 个 ring.rs tests 全 PASS（含既有 qring/legacy 单测）。
+
+_updated: 2026-08-15 11:05:14_
 ### 修订核心清单：异构=卖点，长上下文=目标，KV 搬运减少=手段优势（非平行差异化）
 
 type: `revision` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `owner-first-principles-20260815-heterogeneous-selling-point`
