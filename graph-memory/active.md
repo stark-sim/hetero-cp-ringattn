@@ -2018,6 +2018,18 @@ type: `decision` · status: `held` · confidence: 1.0 · importance: 0.98 · sou
 [2026-08-02 实现] b6902ba 验证显式 runtime Kind；VERDICT: IMPLEMENTED。
 
 _updated: 2026-08-01 20:38:25_
+### N=3 逐阶段计时：recv_wait 占 98-100%，差异=自驱动 process 串行化 15ms
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 0.97 · source: `decode-route-stage-timing-20260815`
+
+N=3 逐阶段计时（commit b40b351，Qwen2-0.5B，white+pearl+laptop tailscale 网，n3t1/n3t2/n3t3）：
+1. 两条路线每 token 完整 forward 分解：recv_wait 占 98-100%（Q-ring white 3546/3587ms=99%，自驱动 3629/3646ms=100%），merge/process 仅 15-16ms（0.4%），send 1-2ms。
+2. 结论：延迟完全由网络 recv 等待主导，通信量（字节）与计算几乎无关紧要。
+3. 每层有效网络关键路径：两条路线都约 140-150ms/layer ≈ 1 个 tailscale RTT（124-126ms）+ 余量。
+4. 差异来源：自驱动环是严格的 recv->process->send 串行链（2 跳，process 在关键路径上，无重叠）；Q-ring 是 2 轮全节点并行，merge 与其他节点 recv 重叠（pipeline）。实测差异 SD-Q ≈ 15-16ms ≈ 一个节点的 process+send 串行化开销。
+5. 通信量对比仍成立：自驱动省 33.8% wire bytes（N=3），但省字节不省延迟——因为延迟由 RTT 决定，非带宽。
+
+_updated: 2026-08-15 12:35:06_
 ### 比较 KV ring、batched accumulator 与混合 continuation 路线
 
 type: `task` · status: `planning` · confidence: 0.92 · importance: 0.97 · source: `user-confirmed-2026-08-03`
@@ -2037,6 +2049,17 @@ type: `decision` · status: `held` · confidence: 0.95 · importance: 0.96 · so
 结论：Node 4b DEFER multi-query continuation ring，只实现有证据的 KV-ring correctness；把 Q-ring 作为独立路线选择记忆，待 baseline 可运行后按 payload bytes 与实测带宽决定。VERDICT: DEFER。
 
 _updated: 2026-08-03 09:14:32_
+### 修订 N=3 延迟归因：RTT 主导确认，但差异是 process 不可重叠非常数
+
+type: `revision` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `decode-route-stage-timing-20260815`
+
+修订 decision-decode-route-n3-verdict-20260815 的延迟归因：原记录把 N=3 自驱动环延迟 +9-15% 归因于"串行化 + RTT 主导"，但未量化。逐阶段计时（b40b351）精确归因：
+- 延迟 98-100% 是 recv_wait（网络等待），不是计算、不是通信量；
+- 两条路线每层网络关键路径相同（~1 tailscale RTT/layer），差异仅来自自驱动环的 process 串行化（15-16ms/token，占 0.4% 但不可重叠）；
+- 因此 N=3 的 +2-15% 延迟差本质是"串行化 process 不可重叠"的常数开销，与通信量节省（33.8%）是两个独立维度：省带宽成立，省延迟不成立（RTT 主导网络）。
+【修正】原裁决"tailscale RTT 淹没差异"不准确——实测差异虽小但稳定（n3t1/t2/t3 一致），且逐阶段可解释；真正机制是 recv_wait 主导 + 自驱动 process 不可重叠。
+
+_updated: 2026-08-15 12:35:06_
 ### N=3 实测：自驱动环省通信 33.8% 但延迟 +9-15%（tailscale 网）
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `decode-route-n3-experiment-20260815`
