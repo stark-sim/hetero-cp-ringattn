@@ -2,6 +2,55 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### HCP 核心方案全局复核：关键点清单（只记录不分析）
+
+type: `task` · status: `pending` · confidence: 1.0 · importance: 1.0 · source: `hcp-core-review-keypoints-20260815`
+
+全局视角核心方案复核（用户发起，2026-08-15）。原则：只整理记录关键点，暂不对各点展开具体分析；阶段定位：一期二期一直在走 route B（自驱动 stationary ring），三期生态/轮子尚未开始，许多优化在接轮子后前提会变，不做前置优化。下含 6 个探究点子节点（K1-K6），逐点确认后再分别立项。
+
+_updated: 2026-08-15 04:54:23_
+### K1 路线史实澄清：一期二期 route B，三期实测跑在哪条路径
+
+type: `task` · status: `pending` · confidence: 1.0 · importance: 1.0 · source: `hcp-core-review-keypoints-20260815`
+
+K1【路线史实澄清】用户指出一期二期一直在走 route B；先前会话中"三期实测跑在 route A（seq 切分 Q-ring + decode 冗余 forward）、与 07-28 裁定分叉"的陈述造成混乱，必须核实：(a) 三期 phase3-9/10 受控对比实际执行的是哪条代码路径（WorkerCommand::Prefill/Decode + ring_decode_attention Q-ring，还是 StationaryContinuation 自驱动环）；(b) 若是前者，何时、为何从 route B 切到该路径，decision-self-driving-ring-20260728（N× 冗余 forward 不可接受）与该路径的关系；(c) 据此修正 graph 中相关表述。产物：一页路线演进时间线（一期/二期/三期各跑什么路径、对应 commit/决策节点）。
+
+_updated: 2026-08-15 04:54:23_
+### K2 decode 适用性：route A/B 共同证实或证伪 decode 是否适合 HCP
+
+type: `task` · status: `pending` · confidence: 1.0 · importance: 1.0 · source: `hcp-core-review-keypoints-20260815`
+
+K2【decode 适用性证实/证伪】假设：decode 阶段可能确实不适用 ring-attn；prefill 相比 TP 仍是主流低成本方案。研究目标：用 route A 与 route B 两条路径的实测共同回答"decode 是否适合 HCP"——给出证实或证伪的证据，而非停留在推断。已知线索（待复核）：decode Q-ring 冗余 forward 的收益交叉点 ~34 万 token（3B/N=2，KV>=N×权重才省流量）；每 token 36x(N-1) 串行环跳构成延迟地板。注意：这些数字本身也需在 K1 澄清后重新归属到正确路线。
+
+_updated: 2026-08-15 04:54:23_
+### K3 退路形态：decode 证伪则 HCP 走 PD 分离，参考 dynamo
+
+type: `task` · status: `pending` · confidence: 1.0 · importance: 1.0 · source: `hcp-core-review-keypoints-20260815`
+
+K3【若 decode 证伪的退路形态】若 K2 证实 decode 不适合 HCP，则 HCP 形态选择转向 PD 分离方案，参考 dynamo（生态级对比，此前用户裁定推迟到三期）。待分析：HCP 的 prefill 侧优势（KV 切分、异构聚合）与 PD 分离/decode 侧生态轮子如何组合；dynamo 的哪些设计可复用。
+
+_updated: 2026-08-15 04:54:23_
+### K4 传输解绑：评估 NIXL 作为 HCP ring 传输轮子
+
+type: `task` · status: `pending` · confidence: 1.0 · importance: 1.0 · source: `hcp-core-review-keypoints-20260815`
+
+K4【传输层解绑】QUIC 不是 HCP 绑定的传输；NIXL 已在 vLLM PD 栈证明可做 CUDA<->ROCm 异构传输（UCX 1.19.1 --with-rocm + nixl rocm wheel + rixl shim，white/pearl 实测链通）。待评估：NIXL 是否适合作为 HCP ring 的传输轮子（语义匹配：block 级 KV 传输 vs HCP 的 micro KV block / (Q,O,LSE) 小包；性能：vs QUIC 用户态逐跳开销）。
+
+_updated: 2026-08-15 04:54:23_
+### K5 广义化：同构 TP 集群抽象为 ring 上的 worker
+
+type: `task` · status: `pending` · confidence: 1.0 · importance: 1.0 · source: `hcp-core-review-keypoints-20260815`
+
+K5【HCP 广义化方向】最好的广义化方式：把抽象提升到"同构 TP 集群作为 ring 上的一个 worker"，使不同同构集群之间也能合作。待分析：worker 抽象边界（域内黑盒原则 bp-plugin-architecture 已支持域内替换为 vLLM/TRT-LLM/MLX）、环协议对"集群 worker"的适配、capacity 表征。
+
+_updated: 2026-08-15 04:54:23_
+### K6 核心方案隐患清单存档（S1-S5 + P 类）
+
+type: `analysis` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `hcp-core-review-keypoints-20260815`
+
+K6【前序全局分析的隐患清单（已陈述，存档备查，暂不展开）】S1 价值区间=容量独占区（单节点放得下则 HCP 恒劣）；S2 CXL-class 经济性为未验证假设（必要性已证、充分性无实机证据）；S3 N>2 无生产路径证据（straggler/逐跳传输量/故障传播未测）；S4 环=链的故障语义（无副本无降级）；S5 百万 token 级在线 softmax 跨平台 bf16 误差累积未测量。P 类（接轮子后前提会变，暂不做）：workspace 入账、排队、continuous batching、fused kernel。注：K6 中 decode 相关条目归属以 K1 澄清结果为准。
+
+_updated: 2026-08-15 04:54:23_
 ### admission 修复验证 + 8k 墙扫描：120/120 全绿；30k 真约束=激活工作区
 
 type: `evidence` · status: `verified` · confidence: 0.9 · importance: 1.0 · source: `phase3-10-fix-validation-20260815`
