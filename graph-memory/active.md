@@ -2,6 +2,27 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### K10 决策：transport trait 加 wire-bytes 计量 + 主线 SD decode 补字节字段 + 聚合台账（对齐 NIXL telemetry / TP all-reduce 口径）
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@k10-kv-byte-ledger-20260816`
+
+【K10 动机六问——KV 搬运量定量账本（2026-08-16）】
+
+1. 问题：B 类核心主张"KV 搬运量大幅减少"目前只有机制性定性和容量账面比（2.7x），缺 bytes-on-wire 定量台账，三期 vLLM PD 对比无法用同口径字节数裁决。主线 decode 已是 SD（stationary_decode），但它的 perf event 只有 sends/recvs 计数、无任何字节字段——这是最大缺口。
+
+2. 现状：perf event 字节字段碎片化且口径不一——ring_attention（prefill KV ring）有 kv_sent_bytes/kv_recv_bytes（tensor payload 估算）、ring_decode（legacy Q-ring）有 packet_sent_bytes/packet_recv_bytes（估算）、stationary_continuation 与主线 stationary_decode 都只有 sends/recvs 无 bytes。且这些是 payload 估算（numel×elem_bytes），不是真实 wire frame 字节（含 meta JSON + 4 字节 length prefix）。transport trait 无统一计量接口，未来 NIXL 无法复用同口径。
+
+3. 终态：(a) KvTransport trait 增加 wire_bytes_sent()/wire_bytes_recv() 累计计数器（默认 0），TCP/QUIC 报告真实 serialized frame 字节；(b) 主线 stationary_decode 与 stationary_continuation 的 perf event 补齐 sent_bytes/recv_bytes（从 per-layer transport 计数器差值累计）；(c) scripts/kv_transport_ledger.py 聚合 HCP_PERF_LOG 为 per-request/per-token 的 KV 搬运量台账，并给出 HCP ring vs vLLM PD（NIXL 整段 KV 一次搬移）vs TP（每层 all-reduce activation）的同口径对比公式。
+
+4. 他者：vLLM PD 的 NIXL 用 getXferTelemetry 报告真实 transfer bytes；TP 的 all-reduce 字节 = 2×(N-1)/N × activation 字节 × layers。对比口径都是"实际传输的数据字节数"，因此 HCP 也必须用真实 wire bytes 而非 payload 估算，否则低估 meta 开销、口径不对齐。
+
+5. 本方案：trait 加 wire_bytes_sent/recv 增量计数器（不改变现有 send/recv 返回值签名，默认实现 0，mock 保持 0）；TCP 在 flush_send 累加写出字节、在 frame decode 累加读入字节；QUIC 在主线程 submit_send 累加 frame.len()、recv task 经 Arc<AtomicU64> 累加（recv_frame_from_stream 改为返回 frame wire 长度）；stationary_decode/continuation 逐层用 transport 计数器差值累计 sd_sent_bytes/sd_recv_bytes 写入 perf event；聚合脚本读 JSONL 输出台账。
+
+6. 为什么：真实 wire bytes 是唯一能同时对齐 NIXL telemetry 与 TP all-reduce 的口径；trait 层累计让 NIXL transport 接入时自然复用（NIXL 的 getXferTelemetry 直接填同字段）；逐层差值累计避免在 worker 层重复实现 serialize 逻辑，单一事实源在 transport。
+
+VERDICT: IMPLEMENT（先 K10 字节台账，再接 NIXL transport，两任务共用同一计量接口）。
+
+_updated: 2026-08-15 15:04:48_
 ### 自驱动环合并入主线 decode 的代码与验证
 
 type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@decode-route-merge-code-20260816`
@@ -158,7 +179,7 @@ K9【多轮 continuation 数据流收口】task-multiround-stage-dataflow-analys
 _updated: 2026-08-15 05:17:02_
 ### K10 KV 搬运量定量账本：HCP ring vs PD vs TP 的 bytes-on-wire
 
-type: `task` · status: `pending` · confidence: 1.0 · importance: 1.0 · source: `hcp-core-review-keypoints-round2-20260815`
+type: `task` · status: `completed` · confidence: 1.0 · importance: 1.0 · source: `hcp-core-review-keypoints-round2-20260815`
 
 K10【KV 搬运量定量账本】"KV 搬运量大幅减少"是用户裁定的 B 类核心主张，但目前只有机制性定性和容量账面比（2.7x），缺 bytes-on-wire 定量对比：HCP ring（prefill KV micro block 逐跳 + decode Q/O/LSE 小包）vs vLLM PD（NIXL 整段 KV 搬移）vs TP（每层 all-reduce）。待做：每请求/每 token 的线上字节数定量台账（perf event 已有 sent/recv 字节字段，可聚合），把核心主张从定性变定量。
 
