@@ -2,6 +2,34 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### K7 调度策略线收口：Striped/ZigZag 与异构不均分的兼容性
+
+type: `task` · status: `pending` · confidence: 1.0 · importance: 1.0 · source: `hcp-core-review-keypoints-round2-20260815`
+
+K7【调度策略线收口】Vanilla/Striped/ZigZag 已在 HCP 实现并对比（claim-ring-derivatives），但 Striped + 非均等 capacity-aware 切分的兼容性问题挂起（uncertainty-striped-uneven-20260629、hyp-stripe-ring、task-stripe-real-hardware-20260629 均 suspended；3:1 实测 Striped 反使瓶颈 domain 更慢）。待确认：异构不均分是 HCP 核心主张（capacity-weighted），负载均衡策略线与它的关系必须收口——要么 revival 解决兼容性，要么正式裁定放弃并写明适用边界，避免悬置。
+
+_updated: 2026-08-15 05:17:02_
+### K8 量化路径：权重/KV 量化对 HCP 容量主张的倍数效应
+
+type: `task` · status: `pending` · confidence: 1.0 · importance: 1.0 · source: `hcp-core-review-keypoints-round2-20260815`
+
+K8【量化路径缺失】hyp-net-speed 已实测 7B bf16 装不进 pearl 16GB（分布式 7B 无量化路径不可行）；route B 权重按层切分可缓解权重侧，但权重量化与 KV 量化从未立项。KV 量化（如 FP8 KV cache）直接放大 HCP 的容量主张（B 类核心：同显存装更长上下文），是主流现成轮子（vLLM 已支持）。待分析：量化在 HCP 路线的位置——KV 量化对容量账的倍数效应、跨平台 kernel 支持（CUDA/ROCm/MPS 一致性）、与在线 softmax 合并路径的数值兼容性。
+
+_updated: 2026-08-15 05:17:02_
+### K9 多轮 continuation 数据流收口（长上下文真实使用形态）
+
+type: `task` · status: `pending` · confidence: 1.0 · importance: 1.0 · source: `hcp-core-review-keypoints-round2-20260815`
+
+K9【多轮 continuation 数据流收口】task-multiround-stage-dataflow-analysis-20260805（状态 active）规划了同一请求 prefill->decode->continuation->decode 多轮的 KV/activation/Q-O-LSE/position metadata 全生命周期数据流分析，区分 KV-ring baseline 与 batched accumulator 目标。多轮 continuation 是长上下文的真实使用形态（route B stationary continuation 的核心场景），其端到端验证与数据流收口情况待确认。
+
+_updated: 2026-08-15 05:17:02_
+### K10 KV 搬运量定量账本：HCP ring vs PD vs TP 的 bytes-on-wire
+
+type: `task` · status: `pending` · confidence: 1.0 · importance: 1.0 · source: `hcp-core-review-keypoints-round2-20260815`
+
+K10【KV 搬运量定量账本】"KV 搬运量大幅减少"是用户裁定的 B 类核心主张，但目前只有机制性定性和容量账面比（2.7x），缺 bytes-on-wire 定量对比：HCP ring（prefill KV micro block 逐跳 + decode Q/O/LSE 小包）vs vLLM PD（NIXL 整段 KV 搬移）vs TP（每层 all-reduce）。待做：每请求/每 token 的线上字节数定量台账（perf event 已有 sent/recv 字节字段，可聚合），把核心主张从定性变定量。
+
+_updated: 2026-08-15 05:17:02_
 ### HCP 核心方案全局复核：关键点清单（只记录不分析）
 
 type: `task` · status: `pending` · confidence: 1.0 · importance: 1.0 · source: `hcp-core-review-keypoints-20260815`
