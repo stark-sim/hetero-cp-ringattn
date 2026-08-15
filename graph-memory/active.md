@@ -2,6 +2,21 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### 低 RTT 理论外推：N=3/4 有线下 SD 延迟省 ~2.5x + 带宽省 33-50%
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `decode-route-low-rtt-theory-20260815`
+
+低 RTT（全有线）场景理论分析（2026-08-15）：
+【前提】两条 decode 路线都是 N-1 hop/layer（ring 拓扑下界），hop 维度无法区分；tailscale 实测（recv_wait 占 98-100%）证实 RTT 主导时两者延迟趋同、通信量是唯一区分维度。由此转向：有线（RTT≈0.2ms）下 N=3/N=4 的理论外推。
+【通信量/每 token】Qwen2-0.5B：N=3 Q-ring 512KB vs SD 339KB（SD 省 33.8%）；N=4 Q-ring 1024KB vs SD 509KB（SD 省 50.3%）；N=8 省 75.2%。Qwen2.5-3B 同比例（N=3 省 33.6%，N=4 省 50.2%）。
+【延迟/每 token 关键路径（低 RTT，recv_wait→~0）】
+Q-ring：每节点完整 forward（local partial≈9.4ms + merge 15.8ms + MLP 14ms ≈ 39ms），N 节点并行 wall-clock=39ms；网络项 (N-1)*RTT≈0.4ms。
+SD：计算分布（starter q_proj + middle partial + finisher MLP 串行合计≈15.6ms），+ 网络 (N-1)*RTT≈0.4ms。
+=> 低 RTT 下 SD 延迟约省 2.5x（15.6 vs 39ms）+ 带宽省 33-50%。
+【反转机制】tailscale 实验 SD 反而慢 2-15%，因为 recv_wait（RTT 125ms/层）主导，完全压过计算差异；一旦 RTT 降到 0.2ms，计算成为主导，SD 的去冗余 forward 优势显现。
+【边界】这是理论外推，未经有线 N=3 实测验证；模型为 0.5B/3B 单 token decode；多请求并发下 SD 的 process 可与其他请求重叠（用户观点），优势可能进一步扩大。
+
+_updated: 2026-08-15 12:42:09_
 ### N=3 裁决：自驱动环省带宽但延迟不占优（RTT 主导）；按指标拆分，Q-ring 保持默认
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `decode-route-n3-experiment-20260815`
