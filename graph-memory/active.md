@@ -214,7 +214,7 @@ K3【若 decode 证伪的退路形态】若 K2 证实 decode 不适合 HCP，则
 _updated: 2026-08-15 04:54:23_
 ### K4 传输解绑：评估 NIXL 作为 HCP ring 传输轮子
 
-type: `task` · status: `pending` · confidence: 1.0 · importance: 1.0 · source: `hcp-core-review-keypoints-20260815`
+type: `task` · status: `active` · confidence: 1.0 · importance: 1.0 · source: `hcp-core-review-keypoints-20260815`
 
 K4【传输层解绑】QUIC 不是 HCP 绑定的传输；NIXL 已在 vLLM PD 栈证明可做 CUDA<->ROCm 异构传输（UCX 1.19.1 --with-rocm + nixl rocm wheel + rixl shim，white/pearl 实测链通）。待评估：NIXL 是否适合作为 HCP ring 的传输轮子（语义匹配：block 级 KV 传输 vs HCP 的 micro KV block / (Q,O,LSE) 小包；性能：vs QUIC 用户态逐跳开销）。
 
@@ -2458,6 +2458,29 @@ N=4 双机模拟实测（commit b40b351，white 托管 domain 0,1 + pearl 托管
 4. 结论：N=4 双机模拟混入"同机共享 GPU 串行化"，延迟不可用于方案裁决；通信量优势（SD 省 50.3%）稳定。
 
 _updated: 2026-08-15 12:50:24_
+### NIXL 接入 transport trait 决策：frame-carrier（薄适配，推荐）vs block-direct（独立大节点）
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 0.9 · source: `hetero-cp-ringattn@nixl-transport-decision-20260816`
+
+【NIXL 接入 transport trait 的动机六问（2026-08-16）】
+
+1. 问题：HCP 的 KvTransport trait 目前只有 QUIC（生产）+ TCP（测试）+ Mock（单测）三个实现。用户要求把 NIXL 接上 transport trait，作为 QUIC/TCP 之外的第三种通信选择——服务"网络自由=手段"卖点（P2P ring 不绑定厂商 collective 栈，从 2.5GbE 到 CXL 都能跑）。这是 K4（评估 NIXL 作为 HCP ring 传输轮子）从"评估"升级为"实现"。
+
+2. 现状：NIXL 是 C++/CUDA/ROCm 库（ai-dynamo/nixl），语义是 block 级 GPU 内存传输（Agent → register_memory → transfer → notification），有官方 Rust 绑定（nixl-sys FFI crate + 高层 nixl crate，crates.io 1.4.0，bindgen 构建）。KvTransport 是"序列化 tensor → frame bytes → 流式 send/recv"抽象。两者语义不同构：NIXL 是 block 传输 + 通知，不是字节流。NIXL 只能在 white(CUDA)/pearl(ROCm) 构建运行（已探明：pearl 有 /home/stark/build/nixl-1.4.0 源码构建 + libnixl.so + src/api/cpp/nixl.h；white 有 conda 轮内 libnixl.so），Mac 无 UCX/CUDA/ROCm，无法本地构建或运行 NIXL。
+
+3. 终态：cargo feature（如 nixl-backend，默认 off）门控的 NixlKvTransport 实现 KvTransport，作为第三种传输；默认 Mac 构建保持绿（feature off）；feature on 只在 white/pearl 编译 + smoke。NIXL 侧的 wire_bytes_sent/recv 复用 K10 刚建的计量接口（用 getXferTelemetry 或 transfer 字节数填同字段）。
+
+4. 他者：vLLM PD 用 NixlConnector 做 prefill→decode 整段 KV 搬移（block 级、GPU-direct）。Dynamo 的 block_manager/storage/nixl.rs 是同一 FFI 的官方用法。NIXL 的既有价值全在 GPU-direct block 传输（避免序列化+拷贝）；若只是"用 NIXL 搬序列化后的 frame bytes"，等于把 UCX 当字节管道，丢掉了 NIXL 的零拷贝优势。
+
+5. 本方案（两形态，需用户裁定）：
+   - 形态 A（frame-carrier，薄适配）：serialize frame → 注册 host/device buffer → NIXL transfer → 对端 deserialize。复用 K10 wire-byte 口径，trait 不变，是"第三种传输"的字面实现（网络自由），但不兑现 NIXL 零拷贝价值。Mac 不可构建，验证在 white/pearl。
+   - 形态 B（block-direct，新抽象）：直接注册 K/V tensor device 内存做 block 传输，绕开序列化。兑现 NIXL 价值，但 KvTransport trait 是字节流语义，需要新的 block-transport trait 面或并行抽象，改动远大于"接上 transport trait"。
+
+6. 为什么：用户指令是"接上 transport trait"——字面对应形态 A。形态 A 是网络自由卖点的正确落点（第三种可插拔传输），且 K10 刚建的 wire-byte 接口让 NIXL 与 QUIC/TCP 同口径可对比。形态 B 是更大的架构重构（block 级数据面 + 调度改造），应作为独立后续节点，不混入本节点。硬约束：本节点代码 Mac 上只能 cargo check 门控状态（feature off 绿），真实编译+smoke 必须在 white/pearl 经 git pull + rebuild。
+
+VERDICT: 待用户裁定形态 A（frame-carrier，推荐，字面接 trait + 网络自由）vs 形态 B（block-direct，独立大节点）。
+
+_updated: 2026-08-15 15:26:59_
 ### K5 广义化：同构 TP 集群抽象为 ring 上的 worker（L3 编排层愿景，待验证）
 
 type: `task` · status: `pending` · confidence: 1.0 · importance: 0.9 · source: `owner-first-principles-20260815-heterogeneous-selling-point`
