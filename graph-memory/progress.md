@@ -2,6 +2,27 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### NIXL block-direct transport S1+S2：KvBlockTransport trait + fallback（Mac 绿）+ NixlBlockTransport FFI（Mac 类型检查，远端 smoke 待做）
+
+type: `evidence` · status: `verified` · confidence: 0.9 · importance: 0.9 · source: `hetero-cp-ringattn@358c4c5`
+
+NIXL block-direct transport 实现 S1+S2 完成（commit 358c4c5，形态 B）。
+
+实现：
+1. S1 — KvBlockTransport trait（block 级数据面：register → side-channel metadata → async transfer → poll），描述符模型 addr+len+dev_id+meta 对齐 NIXL nixlBasicDesc 与 vLLM 物理 block；SerializedBlockTransport in-memory fallback 作为 Mac 可测参考基线（register → metadata 交换 → submit_transfer → poll_transfers round-trip，wire_bytes sent==recv==frame size）。
+2. S2 — NixlBlockTransport FFI：手写声明稳定 C API（nixl_capi_*，libnixl_capi.so），实现 KvBlockTransport（register_mem → get_local_md/load_remote_md → create_xfer_req/post_xfer_req → get_xfer_status/get_xfer_telemetry），telemetry.total_bytes 填 K10 wire-byte 口径。feature nixl-backend 门控（默认 off）。
+3. 设计文档 docs/NIXL_BLOCK_TRANSPORT.md：数据面分两路径（prefill KV ring=block-direct，decode SD packet=字节流不动）、side channel 复用 HCP 控制面、paged-KV 化（block_size=16 + block_table）后置为 S4。
+4. 脚本 scripts/nixl_transport_probe.sh：white/pearl 远程 build/probe 入口。
+
+验证：
+- 手写 extern "C"（非 bindgen nixl-sys）使 Mac 无需 libclang 即可 cargo check --features tch-backend,nixl-backend --lib 类型检查通过（check 不链接）。
+- Mac 默认路径 cargo build/test --features tch-backend --lib = 161 passed / 0 failed / 5 ignored（新增 serialized_block_transport_roundtrips_registered_block）。
+- rustfmt + git diff --check 绿；clippy nixl-backend 无 nixl.rs 诊断。
+- NIXL C API 符号面已从 pearl /home/stark/build/nixl-1.4.0/src/bindings/rust/wrapper.h 逐函数核对（create_agent/register_mem/get_local_md/load_remote_md/create_xfer_req/post_xfer_req/get_xfer_status/get_xfer_telemetry/notif map）。
+
+证据边界：S2 的 NixlBlockTransport 仅在 Mac 上做了类型检查（cargo check，feature on 不链接），未在 white/pearl 做真实 link + register→transfer→poll 运行时 smoke——这是 S2 的剩余验证，需远端 git pull + rebuild（scripts/nixl_transport_probe.sh）。本证据不声称 NIXL FFI 运行时正确，不覆盖 prefill KV ring 接线（S3）或 paged-KV 化（S4）。
+
+_updated: 2026-08-15 18:00:53_
 ### K10 完成：transport wire-byte 计量 + 四类 perf event 统一 bytes-on-wire + 聚合台账（160 tests 绿）
 
 type: `evidence` · status: `verified` · confidence: 1.0 · importance: 1.0 · source: `hetero-cp-ringattn@4375ded`
