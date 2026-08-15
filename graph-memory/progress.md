@@ -2,6 +2,28 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### NIXL 改用官方 nixl-sys crate 并真实验证：pearl bindgen 编译 + register/metadata 运行通过（367fe04）
+
+type: `evidence` · status: `verified` · confidence: 0.95 · importance: 0.95 · source: `hetero-cp-ringattn@367fe04`
+
+NIXL block transport 改用官方 nixl-sys crate 并真实验证通过（commit 367fe04）。
+
+裁决（用户 2026-08-16）：S2 应复用官方 nixl-sys crate（bindgen FFI + safe Agent/Backend/XferDescList/XferRequest 封装），而非手写 extern "C"。white/pearl 用 inventory 的 sudo 密码装 clang + libclang-dev。
+
+实现：
+1. rust/Cargo.toml：nixl-sys = { version = "1.4", optional = true, features = ["stub-api"] }；nixl-backend = ["dep:nixl-sys"]。stub-api 使 crate 运行时 dlopen libnixl_capi.so（无需构建期链接 libnixl），对 pearl 源码构建树与 white conda 轮都适用。
+2. rust/src/distributed/transport/nixl.rs 重写：删手写 extern "C"（~500 行），改用 nixl_sys::{Agent, Backend, OptArgs, MemType, XferDescList, XferOp, XferRequest, NixlDescriptor, MemoryRegion, RegistrationHandle}。自定义 VramRegion 实现 MemoryRegion + NixlDescriptor（MemType::Vram）注册 device tensor；Agent::new → get_available_plugins 确认 UCX → get_plugin_params + create_backend("UCX") → OptArgs::add_backend；register_block 用 register_memory、deregister 靠 RegistrationHandle 的 Drop；submit_transfer 用 create_xfer_req(XferOp::Write) + post_xfer_req；poll_transfers 用 get_xfer_status + XferRequest::get_telemetry().total_bytes 填 K10 wire-byte 口径。unsafe impl Send（OptArgs 内部 NonNull 非 Send，与官方对 Backend/XferRequest 的 unsafe Send 一致）。KvBlockTransport trait 面不变。
+3. clang 安装：white(Ubuntu 26.04) clang 21.1.8 + libclang-21-dev；pearl(Ubuntu 24.04) clang 18.1.3 + libclang-18-dev；两机 stdbool.h 均能找到。
+
+验证：
+- pearl 上 cargo build --features tch-backend,nixl-backend --bin nixl-probe 真实编译链接通过（nixl-sys bindgen + stub-api dlopen libnixl_capi.so）。
+- 探针输出：agent created / registered block id=0 len=96 / local metadata bytes=686 / OK，与手写 FFI 版一致。
+- spike：官方 crate is_stub()==false 且完整 register(host block)+get_local_md 生命周期跑通。
+- Mac：cargo build/test --features tch-backend --lib = 161 passed / 0 failed / 5 ignored（nixl feature off 不碰 nixl-sys）；rustfmt + git diff --check 绿。
+
+证据边界：这是单机 pearl(ROCm) 的 register + local_metadata 运行时验证（官方 crate 版），不覆盖跨机 CUDA↔ROCm register→transfer→poll 全生命周期、不覆盖双 agent side-channel 交换、不覆盖 prefill KV ring 接线（S3）或 paged-KV 化（S4）。white(CUDA) 端未用 nixl-sys 版跑（其 libnixl_capi.so 在 conda 轮内路径不同，S3 时统一）。Mac 上 nixl-backend 无法编译（无 libclang.dylib），nixl-sys 仅在 white/pearl 编译。
+
+_updated: 2026-08-15 19:51:56_
 ### NIXL S2 真实验证：pearl(ROCm) 手写 FFI 链接 + agent 创建 + UCX backend 实例化 + VRAM block 注册 + metadata 拉取全通过
 
 type: `evidence` · status: `verified` · confidence: 0.95 · importance: 0.95 · source: `hetero-cp-ringattn@106d2e2`
