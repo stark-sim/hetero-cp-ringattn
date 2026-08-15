@@ -2,6 +2,17 @@
 
 当前活跃的任务、决策、风险和假设。
 
+### N=3 裁决：自驱动环省带宽但延迟不占优（RTT 主导）；按指标拆分，Q-ring 保持默认
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `decode-route-n3-experiment-20260815`
+
+N=3 裁决（2026-08-15）："自驱动环是 Q-ring 升级"的判定必须按指标拆开：
+1. 通信量：自驱动环明确更省（-33.8% 每 token wire bytes）——若核心目标是 KV 搬运量/带宽，自驱动环胜。
+2. 延迟：在 RTT 主导网络（tailscale 140-310ms）自驱动环反而慢 9-15%——串行化代价超过通信节省。Q-ring 的并行冗余 forward 在网络高 RTT 时重叠更好。
+3. 待澄清：N=3 全有线 2.5GbE（无 tailscale）下复测，才能分离"通信节省"与"串行延迟"两个效应；以及多请求并发下自驱动环的计算重叠恢复程度（用户观点：多请求可补重叠）。
+4. 现状 default 保持 Q-ring 合理；自驱动环作为"省带宽"路线保留，不作为"低延迟"路线。
+
+_updated: 2026-08-15 12:15:28_
 ### N=2 裁决：Q-ring 与自驱动环打平，需 N=3 才能区分；N=3 网络前提待确认
 
 type: `decision` · status: `held` · confidence: 1.0 · importance: 1.0 · source: `decode-route-n2-experiment-20260815`
@@ -2026,6 +2037,17 @@ type: `decision` · status: `held` · confidence: 0.95 · importance: 0.96 · so
 结论：Node 4b DEFER multi-query continuation ring，只实现有证据的 KV-ring correctness；把 Q-ring 作为独立路线选择记忆，待 baseline 可运行后按 payload bytes 与实测带宽决定。VERDICT: DEFER。
 
 _updated: 2026-08-03 09:14:32_
+### N=3 实测：自驱动环省通信 33.8% 但延迟 +9-15%（tailscale 网）
+
+type: `evidence` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `decode-route-n3-experiment-20260815`
+
+N=3 实测对照（commit dd0f809，Qwen2-0.5B，m=1 段，5 次重复 n3cmp1-5，topology: white-(2.5GbE)->pearl-(Tailscale)->laptop-(Tailscale)->white，RTT 140-310ms tailscale 链路）：
+1. 通信量（每 token 24 层，实测+理论一致）：Q-ring 511.9KB vs 自驱动环 339.0KB，自驱动省 33.8%。per-node-per-layer: Q-ring 7280B（2 packets x 3640B）vs 自驱动 4821B（16/24 sends x 7232B）。
+2. 延迟中位数（每 token 完整 forward）：white Q-ring 3100.6ms vs 自驱动 3565.9ms（+15.0%）；pearl 3078.6 vs 3344.3（+8.6%）；laptop 3061.7 vs 3435.7（+12.2%）。自驱动环延迟不占优。
+3. 波动大（tailscale 网况）：Q-ring 2715-3675ms，自驱动 2740-4040ms。
+4. 与 N=2 对比：N=2 打平（通信 99.7%），N=3 通信省 33.8% 但延迟反超 9-15%——省通信字节未转化为省延迟，因为 tailscale 高 RTT 主导，自驱动单 packet 串行 2 跳每跳吃 RTT，Q-ring 冗余 forward 在 3 节点并行、网络与计算重叠更好。
+
+_updated: 2026-08-15 12:15:28_
 ### N=2 实测：Q-ring vs 自驱动环 decode 打平（white 40.7 vs 40.4ms）
 
 type: `evidence` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `decode-route-n2-experiment-20260815`
