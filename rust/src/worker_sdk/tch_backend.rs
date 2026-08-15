@@ -354,6 +354,7 @@ impl TchWorkerBackend {
             starter_domain,
         )?;
         let layers = self.model.config.num_layers;
+        let sc_start = std::time::Instant::now();
 
         // Frozen plan: this domain's position offsets and the per-layer starters.
         let schedule = FrozenKvAssigneeSchedule::new(capacity_tickets, request_id, tokens.len())?;
@@ -538,6 +539,30 @@ impl TchWorkerBackend {
                     middle_layers += 1;
                     sends += 1;
                 }
+            }
+        }
+
+        // HCP_PERF_LOG timing event (same JSONL shape as ring_decode) so a single
+        // N=2/N=3 run can compare Q-ring decode vs stationary continuation.
+        if let Ok(path) = std::env::var("HCP_PERF_LOG") {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let ts = format!("{}.{:03}Z", now.as_secs(), now.subsec_millis());
+            let line = format!(
+                "{{\"ts\":\"{ts}\",\"event\":\"stationary_continuation\",\"domain\":{},\"request_id\":{request_id},\"layers\":{layers},\"domains\":{domains},\"tokens\":{},\"sends\":{sends},\"recvs\":{recvs},\"hops_per_layer\":{},\"total_ms\":{:.3}}}\n",
+                self.domain_id,
+                tokens.len(),
+                domains - 1,
+                sc_start.elapsed().as_secs_f64() * 1000.0
+            );
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = f.write_all(line.as_bytes());
             }
         }
 
