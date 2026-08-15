@@ -702,6 +702,16 @@ impl HcpRingAttentionBackend {
             (q.numel() * 2) * elem_bytes + q.size()[0] as usize * q.size()[1] as usize * 4;
         let mut perf_sent_bytes = 0usize;
         let mut perf_recv_bytes = 0usize;
+        let wire_sent_start = self
+            .kv_transport
+            .as_ref()
+            .map(|t| t.wire_bytes_sent())
+            .unwrap_or(0);
+        let wire_recv_start = self
+            .kv_transport
+            .as_ref()
+            .map(|t| t.wire_bytes_recv())
+            .unwrap_or(0);
         let mut perf_recv_wait_ms = 0.0_f64;
         let mut perf_merge_ms = 0.0_f64;
         let mut perf_send_ms = 0.0_f64;
@@ -778,6 +788,16 @@ impl HcpRingAttentionBackend {
         }
 
         let total_ms = ring_start.elapsed().as_secs_f64() * 1000.0;
+        let wire_sent = self
+            .kv_transport
+            .as_ref()
+            .map(|t| t.wire_bytes_sent().saturating_sub(wire_sent_start))
+            .unwrap_or(0);
+        let wire_recv = self
+            .kv_transport
+            .as_ref()
+            .map(|t| t.wire_bytes_recv().saturating_sub(wire_recv_start))
+            .unwrap_or(0);
         self.emit_perf_event(
             "ring_decode",
             &[
@@ -788,6 +808,8 @@ impl HcpRingAttentionBackend {
                 ("send_ms", &format!("{:.3}", perf_send_ms)),
                 ("packet_sent_bytes", &perf_sent_bytes.to_string()),
                 ("packet_recv_bytes", &perf_recv_bytes.to_string()),
+                ("wire_sent_bytes", &wire_sent.to_string()),
+                ("wire_recv_bytes", &wire_recv.to_string()),
                 ("num_domains", &self.num_domains.to_string()),
             ],
         );
@@ -879,6 +901,16 @@ impl HcpRingAttentionBackend {
         };
 
         let ring_start = Instant::now();
+        let wire_sent_start = self
+            .kv_transport
+            .as_ref()
+            .map(|t| t.wire_bytes_sent())
+            .unwrap_or(0);
+        let wire_recv_start = self
+            .kv_transport
+            .as_ref()
+            .map(|t| t.wire_bytes_recv())
+            .unwrap_or(0);
         let mut perf_local_compute_ms = 0.0_f64;
         let mut perf_peer_compute_ms = 0.0_f64;
         let mut perf_recv_ms = 0.0_f64;
@@ -1331,6 +1363,16 @@ impl HcpRingAttentionBackend {
         // ====== Phase 4: 提取输出 & perf 上报 ======
         let total_ms = ring_start.elapsed().as_secs_f64() * 1000.0;
         if has_transport {
+            let wire_sent = self
+                .kv_transport
+                .as_ref()
+                .map(|t| t.wire_bytes_sent().saturating_sub(wire_sent_start))
+                .unwrap_or(0);
+            let wire_recv = self
+                .kv_transport
+                .as_ref()
+                .map(|t| t.wire_bytes_recv().saturating_sub(wire_recv_start))
+                .unwrap_or(0);
             self.emit_perf_event(
                 "ring_attention",
                 &[
@@ -1343,6 +1385,8 @@ impl HcpRingAttentionBackend {
                     ("flush_ms", &format!("{:.3}", perf_flush_ms)),
                     ("kv_sent_bytes", &perf_kv_sent_bytes.to_string()),
                     ("kv_recv_bytes", &perf_kv_recv_bytes.to_string()),
+                    ("wire_sent_bytes", &wire_sent.to_string()),
+                    ("wire_recv_bytes", &wire_recv.to_string()),
                     ("micro_blocks", &perf_micro_block_count.to_string()),
                     ("num_domains", &self.num_domains.to_string()),
                     ("seq_len", &seq_len.to_string()),

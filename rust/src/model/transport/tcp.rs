@@ -59,6 +59,9 @@ pub struct TcpKvTransport {
     pending_kv: std::collections::VecDeque<KvBlock>,
     pending_packets: std::collections::VecDeque<RingPacket>,
     pending_self_driving_packets: std::collections::VecDeque<SelfDrivingPacket>,
+    /// K10 wire-byte accounting: cumulative serialized frame bytes sent/recv.
+    wire_sent: u64,
+    wire_recv: u64,
 }
 
 #[cfg(feature = "tch-backend")]
@@ -79,6 +82,8 @@ impl TcpKvTransport {
             pending_kv: std::collections::VecDeque::new(),
             pending_packets: std::collections::VecDeque::new(),
             pending_self_driving_packets: std::collections::VecDeque::new(),
+            wire_sent: 0,
+            wire_recv: 0,
         })
     }
 
@@ -309,6 +314,7 @@ impl KvTransport for TcpKvTransport {
             self.stream
                 .write_all(&self.send_buffer)
                 .map_err(|e| format!("flush_send write failed: {e}"))?;
+            self.wire_sent += self.send_buffer.len() as u64;
             self.send_buffer.clear();
         }
         Ok(())
@@ -376,6 +382,14 @@ impl KvTransport for TcpKvTransport {
 
     fn supports_self_driving_packets(&self) -> bool {
         true
+    }
+
+    fn wire_bytes_sent(&self) -> u64 {
+        self.wire_sent
+    }
+
+    fn wire_bytes_recv(&self) -> u64 {
+        self.wire_recv
     }
 
     fn submit_send_self_driving_packet(
@@ -504,6 +518,7 @@ impl TcpKvTransport {
             self.device,
         )?
         .ok_or_else(|| "complete TCP frame decoded as EOF".to_string())?;
+        self.wire_recv += frame_len as u64;
         self.recv_buffer.drain(..frame_len);
         Ok(Some(frame))
     }
@@ -1035,5 +1050,48 @@ mod tests {
             let echoed = client.recv_self_driving_packet().unwrap().unwrap();
             assert_self_driving_packet_eq(&echoed, expected);
         }
+    }
+
+    /// K10: TCP transport wire-byte accounting. After a self-driving packet
+    /// round-trips through the trait split-phase API (submit + flush on the
+    /// sender, recv on the peer), both sides must report the same non-zero
+    /// serialized frame byte count — the transport's single source of truth
+    /// for "bytes on wire".
+    #[test]
+    fn tcp_wire_bytes_account_for_self_driving_packet() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_stream = TcpStream::connect(addr).unwrap();
+        let (server_stream, _) = listener.accept().unwrap();
+
+        let device = Device::Cpu;
+        let mut client: Box<dyn KvTransport> =
+            Box::new(TcpKvTransport::new(client_stream, device).unwrap());
+        let mut server: Box<dyn KvTransport> =
+            Box::new(TcpKvTransport::new(server_stream, device).unwrap());
+
+        assert_eq!(client.wire_bytes_sent(), 0);
+        assert_eq!(server.wire_bytes_recv(), 0);
+
+        let packet = multi_query_self_driving_packet(device, &[5, 6, 7, 8]);
+        client.submit_send_self_driving_packet(&packet).unwrap();
+        client.flush_send().unwrap();
+
+        let sent = client.wire_bytes_sent();
+        assert!(sent > 0, "sent wire bytes must be non-zero");
+
+        let received = server.recv_self_driving_packet().unwrap().unwrap();
+        assert_self_driving_packet_eq(&received, &packet);
+        let recv = server.wire_bytes_recv();
+        assert_eq!(
+            recv, sent,
+            "recv wire bytes must equal sent wire bytes for one frame"
+        );
+
+        // The wire byte count must equal the exact serialized frame length
+        // (length prefix + JSON meta + raw tensor payload), so it is a true
+        // wire-byte measure rather than a payload-only estimate.
+        let frame = serialize_self_driving_packet(&packet).unwrap();
+        assert_eq!(sent, frame.len() as u64);
     }
 }

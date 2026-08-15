@@ -22,6 +22,7 @@ use quinn::{ClientConfig, Endpoint, RecvStream, ServerConfig};
 use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 #[cfg(feature = "tch-backend")]
 use tch::{Device, Tensor};
@@ -194,6 +195,12 @@ pub struct QuicKvTransport {
     recv_task: tokio::task::JoinHandle<()>,
     rt: Handle,
     device: Device,
+    /// K10 wire-byte accounting. Sent bytes are accumulated synchronously on
+    /// the caller thread at submit time (frame length is known after
+    /// serialization); recv bytes are accumulated in the background recv task
+    /// and shared back through an atomic.
+    wire_sent: u64,
+    wire_recv: Arc<AtomicU64>,
 }
 
 #[cfg(feature = "tch-backend")]
@@ -212,7 +219,8 @@ impl QuicKvTransport {
         let (recv_tx, recv_rx) = mpsc::channel::<RingMessage>(buffer_size);
 
         let send_task = rt.spawn(send_task_loop(send, send_rx));
-        let recv_task = rt.spawn(recv_task_loop(recv, recv_tx, device));
+        let wire_recv = Arc::new(AtomicU64::new(0));
+        let recv_task = rt.spawn(recv_task_loop(recv, recv_tx, device, wire_recv.clone()));
 
         Self {
             send_tx,
@@ -224,6 +232,8 @@ impl QuicKvTransport {
             recv_task,
             rt,
             device,
+            wire_sent: 0,
+            wire_recv,
         }
     }
 
@@ -273,12 +283,18 @@ async fn send_task_loop(mut send: SendStream, mut cmd_rx: mpsc::Receiver<SendCmd
 /// 这个 task 独立运行，即使主线程在进行 attention 计算，它也在后台
 /// 等待接收 peer 消息（KV block 或 Q-ring packet），一有数据就推入 channel 供 poll 消费。
 #[cfg(feature = "tch-backend")]
-async fn recv_task_loop(mut recv: RecvStream, msg_tx: mpsc::Sender<RingMessage>, device: Device) {
+async fn recv_task_loop(
+    mut recv: RecvStream,
+    msg_tx: mpsc::Sender<RingMessage>,
+    device: Device,
+    wire_recv: Arc<AtomicU64>,
+) {
     let stream_id = recv.id();
     let mut handshake_done = false;
     loop {
         match recv_frame_from_stream(&mut recv, &mut handshake_done, device).await {
-            Ok(Some(msg)) => {
+            Ok(Some((msg, frame_len))) => {
+                wire_recv.fetch_add(frame_len, Ordering::Relaxed);
                 if msg_tx.send(msg).await.is_err() {
                     eprintln!(
                         "[quic recv_task] exiting (stream {stream_id:?}): message channel closed (receiver dropped)"
@@ -446,7 +462,7 @@ async fn recv_frame_from_stream(
     recv: &mut RecvStream,
     handshake_done: &mut bool,
     device: Device,
-) -> Result<Option<RingMessage>, String> {
+) -> Result<Option<(RingMessage, u64)>, String> {
     // Skip the 1-byte dummy written during stream setup (once per stream)
     if !*handshake_done {
         let mut dummy = [0u8; 1];
@@ -493,19 +509,23 @@ async fn recv_frame_from_stream(
         let visited_domains = meta["visited_domains"]
             .as_u64()
             .ok_or("missing visited_domains")? as usize;
-        return Ok(Some(RingMessage::SelfDrivingPacket(SelfDrivingPacket {
-            layer_idx,
-            residual,
-            normalized,
-            position_ids,
-            q,
-            attention_output,
-            lse,
-            assignee,
-            current_domain,
-            domains,
-            visited_domains,
-        })));
+        let frame_len = quic_frame_wire_len(&meta, meta_len);
+        return Ok(Some((
+            RingMessage::SelfDrivingPacket(SelfDrivingPacket {
+                layer_idx,
+                residual,
+                normalized,
+                position_ids,
+                q,
+                attention_output,
+                lse,
+                assignee,
+                current_domain,
+                domains,
+                visited_domains,
+            }),
+            frame_len,
+        )));
     }
 
     if meta["type"].as_str() == Some("ring_packet") {
@@ -543,13 +563,17 @@ async fn recv_frame_from_stream(
         let q = bytes_to_tensor(&q_bytes, &q_shape, device, &q_dtype)?;
         let o = bytes_to_tensor(&o_bytes, &o_shape, device, &o_dtype)?;
         let lse = bytes_to_tensor(&lse_bytes, &lse_shape, device, &lse_dtype)?;
-        return Ok(Some(RingMessage::RingPacket(RingPacket {
-            layer_idx,
-            q,
-            o,
-            lse,
-            scale,
-        })));
+        let frame_len = quic_frame_wire_len(&meta, meta_len);
+        return Ok(Some((
+            RingMessage::RingPacket(RingPacket {
+                layer_idx,
+                q,
+                o,
+                lse,
+                scale,
+            }),
+            frame_len,
+        )));
     }
 
     let global_seq_start = meta["global_seq_start"]
@@ -613,16 +637,57 @@ async fn recv_frame_from_stream(
         None => None,
     };
 
-    Ok(Some(RingMessage::KvBlock(KvBlock {
-        layer_idx,
-        global_seq_start,
-        global_seq_end,
-        k,
-        v,
-        micro_block_idx,
-        total_micro_blocks,
-        position_ids,
-    })))
+    let frame_len = quic_frame_wire_len(&meta, meta_len);
+    Ok(Some((
+        RingMessage::KvBlock(KvBlock {
+            layer_idx,
+            global_seq_start,
+            global_seq_end,
+            k,
+            v,
+            micro_block_idx,
+            total_micro_blocks,
+            position_ids,
+        }),
+        frame_len,
+    )))
+}
+
+/// 【K10 wire-byte accounting】compute the full serialized frame length
+/// (4-byte meta_len prefix + meta JSON + raw tensor payload) from the parsed
+/// meta. This mirrors the send-side frame layout exactly, so recv-side bytes
+/// are byte-for-byte comparable with send-side bytes.
+#[cfg(feature = "tch-backend")]
+fn quic_frame_wire_len(meta: &serde_json::Value, meta_len: usize) -> u64 {
+    let payload: usize = match meta["type"].as_str() {
+        Some("self_driving_packet") => {
+            let tensors = &meta["tensors"];
+            [
+                "residual",
+                "normalized",
+                "position_ids",
+                "q",
+                "attention_output",
+                "lse",
+            ]
+            .iter()
+            .map(|name| tensors[name]["bytes"].as_u64().unwrap_or(0) as usize)
+            .sum()
+        }
+        Some("ring_packet") => ["q_bytes", "o_bytes", "lse_bytes"]
+            .iter()
+            .map(|key| meta[key].as_u64().unwrap_or(0) as usize)
+            .sum(),
+        _ => {
+            let mut total = meta["k_bytes"].as_u64().unwrap_or(0) as usize
+                + meta["v_bytes"].as_u64().unwrap_or(0) as usize;
+            if let Some(pos) = meta.get("position_ids").filter(|v| !v.is_null()) {
+                total += pos["bytes"].as_u64().unwrap_or(0) as usize;
+            }
+            total
+        }
+    };
+    (4 + meta_len + payload) as u64
 }
 
 #[cfg(feature = "tch-backend")]
@@ -666,6 +731,7 @@ impl KvTransport for QuicKvTransport {
     /// 直到有空间，这是自然的 backpressure。
     fn submit_send(&mut self, block: &KvBlock) -> Result<(), String> {
         let frame = serialize_kv_block(block)?;
+        self.wire_sent += frame.len() as u64;
         self.rt.block_on(async {
             self.send_tx
                 .send(SendCmd::Data(frame))
@@ -742,6 +808,7 @@ impl KvTransport for QuicKvTransport {
     /// 【提交异步发送 Q-ring packet】与 KV block 共用 send channel / send task。
     fn submit_send_packet(&mut self, packet: &RingPacket) -> Result<(), String> {
         let frame = serialize_ring_packet(packet)?;
+        self.wire_sent += frame.len() as u64;
         self.rt.block_on(async {
             self.send_tx
                 .send(SendCmd::Data(frame))
@@ -792,11 +859,20 @@ impl KvTransport for QuicKvTransport {
         true
     }
 
+    fn wire_bytes_sent(&self) -> u64 {
+        self.wire_sent
+    }
+
+    fn wire_bytes_recv(&self) -> u64 {
+        self.wire_recv.load(Ordering::Relaxed)
+    }
+
     fn submit_send_self_driving_packet(
         &mut self,
         packet: &SelfDrivingPacket,
     ) -> Result<(), String> {
         let frame = serialize_self_driving_packet(packet)?;
+        self.wire_sent += frame.len() as u64;
         self.rt.block_on(async {
             self.send_tx
                 .send(SendCmd::Data(frame))
@@ -1245,5 +1321,61 @@ mod tests {
             let echoed = client.recv_self_driving_packet().unwrap().unwrap();
             assert_self_driving_packet_eq(&echoed, expected);
         }
+    }
+
+    /// K10: QUIC transport wire-byte accounting. Sent bytes are counted at
+    /// submit time (frame length known after serialization); recv bytes are
+    /// counted in the background recv task and shared back. After a single
+    /// self-driving packet round-trips, both sides must report the same
+    /// non-zero serialized frame length.
+    #[test]
+    fn quic_wire_bytes_account_for_self_driving_packet() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let TestQuicStreams {
+            _client_endpoint,
+            _server_endpoint,
+            client_send,
+            client_recv,
+            server_send,
+            server_recv,
+        } = connected_quic_streams(&runtime);
+
+        let device = Device::Cpu;
+        let mut client: Box<dyn KvTransport> = Box::new(QuicKvTransport::new(
+            client_send,
+            client_recv,
+            runtime.handle().clone(),
+            device,
+        ));
+        let mut server: Box<dyn KvTransport> = Box::new(QuicKvTransport::new(
+            server_send,
+            server_recv,
+            runtime.handle().clone(),
+            device,
+        ));
+
+        assert_eq!(client.wire_bytes_sent(), 0);
+        assert_eq!(server.wire_bytes_recv(), 0);
+
+        let expected = test_self_driving_packet(device);
+        client.submit_send_self_driving_packet(&expected).unwrap();
+        client.flush_send().unwrap();
+        let sent = client.wire_bytes_sent();
+        assert!(sent > 0, "sent wire bytes must be non-zero");
+
+        let received = server.recv_self_driving_packet().unwrap().unwrap();
+        assert_self_driving_packet_eq(&received, &expected);
+
+        // The recv task increments the shared counter before handing the frame
+        // to the channel, so it is already visible once recv returns.
+        let recv = server.wire_bytes_recv();
+        assert_eq!(
+            recv, sent,
+            "recv wire bytes must equal sent wire bytes for one frame"
+        );
+        assert_eq!(
+            sent,
+            serialize_self_driving_packet(&expected).unwrap().len() as u64
+        );
     }
 }

@@ -124,9 +124,7 @@ pub trait KvTransport: Send {
     }
 
     /// Poll for a self-driving packet without consuming other message types.
-    fn poll_recv_self_driving_packet(
-        &mut self,
-    ) -> Result<Option<SelfDrivingPacket>, String> {
+    fn poll_recv_self_driving_packet(&mut self) -> Result<Option<SelfDrivingPacket>, String> {
         Ok(None)
     }
 
@@ -143,5 +141,28 @@ pub trait KvTransport: Send {
     /// 【测试用 downcast】让测试可以检查 transport 内部状态（如 Mock 记录的发送包）。
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         None
+    }
+
+    // ====== Wire-byte accounting (K10 KV-transport quantitative ledger) ======
+    //
+    // Cumulative serialized frame bytes actually handed to the wire, across
+    // all three payload kinds (KV block, Q-ring packet, self-driving packet).
+    // This is the transport's single source of truth for "bytes on wire":
+    // real frame bytes (length prefix + JSON meta + raw tensor payload), not
+    // the payload-only estimate the attention code used before K10. Real wire
+    // bytes are the only caliber that lines up with vLLM PD's NIXL transfer
+    // telemetry and TP's per-layer all-reduce activation bytes.
+
+    /// Cumulative bytes serialized and written in the send direction.
+    ///
+    /// In-memory mocks return 0 (no wire). Implementations update this on
+    /// every submit/flush of a serialized frame.
+    fn wire_bytes_sent(&self) -> u64 {
+        0
+    }
+
+    /// Cumulative bytes deserialized from the wire in the recv direction.
+    fn wire_bytes_recv(&self) -> u64 {
+        0
     }
 }
