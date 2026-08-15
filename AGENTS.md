@@ -29,16 +29,16 @@ This project uses a graph-backed memory system in `graph-memory/` for cross-sess
 - Raw `reports/**/*.json` files are ignored by git by default. Do not commit generated report JSON unless the user explicitly asks for that exact artifact to be versioned.
 - When an experiment documents project progress or a known-good validation point, summarize the result in docs or graph-memory instead of committing raw generated JSON.
 - Do not commit build outputs, transient logs, cache directories, or large binary artifacts unless explicitly requested.
-- **整理格式再对比内容（通用）**：当被改动的语言或文件格式有公认的 canonical 格式化工具（rustfmt、gofmt、prettier、black、clang-format 等），每次改动后先对改动文件统一运行该工具，再做 `git diff` 审查与提交；diff 应只呈现语义变化，不掺杂格式整理的干扰。若仓库基线尚未整体采纳该工具的输出，只对实际改动的文件运行（如 `rustfmt --edition 2021 <file>`），不做 crate-wide/全仓格式化；需要纯格式基线时，它必须是独立的格式化专用提交。
+- **有官方 fmt 工具就用（默认全仓/crate-wide）**：当被改动的语言或文件格式有公认的 canonical 格式化工具（rustfmt→`cargo fmt`、gofmt、prettier、black、clang-format 等），默认按工具的 crate-wide/全仓模式运行并采纳其输出，使仓库收敛到 formatter 的 canonical 形态，后续每次运行 fmt 就不再产生无谓的代码变动。若仓库基线尚未整体采纳该工具，先做一次独立的「纯格式基线」提交（仅格式化、无语义变化），再在其上叠加语义改动；每次语义改动后跑一遍 fmt，`git diff` 应只呈现语义变化。
 - After committing on `main`, push the commit to the configured remote.
 - Never use `git push --force`, `git push -f`, or any force-push variant. Force-push is prohibited for all branches and remotes unless the user explicitly changes this rule in writing.
 
 ### Sudo / System Changes:
-- If a fix requires `sudo`, root-owned paths, `/opt`, `/usr/local`, system linkers, launch services, or other machine-level changes, stop and ask the user to run the command manually.
+- `sudo` is allowed directly for safe operations (installing packages e.g. `clang-dev`, creating symlinks, system library setup, etc.); execute them yourself rather than asking the user to run them manually.
+- On remote GPU hosts, resolve sudo credentials from `~/.agents/inventory.yaml` (`nodes[*].sudo.method: password`) via the `infrastructure-inventory` skill, and pass the password non-interactively: `printf '%s\n' "$PW" | sudo -S -p '' <cmd>`. Never echo the password into logs or conversation.
+- Only pause and ask the user before *dangerous* destructive operations — e.g. `rm -rf ~`, recursive deletes, disk repartitioning, `dd`, or anything risking irreversible data loss.
 - Do not try to work around missing sudo by patching third-party binaries, rewriting install names, copying system libraries, or changing vendor artifacts unless the user explicitly approves that exact approach.
-- Prefer explaining the root cause and giving the minimal sudo command sequence for the user to run.
-- After the user confirms the system-level fix is done, verify normally from the project.
-- For standalone libtorch on macOS, if `libtorch_cpu.dylib` requires `/opt/llvm-openmp/lib/libomp.dylib`, ask the user to create the `/opt/llvm-openmp/lib` symlink with sudo instead of modifying libtorch dylibs.
+- For standalone libtorch on macOS, if `libtorch_cpu.dylib` requires `/opt/llvm-openmp/lib/libomp.dylib`, create the `/opt/llvm-openmp/lib` symlink with sudo (safe); do not modify libtorch dylibs.
 
 ### Local Hardware Smoke Discipline:
 - On the local Mac, libtorch hardware smoke should use MPS in a non-sandbox/escalated process: `HCP_ENABLE_TORCH=1 HCP_TORCH_DEVICE=mps bash scripts/run_rust_ringattn_smoke.sh`.
