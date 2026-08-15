@@ -702,6 +702,9 @@ impl HcpRingAttentionBackend {
             (q.numel() * 2) * elem_bytes + q.size()[0] as usize * q.size()[1] as usize * 4;
         let mut perf_sent_bytes = 0usize;
         let mut perf_recv_bytes = 0usize;
+        let mut perf_recv_wait_ms = 0.0_f64;
+        let mut perf_merge_ms = 0.0_f64;
+        let mut perf_send_ms = 0.0_f64;
 
         // Phase 0: 本地 partial 作为种子，发往 successor
         let (o_loc, lse_loc) = self.decode_local_partial(q, k, v);
@@ -723,6 +726,7 @@ impl HcpRingAttentionBackend {
         let num_rounds = self.num_domains.saturating_sub(1);
         let mut out: Option<Tensor> = None;
         for round in 0..num_rounds {
+            let recv_start = Instant::now();
             let pkt = {
                 let transport = self.kv_transport.as_mut().unwrap();
                 let pkt = match transport
@@ -739,12 +743,16 @@ impl HcpRingAttentionBackend {
                 })?
             }; // transport borrow 结束
             perf_recv_bytes += packet_bytes;
+            perf_recv_wait_ms += recv_start.elapsed().as_secs_f64() * 1000.0;
 
+            let merge_start = Instant::now();
             let (o_merged, lse_merged) =
                 self.decode_merge_packet(&pkt.q, &pkt.o, &pkt.lse, &k_peer, &v_peer);
+            perf_merge_ms += merge_start.elapsed().as_secs_f64() * 1000.0;
 
             // 转发（最后一轮不需要）
             if round + 1 < num_rounds {
+                let send_start = Instant::now();
                 let transport = self.kv_transport.as_mut().unwrap();
                 transport
                     .submit_send_packet(&RingPacket {
@@ -756,6 +764,7 @@ impl HcpRingAttentionBackend {
                     })
                     .map_err(|e| ModelError::Backend(format!("forward submit_send_packet: {e}")))?;
                 perf_sent_bytes += packet_bytes;
+                perf_send_ms += send_start.elapsed().as_secs_f64() * 1000.0;
             }
             out = Some(o_merged);
         }
@@ -774,6 +783,9 @@ impl HcpRingAttentionBackend {
             &[
                 ("total_ms", &format!("{:.3}", total_ms)),
                 ("rounds", &num_rounds.to_string()),
+                ("recv_wait_ms", &format!("{:.3}", perf_recv_wait_ms)),
+                ("merge_ms", &format!("{:.3}", perf_merge_ms)),
+                ("send_ms", &format!("{:.3}", perf_send_ms)),
                 ("packet_sent_bytes", &perf_sent_bytes.to_string()),
                 ("packet_recv_bytes", &perf_recv_bytes.to_string()),
                 ("num_domains", &self.num_domains.to_string()),

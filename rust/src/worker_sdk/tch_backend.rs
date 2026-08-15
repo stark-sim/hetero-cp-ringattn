@@ -412,6 +412,9 @@ impl TchWorkerBackend {
         let mut finisher_layers = 0_usize;
         let mut sends = 0_usize;
         let mut recvs = 0_usize;
+        let mut sc_recv_wait_ms = 0.0_f64;
+        let mut sc_process_ms = 0.0_f64;
+        let mut sc_send_ms = 0.0_f64;
         for (layer_idx, &starter) in starters.iter().enumerate() {
             let finisher = (starter + domains - 1) % domains;
             final_finisher = finisher;
@@ -429,6 +432,7 @@ impl TchWorkerBackend {
                 .map_err(|e| {
                     format!("stationary continuation layer {layer_idx} start failed: {e}")
                 })?;
+                let process_start = std::time::Instant::now();
                 let outcome = {
                     let context = self.request_contexts.get_mut(&request_id).unwrap();
                     let Some(KvCacheImpl::ReservedPositioned(shard)) =
@@ -450,6 +454,7 @@ impl TchWorkerBackend {
                         )
                     })?
                 };
+                sc_process_ms += process_start.elapsed().as_secs_f64() * 1000.0;
                 let LayerStepOutcome::Forward(next_packet) = outcome else {
                     return Err(format!(
                         "stationary continuation layer {layer_idx} starter finished a {domains}-domain route"
@@ -464,11 +469,14 @@ impl TchWorkerBackend {
                         .ok_or_else(|| {
                             format!("stationary continuation layer {layer_idx} has no KV transport")
                         })?;
+                let send_start = std::time::Instant::now();
                 transport.submit_send_self_driving_packet(&wire)?;
                 transport.flush_send()?;
+                sc_send_ms += send_start.elapsed().as_secs_f64() * 1000.0;
                 starter_layers += 1;
                 sends += 1;
             } else {
+                let recv_start = std::time::Instant::now();
                 let wire = {
                     let transport =
                         self.model.layers[layer_idx]
@@ -482,10 +490,12 @@ impl TchWorkerBackend {
                         format!("stationary continuation layer {layer_idx} predecessor closed")
                     })?
                 };
+                sc_recv_wait_ms += recv_start.elapsed().as_secs_f64() * 1000.0;
                 recvs += 1;
                 let packet = LayerPacket::from_self_driving_packet(wire).map_err(|e| {
                     format!("stationary continuation layer {layer_idx} wire decode failed: {e}")
                 })?;
+                let process_start = std::time::Instant::now();
                 let outcome = {
                     let context = self.request_contexts.get_mut(&request_id).unwrap();
                     let Some(KvCacheImpl::ReservedPositioned(shard)) =
@@ -505,6 +515,7 @@ impl TchWorkerBackend {
                         format!("stationary continuation layer {layer_idx} ring step failed: {e}")
                     })?
                 };
+                sc_process_ms += process_start.elapsed().as_secs_f64() * 1000.0;
                 if finisher == self.domain_id {
                     let LayerStepOutcome::Finished {
                         hidden_states: next_hidden,
@@ -534,8 +545,10 @@ impl TchWorkerBackend {
                                     "stationary continuation layer {layer_idx} has no KV transport"
                                 )
                             })?;
+                    let send_start = std::time::Instant::now();
                     transport.submit_send_self_driving_packet(&wire)?;
                     transport.flush_send()?;
+                    sc_send_ms += send_start.elapsed().as_secs_f64() * 1000.0;
                     middle_layers += 1;
                     sends += 1;
                 }
@@ -550,10 +563,13 @@ impl TchWorkerBackend {
                 .unwrap_or_default();
             let ts = format!("{}.{:03}Z", now.as_secs(), now.subsec_millis());
             let line = format!(
-                "{{\"ts\":\"{ts}\",\"event\":\"stationary_continuation\",\"domain\":{},\"request_id\":{request_id},\"layers\":{layers},\"domains\":{domains},\"tokens\":{},\"sends\":{sends},\"recvs\":{recvs},\"hops_per_layer\":{},\"total_ms\":{:.3}}}\n",
+                "{{\"ts\":\"{ts}\",\"event\":\"stationary_continuation\",\"domain\":{},\"request_id\":{request_id},\"layers\":{layers},\"domains\":{domains},\"tokens\":{},\"sends\":{sends},\"recvs\":{recvs},\"hops_per_layer\":{},\"recv_wait_ms\":{:.3},\"process_ms\":{:.3},\"send_ms\":{:.3},\"total_ms\":{:.3}}}\n",
                 self.domain_id,
                 tokens.len(),
                 domains - 1,
+                sc_recv_wait_ms,
+                sc_process_ms,
+                sc_send_ms,
                 sc_start.elapsed().as_secs_f64() * 1000.0
             );
             use std::io::Write;
