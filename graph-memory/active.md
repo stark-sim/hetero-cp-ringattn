@@ -2181,6 +2181,22 @@ type: `decision` · status: `held` · confidence: 0.95 · importance: 0.96 · so
 结论：Node 4b DEFER multi-query continuation ring，只实现有证据的 KV-ring correctness；把 Q-ring 作为独立路线选择记忆，待 baseline 可运行后按 payload bytes 与实测带宽决定。VERDICT: DEFER。
 
 _updated: 2026-08-03 09:14:32_
+### NIXL S3c-1 真实 KV 几何跨机 transfer 验证通过（16KB~256KB bf16，字节级一致）
+
+type: `evidence` · status: `verified` · confidence: 1.0 · importance: 0.95 · source: `hetero-cp-ringattn@aedba92`
+
+NIXL block-direct S3c-1 真实 KV 几何跨机 transfer 验证通过（commit aedba92）。
+
+【验证结果】nixl-xfer-probe 扩展为真实 KV 几何（bf16 [batch=1, num_kv_heads=2, seq, head_dim=64]，Qwen2-0.5B 的 KV 形状），white(CUDA)↔pearl(ROCm) 双向 register→transfer→poll→dump：
+- seq=64：block len=16384（16KB = 2*64*64*2 bf16 bytes），双向 max|diff|=0.0（字节级一致），telemetry_bytes=16384，wire_bytes_sent=recv=16384。
+- seq=1024：block len=262144（256KB），双向 max|diff|=0.0，telemetry_bytes=262144，wire_bytes_sent=recv=262144。
+- 均 CROSS-MACHINE TRANSFER: PASS。
+
+【价值】把 S3a 的 96-byte f32 冒烟扩展到真实 KV 规模（16KB~256KB bf16），证明 block-direct 的 register/transfer/poll 生命周期能处理真实 prefill KV block 的大小与精度，且字节级无损（memcpy 语义，不改变数值）。telemetry 字节对齐 K10 wire-byte 口径（block-direct 无序列化 meta 开销，真实字节 = block len）。
+
+【边界】这是合成 KV 几何 tensor 的 transfer（arange pattern），不是真实模型 prefill 输出的 KV；不接 ring_attention 的 exchange 数据面；不覆盖 ring 的 double-buffering/轮次同步/动态 desc 交换。接进 ring_attention（S3c-2）仍为后续节点：那是 block-direct 数据面的生产接入，需在 KvTransport 字节流之外加 block-direct 分支 + 固定 buffer + 环上同步。
+
+_updated: 2026-08-16 07:51:39_
 ### NIXL S3b 跨机 side-channel 接 coordinator 控制面验证通过（metadata 走既有 QUIC 控制面，不新增端口）
 
 type: `evidence` · status: `verified` · confidence: 1.0 · importance: 0.95 · source: `hetero-cp-ringattn@0112e75`
