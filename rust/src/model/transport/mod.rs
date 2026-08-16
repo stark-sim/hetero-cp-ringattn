@@ -26,7 +26,7 @@ pub mod r#trait;
 pub use block::{KvBlock, RingPacket, SelfDrivingPacket};
 #[cfg(feature = "tch-backend")]
 pub use block_transport::{
-    BlockDesc, BlockHandle, KvBlockTransport, RemoteBlockDesc, TransferCompletion,
+    BlockDesc, BlockHandle, BlockMemType, KvBlockTransport, RemoteBlockDesc, TransferCompletion,
 };
 #[cfg(feature = "tch-backend")]
 #[allow(unused_imports)]

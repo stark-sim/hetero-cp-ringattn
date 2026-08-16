@@ -17,15 +17,27 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "tch-backend")]
 use tch::Tensor;
 
+/// The memory type a registered block lives in. NIXL can move VRAM device
+/// memory GPU-direct only between like-vendor peers; cross-vendor (CUDA<->ROCm)
+/// transfers must stage through host DRAM (no UCX remote protocol exists for
+/// e.g. "put from cuda to rocm").
+#[cfg(feature = "tch-backend")]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum BlockMemType {
+    Dram,
+    Vram,
+}
+
 /// A registered memory block descriptor: start address, byte length, device
-/// id, and an opaque metadata blob (shape/dtype/etc). Serializes so it can be
-/// exchanged over the side channel.
+/// id, memory type, and an opaque metadata blob (shape/dtype/etc). Serializes
+/// so it can be exchanged over the side channel.
 #[cfg(feature = "tch-backend")]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BlockDesc {
     pub addr: u64,
     pub len: u64,
     pub dev_id: u64,
+    pub mem_type: BlockMemType,
     pub meta: Vec<u8>,
 }
 

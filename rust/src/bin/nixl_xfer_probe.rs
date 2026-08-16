@@ -72,6 +72,7 @@ mod probe {
     fn run(
         agent: &str,
         seed: f32,
+        device: Device,
         md_out: &str,
         md_in: &str,
         desc_out: &str,
@@ -81,7 +82,9 @@ mod probe {
         done_out: &str,
         done_in: &str,
     ) -> Result<(), String> {
-        let device = Device::Cpu; // TEMP DRAM experiment: host memory transfer
+        // S3a validates the cross-vendor (CUDA<->ROCm) path, which must stage
+        // through host DRAM (GPU-direct VRAM put has no cross-vendor UCX
+        // protocol), so the probe defaults to --device cpu.
         let mut transport =
             NixlBlockTransport::new(agent).map_err(|e| format!("create agent: {e}"))?;
         println!("[xfer-probe] agent created: {}", transport.agent_name());
@@ -196,6 +199,10 @@ mod probe {
             .unwrap_or_else(|| "0".to_string())
             .parse()
             .map_err(|_| "bad --seed")?;
+        let device = match get_arg(&args, "--device").as_deref() {
+            Some("cuda") => Device::cuda_if_available(),
+            _ => Device::Cpu,
+        };
         let md_out = get_arg(&args, "--md-out").ok_or("missing --md-out")?;
         let md_in = get_arg(&args, "--md-in").ok_or("missing --md-in")?;
         let desc_out = get_arg(&args, "--desc-out").ok_or("missing --desc-out")?;
@@ -208,6 +215,7 @@ mod probe {
         run(
             &agent,
             seed,
+            device,
             &md_out,
             &md_in,
             &desc_out,

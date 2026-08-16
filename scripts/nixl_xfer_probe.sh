@@ -93,10 +93,11 @@ run_probe() {
 compare_bin() {
   local a="$1" b="$2" label="$3"
   echo "[xfer] compare $label"
-  python3 - "$a" "$b" <<'PY'
+  python3 - "$a" "$b" "$label" <<'PY'
 import struct, sys
 a = open(sys.argv[1], 'rb').read()
 b = open(sys.argv[2], 'rb').read()
+label = sys.argv[3]
 assert len(a) == len(b) == 96, f"expected 96 bytes, got {len(a)}/{len(b)}"
 va = struct.unpack('<24f', a)
 vb = struct.unpack('<24f', b)

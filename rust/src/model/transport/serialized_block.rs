@@ -10,7 +10,8 @@
 
 #[cfg(feature = "tch-backend")]
 use super::block_transport::{
-    AgentMetadata, BlockDesc, BlockHandle, KvBlockTransport, RemoteBlockDesc, TransferCompletion,
+    AgentMetadata, BlockDesc, BlockHandle, BlockMemType, KvBlockTransport, RemoteBlockDesc,
+    TransferCompletion,
 };
 #[cfg(feature = "tch-backend")]
 use std::collections::HashMap;
@@ -105,6 +106,7 @@ impl KvBlockTransport for SerializedBlockTransport {
             addr: tensor.data_ptr() as u64,
             len: bytes.len() as u64,
             dev_id: 0,
+            mem_type: BlockMemType::Dram,
             meta: serde_json::to_vec(&tensor.size())
                 .map_err(|e| format!("serialize shape meta failed: {e}"))?,
         };

@@ -16,7 +16,7 @@
 
 #[cfg(feature = "nixl-backend")]
 use crate::model::transport::block_transport::{
-    BlockDesc, BlockHandle, KvBlockTransport, RemoteBlockDesc, TransferCompletion,
+    BlockDesc, BlockHandle, BlockMemType, KvBlockTransport, RemoteBlockDesc, TransferCompletion,
 };
 #[cfg(feature = "nixl-backend")]
 use nixl_sys::{
@@ -34,25 +34,36 @@ fn map_err(e: NixlError) -> String {
     format!("nixl: {e:?}")
 }
 
-/// A VRAM memory region implementing the nixl-sys descriptor traits so a tch
-/// tensor's device pointer can be registered with NIXL.
+/// Map the transport-level block memory type onto the nixl-sys MemType used in
+/// descriptor lists.
+#[cfg(feature = "nixl-backend")]
+fn block_mem_to_nixl(m: BlockMemType) -> MemType {
+    match m {
+        BlockMemType::Vram => MemType::Vram,
+        BlockMemType::Dram => MemType::Dram,
+    }
+}
+
+/// A registered memory region (DRAM or VRAM) implementing the nixl-sys
+/// descriptor traits so a tch tensor's pointer can be registered with NIXL.
 #[cfg(feature = "nixl-backend")]
 #[derive(Debug)]
-struct VramRegion {
+struct Region {
     ptr: usize,
     len: usize,
     dev_id: u64,
+    mem_type: MemType,
 }
 
-// SAFETY: VramRegion is plain data (pointer + length); the device memory it
-// refers to is owned by the caller and outlives the descriptor.
+// SAFETY: Region is plain data (pointer + length + type); the memory it refers
+// to is owned by the caller and outlives the descriptor.
 #[cfg(feature = "nixl-backend")]
-unsafe impl Send for VramRegion {}
+unsafe impl Send for Region {}
 #[cfg(feature = "nixl-backend")]
-unsafe impl Sync for VramRegion {}
+unsafe impl Sync for Region {}
 
 #[cfg(feature = "nixl-backend")]
-impl MemoryRegion for VramRegion {
+impl MemoryRegion for Region {
     unsafe fn as_ptr(&self) -> *const u8 {
         self.ptr as *const u8
     }
@@ -63,12 +74,9 @@ impl MemoryRegion for VramRegion {
 }
 
 #[cfg(feature = "nixl-backend")]
-impl NixlDescriptor for VramRegion {
+impl NixlDescriptor for Region {
     fn mem_type(&self) -> MemType {
-        // TEMP DRAM experiment: cross-vendor (CUDA<->ROCm) GPU-direct VRAM put
-        // has no UCX remote protocol; host-memory (DRAM) transfer over tcp is
-        // the fallback to validate first.
-        MemType::Dram
+        self.mem_type
     }
 
     fn device_id(&self) -> u64 {
@@ -179,18 +187,30 @@ impl KvBlockTransport for NixlBlockTransport {
             tch::Kind::Double => 8,
             _ => 4,
         };
+        // Cross-vendor (CUDA<->ROCm) GPU-direct VRAM put has no UCX remote
+        // protocol, so a CUDA tensor registers as VRAM only for like-vendor
+        // peers; host (CPU) tensors register as DRAM for the cross-vendor path
+        // (staging through host memory over tcp).
+        let is_cuda = tensor.device().is_cuda();
+        let (mem_type, block_mem_type) = if is_cuda {
+            (MemType::Vram, BlockMemType::Vram)
+        } else {
+            (MemType::Dram, BlockMemType::Dram)
+        };
         let desc = BlockDesc {
             addr: tensor.data_ptr() as u64,
             len: (tensor.numel() * elem_bytes) as u64,
             dev_id: 0,
+            mem_type: block_mem_type,
             meta: serde_json::to_vec(&tensor.size())
                 .map_err(|e| format!("serialize shape meta failed: {e}"))?,
         };
 
-        let region = VramRegion {
+        let region = Region {
             ptr: desc.addr as usize,
             len: desc.len as usize,
             dev_id: desc.dev_id,
+            mem_type,
         };
         let handle = self
             .agent
@@ -227,13 +247,13 @@ impl KvBlockTransport for NixlBlockTransport {
             .map(|(d, _)| d.clone())
             .ok_or_else(|| format!("local block {} not registered", local.id))?;
 
-        let mut local_dlist = XferDescList::new(MemType::Dram).map_err(map_err)?;
+        let mut local_dlist = XferDescList::new(block_mem_to_nixl(local_desc.mem_type)).map_err(map_err)?;
         local_dlist.add_desc(
             local_desc.addr as usize,
             local_desc.len as usize,
             local_desc.dev_id,
         );
-        let mut remote_dlist = XferDescList::new(MemType::Dram).map_err(map_err)?;
+        let mut remote_dlist = XferDescList::new(block_mem_to_nixl(remote.desc.mem_type)).map_err(map_err)?;
         remote_dlist.add_desc(
             remote.desc.addr as usize,
             remote.desc.len as usize,
