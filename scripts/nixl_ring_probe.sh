@@ -109,18 +109,17 @@ case "$mode" in
       ssh_ "$ip" "mv $WD/${h}_peer_md.tmp $WD/${h}_peer_md; mv $WD/${h}_peer_desc.tmp $WD/${h}_peer_desc"
     done
 
-    # two rounds of done sync (predecessor direction): pred's done -> succ's peer_done
-    for round in 1 2; do
+    # two rounds of done sync (predecessor direction): pred's done -> succ's peer_done.
+    # Per-round file names (done.0/done.1) avoid any stale-file race across rounds.
+    for round in 0 1; do
       echo "[ring] round $round done sync"
-      for h in white pearl laptop; do ip="$(ip_of $h)"; wait_remote_file "$ip" "$WD/${h}_done"; done
+      for h in white pearl laptop; do ip="$(ip_of $h)"; wait_remote_file "$ip" "$WD/${h}_done.$round"; done
       for h in white pearl laptop; do
         p="$(pred_of $h)"
         ip="$(ip_of $h)"; pip="$(ip_of $p)"
-        scp -q "$SSH_USER@$pip:$WD/${p}_done" "$SSH_USER@$ip:$WD/${h}_peer_done.tmp"
-        ssh_ "$ip" "mv $WD/${h}_peer_done.tmp $WD/${h}_peer_done"
+        scp -q "$SSH_USER@$pip:$WD/${p}_done.$round" "$SSH_USER@$ip:$WD/${h}_peer_done.$round.tmp"
+        ssh_ "$ip" "mv $WD/${h}_peer_done.$round.tmp $WD/${h}_peer_done.$round"
       done
-      # clear the done files so round 2 waits for fresh signals
-      for h in white pearl laptop; do ip="$(ip_of $h)"; ssh_ "$ip" "rm -f $WD/${h}_done $WD/${h}_peer_done"; done
     done
 
     for h in white pearl laptop; do ip="$(ip_of $h)"; wait_remote_file "$ip" "$WD/${h}_recv.bin"; done

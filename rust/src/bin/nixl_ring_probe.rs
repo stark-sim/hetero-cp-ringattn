@@ -165,10 +165,14 @@ mod probe {
                 "[ring-probe] round {round} transfer complete ({} bytes)",
                 done[0].bytes
             );
-            fs::write(&done_out, b"done").map_err(|e| format!("write done: {e}"))?;
+            // Per-round done files so the host script never races a stale file
+            // across rounds (round 0/1 use distinct names).
+            let done_out_r = format!("{done_out}.{round}");
+            let done_in_r = format!("{done_in}.{round}");
+            fs::write(&done_out_r, b"done").map_err(|e| format!("write done: {e}"))?;
 
             // Wait for the predecessor to finish ITS transfer into our recv.
-            wait_for_file(&done_in, 180)?;
+            wait_for_file(&done_in_r, 180)?;
             // Swap: forward what we just received next round (copy recv into
             // current, preserving the registered current buffer address).
             current.copy_(&recv);
