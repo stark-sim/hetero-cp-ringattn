@@ -2181,6 +2181,27 @@ type: `decision` · status: `held` · confidence: 0.95 · importance: 0.96 · so
 结论：Node 4b DEFER multi-query continuation ring，只实现有证据的 KV-ring correctness；把 Q-ring 作为独立路线选择记忆，待 baseline 可运行后按 payload bytes 与实测带宽决定。VERDICT: DEFER。
 
 _updated: 2026-08-03 09:14:32_
+### NIXL block-direct 接进 prefill KV ring（S3c-2）动机六问：N=2 特化，S3 收官 + S4 前置
+
+type: `decision` · status: `held` · confidence: 1.0 · importance: 0.95 · source: `hetero-cp-ringattn@nixl-s3c2-ring-wiring-20260816`
+
+【NIXL block-direct 接进 prefill KV ring（S3c-2）的动机六问（2026-08-16）】
+
+1. 问题：prefill KV ring 的数据面现在走 KvTransport（QUIC 字节流，序列化 KvBlock 为 JSON meta + length prefix + tensor bytes）。block-direct（KvBlockTransport register/transfer）只在独立探针验证过（S3a/S3c-1），没接进 ring_attention 的生产数据面。"prefill KV ring 走 block 路径"是 S3 的收官目标，未达成。
+
+2. 现状：HcpRingAttentionBackend 有 kv_transport: Option<Box<dyn KvTransport>>，ring_attention 的 exchange（串行/pipeline 两模式）用 submit_send(KvBlock)+recv_kv_block 交换 micro block。KvBlockTransport trait + NixlBlockTransport（register/transfer/poll）已实现并通过 S3a（生命周期）+S3b（控制面 side-channel）+S3c-1（真实 KV 规模 16KB~256KB 字节级一致）。两者接口不同构：字节流（submit_send/recv）vs block-direct（register/transfer/poll）。
+
+3. 终态：prefill KV ring 在"有 block transport 时"走 register/transfer（不序列化），N=2 跨机数值对照 single-node reference（attention 输出一致）；QUIC 字节流回退保留（无 block transport 时）。N=2 是"一轮双向交换"（num_rounds=1），无需 double-buffering/多轮转发，是最小接入面。
+
+4. 他者：vLLM PD 用 NixlConnector 做 prefill→decode 整段 KV 一次 block-direct 搬移（register → 独立 TCP side channel 交换 desc → transfer）。HCP ring 是逐 hop + micro block + capacity-weighted 分片，数据流不同构；且 HCP 的 desc 交换复用 coordinator 控制面（S3b 已建），不新增端口。可复用"register → side channel 交换 desc → transfer"生命周期，但 ring 的 micro block 是运行时切分、desc 动态，需预注册固定 buffer 或每轮交换 desc。
+
+5. 本方案：N=2 特化优先。HcpRingAttentionBackend 加 block_transport 字段；ring_attention 在 num_domains==2 且 block_transport 存在时走 block-direct 分支——register 本地 KV micro block + 接收 buffer，经控制面/预留通道交换 desc，submit_transfer + poll，读接收 buffer 得 peer KV，再走既有 process_kv_block 计算。数值对照 single-node reference。
+
+6. 为什么：block-direct 的价值是不序列化（真实 KV 直接 register/transfer），跨异构虽 host staging（S3a 发现：跨厂商 GPU-direct 无协议），但仍省 JSON meta + length prefix + 反序列化开销；且这是 S4（paged-KV 化，block_size=16 + block_table，对接 vLLM paged KV）的前置——block 数据面的 ring 接入是 S4 的必经之路。代价/边界：跨异构 host staging 让 block-direct 相对字节流的收益有限（用户已判定"NIXL 收益不多"），本节点的价值主要是"block 数据面闭环"与"S4 前置"，而非 NIXL 零拷贝的量化收益。
+
+VERDICT: IMPLEMENT（N=2 特化，作为 S3 收官 + S4 前置；不追求通用 N 节点 double-buffering，那是 S4 的生产化）。
+
+_updated: 2026-08-16 07:54:17_
 ### NIXL S3c-1 真实 KV 几何跨机 transfer 验证通过（16KB~256KB bf16，字节级一致）
 
 type: `evidence` · status: `verified` · confidence: 1.0 · importance: 0.95 · source: `hetero-cp-ringattn@aedba92`
