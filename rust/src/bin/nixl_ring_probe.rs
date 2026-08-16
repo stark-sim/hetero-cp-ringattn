@@ -101,6 +101,15 @@ mod probe {
             .to_kind(Kind::BFloat16);
         let recv = Tensor::zeros(shape, (Kind::BFloat16, device));
 
+        let cur0: Vec<f32> = Vec::try_from(
+            &current.to_kind(Kind::Float).to_device(Device::Cpu).view(-1),
+        )
+        .unwrap_or_default();
+        println!(
+            "[ring-probe] initial current[:4]={:?} (seed={})",
+            &cur0[..cur0.len().min(4)],
+            seed
+        );
         let current_handle = transport
             .register_block(&current)
             .map_err(|e| format!("register current: {e}"))?;
