@@ -75,13 +75,16 @@ run_probe() {
   if [ -n "$preload" ]; then
     prefix="$prefix LD_PRELOAD=$preload"
   fi
-  ssh_ "$host" "$prefix nohup $PROBE \
+  # ssh -f backgrounds the SSH itself so the orchestrator returns immediately
+  # while the probe keeps running on the remote host (avoids the SSH-blocking
+  # behavior of a command ending in `&` with no follow-up command).
+  ssh -f -o BatchMode=yes "$SSH_USER@$host" "$prefix $PROBE \
     --agent $agent --seed $seed \
     --md-out $WD/${tag}_md --md-in $WD/${tag}_peer_md \
     --desc-out $WD/${tag}_desc --desc-in $WD/${tag}_peer_desc \
     --src-dump-out $WD/${tag}_src.bin --dest-dump-out $WD/${tag}_dest.bin \
     --done-out $WD/${tag}_done --done-in $WD/${tag}_peer_done \
-    > $WD/${tag}.log 2>&1 &"
+    > $WD/${tag}.log 2>&1"
 }
 
 compare_bin() {
@@ -132,18 +135,24 @@ case "$mode" in
     scp -q "$SSH_USER@$PEARL_HOST:$WD/pearl_md"   "$LOCAL_TMP/pearl_md"
     scp -q "$SSH_USER@$PEARL_HOST:$WD/pearl_desc" "$LOCAL_TMP/pearl_desc"
     # white's peer = pearl's md/desc; pearl's peer = white's md/desc
-    scp -q "$LOCAL_TMP/pearl_md"   "$SSH_USER@$WHITE_HOST:$WD/white_peer_md"
-    scp -q "$LOCAL_TMP/pearl_desc" "$SSH_USER@$WHITE_HOST:$WD/white_peer_desc"
-    scp -q "$LOCAL_TMP/white_md"   "$SSH_USER@$PEARL_HOST:$WD/pearl_peer_md"
-    scp -q "$LOCAL_TMP/white_desc" "$SSH_USER@$PEARL_HOST:$WD/pearl_peer_desc"
+    # write to .tmp then atomically mv so the probe never reads a half-written
+    # file (scp creates the target before finishing; wait_for_file would see it).
+    scp -q "$LOCAL_TMP/pearl_md"   "$SSH_USER@$WHITE_HOST:$WD/white_peer_md.tmp"
+    scp -q "$LOCAL_TMP/pearl_desc" "$SSH_USER@$WHITE_HOST:$WD/white_peer_desc.tmp"
+    scp -q "$LOCAL_TMP/white_md"   "$SSH_USER@$PEARL_HOST:$WD/pearl_peer_md.tmp"
+    scp -q "$LOCAL_TMP/white_desc" "$SSH_USER@$PEARL_HOST:$WD/pearl_peer_desc.tmp"
+    ssh_ "$WHITE_HOST" "mv $WD/white_peer_md.tmp $WD/white_peer_md; mv $WD/white_peer_desc.tmp $WD/white_peer_desc"
+    ssh_ "$PEARL_HOST" "mv $WD/pearl_peer_md.tmp $WD/pearl_peer_md; mv $WD/pearl_peer_desc.tmp $WD/pearl_peer_desc"
 
     echo "[xfer] wait for both nodes to finish their transfer (done signals)"
     wait_remote_file "$WHITE_HOST" "$WD/white_done"
     wait_remote_file "$PEARL_HOST" "$WD/pearl_done"
 
     echo "[xfer] exchange done signals"
-    scp -q "$SSH_USER@$WHITE_HOST:$WD/white_done" "$SSH_USER@$PEARL_HOST:$WD/pearl_peer_done"
-    scp -q "$SSH_USER@$PEARL_HOST:$WD/pearl_done" "$SSH_USER@$WHITE_HOST:$WD/white_peer_done"
+    scp -q "$SSH_USER@$WHITE_HOST:$WD/white_done" "$SSH_USER@$PEARL_HOST:$WD/pearl_peer_done.tmp"
+    scp -q "$SSH_USER@$PEARL_HOST:$WD/pearl_done" "$SSH_USER@$WHITE_HOST:$WD/white_peer_done.tmp"
+    ssh_ "$WHITE_HOST" "mv $WD/white_peer_done.tmp $WD/white_peer_done"
+    ssh_ "$PEARL_HOST" "mv $WD/pearl_peer_done.tmp $WD/pearl_peer_done"
 
     echo "[xfer] wait for both nodes to dump their dest blocks"
     wait_remote_file "$WHITE_HOST" "$WD/white_dest.bin"

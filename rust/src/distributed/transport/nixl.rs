@@ -20,8 +20,8 @@ use crate::model::transport::block_transport::{
 };
 #[cfg(feature = "nixl-backend")]
 use nixl_sys::{
-    Agent, Backend, MemType, MemoryRegion, NixlDescriptor, NixlError, OptArgs, RegistrationHandle,
-    XferDescList, XferOp, XferRequest,
+    Agent, AgentConfig, Backend, MemType, MemoryRegion, NixlDescriptor, NixlError, OptArgs,
+    RegistrationHandle, ThreadSync, XferDescList, XferOp, XferRequest,
 };
 #[cfg(feature = "nixl-backend")]
 use std::collections::HashMap;
@@ -111,7 +111,23 @@ impl NixlBlockTransport {
     /// backend so VRAM registration succeeds. The official example shows this
     /// is required: a bare agent has "no available backends for VRAM_SEG".
     pub fn new(name: &str) -> Result<Self, String> {
-        let agent = Agent::new(name).map_err(map_err)?;
+        // Cross-machine transfers need the listen thread so this agent's UCX
+        // backend accepts the peer's incoming connection; the default
+        // enable_listen_thread=false makes the agent client-only, which fails
+        // load_remote_md with "UCX endpoint create failed: Connection refused".
+        // capture_telemetry=true makes get_telemetry() available without the
+        // NIXL_TELEMETRY_ENABLE env var.
+        let cfg = AgentConfig {
+            enable_prog_thread: true,
+            enable_listen_thread: true,
+            listen_port: 8888,
+            thread_sync: ThreadSync::None,
+            num_workers: 1,
+            pthr_delay_us: 0,
+            lthr_delay_us: 100_000,
+            capture_telemetry: true,
+        };
+        let agent = Agent::new_configured(name, &cfg).map_err(map_err)?;
 
         // Discover plugins and confirm UCX is available.
         let plugins = agent.get_available_plugins().map_err(map_err)?;

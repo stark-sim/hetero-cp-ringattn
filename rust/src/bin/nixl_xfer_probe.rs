@@ -40,13 +40,20 @@ mod probe {
 
     fn wait_for_file(path: &str, timeout_secs: u64) -> Result<(), String> {
         let start = std::time::Instant::now();
-        while !Path::new(path).exists() {
+        loop {
+            // Wait for a NON-EMPTY file: the host script writes the peer files
+            // with a tmp+rename so an existing-but-empty file (scp mid-write)
+            // must not be read as a complete descriptor.
+            let non_empty = Path::new(path).exists()
+                && std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false);
+            if non_empty {
+                return Ok(());
+            }
             if start.elapsed().as_secs() > timeout_secs {
                 return Err(format!("timed out waiting for {path}"));
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        Ok(())
     }
 
     fn dump_tensor(t: &Tensor, path: &str) -> Result<usize, String> {
