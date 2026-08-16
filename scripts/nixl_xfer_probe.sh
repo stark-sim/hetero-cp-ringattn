@@ -117,7 +117,9 @@ case "$mode" in
     build_host "$PEARL_HOST" "$PEARL_NIXL_LD" "$PEARL_LIBCLANG"
     ;;
   --run)
-    echo "[xfer] clean remote work dirs"
+    echo "[xfer] clean remote work dirs + kill residual probes"
+    for h in "$WHITE_HOST" "$PEARL_HOST"; do ssh_ "$h" "pkill -f nixl-xfer-probe 2>/dev/null; true"; done
+    sleep 2
     ssh_ "$WHITE_HOST" "rm -rf $WD && mkdir -p $WD/tel_hcp-xfer-white"
     ssh_ "$PEARL_HOST" "rm -rf $WD && mkdir -p $WD/tel_hcp-xfer-pearl"
 

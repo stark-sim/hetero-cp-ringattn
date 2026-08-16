@@ -120,7 +120,9 @@ impl NixlBlockTransport {
         let cfg = AgentConfig {
             enable_prog_thread: true,
             enable_listen_thread: true,
-            listen_port: 8888,
+            // 0 lets NIXL/OS pick an ephemeral port so repeated probes (and
+            // future co-located agents) never collide on a fixed listen_port.
+            listen_port: 0,
             thread_sync: ThreadSync::None,
             num_workers: 1,
             pthr_delay_us: 0,
