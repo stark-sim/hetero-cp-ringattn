@@ -16,7 +16,7 @@ LIBTORCH=/home/stark/libtorch
 REPO=/home/stark/hetero-cp-ringattn
 PROBE="$REPO/rust/target/debug/nixl-xfer-probe"
 
-HOST_A=""; HOST_B=""; SEQ=64; DEVICE=cpu; FORCE_TCP=1
+HOST_A=""; HOST_B=""; SEQ=64; DEVICE=cpu; FORCE_TCP=1; MODE=run
 while [ $# -gt 0 ]; do
   case "$1" in
     --host-a) HOST_A="$2"; shift 2 ;;
@@ -24,6 +24,7 @@ while [ $# -gt 0 ]; do
     --seq) SEQ="$2"; shift 2 ;;
     --device) DEVICE="$2"; shift 2 ;;
     --no-tcp) FORCE_TCP=0; shift ;;
+    --build|--run) MODE="${1#--}"; shift ;;
     *) echo "unknown arg $1" >&2; exit 2 ;;
   esac
 done
@@ -104,7 +105,7 @@ wait_remote_file() {
   done
 }
 
-mode="${1:---run}"
+mode="$MODE"
 case "$mode" in
   --build)
     build_host "$HOST_A" "$A_IP" "$A_LD" "$A_CLANG"
