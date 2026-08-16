@@ -173,10 +173,25 @@ mod probe {
 
             // Wait for the predecessor to finish ITS transfer into our recv.
             wait_for_file(&done_in_r, 180)?;
+            let recv_dbg: Vec<f32> = Vec::try_from(
+                &recv.to_kind(Kind::Float).to_device(Device::Cpu).view(-1),
+            )
+            .unwrap_or_default();
+            println!(
+                "[ring-probe] round {round} BEFORE swap recv[:4]={:?}",
+                &recv_dbg[..recv_dbg.len().min(4)]
+            );
             // Swap: forward what we just received next round (copy recv into
             // current, preserving the registered current buffer address).
             current.copy_(&recv);
-            println!("[ring-probe] round {round} swapped (recv -> forward)");
+            let cur_dbg: Vec<f32> = Vec::try_from(
+                &current.to_kind(Kind::Float).to_device(Device::Cpu).view(-1),
+            )
+            .unwrap_or_default();
+            println!(
+                "[ring-probe] round {round} AFTER swap current[:4]={:?}",
+                &cur_dbg[..cur_dbg.len().min(4)]
+            );
         }
 
         // Dump recv: after the last round it holds the last predecessor KV.
