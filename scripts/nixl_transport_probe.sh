@@ -26,6 +26,15 @@ case "$HOST" in
     HIP_PRELOAD=""
     LIBCLANG_PATH="${LIBCLANG_PATH:-/usr/lib/llvm-21/lib}"
     ;;
+  laptop)
+    # RTX 4060 Laptop (CUDA), libtorch CUDA 13, clang 18 — same conda-wheel
+    # nixl_cu13 layout as white, no LD_PRELOAD.
+    WHEEL_DIR="${NIXL_WHEEL_DIR:-$HOME/miniconda3/envs/vllm-v1/lib/python3.11/site-packages}"
+    NIXL_LD="$WHEEL_DIR/.nixl_cu13.mesonpy.libs"
+    PLUGIN_DIR="${NIXL_PLUGIN_DIR:-$WHEEL_DIR/.nixl_cu13.mesonpy.libs/plugins}"
+    HIP_PRELOAD=""
+    LIBCLANG_PATH="${LIBCLANG_PATH:-/usr/lib/llvm-18/lib}"
+    ;;
   pearl)
     NIXL_PREFIX="${NIXL_PREFIX:-/home/stark/build/nixl-1.4.0}"
     NIXL_BUILD="$NIXL_PREFIX/build/src"
