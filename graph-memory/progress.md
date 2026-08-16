@@ -2,23 +2,23 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
-### 组件复用边界：绑定层 vs 运行期实现层——复用官方 crate 不等于复用其实现
+### feature 实现探索后记录：最终实现 + 选中方案 + 被弃方案 + 原因
 
 type: `lesson` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `hetero-cp-ringattn@1b275c4`
 
-【教训】复用官方 crate/轮子要按层说清楚：绑定/声明层 vs 安全封装层 vs 运行期实现层，不能一句话混为一谈。
+【教训】实现一个 feature 经过探索后，要把「最终实现 + 选中方案 + 被弃方案 + 各自原因」作为持久记录，不能只记「做了什么」。
 
-触发场景：NIXL 接入用官方 nixl-sys crate + stub-api feature。我先后写了「复用官方 crate」和「capi.so 彻底退役」，但 stub-api 的 stubs.cpp 在运行期 dlopen("libnixl_capi.so") 转发 nixl_capi_* 符号——libnixl_capi.so 根本没退役，只是从「手写 extern "C" + 编译期 #[link]」改成「官方 crate 的 stub 运行期 dlopen」。
+触发场景：NIXL 第三传输接入。探索了多个候选（手写 FFI vs 官方 crate、stub-api vs 非 stub、conda 轮 vs 源码树），最终实现是官方 nixl-sys crate + stub-api；但最初只记了「最终实现」，没记「抛弃了什么、为什么」。追问「是复用官方 crate 吗」暴露选择原因不持久，且措辞把复用边界写错（说「capi.so 退役」而 stub-api 仍在运行期 dlopen libnixl_capi.so）。
 
-根因：把「复用」当成单一 yes/no，而不是按层拆分。复用的是绑定层（bindgen）+ 安全封装层（Agent/Backend/XferRequest/Drop/错误）；运行期实现仍是同一个 libnixl_capi.so。
+根因：探索结论被当成临时工作记忆，而非持久项目知识。「what」记了，「why / 被弃方案」没记。
 
-第一条件可防：在写「复用/退役」结论前，读 crate 的 build.rs / feature flag / stub 源码，确定符号是编译期 link 还是运行期 dlopen；每个组件选择写一行「结果 + 原因」。
+第一条件可防：feature 落地提交时，按 skill feature-implementation-record 写一段持久记录——最终实现（文件/commit）、选中方案、每个被弃方案 + 具体原因（正确性/成本/不匹配/沉没成本/可维护性/可移植性/性能）。
 
-组件选择（结果 + 原因）已记入 evidence-nixl-sys-white-cuda-verified-20260816；通用判断模式沉淀为 skill component-reuse-boundary（~/.agents/skills/component-reuse-boundary）。
+本案例的选择（结果 + 原因）已记入 evidence-nixl-sys-white-cuda-verified-20260816；通用记录模式沉淀为 skill feature-implementation-record（~/.agents/skills/feature-implementation-record）。
 
-边界：环境事实（哪个 .so 在哪）→ infrastructure-inventory；dlopen/link 调试 → systematic-debugging；本节点只记录判断模式与选择原因。
+边界：实现前分析 → motivation-analysis；实验对比 → route-experimentation；环境事实 → infrastructure-inventory；本节点只记录「探索后的选择结论 + 原因」。
 
-_updated: 2026-08-16 04:02:37_
+_updated: 2026-08-16 05:10:03_
 ### NIXL 官方 nixl-sys crate 在 white(CUDA) 真实验证：conda 轮 + bindgen 编译 + register/metadata 运行通过
 
 type: `evidence` · status: `verified` · confidence: 0.95 · importance: 0.95 · source: `hetero-cp-ringattn@1b275c4`
