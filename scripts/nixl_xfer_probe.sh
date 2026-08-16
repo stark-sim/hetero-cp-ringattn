@@ -82,7 +82,7 @@ run_probe() {
   # while the probe keeps running on the remote host (avoids the SSH-blocking
   # behavior of a command ending in `&` with no follow-up command).
   ssh -f -o BatchMode=yes "$SSH_USER@$host" "$prefix $PROBE \
-    --agent $agent --seed $seed \
+    --agent $agent --seed $seed --seq ${SEQ:-64} \
     --md-out $WD/${tag}_md --md-in $WD/${tag}_peer_md \
     --desc-out $WD/${tag}_desc --desc-in $WD/${tag}_peer_desc \
     --src-dump-out $WD/${tag}_src.bin --dest-dump-out $WD/${tag}_dest.bin \
@@ -98,9 +98,9 @@ import struct, sys
 a = open(sys.argv[1], 'rb').read()
 b = open(sys.argv[2], 'rb').read()
 label = sys.argv[3]
-assert len(a) == len(b) == 96, f"expected 96 bytes, got {len(a)}/{len(b)}"
-va = struct.unpack('<24f', a)
-vb = struct.unpack('<24f', b)
+assert len(a) == len(b) and len(a) > 0 and len(a) % 4 == 0, f"expected equal f32-aligned dumps, got {len(a)}/{len(b)}"
+va = struct.unpack(f'<{len(a)//4}f', a)
+vb = struct.unpack(f'<{len(b)//4}f', b)
 diffs = [abs(x - y) for x, y in zip(va, vb)]
 md = max(diffs)
 print(f"  {sys.argv[1].split('/')[-1]} vs {sys.argv[2].split('/')[-1]}: max|diff|={md}")

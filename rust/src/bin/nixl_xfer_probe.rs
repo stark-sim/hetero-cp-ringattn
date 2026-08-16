@@ -25,9 +25,6 @@ mod probe {
     use std::fs;
     use tch::{Device, Kind, Tensor};
 
-    const SHAPE: [i64; 4] = [1, 2, 3, 4];
-    const NUMEL: i64 = 24;
-
     fn get_arg(args: &[String], name: &str) -> Option<String> {
         let mut it = args.iter();
         while let Some(a) = it.next() {
@@ -72,6 +69,7 @@ mod probe {
     fn run(
         agent: &str,
         seed: f32,
+        seq: i64,
         device: Device,
         md_out: &str,
         md_in: &str,
@@ -89,13 +87,18 @@ mod probe {
             NixlBlockTransport::new(agent).map_err(|e| format!("create agent: {e}"))?;
         println!("[xfer-probe] agent created: {}", transport.agent_name());
 
-        // src = arange + seed (unique per node so each direction is verifiable);
-        // dest = zeros, to be overwritten by the peer's transfer.
-        let src = Tensor::arange(NUMEL, (Kind::Float, device))
+        // Real KV-geometry block: [batch=1, num_kv_heads=2, seq, head_dim=64]
+        // in bf16 (Qwen2-0.5B's KV dtype). src = arange + seed (unique per node
+        // so each direction is verifiable); dest = zeros, overwritten by the
+        // peer's transfer. seq is configurable to exercise real KV sizes.
+        let shape: [i64; 4] = [1, 2, seq, 64];
+        let numel: i64 = shape.iter().product();
+        let src = Tensor::arange(numel, (Kind::Float, device))
             .f_add_scalar(seed as f64)
             .map_err(|e| format!("add scalar: {e:?}"))?
-            .reshape(SHAPE);
-        let dest = Tensor::zeros(SHAPE, (Kind::Float, device));
+            .reshape(shape)
+            .to_kind(Kind::BFloat16);
+        let dest = Tensor::zeros(shape, (Kind::BFloat16, device));
 
         let src_handle = transport
             .register_block(&src)
@@ -203,6 +206,10 @@ mod probe {
             Some("cuda") => Device::cuda_if_available(),
             _ => Device::Cpu,
         };
+        let seq: i64 = get_arg(&args, "--seq")
+            .unwrap_or_else(|| "64".to_string())
+            .parse()
+            .map_err(|_| "bad --seq")?;
         let md_out = get_arg(&args, "--md-out").ok_or("missing --md-out")?;
         let md_in = get_arg(&args, "--md-in").ok_or("missing --md-in")?;
         let desc_out = get_arg(&args, "--desc-out").ok_or("missing --desc-out")?;
@@ -215,6 +222,7 @@ mod probe {
         run(
             &agent,
             seed,
+            seq,
             device,
             &md_out,
             &md_in,
