@@ -2,23 +2,23 @@
 
 This project uses a graph-backed memory system in `graph-memory/` for cross-session context continuity.
 
-- **Source of truth:** `graph-memory/graph.db` (SQLite + FTS5 + graph).
+- **Source of truth:** `graph-memory/graph.db` (SQLite + FTS5 + graph) — query it directly.
 - **Human-readable blueprint:** `graph-memory/blueprint.md` — read this first every session.
-- **Exported views:** `graph-memory/active.md`, `graph-memory/progress.md`, `graph-memory/systemPatterns.md`, `graph-memory/techContext.md`, `graph-memory/productContext.md`.
+- **No exported Markdown views:** the database is the only memory artifact besides the blueprint. Do not generate or maintain exported `.md` views.
 
 ### At Session Start - ALWAYS:
-1. Read `graph-memory/RULES.md` - all rules are there
-2. Read `graph-memory/blueprint.md` - project scope and current architecture
-3. Read `graph-memory/active.md` - current work and active decisions
-4. Read `graph-memory/progress.md` - recent status
-5. Query `graph-memory/graph.db` when deeper context is needed
+1. Read `graph-memory/blueprint.md` - project scope and current architecture
+2. Query `graph-memory/graph.db` for active-layer nodes (tasks, decisions, risks, blockers) and recent evidence
+3. Pay special attention to `questioned` or `revised` beliefs
+4. Reconcile the graph with `git status` and recent commits
 
 ### During Work - Update When:
-- Feature completed -> insert/update nodes in `graph.db`, then regenerate `active.md` / `progress.md`
-- Architecture decision made -> insert/update `decision` / `belief` nodes in `graph.db`, then regenerate `systemPatterns.md`
-- New dependency added -> insert/update `component` / `dependency` nodes in `graph.db`, then regenerate `techContext.md`
-- User preference learned -> insert/update `preference` nodes in `graph.db`, then regenerate `active.md`
+- Feature completed -> insert/update `task` / `evidence` / `lesson` nodes in `graph.db`; evidence `source` cites the relevant commit (`<repo>@<sha>`)
+- Architecture decision made -> insert/update `decision` / `belief` nodes in `graph.db`, link supporting evidence
+- New dependency added -> insert/update `component` / `dependency` nodes in `graph.db`
+- User preference learned -> insert/update `preference` nodes in `graph.db`
 - Evidence contradicts a belief -> run conflict resolution: create `revision` / `evidence` nodes, update confidence, mark supersession with `REPLACED_BY` / `SUPERSEDES` edges
+- The database itself is current after each committed transaction; there is no view sync or export step
 
 ### Git Discipline:
 - Split work into task-sized checkpoints.
@@ -71,10 +71,10 @@ When running on heterogeneous hosts that mix libtorch, CUDA, ROCm, and conda, fo
 5. **Prefer even stronger isolation with direnv (`.envrc`)** if the current global-dotfile setup becomes hard to maintain.
 
 ### Special Commands:
-- `memory bank update` / `graph memory update` / `memory bank güncelle` -> Review and update graph memory, regenerate markdown views
-- `memory bank status` / `graph memory status` / `memory bank durumu` -> Show current active/progress summary
-- `memory bank read` / `graph memory read` / `memory bank oku` -> Read blueprint + active + progress and present context
-- `export memory` / `regenerate markdown` -> Regenerate markdown views from `graph.db`
+- `memory bank update` / `graph memory update` / `memory bank güncelle` -> Invoke the `graph-memory` skill: review and update `graph.db` (nodes/edges, confidence, supersession)
+- `memory bank status` / `graph memory status` / `memory bank durumu` -> Invoke the `graph-memory` skill: show current active tasks/decisions and recent evidence from `graph.db`
+- `memory bank read` / `graph memory read` / `memory bank oku` -> Read `blueprint.md` and query `graph.db`, then present context
+- `prune memory` / `archive old memory` -> Invoke the `graph-memory` skill maintenance flow (see its `references/maintenance.md`)
 
 ### Pre-Action Motivation Analysis (动机剖析六问):
 Before starting any non-trivial work — optimization or ordinary — you MUST be able to answer six questions, and record the answers in the corresponding graph-memory `decision`/`task` node (or the commit message for trivial changes):
@@ -103,8 +103,7 @@ Do NOT treat "faster / less memory" as an unqualified win. End with a verdict (i
 - **What it means for this project**: HCP is **inference-only** (90% inference, 10% training per product thesis). For greedy/temperature sampling decode, only the last token matters. However, our distributed correctness tests currently compare *all* positions (`ref_logits.narrow(1, i, 1)` vs `dist_logits.narrow(1, i, 1)`). "Last token only" would break those tests unless we add a `return_full_logits: bool` flag. The flag adds API surface complexity. Given that prefill is a one-time cost and decode is the loop, the win is limited to prefill phase only. **Conclusion: skip for now, revisit if prefill becomes the bottleneck.**
 
 ### NEVER:
-- Modify `graph-memory/RULES.md` (it's immutable)
 - Write secrets (API keys, tokens, passwords) to graph-memory files or `graph.db`
-- Skip reading graph memory at session start
+- Skip reading graph memory at session start (`blueprint.md` + `graph.db` query)
 
 ---
