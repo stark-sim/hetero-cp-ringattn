@@ -85,7 +85,10 @@ pub struct NixlBlockTransport {
     next_block_id: u64,
     /// block id -> (advertised descriptor, registration handle).
     blocks: HashMap<u64, (BlockDesc, RegistrationHandle)>,
-    pending: Vec<(u64, XferRequest)>,
+    /// (remote block id, local byte len, xfer request). The local byte
+    /// len is carried so poll_transfers can fill the K10 wire-byte ledger
+    /// even when NIXL telemetry is disabled (get_telemetry -> NoTelemetry).
+    pending: Vec<(u64, u64, XferRequest)>,
     wire_sent: u64,
     wire_recv: u64,
 }
@@ -231,24 +234,28 @@ impl KvBlockTransport for NixlBlockTransport {
             .post_xfer_req(&req, Some(&self.opt_args))
             .map_err(map_err)?;
         self.wire_sent += local_desc.len;
-        self.pending.push((remote.block_id, req));
+        self.pending.push((remote.block_id, local_desc.len, req));
         Ok(())
     }
 
     fn poll_transfers(&mut self) -> Result<Vec<TransferCompletion>, String> {
         let mut completions = Vec::new();
         let mut remaining = Vec::new();
-        for (block_id, req) in self.pending.drain(..) {
+        for (block_id, local_len, req) in self.pending.drain(..) {
             let status = self.agent.get_xfer_status(&req).map_err(map_err)?;
             if status.is_success() {
-                let telemetry = req.get_telemetry().map_err(map_err)?;
-                self.wire_recv += telemetry.total_bytes;
-                completions.push(TransferCompletion {
-                    block_id,
-                    bytes: telemetry.total_bytes,
-                });
+                // telemetry may be disabled (NoTelemetry); fall back to the
+                // advertised block length so the K10 wire-byte ledger stays
+                // accurate. total_bytes is the transfer's true byte count when
+                // telemetry is on (NIXL_TELEMETRY_ENABLE + NIXL_TELEMETRY_DIR).
+                let bytes = match req.get_telemetry() {
+                    Ok(t) => t.total_bytes,
+                    Err(_) => local_len,
+                };
+                self.wire_recv += bytes;
+                completions.push(TransferCompletion { block_id, bytes });
             } else {
-                remaining.push((block_id, req));
+                remaining.push((block_id, local_len, req));
             }
         }
         self.pending = remaining;

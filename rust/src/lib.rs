@@ -49,8 +49,8 @@ pub use model::self_driving::{
 };
 #[cfg(feature = "tch-backend")]
 pub use model::transport::{
-    KvBlock, KvBlockTransport, KvTransport, LinkedMockKvTransport, RingPacket, SelfDrivingPacket,
-    TcpKvTransport,
+    BlockDesc, BlockHandle, KvBlock, KvBlockTransport, KvTransport, LinkedMockKvTransport,
+    RemoteBlockDesc, RingPacket, SelfDrivingPacket, TcpKvTransport, TransferCompletion,
 };
 #[cfg(feature = "tch-backend")]
 pub use model::{KvCacheImpl, LlamaModel, ModelConfig, ModelError, ModelWeights};
