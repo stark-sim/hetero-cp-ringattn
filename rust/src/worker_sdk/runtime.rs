@@ -346,6 +346,12 @@ impl WorkerRuntime {
                     #[cfg(feature = "nixl-backend")]
                     if let Some(t) = self.nixl_transport.as_mut() {
                         for (peer_domain, md, _descs) in &peers {
+                            // The coordinator broadcasts every peer including
+                            // self; an agent cannot load its own metadata, so
+                            // skip the self entry.
+                            if *peer_domain == domain_id as u64 {
+                                continue;
+                            }
                             match t.load_remote_metadata(md) {
                                 Ok(name) => println!(
                                     "[worker {domain_id}] loaded NIXL metadata from domain {peer_domain} (agent {name})"

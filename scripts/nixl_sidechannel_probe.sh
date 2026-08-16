@@ -16,7 +16,7 @@ set -euo pipefail
 SSH_USER="${SSH_USER:-stark}"
 WHITE_HOST="${WHITE_HOST:-100.118.253.68}"
 PEARL_HOST="${PEARL_HOST:-100.111.242.55}"
-MODEL_DIR="${MODEL_DIR:-/home/stark/models/Qwen2-0.5B}"
+MODEL_DIR="${MODEL_DIR:-/home/stark/models/Qwen2-0.5B-1M}"
 
 REPO=/home/stark/hetero-cp-ringattn
 BIN="$REPO/rust/target/debug/hcp-ringattn-rust"
@@ -47,7 +47,7 @@ build_host() {
     LIBTORCH=$LIBTORCH LIBCLANG_PATH=$libclang \
     LIBRARY_PATH=$nixl_ld:$LIBTORCH/lib:\${LIBRARY_PATH:-} \
     LD_LIBRARY_PATH=$nixl_ld:$LIBTORCH/lib:\${LD_LIBRARY_PATH:-} \
-    cargo build --features tch-backend,nixl-backend --bin hcp-ringattn-rust"
+    cargo build --manifest-path rust/Cargo.toml --features tch-backend,nixl-backend --bin hcp-ringattn-rust"
   echo "[s3b] build OK on $host"
 }
 
@@ -60,28 +60,28 @@ case "$mode" in
   --run)
     WD=/tmp/nixl_s3b
     echo "[s3b] clean + kill residual"
-    for h in "$WHITE_HOST" "$PEARL_HOST"; do ssh_ "$h" "pkill -f '[h]cp-ringattn-rust' 2>/dev/null; true"; done
+    for h in "$WHITE_HOST" "$PEARL_HOST"; do ssh_ "$h" "pkill -f '[h]cp-ringattn-rust' 2>/dev/null; true; rm -rf $WD; mkdir -p $WD"; done
     sleep 1
 
     echo "[s3b] launch coordinator (white, --nixl-exchange)"
-    ssh_ "$WHITE_HOST" "cd $REPO && env LD_LIBRARY_PATH=$LIBTORCH/lib HCP_TCH_DEVICE=cuda:0 nohup $BIN \
+    ssh -f -o BatchMode=yes "$SSH_USER@$WHITE_HOST" "cd $REPO && env LD_LIBRARY_PATH=$LIBTORCH/lib HCP_TCH_DEVICE=cuda:0 $BIN \
       --distributed-role coordinator --model-dir $MODEL_DIR --num-domains 2 \
       --listen-addr 0.0.0.0:$COORD_PORT --nixl-exchange \
-      > $WD/coordinator.log 2>&1 < /dev/null &"
+      > $WD/coordinator.log 2>&1"
 
     echo "[s3b] launch worker 1 (pearl, domain 1)"
-    ssh_ "$PEARL_HOST" "cd $REPO && env LD_LIBRARY_PATH=$PEARL_NIXL_LD:$LIBTORCH/lib NIXL_PLUGIN_DIR=$PEARL_PLUGIN_DIR UCX_TLS=tcp HCP_TCH_DEVICE=cuda:0 LD_PRELOAD=$PEARL_PRELOAD nohup $BIN \
+    ssh -f -o BatchMode=yes "$SSH_USER@$PEARL_HOST" "cd $REPO && env LD_LIBRARY_PATH=$PEARL_NIXL_LD:$LIBTORCH/lib NIXL_PLUGIN_DIR=$PEARL_PLUGIN_DIR UCX_TLS=tcp HCP_TCH_DEVICE=cuda:0 LD_PRELOAD=$PEARL_PRELOAD $BIN \
       --distributed-role worker --domain-id 1 --model-dir $MODEL_DIR \
       --listen-addr 0.0.0.0:$W1_PORT --next-peer-addr $WHITE_HOST:$W0_PORT \
       --coordinator-addr $WHITE_HOST:$COORD_PORT --num-domains 2 \
-      > $WD/worker1.log 2>&1 < /dev/null &"
+      > $WD/worker1.log 2>&1"
 
     echo "[s3b] launch worker 0 (white, domain 0)"
-    ssh_ "$WHITE_HOST" "cd $REPO && env LD_LIBRARY_PATH=$WHITE_NIXL_LD:$LIBTORCH/lib NIXL_PLUGIN_DIR=$WHITE_PLUGIN_DIR UCX_TLS=tcp HCP_TCH_DEVICE=cuda:0 nohup $BIN \
+    ssh -f -o BatchMode=yes "$SSH_USER@$WHITE_HOST" "cd $REPO && env LD_LIBRARY_PATH=$WHITE_NIXL_LD:$LIBTORCH/lib NIXL_PLUGIN_DIR=$WHITE_PLUGIN_DIR UCX_TLS=tcp HCP_TCH_DEVICE=cuda:0 $BIN \
       --distributed-role worker --domain-id 0 --model-dir $MODEL_DIR \
       --listen-addr 0.0.0.0:$W0_PORT --next-peer-addr $PEARL_HOST:$W1_PORT \
       --coordinator-addr 127.0.0.1:$COORD_PORT --num-domains 2 \
-      > $WD/worker0.log 2>&1 < /dev/null &"
+      > $WD/worker0.log 2>&1"
 
     echo "[s3b] waiting for coordinator to finish the exchange (up to 180s)"
     deadline=$(( $(date +%s) + 180 ))
@@ -98,8 +98,8 @@ case "$mode" in
     ssh_ "$PEARL_HOST" "grep -E 'NIXL|loaded NIXL|reported NIXL|handshake sent' $WD/worker1.log" || true
 
     # Success = both workers loaded the peer's metadata via the control plane.
-    w0_ok=$(ssh_ "$WHITE_HOST" "grep -c 'loaded NIXL metadata from domain 1' $WD/worker0.log" || echo 0)
-    w1_ok=$(ssh_ "$PEARL_HOST" "grep -c 'loaded NIXL metadata from domain 0' $WD/worker1.log" || echo 0)
+    w0_ok=$(ssh_ "$WHITE_HOST" "grep -c 'loaded NIXL metadata from domain 1' $WD/worker0.log || true")
+    w1_ok=$(ssh_ "$PEARL_HOST" "grep -c 'loaded NIXL metadata from domain 0' $WD/worker1.log || true")
     echo "[s3b] worker0 loaded peer metadata: ${w0_ok}; worker1 loaded peer metadata: ${w1_ok}"
     if [ "${w0_ok}" -ge 1 ] && [ "${w1_ok}" -ge 1 ]; then
       echo "[s3b] SIDE-CHANNEL EXCHANGE: PASS"
