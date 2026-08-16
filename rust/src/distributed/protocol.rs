@@ -64,6 +64,17 @@ pub enum WorkerCommand {
     SyncGlobalSeqLen { request_id: u64, len: usize },
     /// Release per-request state (KV cache, past_key_values, etc.) for a completed request.
     ReleaseRequest { request_id: u64 },
+    /// S3b: request each worker to report its NIXL block-transport metadata for
+    /// the coordinator-mediated side channel. Workers reply with NixlMetadata.
+    /// The coordinator is the single source of topology knowledge, so NIXL
+    /// agent metadata + block descriptors travel over the existing control
+    /// plane instead of a separate side-channel port.
+    NixlExchange,
+    /// S3b: broadcast every peer's NIXL metadata + block descriptors to every
+    /// worker. Each entry is (domain_id, nixl_metadata_blob,
+    /// serialized_block_descs). Pure bytes: the coordinator relays without
+    /// deserializing, so this stays independent of the nixl-backend feature.
+    NixlPeers { peers: Vec<(u64, Vec<u8>, Vec<u8>)> },
     /// Shutdown the worker.
     Shutdown,
 }
@@ -94,6 +105,9 @@ pub enum WorkerResponse {
     },
     /// Worker encountered an error.
     Error { request_id: u64, message: String },
+    /// S3b: worker's NIXL metadata (get_local_md blob) + serialized block
+    /// descriptors, reported in response to NixlExchange.
+    NixlMetadata { metadata: Vec<u8>, block_descs: Vec<u8> },
 }
 
 /// Validate the frozen-plan fields of a `StationaryContinuation` command.
@@ -707,5 +721,43 @@ mod tests {
         assert!(validate_stationary_continuation(2, &[11], &[5], &[1, 3], 2).is_err());
         // zero domains
         assert!(validate_stationary_continuation(0, &[11], &[5], &[], 0).is_err());
+    }
+
+    #[test]
+    fn nixl_side_channel_roundtrips_bincode() {
+        // Coordinator -> worker: request metadata exchange.
+        let exchange = WorkerCommand::NixlExchange;
+        let bytes = serialize(&exchange).unwrap();
+        assert!(matches!(deserialize::<WorkerCommand>(&bytes).unwrap(), WorkerCommand::NixlExchange));
+
+        // Worker -> coordinator: report metadata + block descriptors (opaque bytes).
+        let meta = WorkerResponse::NixlMetadata {
+            metadata: vec![0xAB, 0xCD, 0x01, 0x02],
+            block_descs: vec![0x10, 0x20, 0x30],
+        };
+        let bytes = serialize(&meta).unwrap();
+        let decoded: WorkerResponse = deserialize(&bytes).unwrap();
+        let WorkerResponse::NixlMetadata {
+            metadata,
+            block_descs,
+        } = decoded
+        else {
+            panic!("expected NixlMetadata response");
+        };
+        assert_eq!(metadata, vec![0xAB, 0xCD, 0x01, 0x02]);
+        assert_eq!(block_descs, vec![0x10, 0x20, 0x30]);
+
+        // Coordinator -> worker: broadcast all peers' metadata.
+        let peers = WorkerCommand::NixlPeers {
+            peers: vec![(0, vec![1, 2, 3], vec![9, 8]), (1, vec![4, 5], vec![7, 6])],
+        };
+        let bytes = serialize(&peers).unwrap();
+        let decoded: WorkerCommand = deserialize(&bytes).unwrap();
+        let WorkerCommand::NixlPeers { peers: p } = decoded else {
+            panic!("expected NixlPeers command");
+        };
+        assert_eq!(p.len(), 2);
+        assert_eq!(p[0], (0, vec![1, 2, 3], vec![9, 8]));
+        assert_eq!(p[1], (1, vec![4, 5], vec![7, 6]));
     }
 }

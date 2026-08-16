@@ -15,6 +15,10 @@ use crate::distributed::protocol::{
 };
 use crate::model::transport::KvTransport;
 use crate::worker_sdk::backend::WorkerBackend;
+#[cfg(feature = "nixl-backend")]
+use crate::distributed::transport::nixl::NixlBlockTransport;
+#[cfg(feature = "nixl-backend")]
+use crate::model::transport::block_transport::{BlockDesc, KvBlockTransport as BlockTransport};
 use quinn::{RecvStream, SendStream};
 use std::net::SocketAddr;
 use tokio::runtime::Runtime;
@@ -29,6 +33,15 @@ pub struct WorkerRuntime {
     coord_send: SendStream,
     coord_recv: RecvStream,
     rt: Runtime,
+    /// S3b: NIXL block transport (cross-vendor host-staging path), only present
+    /// when built with nixl-backend (white/pearl). Its metadata is exchanged
+    /// over the coordinator control plane via NixlExchange/NixlPeers.
+    #[cfg(feature = "nixl-backend")]
+    nixl_transport: Option<NixlBlockTransport>,
+    /// S3b: the probe block's descriptor, serialized and reported to the
+    /// coordinator so peers can address this worker's registered block.
+    #[cfg(feature = "nixl-backend")]
+    nixl_block_desc: Option<BlockDesc>,
 }
 
 impl WorkerRuntime {
@@ -92,12 +105,30 @@ impl WorkerRuntime {
             .map_err(|e| format!("handshake write failed: {e}"))?;
         println!("[worker {domain_id}] handshake sent to coordinator");
 
+        // S3b: create the NIXL block transport and register a small host block
+        // so its metadata can be exchanged over the coordinator control plane.
+        #[cfg(feature = "nixl-backend")]
+        let (nixl_transport, nixl_block_desc) = {
+            let mut t = NixlBlockTransport::new(&format!("hcp-worker-{domain_id}"))
+                .map_err(|e| format!("nixl transport failed: {e}"))?;
+            let probe = tch::Tensor::zeros([1, 2, 3, 4], (tch::Kind::Float, tch::Device::Cpu));
+            let handle = t
+                .register_block(&probe)
+                .map_err(|e| format!("nixl register probe block: {e}"))?;
+            println!("[worker {domain_id}] NIXL transport ready, probe block id={}", handle.id);
+            (Some(t), Some(handle.desc))
+        };
+
         Ok(Self {
             backend,
             domain_id,
             coord_send,
             coord_recv,
             rt,
+            #[cfg(feature = "nixl-backend")]
+            nixl_transport,
+            #[cfg(feature = "nixl-backend")]
+            nixl_block_desc,
         })
     }
 
@@ -283,6 +314,52 @@ impl WorkerRuntime {
                     };
                     send_response_quic(&mut self.coord_send, &resp, &rt_handle)
                         .map_err(|e| format!("send StationaryDecodeDone failed: {e}"))?;
+                }
+                WorkerCommand::NixlExchange => {
+                    // Report this worker's NIXL metadata + block descriptor over
+                    // the coordinator control plane (S3b side channel).
+                    #[cfg(feature = "nixl-backend")]
+                    let (metadata, block_descs) = {
+                        let md = self
+                            .nixl_transport
+                            .as_ref()
+                            .and_then(|t| t.local_metadata().ok())
+                            .unwrap_or_default();
+                        let descs = self
+                            .nixl_block_desc
+                            .as_ref()
+                            .map(|d| bincode::serialize(d).unwrap_or_default())
+                            .unwrap_or_default();
+                        (md, descs)
+                    };
+                    #[cfg(not(feature = "nixl-backend"))]
+                    let (metadata, block_descs) = (Vec::new(), Vec::new());
+                    let resp = WorkerResponse::NixlMetadata {
+                        metadata,
+                        block_descs,
+                    };
+                    send_response_quic(&mut self.coord_send, &resp, &rt_handle)
+                        .map_err(|e| format!("send NixlMetadata failed: {e}"))?;
+                    println!("[worker {domain_id}] reported NIXL metadata");
+                }
+                WorkerCommand::NixlPeers { peers } => {
+                    #[cfg(feature = "nixl-backend")]
+                    if let Some(t) = self.nixl_transport.as_mut() {
+                        for (peer_domain, md, _descs) in &peers {
+                            match t.load_remote_metadata(md) {
+                                Ok(name) => println!(
+                                    "[worker {domain_id}] loaded NIXL metadata from domain {peer_domain} (agent {name})"
+                                ),
+                                Err(e) => eprintln!(
+                                    "[worker {domain_id}] load NIXL metadata from domain {peer_domain} failed: {e}"
+                                ),
+                            }
+                        }
+                    }
+                    println!(
+                        "[worker {domain_id}] processed {} peer NIXL metadata",
+                        peers.len()
+                    );
                 }
                 WorkerCommand::Shutdown => {
                     println!("[worker {domain_id}] shutting down");

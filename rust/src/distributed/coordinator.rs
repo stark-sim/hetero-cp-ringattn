@@ -129,6 +129,11 @@ struct CoordinatorArgs {
     /// Default 1536 MiB covers one serialized prefill's workspace for the
     /// models in scope; 0 disables the reserve (historical behavior).
     activation_reserve_mb: u64,
+    /// S3b: run the NIXL metadata side-channel exchange over the control plane
+    /// (NixlExchange/NixlPeers) right after worker handshake, then exit. This
+    /// validates that NIXL agent metadata + block descriptors travel through
+    /// the coordinator without a separate side-channel port.
+    nixl_exchange: bool,
 }
 
 fn parse_args() -> CoordinatorArgs {
@@ -155,6 +160,7 @@ fn parse_args() -> CoordinatorArgs {
     let mut trace_jsonl = None;
     let mut max_batch_size = 4usize;
     let mut activation_reserve_mb = 1536u64;
+    let mut nixl_exchange = false;
 
     let mut args = std::env::args().skip(1); // skip binary name
     while let Some(arg) = args.next() {
@@ -224,6 +230,9 @@ fn parse_args() -> CoordinatorArgs {
                     .parse()
                     .expect("invalid --activation-reserve-mb")
             }
+            "--nixl-exchange" => {
+                nixl_exchange = true;
+            }
             "--session-continuation-tokens" => {
                 session_continuation_tokens = args.next().unwrap().parse().unwrap();
             }
@@ -255,7 +264,59 @@ fn parse_args() -> CoordinatorArgs {
         trace_jsonl,
         max_batch_size,
         activation_reserve_mb,
+        nixl_exchange,
     }
+}
+
+/// S3b: exchange NIXL block-transport metadata over the coordinator control
+/// plane. Broadcast NixlExchange -> collect each worker's NixlMetadata ->
+/// broadcast NixlPeers. The coordinator relays opaque bytes without
+/// deserializing, so it stays independent of the nixl-backend feature.
+fn exchange_nixl_metadata(
+    worker_streams: &mut [(quinn::SendStream, quinn::RecvStream)],
+    rt: &tokio::runtime::Runtime,
+) -> Result<(), String> {
+    // 1. Request metadata from every worker.
+    for (send, _) in worker_streams.iter_mut() {
+        send_command_quic(send, &WorkerCommand::NixlExchange, rt.handle())?;
+    }
+    // 2. Collect each worker's metadata + block descriptors. Domain order ==
+    //    stream index (worker_handshakes is sorted by domain_id before the
+    //    streams are extracted).
+    let mut peers = Vec::with_capacity(worker_streams.len());
+    for (domain_id, (_, recv)) in worker_streams.iter_mut().enumerate() {
+        let resp = recv_response_quic(recv, rt.handle())?;
+        let WorkerResponse::NixlMetadata {
+            metadata,
+            block_descs,
+        } = resp
+        else {
+            return Err(format!(
+                "worker {domain_id}: expected NixlMetadata, got {resp:?}"
+            ));
+        };
+        println!(
+            "[coordinator] worker {domain_id} reported NIXL metadata {} bytes, descs {} bytes",
+            metadata.len(),
+            block_descs.len()
+        );
+        peers.push((domain_id as u64, metadata, block_descs));
+    }
+    // 3. Broadcast all peers' metadata to every worker.
+    for (send, _) in worker_streams.iter_mut() {
+        send_command_quic(
+            send,
+            &WorkerCommand::NixlPeers {
+                peers: peers.clone(),
+            },
+            rt.handle(),
+        )?;
+    }
+    println!(
+        "[coordinator] exchanged NIXL metadata across {} workers",
+        peers.len()
+    );
+    Ok(())
 }
 
 /// Write collected logits chunks to a binary file for correctness comparison.
@@ -2293,6 +2354,32 @@ pub fn run() {
 
     // Wrap worker_streams in Arc<Mutex> for shared access between concurrent requests.
     let worker_streams = Arc::new(std::sync::Mutex::new(worker_streams));
+
+    // S3b: NIXL metadata side-channel exchange over the control plane, then exit.
+    if args.nixl_exchange {
+        let result = {
+            let mut guard = worker_streams.lock().unwrap_or_else(|e| e.into_inner());
+            exchange_nixl_metadata(&mut guard, &rt)
+        };
+        let mut worker_streams = match Arc::try_unwrap(worker_streams) {
+            Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| e.into_inner()),
+            Err(_) => {
+                eprintln!("[coordinator] warning: worker_streams still shared, cannot shutdown");
+                return;
+            }
+        };
+        shutdown_workers(&mut worker_streams, &endpoint, &rt);
+        match result {
+            Ok(()) => {
+                println!("[coordinator] NIXL metadata exchange done");
+                return;
+            }
+            Err(e) => {
+                eprintln!("[coordinator] NIXL metadata exchange failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     // experimental (route-B 2c, test-only): stationary continuation E2E entry.
     // Default off — without --continuation-segment the behavior is unchanged.
