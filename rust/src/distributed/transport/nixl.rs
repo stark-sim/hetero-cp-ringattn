@@ -260,9 +260,6 @@ impl KvBlockTransport for NixlBlockTransport {
             remote.desc.dev_id,
         );
 
-        eprintln!("[nixl-t] submit local id={} addr={:#x} len={} mem={:?} -> remote agent={} addr={:#x} len={}",
-            local.id, local_desc.addr, local_desc.len, local_desc.mem_type,
-            remote.agent, remote.desc.addr, remote.desc.len);
         let req = self
             .agent
             .create_xfer_req(
