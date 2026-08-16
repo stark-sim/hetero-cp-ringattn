@@ -71,7 +71,10 @@ run_probe() {
   tag="$(echo "$agent" | sed 's/hcp-xfer-//')"   # white / pearl
   local prefix
   prefix="cd $REPO && env LD_LIBRARY_PATH=$nixl_ld:$LIBTORCH/lib NIXL_PLUGIN_DIR=$plugin_dir"
-  prefix="$prefix NIXL_TELEMETRY_ENABLE=1 NIXL_TELEMETRY_DIR=$WD/tel_$agent HCP_TCH_DEVICE=cuda:0"
+  # UCX_TLS=tcp: force TCP transport and exclude cuda_ipc/rocm GPU-direct,
+  # which has no cross-vendor (CUDA<->ROCm) remote protocol ("cannot find
+  # remote protocol for put(multi) from cuda/GPU0 to rocm").
+  prefix="$prefix NIXL_TELEMETRY_ENABLE=1 NIXL_TELEMETRY_DIR=$WD/tel_$agent HCP_TCH_DEVICE=cuda:0 UCX_TLS=tcp"
   if [ -n "$preload" ]; then
     prefix="$prefix LD_PRELOAD=$preload"
   fi
@@ -118,7 +121,9 @@ case "$mode" in
     ;;
   --run)
     echo "[xfer] clean remote work dirs + kill residual probes"
-    for h in "$WHITE_HOST" "$PEARL_HOST"; do ssh_ "$h" "pkill -f nixl-xfer-probe 2>/dev/null; true"; done
+    # [n]ixl regex trick: the pattern matches the probe's argv but NOT the
+    # pkill shell's own argv (which contains the literal "[n]ixl-xfer-probe").
+    for h in "$WHITE_HOST" "$PEARL_HOST"; do ssh_ "$h" "pkill -f '[n]ixl-xfer-probe' 2>/dev/null; true"; done
     sleep 2
     ssh_ "$WHITE_HOST" "rm -rf $WD && mkdir -p $WD/tel_hcp-xfer-white"
     ssh_ "$PEARL_HOST" "rm -rf $WD && mkdir -p $WD/tel_hcp-xfer-pearl"

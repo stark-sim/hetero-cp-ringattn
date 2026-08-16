@@ -65,7 +65,10 @@ impl MemoryRegion for VramRegion {
 #[cfg(feature = "nixl-backend")]
 impl NixlDescriptor for VramRegion {
     fn mem_type(&self) -> MemType {
-        MemType::Vram
+        // TEMP DRAM experiment: cross-vendor (CUDA<->ROCm) GPU-direct VRAM put
+        // has no UCX remote protocol; host-memory (DRAM) transfer over tcp is
+        // the fallback to validate first.
+        MemType::Dram
     }
 
     fn device_id(&self) -> u64 {
@@ -224,13 +227,13 @@ impl KvBlockTransport for NixlBlockTransport {
             .map(|(d, _)| d.clone())
             .ok_or_else(|| format!("local block {} not registered", local.id))?;
 
-        let mut local_dlist = XferDescList::new(MemType::Vram).map_err(map_err)?;
+        let mut local_dlist = XferDescList::new(MemType::Dram).map_err(map_err)?;
         local_dlist.add_desc(
             local_desc.addr as usize,
             local_desc.len as usize,
             local_desc.dev_id,
         );
-        let mut remote_dlist = XferDescList::new(MemType::Vram).map_err(map_err)?;
+        let mut remote_dlist = XferDescList::new(MemType::Dram).map_err(map_err)?;
         remote_dlist.add_desc(
             remote.desc.addr as usize,
             remote.desc.len as usize,

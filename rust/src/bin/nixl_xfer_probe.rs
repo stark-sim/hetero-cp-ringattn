@@ -81,7 +81,7 @@ mod probe {
         done_out: &str,
         done_in: &str,
     ) -> Result<(), String> {
-        let device = Device::cuda_if_available();
+        let device = Device::Cpu; // TEMP DRAM experiment: host memory transfer
         let mut transport =
             NixlBlockTransport::new(agent).map_err(|e| format!("create agent: {e}"))?;
         println!("[xfer-probe] agent created: {}", transport.agent_name());
