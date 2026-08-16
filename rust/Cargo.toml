@@ -51,6 +51,11 @@ name = "nixl-xfer-probe"
 path = "src/bin/nixl_xfer_probe.rs"
 required-features = ["nixl-backend"]
 
+[[bin]]
+name = "nixl-ring-probe"
+path = "src/bin/nixl_ring_probe.rs"
+required-features = ["nixl-backend"]
+
 
 
 [build-dependencies]
