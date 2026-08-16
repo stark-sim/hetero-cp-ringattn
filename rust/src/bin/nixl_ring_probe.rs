@@ -160,8 +160,12 @@ mod probe {
         let succ_desc: RemoteBlockDesc =
             serde_json::from_str(&desc_str).map_err(|e| format!("parse desc: {e}"))?;
         println!(
-            "[ring-probe] successor recv desc agent={} block_id={} len={}",
-            succ_desc.agent, succ_desc.block_id, succ_desc.desc.len
+            "[ring-probe] successor recv desc agent={} block_id={} len={} addr={}",
+            succ_desc.agent, succ_desc.block_id, succ_desc.desc.len, succ_desc.desc.addr
+        );
+        println!(
+            "[ring-probe] own recv desc addr={}",
+            recv_handle.desc.addr
         );
 
         // Hop-by-hop circulation.
