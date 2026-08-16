@@ -120,6 +120,14 @@ mod probe {
         let recv_handle = transport
             .register_block(&recv)
             .map_err(|e| format!("register recv: {e}"))?;
+        let cur_after_reg: Vec<f32> = Vec::try_from(
+            &current.to_kind(Kind::Float).to_device(Device::Cpu).view(-1),
+        )
+        .unwrap_or_default();
+        println!(
+            "[ring-probe] current AFTER register[:4]={:?}",
+            &cur_after_reg[..cur_after_reg.len().min(4)]
+        );
         println!(
             "[ring-probe] current id={} len={}, recv id={} len={}",
             current_handle.id, current_handle.desc.len, recv_handle.id, recv_handle.desc.len
