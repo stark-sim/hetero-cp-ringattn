@@ -2,6 +2,23 @@
 
 按时间倒序排列的重要进展、实验和学到的教训。
 
+### 组件复用边界：绑定层 vs 运行期实现层——复用官方 crate 不等于复用其实现
+
+type: `lesson` · status: `held` · confidence: 0.9 · importance: 0.9 · source: `hetero-cp-ringattn@1b275c4`
+
+【教训】复用官方 crate/轮子要按层说清楚：绑定/声明层 vs 安全封装层 vs 运行期实现层，不能一句话混为一谈。
+
+触发场景：NIXL 接入用官方 nixl-sys crate + stub-api feature。我先后写了「复用官方 crate」和「capi.so 彻底退役」，但 stub-api 的 stubs.cpp 在运行期 dlopen("libnixl_capi.so") 转发 nixl_capi_* 符号——libnixl_capi.so 根本没退役，只是从「手写 extern "C" + 编译期 #[link]」改成「官方 crate 的 stub 运行期 dlopen」。
+
+根因：把「复用」当成单一 yes/no，而不是按层拆分。复用的是绑定层（bindgen）+ 安全封装层（Agent/Backend/XferRequest/Drop/错误）；运行期实现仍是同一个 libnixl_capi.so。
+
+第一条件可防：在写「复用/退役」结论前，读 crate 的 build.rs / feature flag / stub 源码，确定符号是编译期 link 还是运行期 dlopen；每个组件选择写一行「结果 + 原因」。
+
+组件选择（结果 + 原因）已记入 evidence-nixl-sys-white-cuda-verified-20260816；通用判断模式沉淀为 skill component-reuse-boundary（~/.agents/skills/component-reuse-boundary）。
+
+边界：环境事实（哪个 .so 在哪）→ infrastructure-inventory；dlopen/link 调试 → systematic-debugging；本节点只记录判断模式与选择原因。
+
+_updated: 2026-08-16 04:02:37_
 ### NIXL 官方 nixl-sys crate 在 white(CUDA) 真实验证：conda 轮 + bindgen 编译 + register/metadata 运行通过
 
 type: `evidence` · status: `verified` · confidence: 0.95 · importance: 0.95 · source: `hetero-cp-ringattn@1b275c4`
@@ -25,9 +42,18 @@ NIXL block transport 用官方 nixl-sys crate 在 white(CUDA/RTX4090) 真实验�
 
 scripts/nixl_transport_probe.sh 泛化：按 hostname 自动切 white/pearl（white=conda 轮 cu13，pearl=源码树 + libtorch_hip.so preload），并修复原脚本 cd 到仓库根却 cargo build 无 Cargo.toml 的 bug（改用 --manifest-path rust/Cargo.toml）。
 
-证据边界：单机 white(CUDA) 的 register + local_metadata 运行时验证（官方 nixl-sys crate 版）。至此 white(CUDA)+pearl(ROCm) 两台均用官方 nixl-sys crate 通过 S2 单机 register/metadata 冒烟；手写 capi.so FFI 彻底退役。不覆盖跨机 CUDA↔ROCm register→transfer→poll 全生命周期、双 agent side-channel 交换、prefill KV ring 接线（S3）或 paged-KV 化（S4）。
+组件选择（结果 + 原因）：
+1. nixl-sys 官方 crate vs 手写 extern "C" → 官方 crate。原因：bindgen 生成绑定 + 安全封装（Agent/Backend/XferRequest/Drop/错误）由上游维护，删 ~500 行手写 FFI，类型/生命周期正确。
+2. nixl-sys 的 stub-api vs 非 stub（真实 link）→ stub-api。原因：构建期免链 NIXL C++ 库（libnixl.so/libnixl_build.so/libnixl_common.so），且同一构建产物可 dlopen 不同布局的 libnixl_capi.so（pearl 源码树 / white conda 轮）。代价：运行期实现仍是 libnixl_capi.so，复用仅到绑定层。
+3. 运行期绑定：dlopen（stub-api）vs 构建期 link（旧手写 #[link]）→ dlopen。原因：是 #2 的直接后果；代价：LD_LIBRARY_PATH 必须包含 libnixl_capi.so 所在目录，否则首次调用 dlopen 失败。
+4. white 的 libnixl_capi.so 来源：conda 轮 nixl_cu13 vs 源码构建树 → conda 轮。原因：vllm-v1 环境已装、RPATH 自包含（ldd 无 not-found）、匹配 CUDA 13 的 libtorch。
+5. pearl 的 libnixl_capi.so 来源：源码构建树 vs conda 轮 → 源码树。原因：pearl 是 ROCm，cu13/cu12 轮的 UCX 是 CUDA 构建、无法注册 HIP 指针（先前已证 NIXL_ERR_BACKEND），需 --with-rocm 源码构建 UCX。
 
-_updated: 2026-08-15 20:23:16_
+复用边界澄清：复用的是官方 nixl-sys crate 的绑定层（bindgen）+ 安全封装层；NIXL 运行期实现仍由 libnixl_capi.so 提供——stub-api 在运行期 dlopen("libnixl_capi.so") 转发 nixl_capi_* 符号。退役的是「手写 extern "C" 声明 + 编译期 link」，不是 libnixl_capi.so 这个库。
+
+证据边界：单机 white(CUDA) 的 register + local_metadata 运行时验证（官方 nixl-sys crate 版）。至此 white(CUDA)+pearl(ROCm) 两台均用官方 nixl-sys crate 通过 S2 单机 register/metadata 冒烟。不覆盖跨机 CUDA↔ROCm register→transfer→poll 全生命周期、双 agent side-channel 交换、prefill KV ring 接线（S3）或 paged-KV 化（S4）。
+
+_updated: 2026-08-16 04:02:37_
 ### NIXL 改用官方 nixl-sys crate 并真实验证：pearl bindgen 编译 + register/metadata 运行通过（367fe04）
 
 type: `evidence` · status: `verified` · confidence: 0.95 · importance: 0.95 · source: `hetero-cp-ringattn@367fe04`
@@ -47,9 +73,9 @@ NIXL block transport 改用官方 nixl-sys crate 并真实验证通过（commit 
 - spike：官方 crate is_stub()==false 且完整 register(host block)+get_local_md 生命周期跑通。
 - Mac：cargo build/test --features tch-backend --lib = 161 passed / 0 failed / 5 ignored（nixl feature off 不碰 nixl-sys）；rustfmt + git diff --check 绿。
 
-证据边界：这是单机 pearl(ROCm) 的 register + local_metadata 运行时验证（官方 crate 版），不覆盖跨机 CUDA↔ROCm register→transfer→poll 全生命周期、不覆盖双 agent side-channel 交换、不覆盖 prefill KV ring 接线（S3）或 paged-KV 化（S4）。white(CUDA) 端未用 nixl-sys 版跑（其 libnixl_capi.so 在 conda 轮内路径不同，S3 时统一）。Mac 上 nixl-backend 无法编译（无 libclang.dylib），nixl-sys 仅在 white/pearl 编译。
+证据边界：这是单机 pearl(ROCm) 的 register + local_metadata 运行时验证（官方 crate 版），不覆盖跨机 CUDA↔ROCm register→transfer→poll 全生命周期、不覆盖双 agent side-channel 交换、不覆盖 prefill KV ring 接线（S3）或 paged-KV 化（S4）。white(CUDA) 端随后也已用 nixl-sys 版验证通过（conda 轮 nixl_cu13，见 evidence-nixl-sys-white-cuda-verified-20260816）。Mac 上 nixl-backend 无法编译（无 libclang.dylib），nixl-sys 仅在 white/pearl 编译。
 
-_updated: 2026-08-15 19:51:56_
+_updated: 2026-08-16 04:02:37_
 ### NIXL S2 真实验证：pearl(ROCm) 手写 FFI 链接 + agent 创建 + UCX backend 实例化 + VRAM block 注册 + metadata 拉取全通过
 
 type: `evidence` · status: `verified` · confidence: 0.95 · importance: 0.95 · source: `hetero-cp-ringattn@106d2e2`
