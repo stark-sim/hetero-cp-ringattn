@@ -164,8 +164,8 @@ mod probe {
             succ_desc.agent, succ_desc.block_id, succ_desc.desc.len, succ_desc.desc.addr
         );
         println!(
-            "[ring-probe] own recv desc addr={}",
-            recv_handle.desc.addr
+            "[ring-probe] own recv desc addr={} current addr={}",
+            recv_handle.desc.addr, current_handle.desc.addr
         );
 
         // Hop-by-hop circulation.
