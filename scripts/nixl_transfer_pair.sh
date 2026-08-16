@@ -24,7 +24,7 @@ while [ $# -gt 0 ]; do
     --seq) SEQ="$2"; shift 2 ;;
     --device) DEVICE="$2"; shift 2 ;;
     --no-tcp) FORCE_TCP=0; shift ;;
-    --build|--run) MODE="${1#--}"; shift ;;
+    --build|--run) MODE="$1"; shift ;;
     *) echo "unknown arg $1" >&2; exit 2 ;;
   esac
 done
@@ -33,29 +33,31 @@ if [ -z "$HOST_A" ] || [ -z "$HOST_B" ]; then
   exit 2
 fi
 
-# host -> (ssh ip, nixl_ld, plugin_dir, preload, libclang)
+# host -> (ssh ip, nixl_ld, plugin_dir, preload, libclang, ucx_net_device)
+# ucx_net_device pins UCX to the WiFi iface shared by all three nodes (192.168.8.x),
+# otherwise white's wired enp10s0 (192.168.100.1) is picked and laptop cannot reach it.
 host_env() {
   case "$1" in
     white)
-      W=~/miniconda3/envs/vllm-v1/lib/python3.11/site-packages
-      echo "100.118.253.68|$W/.nixl_cu13.mesonpy.libs|$W/.nixl_cu13.mesonpy.libs/plugins||/usr/lib/llvm-21/lib"
+      W=/home/stark/miniconda3/envs/vllm-v1/lib/python3.11/site-packages
+      echo "100.118.253.68|$W/.nixl_cu13.mesonpy.libs|$W/.nixl_cu13.mesonpy.libs/plugins||/usr/lib/llvm-21/lib|wlp11s0"
       ;;
     laptop)
-      W=~/miniconda3/envs/vllm-v1/lib/python3.11/site-packages
-      echo "100.96.154.1|$W/.nixl_cu13.mesonpy.libs|$W/.nixl_cu13.mesonpy.libs/plugins||/usr/lib/llvm-18/lib"
+      W=/home/stark/miniconda3/envs/vllm-v1/lib/python3.11/site-packages
+      echo "100.96.154.1|$W/.nixl_cu13.mesonpy.libs|$W/.nixl_cu13.mesonpy.libs/plugins||/usr/lib/llvm-18/lib|wlp3s0"
       ;;
     pearl)
       B=/home/stark/build/nixl-1.4.0/build/src
-      echo "100.111.242.55|$B/bindings:$B/core:$B/infra:$B/utils/serdes:$B/utils/stream:$B/utils/common:$B/plugins/ucx|$B/plugins/ucx|/home/stark/libtorch/lib/libtorch_hip.so|/usr/lib/llvm-18/lib"
+      echo "100.111.242.55|$B/bindings:$B/core:$B/infra:$B/utils/serdes:$B/utils/stream:$B/utils/common:$B/plugins/ucx|$B/plugins/ucx|/home/stark/libtorch/lib/libtorch_hip.so|/usr/lib/llvm-18/lib|wlo1"
       ;;
     *) echo "unknown host $1" >&2; exit 2 ;;
   esac
 }
 
-A_IP=""; A_LD=""; A_PLUGIN=""; A_PRELOAD=""; A_CLANG=""
-B_IP=""; B_LD=""; B_PLUGIN=""; B_PRELOAD=""; B_CLANG=""
-IFS='|' read -r A_IP A_LD A_PLUGIN A_PRELOAD A_CLANG <<< "$(host_env $HOST_A)"
-IFS='|' read -r B_IP B_LD B_PLUGIN B_PRELOAD B_CLANG <<< "$(host_env $HOST_B)"
+A_IP=""; A_LD=""; A_PLUGIN=""; A_PRELOAD=""; A_CLANG=""; A_WIFI=""
+B_IP=""; B_LD=""; B_PLUGIN=""; B_PRELOAD=""; B_CLANG=""; B_WIFI=""
+IFS='|' read -r A_IP A_LD A_PLUGIN A_PRELOAD A_CLANG A_WIFI <<< "$(host_env $HOST_A)"
+IFS='|' read -r B_IP B_LD B_PLUGIN B_PRELOAD B_CLANG B_WIFI <<< "$(host_env $HOST_B)"
 
 ssh_() { ssh -o BatchMode=yes "$SSH_USER@$1" "${@:2}"; }
 
@@ -68,10 +70,10 @@ build_host() {
 }
 
 run_probe() {
-  local ip="$1" agent="$2" seed="$3" ld="$4" plugin="$5" preload="$6"
+  local ip="$1" agent="$2" seed="$3" ld="$4" plugin="$5" preload="$6" wifi="$7"
   local tag; tag="$(echo "$agent" | sed 's/hcp-xfer-//')"
   local prefix
-  prefix="cd $REPO && env LD_LIBRARY_PATH=$ld:$LIBTORCH/lib NIXL_PLUGIN_DIR=$plugin NIXL_TELEMETRY_ENABLE=1 NIXL_TELEMETRY_DIR=$WD/tel_$agent HCP_TCH_DEVICE=cuda:0"
+  prefix="cd $REPO && env LD_LIBRARY_PATH=$ld:$LIBTORCH/lib NIXL_PLUGIN_DIR=$plugin NIXL_TELEMETRY_ENABLE=1 NIXL_TELEMETRY_DIR=$WD/tel_$agent HCP_TCH_DEVICE=cuda:0 UCX_NET_DEVICES=$wifi"
   if [ "$FORCE_TCP" = "1" ]; then prefix="$prefix UCX_TLS=tcp"; fi
   if [ -n "$preload" ]; then prefix="$prefix LD_PRELOAD=$preload"; fi
   ssh -f -o BatchMode=yes "$SSH_USER@$ip" "$prefix $PROBE \
@@ -119,8 +121,8 @@ case "$mode" in
     for ip in "$A_IP" "$B_IP"; do ssh_ "$ip" "pkill -f '[n]ixl-xfer-probe' 2>/dev/null; true; rm -rf $WD; mkdir -p $WD/tel_hcp-xfer-a $WD/tel_hcp-xfer-b"; done
     sleep 1
 
-    run_probe "$A_IP" hcp-xfer-a 0   "$A_LD" "$A_PLUGIN" "$A_PRELOAD"
-    run_probe "$B_IP" hcp-xfer-b 100 "$B_LD" "$B_PLUGIN" "$B_PRELOAD"
+    run_probe "$A_IP" hcp-xfer-a 0   "$A_LD" "$A_PLUGIN" "$A_PRELOAD" "$A_WIFI"
+    run_probe "$B_IP" hcp-xfer-b 100 "$B_LD" "$B_PLUGIN" "$B_PRELOAD" "$B_WIFI"
 
     for f in a_md a_desc a_src.bin; do wait_remote_file "$A_IP" "$WD/$f"; done
     for f in b_md b_desc b_src.bin; do wait_remote_file "$B_IP" "$WD/$f"; done
