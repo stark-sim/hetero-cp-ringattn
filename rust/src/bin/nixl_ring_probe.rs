@@ -104,6 +104,11 @@ mod probe {
             .reshape(shape)
             .to_kind(Kind::BFloat16);
         let recv = Tensor::zeros(shape, (Kind::BFloat16, device));
+        let recv0: Vec<f32> = Vec::try_from(
+            &recv.to_kind(Kind::Float).to_device(Device::Cpu).view(-1),
+        )
+        .unwrap_or_default();
+        println!("[ring-probe] recv AFTER alloc[:4]={:?}", &recv0[..recv0.len().min(4)]);
 
         let cur0: Vec<f32> = Vec::try_from(
             &current.to_kind(Kind::Float).to_device(Device::Cpu).view(-1),
@@ -213,6 +218,14 @@ mod probe {
             println!(
                 "[ring-probe] round {round} BEFORE swap recv[:4]={:?}",
                 &recv_dbg[..recv_dbg.len().min(4)]
+            );
+            let cur_before_swap: Vec<f32> = Vec::try_from(
+                &current.to_kind(Kind::Float).to_device(Device::Cpu).view(-1),
+            )
+            .unwrap_or_default();
+            println!(
+                "[ring-probe] round {round} BEFORE swap current[:4]={:?}",
+                &cur_before_swap[..cur_before_swap.len().min(4)]
             );
             // Swap: forward what we just received next round (copy recv into
             // current, preserving the registered current buffer address).
