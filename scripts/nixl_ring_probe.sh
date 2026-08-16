@@ -45,7 +45,7 @@ run_probe() {
   if [ -n "$preload" ]; then prefix="$prefix LD_PRELOAD=$preload"; fi
   ssh -f -o BatchMode=yes "$SSH_USER@$ip" "$prefix $PROBE \
     --agent hcp-ring-$host --seed $seed --seq $seq --rounds 2 \
-    --md-out $WD/${host}_md --md-in $WD/${host}_peer_md \
+    --md-out $WD/${host}_md --md-in $WD/${host}_peer_md --md-in2 $WD/${host}_peer_md2 \
     --desc-out $WD/${host}_desc --desc-in $WD/${host}_peer_desc \
     --done-out $WD/${host}_done --done-in $WD/${host}_peer_done \
     --dump-out $WD/${host}_recv.bin \
@@ -97,16 +97,20 @@ case "$mode" in
       for f in ${h}_md ${h}_desc; do wait_remote_file "$ip" "$WD/$f"; done
     done
 
-    # desc + md exchange (successor direction): succ's md/desc -> pred's peer_*
-    echo "[ring] exchange md + desc (successor -> predecessor)"
+    # desc + md exchange. succ's md/desc -> pred's peer_* (transfer direction),
+    # PLUS pred's md -> succ's peer_md2, so each node loads BOTH ring neighbors
+    # (NIXL's UCX link needs both peers loaded before a Write lands correctly).
+    echo "[ring] exchange md + desc (successor + predecessor)"
     for h in white pearl laptop; do
-      s="$(succ_of $h)"
-      ip="$(ip_of $h)"; sip="$(ip_of $s)"
+      s="$(succ_of $h)"; p="$(pred_of $h)"
+      ip="$(ip_of $h)"; sip="$(ip_of $s)"; pip="$(ip_of $p)"
       scp -q "$SSH_USER@$sip:$WD/${s}_md"   "$LOCAL/${s}_md"
       scp -q "$SSH_USER@$sip:$WD/${s}_desc" "$LOCAL/${s}_desc"
+      scp -q "$SSH_USER@$pip:$WD/${p}_md"   "$LOCAL/${p}_md"
       scp -q "$LOCAL/${s}_md"   "$SSH_USER@$ip:$WD/${h}_peer_md.tmp"
       scp -q "$LOCAL/${s}_desc" "$SSH_USER@$ip:$WD/${h}_peer_desc.tmp"
-      ssh_ "$ip" "mv $WD/${h}_peer_md.tmp $WD/${h}_peer_md; mv $WD/${h}_peer_desc.tmp $WD/${h}_peer_desc"
+      scp -q "$LOCAL/${p}_md"   "$SSH_USER@$ip:$WD/${h}_peer_md2.tmp"
+      ssh_ "$ip" "mv $WD/${h}_peer_md.tmp $WD/${h}_peer_md; mv $WD/${h}_peer_desc.tmp $WD/${h}_peer_desc; mv $WD/${h}_peer_md2.tmp $WD/${h}_peer_md2"
     done
 
     # two rounds of done sync (predecessor direction): pred's done -> succ's peer_done.

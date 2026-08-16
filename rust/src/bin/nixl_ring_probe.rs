@@ -79,6 +79,10 @@ mod probe {
             .map_err(|_| "bad --rounds")?;
         let md_out = get_arg(&args, "--md-out").ok_or("missing --md-out")?;
         let md_in = get_arg(&args, "--md-in").ok_or("missing --md-in")?;
+        // Optional second metadata blob (the predecessor's) so both ring
+        // neighbors are loaded — NIXL's UCX link may need both peers to have
+        // loaded each other before a Write lands on the right registered block.
+        let md_in2 = get_arg(&args, "--md-in2");
         let desc_out = get_arg(&args, "--desc-out").ok_or("missing --desc-out")?;
         let desc_in = get_arg(&args, "--desc-in").ok_or("missing --desc-in")?;
         let done_out = get_arg(&args, "--done-out").ok_or("missing --done-out")?;
@@ -144,6 +148,14 @@ mod probe {
             .load_remote_metadata(&peer_md)
             .map_err(|e| format!("load remote md: {e}"))?;
         println!("[ring-probe] loaded remote md agent={}", peer_agent);
+        if let Some(md2) = &md_in2 {
+            wait_for_file(md2, 180)?;
+            let pred_md = fs::read(md2).map_err(|e| format!("read md_in2: {e}"))?;
+            let pred_agent = transport
+                .load_remote_metadata(&pred_md)
+                .map_err(|e| format!("load pred md: {e}"))?;
+            println!("[ring-probe] loaded pred md agent={}", pred_agent);
+        }
         let desc_str = fs::read_to_string(&desc_in).map_err(|e| format!("read desc: {e}"))?;
         let succ_desc: RemoteBlockDesc =
             serde_json::from_str(&desc_str).map_err(|e| format!("parse desc: {e}"))?;
