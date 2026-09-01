@@ -48,6 +48,7 @@ def main():
     doc = Document(SRC)
     replace_all(doc, "面向大规模分布式AI的异构硬件合作可行性理论与关键技术研究", NEW_TITLE)
     replace_all(doc, "异构硬件合作", "异构算力协同")
+    replace_all(doc, "异构合作", "异构算力协同")
     replace_all(doc, "大规模AI系统", "大规模大模型系统")
     replace_all(doc, "AI基础设施", "大模型基础设施")
     replace_all(doc, "其他分布式 AI 工作负载", "其他分布式大模型工作负载")
