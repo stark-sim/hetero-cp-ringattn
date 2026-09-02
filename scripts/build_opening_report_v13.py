@@ -8,7 +8,7 @@ from docx.shared import Inches, Pt
 
 BASE = Path('/Users/stark_sim/Desktop/硕士课题/开题报告')
 SRC = BASE / '开题报告_新版12_沈达_面向大模型推理与强化学习后训练的异构算力负载承接研究.docx'
-OUT = BASE / '开题报告_新版14_沈达_面向大模型推理与强化学习后训练的异构算力负载承接研究.docx'
+OUT = BASE / '开题报告_新版15_沈达_面向大模型推理与强化学习后训练的异构算力负载承接研究.docx'
 IMG_DIR = Path('/Users/stark_sim/VSCodeProjects/hetero-cp-ringattn/output/imagegen')
 
 
@@ -143,7 +143,7 @@ def main():
         q = make_para(doc, text)
         insert_after(p, q)
         p = q
-    ascend = IMG_DIR / 'domestic-ascend-evidence-map-v1.png'
+    ascend = IMG_DIR / 'domestic-ascend-evidence-map-v2.png'
     if ascend.exists():
         cap = add_figure(doc, p, ascend, '图4  国内昇腾异构算力的能力基础、系统边界与本课题切入点', width=6.0)
         p = cap
@@ -168,7 +168,7 @@ def main():
     note = add_table_after(doc, p, '表1  两条研究路线的方案闭环', ['研究路线', '输入与约束', '本课题新增机制', '基线与主要评价'], rows, [1.0, 1.7, 2.1, 1.6])
 
     p = find_para(doc, '3.2  实施方案')
-    matrix = IMG_DIR / 'two-route-experimental-matrix-v1.png'
+    matrix = IMG_DIR / 'two-route-experimental-matrix-v2.png'
     if matrix.exists():
         add_figure(doc, p, matrix, '图5  两条路线的独立实验矩阵与统一准入门槛', width=6.0)
 
