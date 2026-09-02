@@ -8,7 +8,7 @@ from docx.shared import Inches, Pt
 
 BASE = Path('/Users/stark_sim/Desktop/硕士课题/开题报告')
 SRC = BASE / '开题报告_新版12_沈达_面向大模型推理与强化学习后训练的异构算力负载承接研究.docx'
-OUT = BASE / '开题报告_新版15_沈达_面向大模型推理与强化学习后训练的异构算力负载承接研究.docx'
+OUT = BASE / '开题报告_新版16_沈达_面向大模型推理与强化学习后训练的异构算力负载承接研究.docx'
 IMG_DIR = Path('/Users/stark_sim/VSCodeProjects/hetero-cp-ringattn/output/imagegen')
 
 
@@ -143,17 +143,20 @@ def main():
         q = make_para(doc, text)
         insert_after(p, q)
         p = q
-    ascend = IMG_DIR / 'domestic-ascend-evidence-map-v2.png'
-    if ascend.exists():
-        cap = add_figure(doc, p, ascend, '图4  国内昇腾异构算力的能力基础、系统边界与本课题切入点', width=6.0)
+    framing = make_para(doc, '图4将异构现状、已有系统的承接粒度和本课题拟补足的研究空档放在同一比较轴上；昇腾与CloudMatrix384作为国内工程证据嵌入主流承接方式，而不单独代表本课题的研究对象。')
+    insert_after(p, framing)
+    p = framing
+    state = IMG_DIR / 'heterogeneous-service-landscape-v1.png'
+    if state.exists():
+        cap = add_figure(doc, p, state, '图4  异构算力服务现状、主流承接方式与研究空档', width=6.0)
         p = cap
     rows = [
-        ('PanGu-Σ', '昇腾910 + MindSpore；稀疏专家与专家计算/存储分离', '证明国产NPU可支撑大模型训练；收益依赖并行结构与系统协同'),
-        ('CloudMatrix384', '384昇腾910 + 192鲲鹏；UB全互联；Prefill/Decode/缓存分离', '证明生产级异构池化；同时揭示MoE/KV高带宽互联边界'),
-        ('MindSpore / MindSpeed', '数据、张量、流水、混合并行及国产运行时', '作为后端与并行基线；不等于跨厂商任务内协同'),
-        ('ReDSEa / vLLM-Ascend', '鲲鹏+昇腾异构求解；vLLM插件化昇腾后端', '说明异构映射和软件适配可落地；仍需本课题的准入与回退验证'),
+        ('Dynamo / vLLM / llm-d', '请求路由、Prefill/Decode分离、KV管理、后端接口', '适合请求级/阶段级承接；不解决单请求任务内HCP'),
+        ('CloudMatrix384 / vLLM-Ascend', '昇腾+鲲鹏专用互联；国产后端插件与阶段解耦', '证明国产异构池化可落地；依赖专用高带宽互联与软件栈'),
+        ('HetRL / Prime RL', 'rollout、奖励、评估阶段放置；异步流水与弹性设备', '适合RL阶段承接；版本、队列和恢复边界仍需组合验证'),
+        ('本课题', '长上下文Prefill的HCP；RL阶段能力合同与回退', '把协同粒度、准入条件和负向边界变成可测规则'),
     ]
-    note = add_table_after(doc, p, '表3  国内昇腾相关工作的证据与边界', ['代表工作', '已展示能力', '对本课题的启示与限制'], rows, [1.3, 3.0, 2.1])
+    note = add_table_after(doc, p, '表3  主流异构承接方式与本课题增量边界', ['代表工作/对象', '已展示能力', '对本课题的启示与限制'], rows, [1.6, 2.8, 2.0])
 
     # Add overview figure and a compact research-plan matrix at the beginning of Chapter 3.
     p = find_para(doc, '两条路线均从相同的分析维度出发')
@@ -168,9 +171,11 @@ def main():
     note = add_table_after(doc, p, '表1  两条研究路线的方案闭环', ['研究路线', '输入与约束', '本课题新增机制', '基线与主要评价'], rows, [1.0, 1.7, 2.1, 1.6])
 
     p = find_para(doc, '3.2  实施方案')
-    matrix = IMG_DIR / 'two-route-experimental-matrix-v2.png'
+    value_note = make_para(doc, '图5不再重复研究路线和实验矩阵，而是区分参考框架已经提供的能力、尚未覆盖的具体空档，以及本课题拟增加并验证的机制。推理与LLM-RL在图中保持为上下两条独立路线。')
+    insert_after(p, value_note)
+    matrix = IMG_DIR / 'heterogeneous-value-boundary-v1.png'
     if matrix.exists():
-        add_figure(doc, p, matrix, '图5  两条路线的独立实验矩阵与统一准入门槛', width=6.0)
+        add_figure(doc, value_note, matrix, '图5  现有异构系统能力与本课题新增机制的边界对比', width=6.0)
 
     # Route-specific figures stay inside their own sections.
     p = find_para(doc, '本研究只把长上下文Prefill作为任务内异构协同的验证对象')
