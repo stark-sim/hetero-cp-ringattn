@@ -74,10 +74,32 @@ def rl(layer: Image.Image) -> None:
     label(layer, (760, 1030), "异构设备池", 27, border=INK)
 
 
+def separate_overview(layer: Image.Image) -> None:
+    label(layer, (510, 125), "方向一：长上下文推理", 38, color=ACCENT, border=ACCENT)
+    label(layer, (510, 172), "任务内异构协同", 25, border=INK)
+    label(layer, (1505, 125), "方向二：LLM-RL 后训练", 38, color=ACCENT, border=ACCENT)
+    label(layer, (1505, 172), "阶段级异构承接", 25, border=INK)
+    label(layer, (132, 255), "异构设备池", 26, border=INK)
+    label(layer, (355, 255), "HCP 准入判断", 25, border=ACCENT)
+    label(layer, (610, 255), "长上下文 Prefill", 25, border=INK)
+    label(layer, (890, 255), "非对称 HCP", 26, color=ACCENT, border=ACCENT)
+    label(layer, (890, 820), "不均匀切分 + K/V Ring", 22, color=ACCENT, border=ACCENT)
+    label(layer, (1190, 255), "异构设备池", 26, border=INK)
+    label(layer, (1435, 255), "阶段能力合同", 25, border=ACCENT)
+    label(layer, (1665, 255), "Rollout / 奖励 / 评估", 23, border=INK)
+    label(layer, (1900, 255), "局部高带宽\n策略更新", 24, color=ACCENT, border=ACCENT)
+    label(layer, (1540, 820), "版本、队列与弹性回退", 22, color=ACCENT, border=ACCENT)
+
+
 def main() -> None:
     save_with_labels("heterogeneous-load-admission-overview-v2.png", "heterogeneous-load-admission-overview-v3.png", overview)
     save_with_labels("heterogeneous-hcp-prefill-detail-v2.png", "heterogeneous-hcp-prefill-detail-v3.png", hcp)
     save_with_labels("heterogeneous-llm-rl-stage-admission-v2.png", "heterogeneous-llm-rl-stage-admission-v3.png", rl)
+    save_with_labels(
+        "heterogeneous-two-research-directions-overview-v4.png",
+        "heterogeneous-two-research-directions-overview-v4-labeled.png",
+        separate_overview,
+    )
 
 
 if __name__ == "__main__":
