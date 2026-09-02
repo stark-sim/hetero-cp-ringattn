@@ -8,7 +8,7 @@ from docx.shared import Inches, Pt
 
 BASE = Path('/Users/stark_sim/Desktop/硕士课题/开题报告')
 SRC = BASE / '开题报告_新版12_沈达_面向大模型推理与强化学习后训练的异构算力负载承接研究.docx'
-OUT = BASE / '开题报告_新版13_沈达_面向大模型推理与强化学习后训练的异构算力负载承接研究.docx'
+OUT = BASE / '开题报告_新版14_沈达_面向大模型推理与强化学习后训练的异构算力负载承接研究.docx'
 IMG_DIR = Path('/Users/stark_sim/VSCodeProjects/hetero-cp-ringattn/output/imagegen')
 
 
@@ -128,6 +128,33 @@ def main():
     new = make_para(doc, '这一综述还给出一个重要的节奏判断：研究不应从“如何把更多设备加入任务”开始，而应从“不加入会损失什么、加入后新增什么代价”开始。推理线先验证长上下文是否存在显存墙，再决定是否打开HCP；RL线先确认阶段边界和版本约束，再决定是否把弹性设备纳入工作流。两条路线均以能够被实验拒绝的准入条件作为起点。')
     insert_after(p, new)
 
+    # Add a domestic-evidence subsection before the synthesis, keeping positive
+    # capability claims paired with explicit communication and deployment limits.
+    p = find_para(doc, '这些工作支持“生成和评估阶段适合利用异构资源”的判断')
+    domestic = make_para(doc, '2.2.3  昇腾集群与国产异构软件栈的工程证据', bold=True)
+    insert_after(p, domestic)
+    p = domestic
+    for text in [
+        '昇腾相关公开成果为国内异构算力研究提供了比“设备型号对比”更具体的证据。PanGu-Σ在昇腾910集群和MindSpore上完成了万亿参数稀疏语言模型训练，通过专家计算与存储分离扩大了可用的计算与存储边界[40]；该工作说明国产NPU集群能够承载大模型训练，但其收益来自模型结构、并行方式与系统软件的协同设计，并不意味着任意异构卡都可以直接混合执行高频同步训练。',
+        'CloudMatrix384进一步展示了384个昇腾910 NPU与192个鲲鹏CPU通过统一总线构成的超节点，并在推理侧采用Prefill、Decode和缓存的独立扩展[41]。该案例对本课题有两点启示：一是国产集群已经把异构资源池化和阶段解耦推进到生产级系统；二是其MoE专家并行和KV访问依赖专用高带宽全互联，反向说明普通网络下的跨厂商任务内协同必须谨慎设定边界。',
+        '从软件栈看，MindSpore/MindSpeed提供了数据并行、张量并行、流水并行和混合并行等分布式能力[42]，vLLM-Ascend则通过插件方式把昇腾后端接入主流推理接口[44]。这些工程能力可作为本课题的适配基线，但“后端可运行”与“跨设备共同完成一次任务”是两个不同层次的问题：前者解决算子和运行时兼容，后者还需要设备画像、通信预算、准入和失败回退。',
+        '国内异构协同的学术证据也不只来自大模型。ReDSEa在鲲鹏CPU与昇腾910组成的超算异构系统上对三角方程求解进行自动映射、负载均衡和调度[43]，证明了计算密集型任务可以通过性能模型获得异构收益；但其任务具有明确的分块结构，与LLM推理或RL后训练不同。因此，本课题将昇腾集群和ReDSEa作为“异构承接可行但依赖负载结构”的国内证据，而不是直接复用其性能结论。'
+    ]:
+        q = make_para(doc, text)
+        insert_after(p, q)
+        p = q
+    ascend = IMG_DIR / 'domestic-ascend-evidence-map-v1.png'
+    if ascend.exists():
+        cap = add_figure(doc, p, ascend, '图4  国内昇腾异构算力的能力基础、系统边界与本课题切入点', width=6.0)
+        p = cap
+    rows = [
+        ('PanGu-Σ', '昇腾910 + MindSpore；稀疏专家与专家计算/存储分离', '证明国产NPU可支撑大模型训练；收益依赖并行结构与系统协同'),
+        ('CloudMatrix384', '384昇腾910 + 192鲲鹏；UB全互联；Prefill/Decode/缓存分离', '证明生产级异构池化；同时揭示MoE/KV高带宽互联边界'),
+        ('MindSpore / MindSpeed', '数据、张量、流水、混合并行及国产运行时', '作为后端与并行基线；不等于跨厂商任务内协同'),
+        ('ReDSEa / vLLM-Ascend', '鲲鹏+昇腾异构求解；vLLM插件化昇腾后端', '说明异构映射和软件适配可落地；仍需本课题的准入与回退验证'),
+    ]
+    note = add_table_after(doc, p, '表3  国内昇腾相关工作的证据与边界', ['代表工作', '已展示能力', '对本课题的启示与限制'], rows, [1.3, 3.0, 2.1])
+
     # Add overview figure and a compact research-plan matrix at the beginning of Chapter 3.
     p = find_para(doc, '两条路线均从相同的分析维度出发')
     overview = IMG_DIR / 'heterogeneous-two-research-directions-overview-v4-labeled.png'
@@ -139,6 +166,11 @@ def main():
         ('LLM-RL后训练阶段', '阶段输入输出、后端兼容性、版本、队列、恢复窗口', '阶段能力合同；rollout/奖励评估/数据处理异构放置；版本与样本完整性检查；节点退出回退', '固定同位、静态阶段放置、异步流水线、动态阶段承接；有效样本吞吐、样本有效率、版本滞后、恢复时间'),
     ]
     note = add_table_after(doc, p, '表1  两条研究路线的方案闭环', ['研究路线', '输入与约束', '本课题新增机制', '基线与主要评价'], rows, [1.0, 1.7, 2.1, 1.6])
+
+    p = find_para(doc, '3.2  实施方案')
+    matrix = IMG_DIR / 'two-route-experimental-matrix-v1.png'
+    if matrix.exists():
+        add_figure(doc, p, matrix, '图5  两条路线的独立实验矩阵与统一准入门槛', width=6.0)
 
     # Route-specific figures stay inside their own sections.
     p = find_para(doc, '本研究只把长上下文Prefill作为任务内异构协同的验证对象')
@@ -158,7 +190,7 @@ def main():
         ('HetRL / Prime RL', '阶段放置、异步rollout、训练/评估工作流组织', '组合阶段能力合同、版本/队列约束、样本完整性与动态回退'),
         ('Prime DiLoCo', '弹性设备网格、低频同步、异步检查点和恢复参考', '在LLM-RL阶段工作流中验证节点加入/退出、链路降级和恢复窗口'),
     ]
-    add_table_after(doc, p, '表2  参考框架已有能力与本课题新增机制', ['参考对象', '已有能力（作为基线或接口）', '本课题新增或待验证内容'], rows, [1.3, 3.0, 2.1])
+    add_table_after(doc, p, '表4  参考框架已有能力与本课题新增机制', ['参考对象', '已有能力（作为基线或接口）', '本课题新增或待验证内容'], rows, [1.3, 3.0, 2.1])
 
     # Make key section headings visually distinct while preserving document fonts.
     for marker in ['1.  课题来源及研究的背景和意义', '2. 国内外在该方向的研究现状及分析', '3. 主要研究内容及实施方案', '4. 预 期 达 到 的 目 标', '5. 已 完 成 的 研 究 工 作 与 进 度 安 排', '6.  为完成课题已具备和所需的条件和经费', '7.  预计研究过程中可能遇到的困难和问题，以及解决的措施', '8.  主要参考文献']:
@@ -168,6 +200,20 @@ def main():
                 para.runs[0].bold = True
         except ValueError:
             pass
+
+    # Extend the bibliography with the domestic evidence cited in section 2.2.
+    p = find_para(doc, 'Prime Intellect. PRIME-DiLoCo: Elastic and Low-Communication Distributed Training')
+    refs = [
+        '[40] Ren X, Zhou P, Meng X, et al. PanGu-Σ: Towards Trillion Parameter Language Model with Sparse Heterogeneous Computing[EB/OL]. arXiv:2303.10845, 2023.',
+        '[41] Zuo P, Lin H, Deng J, et al. Serving Large Language Models on Huawei CloudMatrix384[EB/OL]. arXiv:2506.12708, 2025.',
+        '[42] MindSpore. Distributed Parallelism Overview[EB/OL]. https://www.mindspore.cn/tutorials/experts/en/r2.3.1/parallel/overview.html, 2025.',
+        '[43] Zacharopoulos G, Bournias I, Vlacic V, et al. ReDSEa: Automated Acceleration of Triangular Solver on Supercloud Heterogeneous Systems[EB/OL]. arXiv:2305.19917, 2023.',
+        '[44] vLLM Project. vLLM Ascend: Community-Maintained Hardware Plugin for Running vLLM on Ascend NPU[EB/OL]. https://github.com/vllm-project/vllm-ascend, 2025.',
+    ]
+    for ref in refs:
+        q = make_para(doc, ref, size=9)
+        insert_after(p, q)
+        p = q
 
     doc.save(OUT)
     print(f'wrote {OUT}')
