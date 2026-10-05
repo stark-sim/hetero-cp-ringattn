@@ -85,19 +85,25 @@ def decode_option_vec_u64(data: bytes, offset: int) -> Tuple[Optional[List[int]]
     return vals, offset
 
 
-# WorkerCommand tags (must match Rust enum order)
+# WorkerCommand tags (must match Rust enum order in rust/src/distributed/protocol.rs)
 CMD_PREFILL = 0
 CMD_DECODE = 1
 CMD_DECODE_BATCH = 2
-CMD_SYNC_GLOBAL_SEQ_LEN = 3
-CMD_RELEASE_REQUEST = 4
-CMD_SHUTDOWN = 5
+CMD_STATIONARY_CONTINUATION = 3  # unsupported by this worker (hard error)
+CMD_STATIONARY_DECODE = 4        # unsupported by this worker (hard error)
+CMD_SYNC_GLOBAL_SEQ_LEN = 5
+CMD_RELEASE_REQUEST = 6
+CMD_NIXL_EXCHANGE = 7            # unsupported (hard error)
+CMD_NIXL_PEERS = 8               # unsupported (hard error)
+CMD_SHUTDOWN = 9
 
 # WorkerResponse tags (must match Rust enum order)
 RESP_PREFILL_DONE = 0
 RESP_DECODE_DONE = 1
 RESP_DECODE_BATCH_DONE = 2
-RESP_ERROR = 3
+RESP_STATIONARY_CONTINUATION_DONE = 3
+RESP_ERROR = 4
+RESP_NIXL_METADATA = 5
 
 
 def encode_command(cmd_kind: str, **kwargs) -> bytes:
@@ -194,6 +200,13 @@ def decode_command(data: bytes) -> dict:
     elif tag == CMD_RELEASE_REQUEST:
         request_id, offset = decode_u64(data, offset)
         return {"kind": "ReleaseRequest", "request_id": int(request_id)}
+    elif tag in (CMD_STATIONARY_CONTINUATION, CMD_STATIONARY_DECODE):
+        raise NotImplementedError(
+            f"stationary ring commands (tag {tag}) are not supported by the Python worker; "
+            f"run the coordinator in CLI batch mode (layer_kv_capacities=None)"
+        )
+    elif tag in (CMD_NIXL_EXCHANGE, CMD_NIXL_PEERS):
+        raise NotImplementedError(f"NIXL commands (tag {tag}) are not supported by the Python worker")
     elif tag == CMD_SHUTDOWN:
         return {"kind": "Shutdown"}
     else:
