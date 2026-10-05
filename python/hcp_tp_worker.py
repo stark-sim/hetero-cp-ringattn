@@ -71,6 +71,19 @@ class TPTransformersBackend(HcpWorkerBackend):
         self._cache_v: List[torch.Tensor] = []
         self._cache_len = 0
         self._last_logits: Optional[torch.Tensor] = None
+        # init 末尾做一次 all_gather（两 rank 顺序一致），异构 TP 对实测求和
+        free = self._local_free_mb()
+        if world_size > 1:
+            t = torch.tensor([float(free)], dtype=torch.float32, device=self.device)
+            outs = [torch.empty(1, dtype=torch.float32, device=self.device)
+                    for _ in range(world_size)]
+            dist.all_gather(outs, t)
+            per_rank = [int(o.item()) for o in outs]
+            self._capacity_mb = sum(per_rank)
+            print(f"[tp backend] capacity: per-rank free MB={per_rank} "
+                  f"total={self._capacity_mb}", flush=True)
+        else:
+            self._capacity_mb = free
         print(
             f"[tp backend] rank={rank}/{world_size} device={self.device} "
             f"local_q_heads={self.engine.local_q_heads} "
@@ -350,26 +363,31 @@ class TPTransformersBackend(HcpWorkerBackend):
     def load_model(self, model_dir: str, device: str) -> None:
         pass
 
+    def _local_free_mb(self) -> int:
+        if self.device.type == "npu":
+            try:
+                import torch_npu
+
+                free, _ = torch_npu.npu.mem_get_info(self.device)
+                return int(free // (1024 * 1024))
+            except ImportError:
+                return 4096
+        if self.device.type == "mps":
+            return int(torch.mps.recommended_max_memory() // (1024 * 1024))
+        if self.device.type == "cuda":
+            free, _ = torch.cuda.mem_get_info(self.device)
+            return int(free // (1024 * 1024))
+        return 4096
+
     @property
     def capacity_mb(self) -> int:
-        """逻辑 domain 容量 = 单芯空闲 × tp_size。
+        """逻辑 domain 容量 = all_gather 各 rank 空闲显存求和（init 时缓存）。
 
         权重与 KV 都按 head 切到 tp_size 个设备上，有效容量随芯数线性扩展；
-        同构双芯下用 rank0 单芯值外推即可（避免额外 collective）。
+        异构 TP 对（如 4060 8GB + 4090 24GB）不能用 rank0×tp_size 外推，
+        必须实测求和。all_gather 在 __init__ 末尾执行一次，两 rank 顺序一致。
         """
-        try:
-            import torch_npu  # noqa: F401
-            if self.device.type == "npu":
-                free, _ = torch_npu.npu.mem_get_info(self.device)
-                return int(free // (1024 * 1024)) * self.world_size
-        except ImportError:
-            pass
-        if self.device.type == "mps":
-            return int(torch.mps.recommended_max_memory() // (1024 * 1024)) * self.world_size
-        if torch.cuda.is_available():
-            free, _ = torch.cuda.mem_get_info()
-            return int(free // (1024 * 1024)) * self.world_size
-        return 4096 * self.world_size
+        return self._capacity_mb
 
     @property
     def num_layers(self) -> int:

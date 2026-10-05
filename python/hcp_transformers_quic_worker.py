@@ -389,7 +389,8 @@ async def run_worker(
     if tp_size > 1:
         from hcp_tp_worker import TPTransformersBackend
 
-        tp_device = "npu" if device.startswith("npu") else "cpu"
+        tp_device = ("npu" if device.startswith("npu")
+                     else "cuda" if device.startswith("cuda") else "cpu")
         init_method = f"tcp://{tp_master_addr}:{tp_master_port}"
         backend = TPTransformersBackend(
             model_dir, tp_device, tp_backend, 0, tp_size, init_method, num_domains,
@@ -457,7 +458,8 @@ def main():
         if args.tp_rank != 0:
             from hcp_tp_worker import run_tp_follower
 
-            tp_device = "npu" if args.device.startswith("npu") else "cpu"
+            tp_device = ("npu" if args.device.startswith("npu")
+                         else "cuda" if args.device.startswith("cuda") else "cpu")
             run_tp_follower(
                 args.model_dir, tp_device, args.tp_backend,
                 args.tp_rank, args.tp_size, init_method, args.num_domains,
