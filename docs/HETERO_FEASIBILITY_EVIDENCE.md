@@ -156,7 +156,33 @@ python3.12 scripts/test_ring_exact_prefill_local.py
 bash scripts/run_npu_2domain_atomgit.sh
 ```
 
-## 6. 已知限制
+## 6. 混合后端 ring（Rust↔Python worker 混编，`af864ed`）
+
+Python worker 以 `--ring-mode rust` 加入 Rust per-layer-stream 环（每条流 1 dummy
+字节、帧按 layer_idx 路由、micro-block 重组、GQA 线上扩展、wire dtype 标签
+bfloat16），decode 阶段完整参与 Q-ring RingPacket 在线 softmax 合并（owned shard
+= 自己的 prefill chunk + growth 位置 p % N == domain_id + 当前 token）。
+
+| Run | 拓扑 | 结果 |
+|---|---|---|
+| `mixed-local-20261006-011932` | Mac loopback：Rust(CPU, d0) + Python(CPU, d1) | 与 golden 逐 token 一致，argmax 16/16 |
+| `mixed3-npuPy-cudaRs-hipRs-20261006-013939` | Python(NPU, d0) + Rust(CUDA 4090, d1) + Rust(HIP 9060XT, d2) | 与 NPU golden 逐 token 一致，argmax 16/16，max\|Δlogit\|=0.68 |
+
+数值域说明：Rust worker 按 config `torch_dtype=bfloat16` 运行，Python worker 跑
+fp32；ring decode 的 packet 合并发生在 Rust 侧 bf16 域，因此混合 ring vs fp32
+golden 的 logits 差异为 bf16 量级（0.2~0.7），argmax 全部一致。混合 ring 的
+正确性判据是 argmax/文本级一致性 + ring 不挂起，logits 地板级等价主张仅适用于
+同精度的全 Python ring（§4）。
+
+附带修复（`38f5cf8`）：Python bincode 命令/响应枚举标签与当前 Rust 源码对齐
+（SyncGlobalSeqLen=5 / ReleaseRequest=6 / Shutdown=9 / Error=4）。旧标签只在
+旧编译二进制下碰巧正确——这是一次"重建即坏"的隐性协议漂移，已回归验证
+（route A + 全 Python 3-domain 在新二进制下双双 PASS）。
+
+工件 SHA-256（mixed3-20261006-013939）：prompt.txt `6e2344ce408538d8`、
+logits_ring/logits_1.bin `78f3b663dd91c2ed`、coordinator_ring.log `eef5095d062769`。
+
+## 7. 已知限制
 
 1. Python worker 仅支持 vanilla 连续分片；striped/zigzag 会硬报错（护栏，
    见 `a03b93a`）。
