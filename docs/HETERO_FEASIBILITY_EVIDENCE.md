@@ -157,6 +157,35 @@ logits 级比对（ring 对全部四个单域 golden，以及 golden 两两互�
 附带改动：worker `capacity_mb` 增加 MPS 分支
 （`torch.mps.recommended_max_memory()`，此前落默认 4096 MB 占位）。
 
+### 4.7 R6：抽象 worker——双芯 NPU 经 HCCL TP 聚合为单逻辑 domain
+
+`python/hcp_tp_engine.py`（N1，`f9f7890`）+ `python/hcp_tp_worker.py`（N2，
+`6ed8bc7`）：Megatron 式 head 并行 TP over torch.distributed（HCCL；gloo/NCCL
+仅换 backend 字符串）。Qwen2-0.5B TP=2：每芯 7 Q heads + 1 KV head；q/k/v 按
+head 切行、o_proj/down_proj 切列 + all_reduce(SUM)（每层 2 次 collective）；
+embed/norm 复制、lm_head 仅 rank0。rank 0 兼跑 HCP 协议面（QUIC 控制面 + ring
+数据面，wire 格式零变化）；每 rank 只缓存自己 head 切片的全序列 KV
+（**每芯 KV 显存减半**，抽象 worker 的核心收益）。capacity 按两芯合计上报
+（121576 MB）。
+
+| Gate | 拓扑 | 结果 |
+|---|---|---|
+| N1 单元 | Mac gloo/CPU TP=2 vs HF 参考 | argmax 128/128，max\|Δ\|=5.26e-4（fp32 求和重结合地板；world_size=1 与 HF bit 级一致） |
+| N1 单元 | 容器 HCCL npu:0+npu:1 vs 单芯 | argmax 128/128，max\|Δ\|=1.46e-4 |
+| N2 本地 | TP 抽象 domain + 普通 CPU domain 2-domain loopback | TEXT MATCH，worst max\|Δ\|=6.48e-05 |
+| N2 远程 | `pyring3-abstract-tp-20261006-031155`：抽象(NPU×2, d0) + white(CUDA, d1) + pearl(HIP, d2) | 文本逐 token 一致；ring vs 三 golden max\|Δ\| = 6.1e-5 ~ 7.9e-5 |
+
+注：含 TP 域的 ring 的 logits 偏差（≤ 7.9e-5）略高于纯单芯 3/4-domain ring
+（≤ 6.3e-5），增量来自 TP all_reduce 的 fp32 求和重结合（N1 独立测得
+~1.5e-4），与跨后端噪声同量级；argmax 全部一致。decode 的 Q-ring packet
+模式在 tp_size>1 下硬报错（护栏；decode 生态位留给 PD 分离线）。
+
+工件 SHA-256（pyring3-abstract-tp-20261006-031155）：prompt.txt
+`d9adca8a9ae5f67c`、logits_ring/logits_1.bin `89f7e991919fe8e7`、
+coordinator_ring.log `a5241a1b47c2c837`。复现：
+`bash scripts/run_pyring_3domain_abstract_tp.sh`（本地单测
+`scripts/test_tp_ring_local.sh`、TP 单元 `scripts/test_tp_dual_chip.py`）。
+
 ## 5. 工件完整性与复现
 
 ### 5.1 关键工件 SHA-256
