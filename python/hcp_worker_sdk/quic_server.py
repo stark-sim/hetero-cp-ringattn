@@ -42,7 +42,8 @@ class QuicWorkerServer:
         self.global_seq_len = 0
         self.seq_offset = 0
         self.control_client: Optional[QuicControlClient] = None
-        self.kv_transport: Optional[QuicKvTransport] = None
+        self.kv_transport_out: Optional[QuicKvTransport] = None  # to next peer
+        self.kv_transport_in: Optional[QuicKvTransport] = None   # from prev peer
 
     async def run(
         self,
@@ -129,12 +130,20 @@ class QuicWorkerServer:
         next_host: str,
         next_port: int,
     ) -> None:
-        """Setup bidirectional QUIC stream with next peer in the ring."""
+        """Setup N-domain ring: every worker dials next AND accepts from prev.
+
+        KV flows i -> i+1 over each worker's outbound (client) connection;
+        inbound (server) connection carries KV from the prev peer.
+        num_domains=2 is just the N=2 special case of the same topology.
+        """
         if self.num_domains <= 1:
             return
 
-        if self.domain_id == 0:
-            # Domain 0 connects to next_peer first (with retry for slow remote startup)
+        print(f"[worker {self.domain_id}] listening for peer on {listen_host}:{listen_port}...")
+        connected_event, accepted_streams, server_task = await create_quic_server(listen_host, listen_port)
+        self._peer_server_task = server_task
+
+        async def dial_next():
             print(f"[worker {self.domain_id}] connecting to peer {next_host}:{next_port}...")
             for attempt in range(1, 31):
                 try:
@@ -142,24 +151,22 @@ class QuicWorkerServer:
                         create_quic_client(next_host, next_port, send_dummy=True),
                         timeout=30.0,
                     )
-                    self.kv_transport = QuicKvTransport(reader, writer, self.device, dummy_sent=True)
-                    self._peer_conn_mgr = conn_mgr
-                    print(f"[worker {self.domain_id}] peer connected")
-                    break
-                except (ConnectionError, asyncio.TimeoutError) as e:
+                    return reader, writer, conn_mgr
+                except (ConnectionError, asyncio.TimeoutError, OSError) as e:
                     print(f"[worker {self.domain_id}] peer connect attempt {attempt}/30 failed: {e}")
                     await asyncio.sleep(2.0)
-            else:
-                raise ConnectionError(f"failed to connect to peer {next_host}:{next_port} after 30 attempts")
-        else:
-            # Domain N listens first
-            print(f"[worker {self.domain_id}] listening for peer on {listen_host}:{listen_port}...")
-            connected_event, accepted_streams, server_task = await create_quic_server(listen_host, listen_port)
-            await asyncio.wait_for(connected_event.wait(), timeout=180.0)
-            reader, writer = accepted_streams[0]
-            self.kv_transport = QuicKvTransport(reader, writer, self.device)
-            self._peer_server_task = server_task
-            print(f"[worker {self.domain_id}] peer accepted")
+            raise ConnectionError(f"failed to connect to peer {next_host}:{next_port} after 30 attempts")
+
+        (out_reader, out_writer, conn_mgr), _ = await asyncio.gather(
+            dial_next(),
+            asyncio.wait_for(connected_event.wait(), timeout=300.0),
+        )
+        self._peer_conn_mgr = conn_mgr
+        self.kv_transport_out = QuicKvTransport(out_reader, out_writer, self.device, dummy_sent=True)
+        print(f"[worker {self.domain_id}] peer connected (outbound)")
+        in_reader, in_writer = accepted_streams[0]
+        self.kv_transport_in = QuicKvTransport(in_reader, in_writer, self.device)
+        print(f"[worker {self.domain_id}] peer accepted (inbound)")
 
     async def _handle_prefill(self, cmd: dict) -> dict:
         """Run prefill, exchange KV ring, return PrefillDone."""
@@ -203,8 +210,13 @@ class QuicWorkerServer:
         }
 
     async def _exchange_kv_ring(self, prefill: bool) -> None:
-        """Exchange KV blocks through the ring."""
-        if self.num_domains <= 1 or self.kv_transport is None:
+        """Exchange KV blocks through the ring (N-domain).
+
+        Per layer: send local block to next peer while receiving from prev
+        peer, forward the received block next round. After num_domains-1
+        rounds every worker has seen every domain's chunk exactly once.
+        """
+        if self.num_domains <= 1 or self.kv_transport_out is None:
             return
 
         if not prefill:
@@ -217,7 +229,10 @@ class QuicWorkerServer:
             local_block = self.backend.get_kv_block(layer_idx, seq_start, seq_end)
 
             for _round in range(self.num_domains - 1):
-                peer_block = await self.kv_transport._exchange_kv_block(local_block)
+                send_task = asyncio.create_task(self.kv_transport_out._send_kv_block(local_block))
+                recv_task = asyncio.create_task(self.kv_transport_in._recv_kv_block())
+                await asyncio.gather(send_task, recv_task)
+                peer_block = recv_task.result()
                 if peer_block is None:
                     break
                 self.backend.apply_peer_kv(layer_idx, peer_block)

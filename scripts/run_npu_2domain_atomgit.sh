@@ -52,6 +52,7 @@ npu_start_worker() {
     local domain_id="$1" device="$2" peer_port="$3" next_port="$4" num_domains="$5" log_name="$6"
     npu_ssh "
 source /home/developer/Ascend/cann-9.0.0/set_env.sh 2>/dev/null
+export PYTHONUNBUFFERED=1
 export LD_LIBRARY_PATH=/home/developer/Ascend/cann-9.0.0/aarch64-linux/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:\${LD_LIBRARY_PATH:-}
 cd ${NPU_HCP_DIR}
 nohup ${NPU_PY} python/hcp_transformers_quic_worker.py \
