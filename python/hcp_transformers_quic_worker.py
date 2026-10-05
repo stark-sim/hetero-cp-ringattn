@@ -55,6 +55,7 @@ class TransformersBackend(HcpWorkerBackend):
         config = self.model.config
         self._num_layers = getattr(config, "num_hidden_layers", 24)
         self._num_heads = getattr(config, "num_attention_heads", 14)
+        self._num_kv_heads = getattr(config, "num_key_value_heads", self._num_heads)
         self._head_dim = getattr(config, "hidden_size", 896) // self._num_heads
         self._history: List[int] = []
         self._past_key_values = None
@@ -84,6 +85,86 @@ class TransformersBackend(HcpWorkerBackend):
                 else:
                     self._past_key_values = outputs.past_key_values
         return logits.to(torch.float32).cpu(), len(self._history) + seq_offset
+
+    async def prefill_ring_exact(self, chunk: List[int], seq_offset: int, exchange_layer) -> Tuple[torch.Tensor, int]:
+        """精确 context-parallel prefill：逐层 KV ring 交换 + 全局因果注意力。
+
+        与 Rust Q-ring 同一算法：每层先算本地 chunk 的 Q/K/V（RoPE 用全局位置），
+        经 ring 拿到所有 domain 该层的 KV，再按全局位置做精确因果注意力
+        （远端 KV 全可见、本地 chunk 内因果）。每个 worker 缓存该层全量 KV，
+        decode 阶段在完整 cache 上是精确的。
+
+        exchange_layer: async (layer_idx, k, v) -> List[KvBlock]，返回其余
+        domain 该层的 KV 块（带全局 seq 范围）。
+        """
+        from transformers.cache_utils import DynamicCache
+        from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
+
+        device = self.device
+        self._history = list(chunk)
+        self._layer_kv_start = [0] * self._num_layers  # cache holds the full sequence
+
+        core = self.model.model
+        input_ids = torch.tensor([self._history], dtype=torch.long, device=device)
+        my_start = seq_offset
+        my_len = len(chunk)
+        pos = torch.arange(my_start, my_start + my_len, device=device, dtype=torch.long).unsqueeze(0)
+
+        hidden = core.embed_tokens(input_ids)
+        cos, sin = core.rotary_emb(hidden, pos)
+
+        full_cache = DynamicCache()
+        with torch.no_grad():
+            for li, layer in enumerate(core.layers):
+                attn = layer.self_attn
+                residual = hidden
+                h = layer.input_layernorm(hidden)
+                b, s, _ = h.shape
+                q = attn.q_proj(h).view(b, s, self._num_heads, self._head_dim).transpose(1, 2)
+                k = attn.k_proj(h).view(b, s, self._num_kv_heads, self._head_dim).transpose(1, 2)
+                v = attn.v_proj(h).view(b, s, self._num_kv_heads, self._head_dim).transpose(1, 2)
+                q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
+
+                remote = await exchange_layer(li, k, v)
+
+                # 按全局起始位置排序拼接全量 KV，key 位置 = 各块的全局区间
+                blocks = [(my_start, k, v)] + [
+                    (blk.global_seq_start, blk.k.to(device), blk.v.to(device)) for blk in remote
+                ]
+                blocks.sort(key=lambda t: t[0])
+                k_all = torch.cat([t[1] for t in blocks], dim=2)
+                v_all = torch.cat([t[2] for t in blocks], dim=2)
+                key_pos = torch.cat([
+                    torch.arange(t[0], t[0] + t[1].size(2), device=device, dtype=torch.long)
+                    for t in blocks
+                ])
+
+                # 精确因果掩码：key_pos <= query_pos（GQA 手动 repeat，避开
+                # sdpa enable_gqa 在部分后端（torch_npu）上的兼容性问题）
+                mask = key_pos[None, :] <= pos[0, :, None]  # [s, total_kv]
+                gqa_repeat = self._num_heads // self._num_kv_heads
+                if gqa_repeat > 1:
+                    k_att = k_all.repeat_interleave(gqa_repeat, dim=1)
+                    v_att = v_all.repeat_interleave(gqa_repeat, dim=1)
+                else:
+                    k_att, v_att = k_all, v_all
+                attn_out = torch.nn.functional.scaled_dot_product_attention(
+                    q, k_att, v_att, attn_mask=mask[None, None, :, :]
+                )
+                attn_out = attn_out.transpose(1, 2).reshape(b, s, self._num_heads * self._head_dim)
+                hidden = residual + attn.o_proj(attn_out)
+
+                residual = hidden
+                h = layer.post_attention_layernorm(hidden)
+                hidden = residual + layer.mlp(h)
+
+                full_cache.update(k_all, v_all, li)
+
+            hidden = core.norm(hidden)
+            logits = self.model.lm_head(hidden[:, -1])
+
+        self._past_key_values = full_cache
+        return logits[0].to(torch.float32).cpu(), my_start + my_len
 
     def decode(self, token: int) -> torch.Tensor:
         from transformers.cache_utils import DynamicCache

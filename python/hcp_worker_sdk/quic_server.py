@@ -7,7 +7,7 @@ and QUIC streams for peer KV ring exchange.
 
 import asyncio
 import torch
-from typing import Optional
+from typing import List, Optional, Tuple
 
 from .backend import HcpWorkerBackend
 from .bincode import encode_response, decode_command
@@ -182,16 +182,21 @@ class QuicWorkerServer:
                     f"are not supported by the Python worker"
                 )
 
-        logits, seq_len = self.backend.prefill(chunk, self.seq_offset, position_ids=position_ids)
+        if self.num_domains > 1 and hasattr(self.backend, "prefill_ring_exact"):
+            # 精确 CP：逐层 KV ring 交换在 forward 过程中完成（与 Rust Q-ring
+            # 同算法）；最后一个 domain 的最后位置 logits 直接精确，无需 recalc。
+            logits, seq_len = await self._prefill_ring_exact(chunk)
+        else:
+            logits, seq_len = self.backend.prefill(chunk, self.seq_offset, position_ids=position_ids)
+
+            # KV Ring exchange
+            await self._exchange_kv_ring(prefill=True)
+
+            # KV exchange 后，最后一个 domain 用完整 KV 重新计算 logits
+            # （只有最后一个 domain 的 self._history[-1] 是 prompt 最后一个 token）
+            if hasattr(self.backend, 'recalculate_logits') and self.domain_id == self.num_domains - 1:
+                logits = self.backend.recalculate_logits()
         self.global_seq_len = seq_len
-
-        # KV Ring exchange
-        await self._exchange_kv_ring(prefill=True)
-
-        # KV exchange 后，最后一个 domain 用完整 KV 重新计算 logits
-        # （只有最后一个 domain 的 self._history[-1] 是 prompt 最后一个 token）
-        if hasattr(self.backend, 'recalculate_logits') and self.domain_id == self.num_domains - 1:
-            logits = self.backend.recalculate_logits()
 
         logits_bytes = logits.detach().cpu().numpy().astype("float32").tobytes()
         return {
@@ -200,6 +205,31 @@ class QuicWorkerServer:
             "last_logits_bytes": logits_bytes,
             "global_seq_len": self.global_seq_len,
         }
+
+    async def _prefill_ring_exact(self, chunk: List[int]) -> Tuple[torch.Tensor, int]:
+        """精确 CP prefill：逐层调用 backend.prefill_ring_exact，每层做 N-1 轮
+        ring 交换（发送本层本地块、接收并转发前序块），与 Rust worker 同构。"""
+        from .types import KvBlock
+
+        my_start = self.seq_offset
+        my_len = len(chunk)
+
+        async def exchange_layer(layer_idx: int, k: torch.Tensor, v: torch.Tensor):
+            block = KvBlock(layer_idx, my_start, my_start + my_len, k, v)
+            remote = []
+            cur = block
+            for _round in range(self.num_domains - 1):
+                send_task = asyncio.create_task(self.kv_transport_out._send_kv_block(cur))
+                recv_task = asyncio.create_task(self.kv_transport_in._recv_kv_block())
+                await asyncio.gather(send_task, recv_task)
+                blk = recv_task.result()
+                if blk is None:
+                    raise ConnectionError(f"ring peer closed during prefill layer {layer_idx}")
+                remote.append(blk)
+                cur = blk  # forward to next peer
+            return remote
+
+        return await self.backend.prefill_ring_exact(chunk, my_start, exchange_layer)
 
     async def _handle_decode(self, cmd: dict) -> dict:
         """Run decode, return DecodeDone."""
