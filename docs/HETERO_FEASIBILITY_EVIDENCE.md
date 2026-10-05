@@ -186,6 +186,34 @@ coordinator_ring.log `a5241a1b47c2c837`。复现：
 `bash scripts/run_pyring_3domain_abstract_tp.sh`（本地单测
 `scripts/test_tp_ring_local.sh`、TP 单元 `scripts/test_tp_dual_chip.py`）。
 
+### 4.8 R7：抽象 worker 泛化到 NCCL 跨机异构卡（laptop 4060 + white 4090）
+
+`reports/pyring4-nccl-abstract-20261006-074637`：d0 = 抽象 worker
+（laptop RTX 4060 8GB rank0 + white RTX 4090 rank1，**NCCL over tailscale**），
+d1 = 容器 NPU、d2 = pearl HIP、d3 = Mac MPS 的 4-domain ring（64 tokens）。
+
+- **主 gate PASS**：ring 与 MPS golden 逐 token 一致；四后端 golden 亦全部一致。
+- logits：ring vs 四 golden max|Δ| = 3.53e-5 ~ 7.41e-5，argmax 全步一致
+  （min_margin 0.0598）。
+- **异构 TP capacity 实证**：all_gather 求和上报 [6414, 21722] = 28136 MB
+  （4060 实测 6.4GB + 4090 实测 21.7GB；旧的 rank0×2 外推会错报 12828MB）。
+- **NCCL 版本教训**：2.28.9 ↔ 2.29.7 bootstrap wire 结构体差 4 字节，首个
+  all_reduce 静默挂死（须 `NCCL_DEBUG_FILE` 取证）；对齐到双端 2.29.7 后
+  smoke 6 秒通过。跨机 NCCL 组队前必须对齐小版本。
+- **collective 开销**（`HCP_TP_TIMING=1`，rank0 视角）：prefill 每层
+  all_gather 0.32ms + remote bcast 1.31ms + 2×all_reduce 1.40ms/call，
+  24 层合计 106.5ms；decode 每 token collective 5-7ms。低延迟因本次
+  laptop↔white tailscale 走了 direct LAN（~5ms）；跨地域 DERP/WiFi
+  （25-70ms RTT）场景未实测，按 RTT 预估 decode 每 token +100-300ms——
+  跨机 TP 是延迟敏感路径，WAN 下不划算（符合"TP 属同机房"的业界共识）。
+- 坑：d3→d0 边 Mac→laptop 的 LAN 直连 UDP "No route to host"（WiFi 客户端
+  隔离），脚本改用 tailnet IP 后通过。
+
+工件 SHA-256：prompt.txt `d9adca8a9ae5f67c`（与 R6 相同）、
+logits_ring/logits_1.bin `41f1e00b4d92e412`、coordinator_ring.log
+`4471fb4228339cdb`。复现：`bash scripts/run_pyring_4domain_nccl_abstract.sh`
+（NCCL 对齐 smoke：`scripts/nccl_smoke_2node.py`）。
+
 ## 5. 工件完整性与复现
 
 ### 5.1 关键工件 SHA-256
