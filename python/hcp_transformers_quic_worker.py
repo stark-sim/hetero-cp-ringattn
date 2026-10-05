@@ -380,7 +380,33 @@ async def run_worker(
     next_peer_port: int,
     device: str,
     ring_mode: str = "python",
+    tp_size: int = 1,
+    tp_backend: str = "hccl",
+    tp_master_addr: str = "127.0.0.1",
+    tp_master_port: int = 29611,
 ):
+    if tp_size > 1:
+        from hcp_tp_worker import TPTransformersBackend
+
+        tp_device = "npu" if device.startswith("npu") else "cpu"
+        init_method = f"tcp://{tp_master_addr}:{tp_master_port}"
+        backend = TPTransformersBackend(
+            model_dir, tp_device, tp_backend, 0, tp_size, init_method, num_domains
+        )
+        server = QuicWorkerServer(
+            backend, domain_id, num_domains, backend.engine.device, ring_mode=ring_mode
+        )
+        try:
+            await server.run(
+                coordinator_host, coordinator_port,
+                peer_listen_host, peer_listen_port,
+                next_peer_host, next_peer_port,
+            )
+        finally:
+            backend.broadcast_shutdown()
+            backend.close()
+        return
+
     backend = TransformersBackend(model_dir, device=device)
     server = QuicWorkerServer(backend, domain_id, num_domains, torch.device(device), ring_mode=ring_mode)
     await server.run(
@@ -405,7 +431,30 @@ def main():
     parser.add_argument("--ring-mode", default="python", choices=["python", "rust"],
                         help="python: 单流双向（Python<->Python）；rust: per-layer 24 流 + "
                              "ring_packet，与 Rust worker 混合成环")
+    parser.add_argument("--tp-size", type=int, default=1,
+                        help="逻辑 domain 内的 TP 进程数；1=现状（单进程 worker）")
+    parser.add_argument("--tp-backend", default="hccl",
+                        help="TP collective backend（hccl / gloo / nccl）")
+    parser.add_argument("--tp-rank", type=int, default=0,
+                        help="本进程的 TP rank；非 0 为纯计算 follower（不连 coordinator/ring）")
+    parser.add_argument("--tp-master-addr", default="127.0.0.1")
+    parser.add_argument("--tp-master-port", type=int, default=29611)
     args = parser.parse_args()
+
+    if args.tp_size > 1:
+        if args.ring_mode == "rust":
+            raise SystemExit("--ring-mode rust is not supported with --tp-size > 1 "
+                             "(Q-ring packet decode 不支持 TP；用默认 python ring mode)")
+        init_method = f"tcp://{args.tp_master_addr}:{args.tp_master_port}"
+        if args.tp_rank != 0:
+            from hcp_tp_worker import run_tp_follower
+
+            tp_device = "npu" if args.device.startswith("npu") else "cpu"
+            run_tp_follower(
+                args.model_dir, tp_device, args.tp_backend,
+                args.tp_rank, args.tp_size, init_method, args.num_domains,
+            )
+            return
 
     asyncio.run(run_worker(
         args.model_dir,
@@ -415,6 +464,10 @@ def main():
         args.next_peer_host, args.next_peer_port,
         args.device,
         args.ring_mode,
+        args.tp_size,
+        args.tp_backend,
+        args.tp_master_addr,
+        args.tp_master_port,
     ))
 
 
