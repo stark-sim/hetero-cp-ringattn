@@ -36,6 +36,7 @@ class TensorParallelQwen2:
         world_size: int = 1,
         backend: str = "gloo",
         init_method: str = "tcp://127.0.0.1:29511",
+        timeout_s: Optional[float] = None,
     ):
         if backend == "hccl" and device != "npu":
             raise ValueError("hccl backend requires device='npu'")
@@ -55,8 +56,14 @@ class TensorParallelQwen2:
         self.world_size = world_size
         self.backend = backend
         if world_size > 1:
+            pg_kwargs = {}
+            if timeout_s is not None:
+                from datetime import timedelta
+
+                pg_kwargs["timeout"] = timedelta(seconds=timeout_s)
             dist.init_process_group(
-                backend, rank=rank, world_size=world_size, init_method=init_method
+                backend, rank=rank, world_size=world_size, init_method=init_method,
+                **pg_kwargs,
             )
 
         from transformers import AutoModelForCausalLM

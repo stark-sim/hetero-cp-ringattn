@@ -52,6 +52,7 @@ class TPTransformersBackend(HcpWorkerBackend):
         world_size: int,
         init_method: str,
         num_domains: int,
+        collective_timeout_s: Optional[float] = None,
     ):
         self.engine = TensorParallelQwen2(
             model_dir,
@@ -60,6 +61,7 @@ class TPTransformersBackend(HcpWorkerBackend):
             world_size=world_size,
             backend=tp_backend,
             init_method=init_method,
+            timeout_s=collective_timeout_s,
         )
         self.num_domains = num_domains
         self.device = self.engine.device
@@ -89,7 +91,14 @@ class TPTransformersBackend(HcpWorkerBackend):
         return torch.cat(outs, dim=1)
 
     def broadcast_shutdown(self) -> None:
-        """通知 follower 退出（best effort）。"""
+        """通知 follower 退出（best effort poison）。
+
+        hdr 形状（int32[3]）只匹配 follower 顶循环的等待点；若 follower 正
+        阻塞在层循环中间的 collective（rank0 ring I/O 失败等异常路径），
+        本信号形状不匹配、无法被接收——此时兜底是 init_process_group 的
+        timeout（--tp-collective-timeout），follower 的阻塞 collective
+        超时后以非零码退出，不会永久挂死。
+        """
         if self.rank != 0 or self.world_size <= 1:
             return
         try:
@@ -175,11 +184,14 @@ class TPTransformersBackend(HcpWorkerBackend):
                 remote = self._broadcast_remote(remote)
 
                 # 各 rank 只保留自己 KV head 的全序列切片
+                # （lkv = num_kv_heads / tp_size，整除约束在引擎 init 断言）
+                lkv = eng.local_kv_heads
+                kvs = slice(eng.rank * lkv, (eng.rank + 1) * lkv)
                 blocks = [(my_start, k, v)] + [
                     (
                         blk.global_seq_start,
-                        blk.k[:, eng.rank : eng.rank + 1],
-                        blk.v[:, eng.rank : eng.rank + 1],
+                        blk.k[:, kvs],
+                        blk.v[:, kvs],
                     )
                     for blk in remote
                 ]
@@ -383,6 +395,7 @@ def run_tp_follower(
     world_size: int,
     init_method: str,
     num_domains: int,
+    collective_timeout_s: Optional[float] = None,
 ) -> None:
     """TP follower 主循环：不连 coordinator/ring，只跟 collective。
 
@@ -392,7 +405,8 @@ def run_tp_follower(
       op=2 shutdown
     """
     backend = TPTransformersBackend(
-        model_dir, device, tp_backend, rank, world_size, init_method, num_domains
+        model_dir, device, tp_backend, rank, world_size, init_method, num_domains,
+        collective_timeout_s=collective_timeout_s,
     )
     eng = backend.engine
     print(f"[tp follower rank {rank}] ready, num_domains={num_domains}", flush=True)

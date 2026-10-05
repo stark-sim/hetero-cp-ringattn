@@ -384,6 +384,7 @@ async def run_worker(
     tp_backend: str = "hccl",
     tp_master_addr: str = "127.0.0.1",
     tp_master_port: int = 29611,
+    tp_collective_timeout: float = 300.0,
 ):
     if tp_size > 1:
         from hcp_tp_worker import TPTransformersBackend
@@ -391,7 +392,8 @@ async def run_worker(
         tp_device = "npu" if device.startswith("npu") else "cpu"
         init_method = f"tcp://{tp_master_addr}:{tp_master_port}"
         backend = TPTransformersBackend(
-            model_dir, tp_device, tp_backend, 0, tp_size, init_method, num_domains
+            model_dir, tp_device, tp_backend, 0, tp_size, init_method, num_domains,
+            collective_timeout_s=tp_collective_timeout,
         )
         server = QuicWorkerServer(
             backend, domain_id, num_domains, backend.engine.device, ring_mode=ring_mode
@@ -403,6 +405,9 @@ async def run_worker(
                 next_peer_host, next_peer_port,
             )
         finally:
+            # 正常 Shutdown 与异常路径都尽力通知 follower（异常路径下 poison
+            # hdr 形状只在 follower 顶循环匹配；层循环中间靠 collective
+            # timeout 兜底）。finally 不吞异常：出错时本进程仍非零退出。
             backend.broadcast_shutdown()
             backend.close()
         return
@@ -439,6 +444,9 @@ def main():
                         help="本进程的 TP rank；非 0 为纯计算 follower（不连 coordinator/ring）")
     parser.add_argument("--tp-master-addr", default="127.0.0.1")
     parser.add_argument("--tp-master-port", type=int, default=29611)
+    parser.add_argument("--tp-collective-timeout", type=float, default=300.0,
+                        help="TP process group collective 超时（秒）；rank0 异常退出后 "
+                             "follower 的阻塞 collective 超时退出，不永久悬挂")
     args = parser.parse_args()
 
     if args.tp_size > 1:
@@ -453,6 +461,7 @@ def main():
             run_tp_follower(
                 args.model_dir, tp_device, args.tp_backend,
                 args.tp_rank, args.tp_size, init_method, args.num_domains,
+                collective_timeout_s=args.tp_collective_timeout,
             )
             return
 
@@ -468,6 +477,7 @@ def main():
         args.tp_backend,
         args.tp_master_addr,
         args.tp_master_port,
+        args.tp_collective_timeout,
     ))
 
 
