@@ -63,6 +63,28 @@ def decode_vec_i64(data: bytes, offset: int) -> Tuple[List[int], int]:
     return vals, offset
 
 
+def decode_option_vec_i64(data: bytes, offset: int) -> Tuple[Optional[List[int]], int]:
+    """bincode 1.3 encodes Option<T> as a single u8 tag (0=None, 1=Some)."""
+    tag = data[offset]
+    offset += 1
+    if tag == 0:
+        return None, offset
+    return decode_vec_i64(data, offset)
+
+
+def decode_option_vec_u64(data: bytes, offset: int) -> Tuple[Optional[List[int]], int]:
+    tag = data[offset]
+    offset += 1
+    if tag == 0:
+        return None, offset
+    length, offset = decode_u64(data, offset)
+    vals = []
+    for _ in range(int(length)):
+        v, offset = decode_u64(data, offset)
+        vals.append(v)
+    return vals, offset
+
+
 # WorkerCommand tags (must match Rust enum order)
 CMD_PREFILL = 0
 CMD_DECODE = 1
@@ -88,6 +110,19 @@ def encode_command(cmd_kind: str, **kwargs) -> bytes:
         data += encode_u64(request_id)
         data += encode_vec_i64(chunk)
         data += encode_i64(seq_offset)
+        # Match Rust WorkerCommand::Prefill trailing Option fields (u8 tags).
+        position_ids = kwargs.get("position_ids")
+        if position_ids is None:
+            data += b"\x00"
+        else:
+            data += b"\x01" + encode_vec_i64(position_ids)
+        layer_kv_capacities = kwargs.get("layer_kv_capacities")
+        if layer_kv_capacities is None:
+            data += b"\x00"
+        else:
+            data += b"\x01" + encode_u64(len(layer_kv_capacities))
+            for cap in layer_kv_capacities:
+                data += encode_u64(cap)
         return data
     elif cmd_kind == "Decode":
         request_id = kwargs["request_id"]
@@ -129,7 +164,17 @@ def decode_command(data: bytes) -> dict:
         request_id, offset = decode_u64(data, offset)
         chunk, offset = decode_vec_i64(data, offset)
         seq_offset, offset = decode_i64(data, offset)
-        return {"kind": "Prefill", "request_id": int(request_id), "chunk": chunk, "seq_offset": seq_offset}
+        # Rust WorkerCommand::Prefill carries two trailing Option fields
+        # (position_ids, layer_kv_capacities); older peers omit them.
+        position_ids = None
+        layer_kv_capacities = None
+        if len(data) >= offset + 1:
+            position_ids, offset = decode_option_vec_i64(data, offset)
+        if len(data) >= offset + 1:
+            layer_kv_capacities, offset = decode_option_vec_u64(data, offset)
+        return {"kind": "Prefill", "request_id": int(request_id), "chunk": chunk,
+                "seq_offset": seq_offset, "position_ids": position_ids,
+                "layer_kv_capacities": layer_kv_capacities}
     elif tag == CMD_DECODE:
         request_id, offset = decode_u64(data, offset)
         token, offset = decode_i64(data, offset)

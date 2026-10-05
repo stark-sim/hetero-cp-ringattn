@@ -29,13 +29,15 @@ class HcpWorkerBackend(ABC):
         pass
 
     @abstractmethod
-    def prefill(self, chunk: List[int], seq_offset: int) -> Tuple[torch.Tensor, int]:
+    def prefill(self, chunk: List[int], seq_offset: int, position_ids=None) -> Tuple[torch.Tensor, int]:
         """
         执行 prefill forward。
 
         Args:
             chunk: token ID 列表，本 domain 负责的 prompt 分片
             seq_offset: 本 chunk 在全局序列中的起始位置
+            position_ids: 可选，显式全局位置（默认 [seq_offset, seq_offset+len)）；
+                RoPE 必须使用全局位置，否则非 0 domain 的 KV 旋转相位错误
 
         Returns:
             last_token_logits: [vocab_size] 的 float32 tensor

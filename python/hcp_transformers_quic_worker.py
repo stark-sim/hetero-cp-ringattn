@@ -64,13 +64,19 @@ class TransformersBackend(HcpWorkerBackend):
     def load_model(self, model_dir: str, device: str) -> None:
         pass
 
-    def prefill(self, chunk: List[int], seq_offset: int) -> Tuple[torch.Tensor, int]:
+    def prefill(self, chunk: List[int], seq_offset: int, position_ids=None) -> Tuple[torch.Tensor, int]:
         from transformers.cache_utils import DynamicCache
         self._history = list(chunk)
         self._layer_kv_start = [seq_offset] * self._num_layers
         input_ids = torch.tensor([self._history], dtype=torch.long, device=self.device)
+        # RoPE must use GLOBAL positions: without explicit position_ids,
+        # transformers would number this chunk 0..len-1, corrupting the
+        # rotation phase of every non-zero domain's KV.
+        if position_ids is None:
+            position_ids = list(range(seq_offset, seq_offset + len(chunk)))
+        position_ids_t = torch.tensor([position_ids], dtype=torch.long, device=self.device)
         with torch.no_grad():
-            outputs = self.model(input_ids, use_cache=True)
+            outputs = self.model(input_ids, position_ids=position_ids_t, use_cache=True)
             logits = outputs.logits[0, -1]
             if outputs.past_key_values is not None:
                 if isinstance(outputs.past_key_values, tuple):

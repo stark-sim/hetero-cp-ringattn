@@ -173,8 +173,16 @@ class QuicWorkerServer:
         request_id = cmd["request_id"]
         chunk = cmd["chunk"]
         self.seq_offset = cmd["seq_offset"]
+        position_ids = cmd.get("position_ids")
+        if position_ids is not None:
+            expected = list(range(self.seq_offset, self.seq_offset + len(chunk)))
+            if list(position_ids) != expected:
+                raise NotImplementedError(
+                    f"non-contiguous position_ids (striped/zigzag ring strategy) "
+                    f"are not supported by the Python worker"
+                )
 
-        logits, seq_len = self.backend.prefill(chunk, self.seq_offset)
+        logits, seq_len = self.backend.prefill(chunk, self.seq_offset, position_ids=position_ids)
         self.global_seq_len = seq_len
 
         # KV Ring exchange
