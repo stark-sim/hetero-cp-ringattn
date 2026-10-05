@@ -45,7 +45,8 @@ MAC_MODEL_DIR="${MAC_MODEL_DIR:-${REPO_ROOT}/models/Qwen2-0.5B}"
 MAC_TS="${MAC_TS:-100.121.35.138}"
 
 SEQ_LEN="${SEQ_LEN:-64}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-10}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-16}"
+PROMPT_SEED="${PROMPT_SEED:-20261005}"
 
 COORD_PORT=29910
 W0_PORT=29911
@@ -63,9 +64,9 @@ COORD_PID=""
 cleanup() {
     echo "=== Cleanup ==="
     [ -n "${COORD_PID}" ] && kill "${COORD_PID}" 2>/dev/null || true
-    npu_ssh 'pkill -f hcp_transformers_quic_worker || true' || true
-    white_ssh 'pkill -f hcp_transformers_quic_worker || true' || true
-    pearl_ssh 'pkill -f hcp_transformers_quic_worker || true' || true
+    npu_ssh 'pkill -f hcp_transformers_quic_worke[r] || true' || true
+    white_ssh 'pkill -f hcp_transformers_quic_worke[r] || true' || true
+    pearl_ssh 'pkill -f hcp_transformers_quic_worke[r] || true' || true
 }
 trap cleanup EXIT INT TERM
 
@@ -141,10 +142,14 @@ npu_ssh "mkdir -p ${NPU_HCP_DIR}/logs && test -f ${NPU_MODEL_DIR}/model.safetens
 white_ssh "mkdir -p ${WHITE_HCP_DIR}/logs && test -f ${WHITE_MODEL}/model.safetensors && echo white ok"
 pearl_ssh "mkdir -p ${PEARL_HCP_DIR}/logs && test -f ${PEARL_MODEL}/model.safetensors && echo pearl ok"
 
-# --- Generate prompt ---
-echo "=== Generating prompt (${SEQ_LEN} tokens) ==="
+# --- Generate prompt (non-periodic natural text) ---
+echo "=== Generating prompt (~${SEQ_LEN} tokens, non-periodic, seed=${PROMPT_SEED}) ==="
 PROMPT_FILE="/tmp/hcp_prompt_${RUN_ID}.txt"
-(cd "${REPO_ROOT}/rust" && cargo run --bin gen_prompt -- "${MAC_MODEL_DIR}/tokenizer.json" "${SEQ_LEN}" "${PROMPT_FILE}") 2>&1 | tail -1 | tee "${REPORT_DIR}/gen_prompt.log"
+PROMPT_PY="${PROMPT_PY:-$(/usr/local/bin/python3.11 -c 'import tokenizers' 2>/dev/null && echo /usr/local/bin/python3.11 || echo /Users/stark_sim/miniconda3/bin/python3.12)}"
+"${PROMPT_PY}" "${REPO_ROOT}/scripts/gen_natural_prompt.py" \
+    "${MAC_MODEL_DIR}/tokenizer.json" "${SEQ_LEN}" "${PROMPT_SEED}" "${PROMPT_FILE}" \
+    | tee "${REPORT_DIR}/gen_prompt.log"
+cp "${PROMPT_FILE}" "${REPORT_DIR}/prompt.txt"
 
 start_coordinator() { # phase num_domains
     "${BINARY}" --distributed-role coordinator \
@@ -153,6 +158,7 @@ start_coordinator() { # phase num_domains
         --max-tokens "${MAX_NEW_TOKENS}" \
         --num-domains "$2" \
         --listen-addr "0.0.0.0:${COORD_PORT}" \
+        --export-logits-dir "${REPORT_DIR}/logits_$1" \
         >"${REPORT_DIR}/coordinator_$1.log" 2>&1 &
     COORD_PID=$!
     echo "Coordinator PID: ${COORD_PID} (phase=$1)"
@@ -167,9 +173,9 @@ finish_phase() { # phase
     set -e
     COORD_PID=""
     echo "Coordinator exit code: ${exit_code}"
-    npu_ssh 'pkill -f hcp_transformers_quic_worker || true' || true
-    white_ssh 'pkill -f hcp_transformers_quic_worker || true' || true
-    pearl_ssh 'pkill -f hcp_transformers_quic_worker || true' || true
+    npu_ssh 'pkill -f hcp_transformers_quic_worke[r] || true' || true
+    white_ssh 'pkill -f hcp_transformers_quic_worke[r] || true' || true
+    pearl_ssh 'pkill -f hcp_transformers_quic_worke[r] || true' || true
     return "${exit_code}"
 }
 

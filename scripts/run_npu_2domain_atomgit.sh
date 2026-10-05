@@ -39,7 +39,7 @@ COORD_PID=""
 cleanup() {
     echo "=== Cleanup ==="
     [ -n "${COORD_PID}" ] && kill "${COORD_PID}" 2>/dev/null || true
-    npu_ssh 'pkill -f hcp_transformers_quic_worker || true' || true
+    npu_ssh 'pkill -f hcp_transformers_quic_worke[r] || true' || true
 }
 trap cleanup EXIT INT TERM
 
@@ -135,7 +135,7 @@ run_phase() {
     COORD_PID=""
     echo "Coordinator exit code: ${exit_code}"
 
-    npu_ssh 'pkill -f hcp_transformers_quic_worker || true' || true
+    npu_ssh 'pkill -f hcp_transformers_quic_worke[r] || true' || true
     npu_ssh "cat ${NPU_HCP_DIR}/logs/worker0_${phase}.log" > "${REPORT_DIR}/worker0_${phase}.log" || true
     if [ "${num_domains}" = "2" ]; then
         npu_ssh "cat ${NPU_HCP_DIR}/logs/worker1_${phase}.log" > "${REPORT_DIR}/worker1_${phase}.log" || true
