@@ -86,7 +86,8 @@ class TransformersBackend(HcpWorkerBackend):
                     self._past_key_values = outputs.past_key_values
         return logits.to(torch.float32).cpu(), len(self._history) + seq_offset
 
-    async def prefill_ring_exact(self, chunk: List[int], seq_offset: int, exchange_layer) -> Tuple[torch.Tensor, int]:
+    async def prefill_ring_exact(self, chunk: List[int], seq_offset: int, exchange_layer,
+                                 domain_id: int = 0, num_domains: int = 1) -> Tuple[torch.Tensor, int]:
         """精确 context-parallel prefill：逐层 KV ring 交换 + 全局因果注意力。
 
         与 Rust Q-ring 同一算法：每层先算本地 chunk 的 Q/K/V（RoPE 用全局位置），
@@ -132,6 +133,7 @@ class TransformersBackend(HcpWorkerBackend):
                     (blk.global_seq_start, blk.k.to(device), blk.v.to(device)) for blk in remote
                 ]
                 blocks.sort(key=lambda t: t[0])
+                prefill_total = max(t[0] + t[1].size(2) for t in blocks)
                 k_all = torch.cat([t[1] for t in blocks], dim=2)
                 v_all = torch.cat([t[2] for t in blocks], dim=2)
                 key_pos = torch.cat([
@@ -164,7 +166,80 @@ class TransformersBackend(HcpWorkerBackend):
             logits = self.model.lm_head(hidden[:, -1])
 
         self._past_key_values = full_cache
+        self._ring_my_start = my_start
+        self._ring_my_end = my_start + my_len
+        self._ring_my_len = my_len
+        self._ring_prefill_total = prefill_total
+        self._ring_domain_id = domain_id
+        self._ring_num_domains = num_domains
         return logits[0].to(torch.float32).cpu(), my_start + my_len
+
+    async def decode_ring_exact(self, token: int, packet_exchange) -> torch.Tensor:
+        """Q-ring decode 参与：逐层 forward + 每层 (q,o,lse) packet 环。
+
+        与 Rust ring.rs ring_decode_attention 同构：
+        - 每个 worker 冗余计算同一 token 的 q/k/v（RoPE 用全局位置）；
+        - packet_exchange 负责：seed（本地 owned shard + 当前 token 的 partial）
+          → N-1 轮（收 packet → 对 owned durable（不含当前 token）merge → 转发），
+          返回全合并的 o（= 本层全局 attention 输出）；
+        - 本 worker 的 cache 始终是精确全量 KV（growth 分片所有权只影响
+          packet merge 的计数范围，不影响本地 cache 内容）。
+        """
+        from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
+
+        device = self.device
+        self._history.append(token)
+        cur_pos = self._ring_prefill_total + (len(self._history) - self._ring_my_len) - 1
+        core = self.model.model
+        input_ids = torch.tensor([[token]], dtype=torch.long, device=device)
+        pos = torch.tensor([[cur_pos]], dtype=torch.long, device=device)
+
+        hidden = core.embed_tokens(input_ids)
+        cos, sin = core.rotary_emb(hidden, pos)
+        rep = self._num_heads // self._num_kv_heads
+
+        cache = self._past_key_values
+        with torch.no_grad():
+            for li, layer in enumerate(core.layers):
+                attn = layer.self_attn
+                residual = hidden
+                h = layer.input_layernorm(hidden)
+                q = attn.q_proj(h).view(1, 1, self._num_heads, self._head_dim).transpose(1, 2)
+                k = attn.k_proj(h).view(1, 1, self._num_kv_heads, self._head_dim).transpose(1, 2)
+                v = attn.v_proj(h).view(1, 1, self._num_kv_heads, self._head_dim).transpose(1, 2)
+                q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
+
+                # 追加当前 token 的 compact KV 到全量 cache
+                cache.update(k, v, li)
+
+                # owned durable（不含当前 token）：自己的 prefill chunk +
+                # global_pos % N == domain_id 的 growth 位置
+                k_all, v_all = self._get_kv_layer(li)
+                total = k_all.size(2)
+                idx = list(range(self._ring_my_start, self._ring_my_end))
+                idx += [p for p in range(self._ring_prefill_total, total - 1)
+                        if p % self._ring_num_domains == self._ring_domain_id]
+                idx_t = torch.tensor(idx, dtype=torch.long, device=device)
+                k_owned = k_all.index_select(2, idx_t)
+                v_owned = v_all.index_select(2, idx_t)
+                if rep > 1:
+                    k_owned = k_owned.repeat_interleave(rep, dim=1)
+                    v_owned = v_owned.repeat_interleave(rep, dim=1)
+                    k_new = k.repeat_interleave(rep, dim=1)
+                    v_new = v.repeat_interleave(rep, dim=1)
+                else:
+                    k_new, v_new = k, v
+
+                o_attn = await packet_exchange(li, q, k_owned, v_owned, k_new, v_new)
+                attn_out = o_attn.transpose(1, 2).reshape(1, 1, self._num_heads * self._head_dim)
+                hidden = residual + attn.o_proj(attn_out)
+                residual = hidden
+                h = layer.post_attention_layernorm(hidden)
+                hidden = residual + layer.mlp(h)
+
+            hidden = core.norm(hidden)
+            logits = self.model.lm_head(hidden[:, -1])
+        return logits[0].to(torch.float32).cpu()
 
     def decode(self, token: int) -> torch.Tensor:
         from transformers.cache_utils import DynamicCache
@@ -302,9 +377,10 @@ async def run_worker(
     next_peer_host: str,
     next_peer_port: int,
     device: str,
+    ring_mode: str = "python",
 ):
     backend = TransformersBackend(model_dir, device=device)
-    server = QuicWorkerServer(backend, domain_id, num_domains, torch.device(device))
+    server = QuicWorkerServer(backend, domain_id, num_domains, torch.device(device), ring_mode=ring_mode)
     await server.run(
         coordinator_host, coordinator_port,
         peer_listen_host, peer_listen_port,
@@ -324,6 +400,9 @@ def main():
     parser.add_argument("--next-peer-host", default="127.0.0.1")
     parser.add_argument("--next-peer-port", type=int, default=26092)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--ring-mode", default="python", choices=["python", "rust"],
+                        help="python: 单流双向（Python<->Python）；rust: per-layer 24 流 + "
+                             "ring_packet，与 Rust worker 混合成环")
     args = parser.parse_args()
 
     asyncio.run(run_worker(
@@ -333,6 +412,7 @@ def main():
         args.peer_listen_host, args.peer_listen_port,
         args.next_peer_host, args.next_peer_port,
         args.device,
+        args.ring_mode,
     ))
 
 

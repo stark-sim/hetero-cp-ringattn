@@ -34,16 +34,19 @@ class QuicWorkerServer:
         domain_id: int,
         num_domains: int,
         device: torch.device,
+        ring_mode: str = "python",
     ):
         self.backend = backend
         self.domain_id = domain_id
         self.num_domains = num_domains
         self.device = device
+        self.ring_mode = ring_mode
         self.global_seq_len = 0
         self.seq_offset = 0
         self.control_client: Optional[QuicControlClient] = None
         self.kv_transport_out: Optional[QuicKvTransport] = None  # to next peer
         self.kv_transport_in: Optional[QuicKvTransport] = None   # from prev peer
+        self.rust_peer = None  # RustRingPeer when ring_mode == "rust"
 
     async def run(
         self,
@@ -139,6 +142,17 @@ class QuicWorkerServer:
         if self.num_domains <= 1:
             return
 
+        if self.ring_mode == "rust":
+            from .rust_ring import RustRingPeer
+            self.rust_peer = RustRingPeer(self.backend.num_layers, self.device)
+            await asyncio.gather(
+                self.rust_peer.connect_out(next_host, next_port),
+                self.rust_peer.serve_in(listen_host, listen_port),
+            )
+            print(f"[worker {self.domain_id}] rust-mode ring peer ready "
+                  f"({self.backend.num_layers} layer streams each way)")
+            return
+
         print(f"[worker {self.domain_id}] listening for peer on {listen_host}:{listen_port}...")
         connected_event, accepted_streams, server_task = await create_quic_server(listen_host, listen_port)
         self._peer_server_task = server_task
@@ -214,6 +228,29 @@ class QuicWorkerServer:
         my_start = self.seq_offset
         my_len = len(chunk)
 
+        if self.ring_mode == "rust":
+            rep = self.backend.num_heads // max(1, getattr(self.backend, "_num_kv_heads", self.backend.num_heads))
+
+            async def exchange_layer(layer_idx: int, k: torch.Tensor, v: torch.Tensor):
+                k_w = k.repeat_interleave(rep, dim=1) if rep > 1 else k
+                v_w = v.repeat_interleave(rep, dim=1) if rep > 1 else v
+                await self.rust_peer.send_kv(layer_idx, k_w, v_w, my_start, my_start + my_len)
+                remote = []
+                for r in range(1, self.num_domains):
+                    blk = await self.rust_peer.recv_kv(layer_idx)
+                    if r < self.num_domains - 1:
+                        await self.rust_peer.send_kv(
+                            layer_idx, blk["k"], blk["v"],
+                            blk["global_seq_start"], blk["global_seq_end"])
+                    remote.append(KvBlock(
+                        layer_idx, blk["global_seq_start"], blk["global_seq_end"],
+                        blk["k"][:, ::rep] if rep > 1 else blk["k"],
+                        blk["v"][:, ::rep] if rep > 1 else blk["v"]))
+                return remote
+
+            return await self.backend.prefill_ring_exact(
+                chunk, my_start, exchange_layer, self.domain_id, self.num_domains)
+
         async def exchange_layer(layer_idx: int, k: torch.Tensor, v: torch.Tensor):
             block = KvBlock(layer_idx, my_start, my_start + my_len, k, v)
             remote = []
@@ -229,16 +266,18 @@ class QuicWorkerServer:
                 cur = blk  # forward to next peer
             return remote
 
-        return await self.backend.prefill_ring_exact(chunk, my_start, exchange_layer)
+        return await self.backend.prefill_ring_exact(
+            chunk, my_start, exchange_layer, self.domain_id, self.num_domains)
 
     async def _handle_decode(self, cmd: dict) -> dict:
         """Run decode, return DecodeDone."""
         request_id = cmd["request_id"]
         token = cmd["token"]
-        logits = self.backend.decode(token)
 
-        # Decode phase typically skips KV exchange (all workers have same full KV)
-        # await self._exchange_kv_ring(prefill=False)
+        if self.ring_mode == "rust" and self.num_domains > 1:
+            logits = await self._decode_ring_exact(token)
+        else:
+            logits = self.backend.decode(token)
 
         logits_bytes = logits.detach().cpu().numpy().astype("float32").tobytes()
         return {
@@ -246,6 +285,28 @@ class QuicWorkerServer:
             "request_id": request_id,
             "logits_bytes": logits_bytes,
         }
+
+    async def _decode_ring_exact(self, token: int) -> torch.Tensor:
+        """Q-ring decode：seed 本地 owned partial，N-1 轮 merge+forward。"""
+        from .rust_ring import online_merge, online_partial
+
+        scale = 1.0 / (self.backend.head_dim ** 0.5)
+        num_domains = self.num_domains
+
+        async def packet_exchange(layer_idx, q, k_owned, v_owned, k_new, v_new):
+            k_seed = torch.cat([k_owned, k_new], dim=2)
+            v_seed = torch.cat([v_owned, v_new], dim=2)
+            o, lse = online_partial(q, k_seed, v_seed, scale)
+            await self.rust_peer.send_packet(layer_idx, q, o, lse, scale)
+            for r in range(1, num_domains):
+                pq, po, plse, pscale = await self.rust_peer.recv_packet(layer_idx)
+                po, plse = online_merge(pq, po, plse, k_owned, v_owned, pscale)
+                if r < num_domains - 1:
+                    await self.rust_peer.send_packet(layer_idx, pq, po, plse, pscale)
+                o, lse = po, plse
+            return o
+
+        return await self.backend.decode_ring_exact(token, packet_exchange)
 
     async def _exchange_kv_ring(self, prefill: bool) -> None:
         """Exchange KV blocks through the ring (N-domain).
