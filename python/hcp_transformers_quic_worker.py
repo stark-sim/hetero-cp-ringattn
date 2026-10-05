@@ -112,6 +112,9 @@ class TransformersBackend(HcpWorkerBackend):
         if hasattr(cache, 'layers'):
             cache.layers[layer_idx].keys = k
             cache.layers[layer_idx].values = v
+        elif hasattr(cache, 'key_cache'):
+            cache.key_cache[layer_idx] = k
+            cache.value_cache[layer_idx] = v
         else:
             cache._key_cache[layer_idx] = k
             cache._value_cache[layer_idx] = v
