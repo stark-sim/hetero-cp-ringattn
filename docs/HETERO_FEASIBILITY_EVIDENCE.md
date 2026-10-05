@@ -1,4 +1,4 @@
-# HCP 异构可行性实验证据（NPU + CUDA + HIP）
+# HCP 异构可行性实验证据（NPU + CUDA + HIP + MPS）
 
 > 目的：为学术论文提供可复核的异构 context parallelism（CP）可行性证据。
 > 所有原始数据（日志、logits 二进制、prompt 文本）保存在 `reports/` 对应目录，
@@ -12,6 +12,11 @@
 的差异同样处于该噪声地板（≤ 6.3e-5），全部 decode 步 argmax 一致**。
 即：HCP 协议层（QUIC 控制面 + KV 环传输）可以承载跨厂商精确 CP 推理。
 
+2026-10-06 起扩展为**四后端全覆盖**：加入 Apple Silicon MPS 后的 4-domain
+ring（NPU+CUDA+HIP+MPS）对全部四个单域 golden 的 max|Δ| ≤ 4.2e-5，**低于
+golden 两两互差（≤ 4.9e-5）**，ring 引入的额外误差在跨后端噪声下不可分辨
+（§4.6）。Rust↔Python 混合 ring 亦已打通（§6）。
+
 ## 2. 实验环境
 
 ### 2.1 硬件与软件栈
@@ -21,6 +26,7 @@
 | domain 0 | AtomGit CANN 容器 | Ascend910_9362（64GB HBM），driver 25.5.5，CANN 9.0.0 | torch 2.7.1+cpu + torch_npu 2.7.1.post4，Python 3.11.4 | 4.45.2 | 60354 MB |
 | domain 1 | white | RTX 4090 24GB | torch 2.13.0+cu130，Python 3.12 (venv-bench) | 5.15.0 | 21134 MB |
 | domain 2 | pearl | RX 9060 XT 16GB（RDNA4, gfx1200 target） | torch 2.13.0a0+rocm7.13.0a20260416，Python 3.11 (conda vllm-rocm) | 5.12.1 | 14060 MB |
+| domain 3 | Mac（兼 coordinator） | Apple Silicon MPS（16GB 统一内存） | torch 2.11.0，Python 3.12 (miniconda) | 4.57.6 | 12124 MB（`torch.mps.recommended_max_memory`） |
 | coordinator | Mac | Apple Silicon（仅 tokenizer/调度/采样，无模型计算） | Rust 二进制（tch/libtorch 仅用于 tokenizer 路径） | — | — |
 
 coordinator 按 capacity-aware 切分：各 worker 上报空闲显存（握手 16 字节包），
@@ -33,9 +39,13 @@ coordinator 按 capacity-aware 切分：各 worker 上报空闲显存（握手 1
 |---|---|---|---|
 | container ↔ Mac / white / pearl | Tailscale，自建 DERP 中继（derp.starksim.com, szx），NAT 打洞失败 | ~120-135 ms | 容器→Mac 581 KB/s，Mac→容器 520 KB/s |
 | white ↔ pearl | 2.5GbE 有线 LAN（192.168.100.0/24） | <1 ms | ~2.5 Gbps 链路 |
+| pearl ↔ Mac | Tailscale（不同 LAN 子网：Mac 192.168.8.0/24） | min 5.8 / avg 21.7 ms（ping ×5 实测） | 未测吞吐 |
+| Mac ↔ white | Tailscale | min 41.2 / avg 97.9 ms（ping ×5 实测） | 未测吞吐 |
 | 容器管理面 | AtomGit VS Code 插件 WebSocket 隧道 | — | scp ~1.2 MB/s |
 
-ring 边：container→white（DERP）、white→pearl（LAN）、pearl→container（DERP）。
+3-domain ring 边：container→white（DERP）、white→pearl（LAN）、pearl→container
+（DERP）。4-domain ring 边：container→white（DERP）、white→pearl（LAN）、
+pearl→mac（tailnet）、mac→container（DERP）。
 容器无 LAN 可达性，任意排序下恰好两条 ring 边跨 DERP。
 
 ### 2.3 代码版本
@@ -123,6 +133,30 @@ ring 与 golden 的差异与"同一 backend 单域重复计算 + 跨后端"噪�
 coordinator 在 Mac（tailscale DERP 控制面），ring 输出与单芯 golden 逐 token
 一致。首次打通 2-domain Rust↔Python KV 环。
 
+### 4.6 R5：4-domain 四后端全覆盖（NPU + CUDA + HIP + MPS）
+
+`reports/pyring4-npu-cuda-hip-mps-20261006-022629`（64 tokens，decode 16 步，
+prompt 与 §4 各 run 逐字节相同：SHA `6e2344ce…`）。拓扑：container(NPU, d0) →
+white(CUDA, d1) → pearl(HIP, d2) → mac(MPS, d3) → container；capacity 上报
+[60353, 21134, 14060, 12124] MB，不均分切分。
+
+logits 级比对（ring 对全部四个单域 golden，以及 golden 两两互差作为噪声地板）：
+
+| 比对 | max|Δ| | mean|Δ| |
+|---|---|---|
+| ring vs golden-MPS（主 gate，末域后端） | 3.20e-05 | 4.24e-06 |
+| ring vs golden-NPU | 3.34e-05 | 4.31e-06 |
+| ring vs golden-CUDA | 3.39e-05 | 4.08e-06 |
+| ring vs golden-HIP | 4.20e-05 | 5.72e-06 |
+| golden 两两互差（6 对，噪声地板） | 2.55e-05 ~ 4.86e-05 | — |
+
+**ring 对任一 golden 的偏差 ≤ golden 两两互差**：4-domain 精确 CP 引入的额外
+误差在跨后端 float32 噪声下不可分辨。文本输出与 MPS golden 逐 token 一致，
+四个后端 golden 亦全部一致（argmax 跨后端确定性对该 prompt 成立）。
+
+附带改动：worker `capacity_mb` 增加 MPS 分支
+（`torch.mps.recommended_max_memory()`，此前落默认 4096 MB 占位）。
+
 ## 5. 工件完整性与复现
 
 ### 5.1 关键工件 SHA-256
@@ -139,12 +173,19 @@ coordinator 在 Mac（tailscale DERP 控制面），ring 输出与单芯 golden 
 | E2-512 | logits_ring/logits_1.bin | c60adce84cf07565 |
 | E2-2048 | prompt.txt | d53d069df9a8c10d |
 | E2-2048 | logits_ring/logits_1.bin | 062904182abd20a6 |
+| R5-4domain `022629` | prompt.txt | 6e2344ce408538d8（与 E0/E1 相同） |
+| R5-4domain | logits_ring/logits_1.bin | 07bd07c2ae93de2e |
+| R5-4domain | logits_golden-mps/logits_1.bin | 2f800e9b3acf940d |
+| R5-4domain | coordinator_ring.log | e372cca4c145bff6 |
 
 ### 5.2 复现命令
 
 ```bash
 # 主 gate（3 goldens + 3-domain ring，自然 prompt，logits 导出）
 SEQ_LEN=2048 MAX_NEW_TOKENS=16 bash scripts/run_pyring_3domain_npu_cuda_hip.sh
+
+# 4-domain 四后端 gate（4 goldens + 4-domain ring，含 Mac MPS）
+bash scripts/run_pyring_4domain_npu_cuda_hip_mps.sh
 
 # logits 级比对（ring vs 各 golden）
 python3 scripts/compare_logits_dir.py reports/<run>/logits_ring reports/<run>/logits_golden-npu
