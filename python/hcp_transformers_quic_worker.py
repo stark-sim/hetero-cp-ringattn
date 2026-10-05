@@ -348,6 +348,8 @@ class TransformersBackend(HcpWorkerBackend):
                 return 4096
             free, _ = torch_npu.npu.mem_get_info(self.device)
             return int(free // (1024 * 1024))
+        if self.device.type == "mps":
+            return int(torch.mps.recommended_max_memory() // (1024 * 1024))
         if torch.cuda.is_available():
             free, _ = torch.cuda.mem_get_info()
             return int(free // (1024 * 1024))
