@@ -13,7 +13,8 @@ set -euo pipefail
 # Ring edges: d0 laptop-rank0 -> d1 container (DERP 100.91.253.114),
 #             d1 -> d2 pearl (DERP 100.111.242.55),
 #             d2 -> d3 mac (tailnet 100.121.35.138),
-#             d3 -> d0 laptop (LAN 192.168.8.109).
+#             d3 -> d0 laptop (tailnet 100.96.154.1；LAN 192.168.8.109 实测
+#             从 Mac 侧 no route to host，WiFi 客户端隔离或网段漂移，退回 tailnet)。
 # TP bootstrap: NCCL master = laptop tailnet 100.96.154.1:29601。
 #
 # 前置条件（当前阻塞项）：两端 NCCL 小版本必须兼容。laptop=2.28.9 /
@@ -40,7 +41,7 @@ NPU_TS="100.91.253.114"
 LAPTOP_SSH="${LAPTOP_SSH:-stark@100.96.154.1}"
 LAPTOP_TS="100.96.154.1"
 LAPTOP_LAN="192.168.8.109"
-LAPTOP_PY="/home/stark/miniconda3/bin/python"
+LAPTOP_PY="/home/stark/venv-nccl229/bin/python"
 LAPTOP_DIR="/home/stark/hetero-cp-ringattn"
 LAPTOP_MODEL="${LAPTOP_DIR}/models/Qwen2-0.5B"
 
@@ -71,7 +72,7 @@ W2_PORT=29923
 W3_PORT=29924
 TP_PORT=29601   # laptop<->white NCCL master
 
-NCCL_ENV="NCCL_SOCKET_IFNAME=tailscale0 NCCL_IB_DISABLE=1"
+NCCL_ENV="NCCL_SOCKET_IFNAME=tailscale0 NCCL_IB_DISABLE=1 HCP_TP_TIMING=1"
 
 RUN_ID="pyring4-nccl-abstract-$(date +%Y%m%d-%H%M%S)"
 REPORT_DIR="${REPO_ROOT}/reports/${RUN_ID}"
@@ -322,7 +323,7 @@ white_start_tp_rank1 4 "w0r1_ring.log"
 laptop_start_tp_rank0 4 "w0_ring.log"
 npu_start_worker   1 npu:0  ${W1_PORT} "${PEARL_TS}"   ${W2_PORT} 4 "w1_ring.log"
 pearl_start_worker 2 cuda:0 ${W2_PORT} "${MAC_TS}"     ${W3_PORT} 4 "w2_ring.log"
-mac_start_worker   3         ${W3_PORT} "${LAPTOP_LAN}" ${W0_PORT} 4 "worker3-mps_ring.log"
+mac_start_worker   3         ${W3_PORT} "${LAPTOP_TS}" ${W0_PORT} 4 "worker3-mps_ring.log"
 wait_remote_ready     white_ssh  "${WHITE_HCP_DIR}/logs/w0r1_ring.log" "follower rank 1. ready" 600
 wait_remote_handshake laptop_ssh "${LAPTOP_DIR}/logs/w0_ring.log" 600
 wait_remote_handshake npu_ssh    "${NPU_HCP_DIR}/logs/w1_ring.log" 600

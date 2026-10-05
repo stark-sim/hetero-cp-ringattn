@@ -26,6 +26,8 @@ head 重复语义按单进程假设写的，tp_size>1 时无意义），在 main
 """
 
 import asyncio
+import os
+import time
 from typing import List, Optional, Tuple
 
 import torch
@@ -67,6 +69,8 @@ class TPTransformersBackend(HcpWorkerBackend):
         self.device = self.engine.device
         self.rank = rank
         self.world_size = world_size
+        self._timing = os.environ.get("HCP_TP_TIMING", "") == "1"
+        self._t_stats = {"gather": 0.0, "bcast": 0.0, "reduce": 0.0}
         self._cache_k: List[torch.Tensor] = []
         self._cache_v: List[torch.Tensor] = []
         self._cache_len = 0
@@ -188,13 +192,19 @@ class TPTransformersBackend(HcpWorkerBackend):
                 q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
 
                 # 出站：all_gather 全头 KV（rank0 送 ring，wire 格式不变）
+                t0 = time.perf_counter() if self._timing else 0.0
                 k_full = self._all_gather_heads(k)
                 v_full = self._all_gather_heads(v)
+                if self._timing:
+                    self._t_stats["gather"] += time.perf_counter() - t0
 
                 remote: List[KvBlock] = []
                 if self.rank == 0 and exchange_layer is not None:
                     remote = await exchange_layer(li, k_full, v_full)
+                t0 = time.perf_counter() if self._timing else 0.0
                 remote = self._broadcast_remote(remote)
+                if self._timing:
+                    self._t_stats["bcast"] += time.perf_counter() - t0
 
                 # 各 rank 只保留自己 KV head 的全序列切片
                 # （lkv = num_kv_heads / tp_size，整除约束在引擎 init 断言）
@@ -227,6 +237,7 @@ class TPTransformersBackend(HcpWorkerBackend):
                     q, k_att, v_att, attn_mask=mask[None, None, :, :]
                 )
                 attn_out = attn_out.transpose(1, 2).reshape(b, my_len, eng.local_q_dim)
+                t0 = time.perf_counter() if self._timing else 0.0
                 partial = attn.o_proj(attn_out)
                 dist.all_reduce(partial, op=dist.ReduceOp.SUM)
                 hidden = residual + partial
@@ -237,12 +248,27 @@ class TPTransformersBackend(HcpWorkerBackend):
                 partial = mlp.down_proj(mlp.act_fn(mlp.gate_proj(h)) * mlp.up_proj(h))
                 dist.all_reduce(partial, op=dist.ReduceOp.SUM)
                 hidden = residual + partial
+                if self._timing:
+                    self._t_stats["reduce"] += time.perf_counter() - t0
 
                 cache_k.append(k_all)
                 cache_v.append(v_all)
 
             hidden = eng.final_norm(hidden)
             logits = eng.lm_head(hidden[:, -1]) if self.rank == 0 else None
+
+        if self._timing:
+            n = max(1, eng.num_layers)
+            s = self._t_stats
+            print(
+                f"[tp timing rank {self.rank}] prefill {n} layers: "
+                f"gather={s['gather'] / n * 1e3:.2f}ms/layer "
+                f"bcast_remote={s['bcast'] / n * 1e3:.2f}ms/layer "
+                f"all_reduce={s['reduce'] / n / 2 * 1e3:.2f}ms/call "
+                f"collective_total={(s['gather'] + s['bcast'] + s['reduce']) * 1e3:.1f}ms",
+                flush=True,
+            )
+            self._t_stats = {"gather": 0.0, "bcast": 0.0, "reduce": 0.0}
 
         self._cache_k = cache_k
         self._cache_v = cache_v
@@ -321,6 +347,7 @@ class TPTransformersBackend(HcpWorkerBackend):
                     k_att, v_att = k_all, v_all
                 attn_out = torch.nn.functional.scaled_dot_product_attention(q, k_att, v_att)
                 attn_out = attn_out.transpose(1, 2).reshape(1, 1, eng.local_q_dim)
+                t0 = time.perf_counter() if self._timing else 0.0
                 partial = attn.o_proj(attn_out)
                 dist.all_reduce(partial, op=dist.ReduceOp.SUM)
                 hidden = residual + partial
@@ -331,9 +358,21 @@ class TPTransformersBackend(HcpWorkerBackend):
                 partial = mlp.down_proj(mlp.act_fn(mlp.gate_proj(h)) * mlp.up_proj(h))
                 dist.all_reduce(partial, op=dist.ReduceOp.SUM)
                 hidden = residual + partial
+                if self._timing:
+                    self._t_stats["reduce"] += time.perf_counter() - t0
 
             hidden = eng.final_norm(hidden)
             self._cache_len = pos + 1
+            if self._timing:
+                n = max(1, eng.num_layers)
+                t = self._t_stats["reduce"]
+                print(
+                    f"[tp timing rank {self.rank}] decode pos={pos}: "
+                    f"all_reduce={t / n / 2 * 1e3:.2f}ms/call "
+                    f"total={t * 1e3:.1f}ms/{n} layers",
+                    flush=True,
+                )
+                self._t_stats["reduce"] = 0.0
             if self.rank != 0:
                 return None
             logits = eng.lm_head(hidden[:, -1])
