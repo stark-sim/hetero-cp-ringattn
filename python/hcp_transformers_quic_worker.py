@@ -23,6 +23,11 @@ from typing import List, Tuple
 
 import torch
 
+try:
+    import torch_npu  # noqa: F401  (registers the "npu" device backend)
+except ImportError:
+    torch_npu = None
+
 sys.path.insert(0, os.path.dirname(__file__))
 
 from hcp_worker_sdk import HcpWorkerBackend, KvBlock
@@ -173,6 +178,11 @@ class TransformersBackend(HcpWorkerBackend):
 
     @property
     def capacity_mb(self) -> int:
+        if self.device.type == "npu":
+            if torch_npu is None:
+                return 4096
+            free, _ = torch_npu.npu.mem_get_info(self.device)
+            return int(free // (1024 * 1024))
         if torch.cuda.is_available():
             free, _ = torch.cuda.mem_get_info()
             return int(free // (1024 * 1024))
