@@ -8,7 +8,7 @@ HCP（Heterogeneous Context Parallelism）让多个异构计算 domain 以**不�
 
 1. **异构是常态**：真实部署中 GPU 代际、显存、互联带宽 rarely 一致。
 2. **非均等 CP 是可行性前提**：均匀分片在异构显存下会让小显存设备先 OOM；分片应匹配设备能力边界。
-3. **P2P 是数学必须，collective 是同构优化**：Ring Attention 原始论文本就是 P2P send/recv；PyTorch CP 的 collective 是对同构 NVLink 集群的工程优化。
+3. **数学必须的是 blockwise online softmax；P2P ring 是异构/低带宽下的工程占优调度**：Ring Attention 原文实现即 collective（`jax.lax.ppermute`）；Ulysses all2all / all-gather KV 与 ring 数学等价。ring 的真正优势域是异构后端无共同 collective 栈、低带宽 WAN、不均分 chunk。（2026-10-06 修正，原 framing"P2P 是数学必须"被一手证据证伪，见 issue #17 / revision-belief-p2p-framing-20261006）
 4. **Correctness 优先于性能**：在数值正确性未跨平台稳定通过前，不引入量化、近似 attention、非 deterministic kernel 等优化。
 
 ## 架构边界
