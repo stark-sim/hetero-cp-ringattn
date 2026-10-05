@@ -105,6 +105,7 @@ class QuicWorkerServer:
                 break
 
         await self.control_client.close()
+        await self.cleanup()
 
     async def cleanup(self) -> None:
         """Cleanup QUIC connections and peer resources."""
@@ -114,6 +115,11 @@ class QuicWorkerServer:
                 await self.control_client.close()
             except Exception as e:
                 print(f"[worker {self.domain_id}] control client close warning: {e}")
+        if self.rust_peer is not None:
+            try:
+                await self.rust_peer.close()
+            except Exception as e:
+                print(f"[worker {self.domain_id}] rust peer close warning: {e}")
         if hasattr(self, "_peer_conn_mgr"):
             try:
                 self._peer_conn_mgr.close()

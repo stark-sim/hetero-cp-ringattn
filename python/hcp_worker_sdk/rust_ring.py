@@ -15,6 +15,7 @@
 
 import asyncio
 import json
+import os
 import ssl
 import struct
 from typing import Dict, List, Optional, Tuple
@@ -56,8 +57,10 @@ class RustRingPeer:
         self._accepted: List[Tuple] = []
         self._accepted_event = asyncio.Event()
         self._reader_tasks: List[asyncio.Task] = []
-        self._server_task: Optional[asyncio.Task] = None
+        self._server = None
+        self._cert_tmp_files: List[str] = []
         self._conn_mgr = None
+        self._peer_error: Optional[str] = None
 
     # ---------- 连接建立 ----------
 
@@ -65,7 +68,10 @@ class RustRingPeer:
         """拨 successor，并按层序开 L 条 stream（每条立即写 dummy）。"""
         last_err: Optional[Exception] = None
         for attempt in range(1, retries + 1):
+            conn_mgr = None
             try:
+                # issue#6: 重试前清空，避免部分建流后 layer→stream 错位
+                self._out_writers = []
                 configuration = QuicConfiguration(is_client=True, verify_mode=ssl.CERT_NONE)
                 conn_mgr = connect(host, port, configuration=configuration)
                 connection = await asyncio.wait_for(conn_mgr.__aenter__(), timeout=30.0)
@@ -78,20 +84,26 @@ class RustRingPeer:
                 return
             except (ConnectionError, asyncio.TimeoutError, OSError) as e:
                 last_err = e
+                if conn_mgr is not None:
+                    try:
+                        await conn_mgr.__aexit__(None, None, None)
+                    except Exception:
+                        pass
                 print(f"[rust-ring] connect {host}:{port} attempt {attempt}/{retries} failed: {e}")
                 await asyncio.sleep(2.0)
         raise ConnectionError(f"failed to connect to {host}:{port}: {last_err}")
 
     async def serve_in(self, host: str, port: int) -> None:
         """监听 predecessor 连接；每条接受的 stream 起一个 reader task。"""
-        cert_pem, key_pem = get_cached_cert()
         import tempfile
+        cert_pem, key_pem = get_cached_cert()
         cert_file = tempfile.NamedTemporaryFile(suffix=".pem", delete=False)
         key_file = tempfile.NamedTemporaryFile(suffix=".pem", delete=False)
         cert_file.write(cert_pem)
         key_file.write(key_pem)
         cert_file.close()
         key_file.close()
+        self._cert_tmp_files = [cert_file.name, key_file.name]
         configuration = QuicConfiguration(is_client=False)
         configuration.load_cert_chain(cert_file.name, key_file.name)
 
@@ -101,9 +113,10 @@ class RustRingPeer:
             if len(self._accepted) >= self.num_layers:
                 self._accepted_event.set()
 
-        self._server_task = asyncio.create_task(serve(
+        # issue#5: serve() 是协程，须保留返回的 QuicServer 句柄才能关监听
+        self._server = await serve(
             host, port, configuration=configuration, stream_handler=stream_handler,
-        ))
+        )
         await asyncio.wait_for(self._accepted_event.wait(), timeout=300.0)
 
     # ---------- 帧 IO ----------
@@ -140,7 +153,12 @@ class RustRingPeer:
                         "total_micro_blocks": int(meta.get("total_micro_blocks", 1)),
                         "k": k, "v": v, "position_ids": position_ids,
                     })
-        except (asyncio.IncompleteReadError, ConnectionResetError):
+        except (asyncio.IncompleteReadError, ConnectionResetError) as e:
+            # reader 死亡要能被 recv 侧感知（issue#7），而非静默挂起
+            self._peer_error = f"reader loop ended: {type(e).__name__}"
+            return
+        except Exception as e:
+            self._peer_error = f"reader loop error: {e}"
             return
 
     @staticmethod
@@ -174,7 +192,7 @@ class RustRingPeer:
 
     async def recv_kv(self, layer: int) -> dict:
         """接收一个完整 KV block（必要时跨 micro-block 重组）。"""
-        first = await self._kv_queues[layer].get()
+        first = await self._queue_get(self._kv_queues[layer], layer, "kv")
         total = first["total_micro_blocks"]
         if total == 1:
             return first
@@ -182,7 +200,7 @@ class RustRingPeer:
         seq_start, seq_end = first["global_seq_start"], first["global_seq_end"]
         got = first["micro_block_idx"] + 1
         while got < total:
-            nxt = await self._kv_queues[layer].get()
+            nxt = await self._queue_get(self._kv_queues[layer], layer, "kv")
             assert nxt["micro_block_idx"] == got, f"micro block out of order on layer {layer}"
             ks.append(nxt["k"])
             vs.append(nxt["v"])
@@ -215,15 +233,31 @@ class RustRingPeer:
         await self._out_writers[layer].drain()
 
     async def recv_packet(self, layer: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
-        return await self._pkt_queues[layer].get()
+        return await self._queue_get(self._pkt_queues[layer], layer, "ring_packet")
+
+    async def _queue_get(self, queue: asyncio.Queue, layer: int, what: str):
+        """issue#7: 带超时的队列读取；reader task 全部死亡时快速失败而非永久挂起。
+        超时与 Rust 侧 HCP_QUIC_TIMEOUT_SECS 默认 600s 对齐。"""
+        timeout = float(os.environ.get("HCP_PY_RING_RECV_TIMEOUT", "600"))
+        if self._peer_error is not None:
+            raise ConnectionError(f"ring peer stream died earlier ({what} layer {layer}): {self._peer_error}")
+        try:
+            return await asyncio.wait_for(queue.get(), timeout=timeout)
+        except asyncio.TimeoutError:
+            raise ConnectionError(f"recv {what} layer {layer} timeout after {timeout}s")
 
     async def close(self) -> None:
         for t in self._reader_tasks:
             t.cancel()
-        if self._server_task is not None:
-            self._server_task.cancel()
+        if self._server is not None:
+            self._server.close()
         if self._conn_mgr is not None:
             await self._conn_mgr.__aexit__(None, None, None)
+        for path in self._cert_tmp_files:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 
 # ---------- online softmax（与 Rust process_kv_block/decode_merge_packet 同公式） ----------
