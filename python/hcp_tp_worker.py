@@ -55,6 +55,7 @@ class TPTransformersBackend(HcpWorkerBackend):
         init_method: str,
         num_domains: int,
         collective_timeout_s: Optional[float] = None,
+        local_rank: Optional[int] = None,
     ):
         self.engine = TensorParallelQwen2(
             model_dir,
@@ -64,6 +65,7 @@ class TPTransformersBackend(HcpWorkerBackend):
             backend=tp_backend,
             init_method=init_method,
             timeout_s=collective_timeout_s,
+            local_rank=local_rank,
         )
         self.num_domains = num_domains
         self.device = self.engine.device
@@ -97,6 +99,25 @@ class TPTransformersBackend(HcpWorkerBackend):
 
     # ---- collective helpers（comm device = engine device：gloo→cpu, hccl→npu）----
 
+    def _sync_device(self) -> None:
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        elif self.device.type == "npu":
+            torch.npu.synchronize(self.device)
+
+    def _time_collective(self, kind: str, fn, *args):
+        """计时只包 collective 调用本身；NCCL/HCCL 的 collective 在 stream 上
+        异步执行，故 timing 开启时前后各做一次 device synchronize，否则
+        perf_counter 只测到入队耗时。timing 关闭路径零同步零开销。"""
+        if not self._timing:
+            return fn(*args)
+        self._sync_device()
+        t0 = time.perf_counter()
+        r = fn(*args)
+        self._sync_device()
+        self._t_stats[kind] += time.perf_counter() - t0
+        return r
+
     def _bcast(self, t: torch.Tensor, src: int = 0) -> torch.Tensor:
         dist.broadcast(t, src)
         return t
@@ -104,7 +125,7 @@ class TPTransformersBackend(HcpWorkerBackend):
     def _all_gather_heads(self, t: torch.Tensor) -> torch.Tensor:
         """[1, local_kv_heads, s, d] -> [1, num_kv_heads, s, d]（rank 序拼接即全局 head 序）。"""
         outs = [torch.empty_like(t) for _ in range(self.world_size)]
-        dist.all_gather(outs, t.contiguous())
+        self._time_collective("gather", dist.all_gather, outs, t.contiguous())
         return torch.cat(outs, dim=1)
 
     def broadcast_shutdown(self) -> None:
@@ -192,19 +213,13 @@ class TPTransformersBackend(HcpWorkerBackend):
                 q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
 
                 # 出站：all_gather 全头 KV（rank0 送 ring，wire 格式不变）
-                t0 = time.perf_counter() if self._timing else 0.0
                 k_full = self._all_gather_heads(k)
                 v_full = self._all_gather_heads(v)
-                if self._timing:
-                    self._t_stats["gather"] += time.perf_counter() - t0
 
                 remote: List[KvBlock] = []
                 if self.rank == 0 and exchange_layer is not None:
                     remote = await exchange_layer(li, k_full, v_full)
-                t0 = time.perf_counter() if self._timing else 0.0
                 remote = self._broadcast_remote(remote)
-                if self._timing:
-                    self._t_stats["bcast"] += time.perf_counter() - t0
 
                 # 各 rank 只保留自己 KV head 的全序列切片
                 # （lkv = num_kv_heads / tp_size，整除约束在引擎 init 断言）
@@ -237,19 +252,16 @@ class TPTransformersBackend(HcpWorkerBackend):
                     q, k_att, v_att, attn_mask=mask[None, None, :, :]
                 )
                 attn_out = attn_out.transpose(1, 2).reshape(b, my_len, eng.local_q_dim)
-                t0 = time.perf_counter() if self._timing else 0.0
                 partial = attn.o_proj(attn_out)
-                dist.all_reduce(partial, op=dist.ReduceOp.SUM)
+                self._time_collective("reduce", dist.all_reduce, partial, dist.ReduceOp.SUM)
                 hidden = residual + partial
 
                 residual = hidden
                 h = layer.post_attention_layernorm(hidden)
                 mlp = layer.mlp
                 partial = mlp.down_proj(mlp.act_fn(mlp.gate_proj(h)) * mlp.up_proj(h))
-                dist.all_reduce(partial, op=dist.ReduceOp.SUM)
+                self._time_collective("reduce", dist.all_reduce, partial, dist.ReduceOp.SUM)
                 hidden = residual + partial
-                if self._timing:
-                    self._t_stats["reduce"] += time.perf_counter() - t0
 
                 cache_k.append(k_all)
                 cache_v.append(v_all)
@@ -294,14 +306,14 @@ class TPTransformersBackend(HcpWorkerBackend):
             else:
                 hdr = torch.empty(2, dtype=torch.int32, device=self.device)
                 k = v = None
-            self._bcast(hdr)
+            self._time_collective("bcast", dist.broadcast, hdr, 0)
             start, ln = int(hdr[0].item()), int(hdr[1].item())
             if self.rank != 0:
                 shape = (1, eng.num_kv_heads, ln, eng.head_dim)
                 k = torch.empty(shape, dtype=torch.float32, device=self.device)
                 v = torch.empty(shape, dtype=torch.float32, device=self.device)
-            self._bcast(k)
-            self._bcast(v)
+            self._time_collective("bcast", dist.broadcast, k, 0)
+            self._time_collective("bcast", dist.broadcast, v, 0)
             out.append(KvBlock(-1, start, start + ln, k, v))
         return out
 
@@ -347,19 +359,16 @@ class TPTransformersBackend(HcpWorkerBackend):
                     k_att, v_att = k_all, v_all
                 attn_out = torch.nn.functional.scaled_dot_product_attention(q, k_att, v_att)
                 attn_out = attn_out.transpose(1, 2).reshape(1, 1, eng.local_q_dim)
-                t0 = time.perf_counter() if self._timing else 0.0
                 partial = attn.o_proj(attn_out)
-                dist.all_reduce(partial, op=dist.ReduceOp.SUM)
+                self._time_collective("reduce", dist.all_reduce, partial, dist.ReduceOp.SUM)
                 hidden = residual + partial
 
                 residual = hidden
                 h = layer.post_attention_layernorm(hidden)
                 mlp = layer.mlp
                 partial = mlp.down_proj(mlp.act_fn(mlp.gate_proj(h)) * mlp.up_proj(h))
-                dist.all_reduce(partial, op=dist.ReduceOp.SUM)
+                self._time_collective("reduce", dist.all_reduce, partial, dist.ReduceOp.SUM)
                 hidden = residual + partial
-                if self._timing:
-                    self._t_stats["reduce"] += time.perf_counter() - t0
 
             hidden = eng.final_norm(hidden)
             self._cache_len = pos + 1
@@ -453,6 +462,7 @@ def run_tp_follower(
     init_method: str,
     num_domains: int,
     collective_timeout_s: Optional[float] = None,
+    local_rank: Optional[int] = None,
 ) -> None:
     """TP follower 主循环：不连 coordinator/ring，只跟 collective。
 
@@ -463,7 +473,7 @@ def run_tp_follower(
     """
     backend = TPTransformersBackend(
         model_dir, device, tp_backend, rank, world_size, init_method, num_domains,
-        collective_timeout_s=collective_timeout_s,
+        collective_timeout_s=collective_timeout_s, local_rank=local_rank,
     )
     eng = backend.engine
     print(f"[tp follower rank {rank}] ready, num_domains={num_domains}", flush=True)

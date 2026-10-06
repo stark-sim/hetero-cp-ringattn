@@ -202,7 +202,10 @@ d1 = 容器 NPU、d2 = pearl HIP、d3 = Mac MPS 的 4-domain ring（64 tokens）
   smoke 6 秒通过。跨机 NCCL 组队前必须对齐小版本。
 - **collective 开销**（`HCP_TP_TIMING=1`，rank0 视角）：prefill 每层
   all_gather 0.32ms + remote bcast 1.31ms + 2×all_reduce 1.40ms/call，
-  24 层合计 106.5ms；decode 每 token collective 5-7ms。低延迟因本次
+  24 层合计 106.5ms；decode 每 token collective 5-7ms。**测量口径注记**：
+  该数字由 issue #23 修正前的打点测得（计时区间含部分层内计算且未做
+  stream 同步），是**上界**；修正后本地 gloo 对照 all_reduce 从
+  6.25ms/call 降到 0.66ms/call，远程干净数值待重测。低延迟因本次
   laptop↔white tailscale 走了 direct LAN（~5ms）；跨地域 DERP/WiFi
   （25-70ms RTT）场景未实测，按 RTT 预估 decode 每 token +100-300ms——
   跨机 TP 是延迟敏感路径，WAN 下不划算（符合"TP 属同机房"的业界共识）。

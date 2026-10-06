@@ -37,7 +37,13 @@ class TensorParallelQwen2:
         backend: str = "gloo",
         init_method: str = "tcp://127.0.0.1:29511",
         timeout_s: Optional[float] = None,
+        local_rank: Optional[int] = None,
     ):
+        # local_rank = 本进程在单机内的设备序号；默认等于全局 rank（单机多卡
+        # TP 的常规情形）。跨机 TP（每机单卡）必须显式传 local_rank=0，
+        # 否则 rank1 会落到不存在的 cuda:1。
+        if local_rank is None:
+            local_rank = rank
         if backend == "hccl" and device != "npu":
             raise ValueError("hccl backend requires device='npu'")
         if device == "npu":
@@ -49,6 +55,9 @@ class TensorParallelQwen2:
                 torch.npu.matmul.allow_hf32 = False  # 严格 fp32 数值
             except Exception:
                 pass
+        elif device == "cuda":
+            torch.cuda.set_device(local_rank)
+            self.device = torch.device(f"cuda:{local_rank}")
         else:
             self.device = torch.device(device)
 

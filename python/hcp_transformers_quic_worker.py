@@ -385,6 +385,7 @@ async def run_worker(
     tp_master_addr: str = "127.0.0.1",
     tp_master_port: int = 29611,
     tp_collective_timeout: float = 300.0,
+    tp_local_rank: int = None,
 ):
     if tp_size > 1:
         from hcp_tp_worker import TPTransformersBackend
@@ -394,7 +395,7 @@ async def run_worker(
         init_method = f"tcp://{tp_master_addr}:{tp_master_port}"
         backend = TPTransformersBackend(
             model_dir, tp_device, tp_backend, 0, tp_size, init_method, num_domains,
-            collective_timeout_s=tp_collective_timeout,
+            collective_timeout_s=tp_collective_timeout, local_rank=tp_local_rank,
         )
         server = QuicWorkerServer(
             backend, domain_id, num_domains, backend.engine.device, ring_mode=ring_mode
@@ -448,6 +449,9 @@ def main():
     parser.add_argument("--tp-collective-timeout", type=float, default=300.0,
                         help="TP process group collective 超时（秒）；rank0 异常退出后 "
                              "follower 的阻塞 collective 超时退出，不永久悬挂")
+    parser.add_argument("--tp-local-rank", type=int, default=None,
+                        help="本进程在单机内的设备序号；默认=tp-rank（单机多卡）。"
+                             "跨机单卡 TP 时各机必须显式传 0")
     args = parser.parse_args()
 
     if args.tp_size > 1:
@@ -464,6 +468,7 @@ def main():
                 args.model_dir, tp_device, args.tp_backend,
                 args.tp_rank, args.tp_size, init_method, args.num_domains,
                 collective_timeout_s=args.tp_collective_timeout,
+                local_rank=args.tp_local_rank,
             )
             return
 
@@ -480,6 +485,7 @@ def main():
         args.tp_master_addr,
         args.tp_master_port,
         args.tp_collective_timeout,
+        args.tp_local_rank,
     ))
 
 

@@ -129,7 +129,7 @@ nohup ${WHITE_PY} python/hcp_transformers_quic_worker.py \
     --model-dir ${WHITE_MODEL} --coordinator-host ${MAC_TS} --coordinator-port ${COORD_PORT} \
     --domain-id 0 --num-domains $1 \
     --device cuda \
-    --tp-size 2 --tp-backend nccl --tp-rank 1 \
+    --tp-size 2 --tp-backend nccl --tp-rank 1 --tp-local-rank 0 \
     --tp-master-addr ${LAPTOP_TS} --tp-master-port ${TP_PORT} \
     > logs/$2 2>&1 < /dev/null &
 echo started white tp rank1 follower pid=\$!
