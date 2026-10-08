@@ -68,6 +68,7 @@ def main() -> int:
             "all_argmax_equal": all(s["argmax_equal"] for s in steps),
             "worst_max_abs_diff": max(s["max_abs_diff"] for s in steps),
             "min_margin_a": min(s["top1_top2_margin_a"] for s in steps),
+            "mean_margin_a": float(np.mean([s["top1_top2_margin_a"] for s in steps])),
         })
 
     if args.json:
@@ -77,8 +78,12 @@ def main() -> int:
             if "error" in r:
                 print(f"{r['pair']}: {r['error']}")
                 continue
+            noise_ratio = (r["worst_max_abs_diff"] / r["min_margin_a"]
+                           if r["min_margin_a"] > 0 else float("inf"))
             print(f"{r['pair'][0]} vs {r['pair'][1]}: all_argmax_equal={r['all_argmax_equal']} "
-                  f"worst_max|Δ|={r['worst_max_abs_diff']:.6g} min_margin={r['min_margin_a']:.6g}")
+                  f"worst_max|Δ|={r['worst_max_abs_diff']:.6g} "
+                  f"margin(min/mean)={r['min_margin_a']:.6g}/{r['mean_margin_a']:.6g} "
+                  f"noise/margin={noise_ratio:.4g}")
             for s in r["steps"]:
                 flag = "" if s["argmax_equal"] else "  <-- ARGMAX DIVERGES"
                 print(f"  step {s['step']:3d}: max|Δ|={s['max_abs_diff']:.6g} "

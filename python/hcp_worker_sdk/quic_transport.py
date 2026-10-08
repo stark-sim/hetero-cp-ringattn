@@ -177,6 +177,10 @@ class QuicKvTransport(KvTransport):
         k = self._bytes_to_tensor(k_bytes, meta["k_shape"], self.device)
         v = self._bytes_to_tensor(v_bytes, meta["v_shape"], self.device)
         # 按 dtype 标签 cast 回发送方模型精度（缺标签的旧发送方 = float32，no-op）
+        for tag in (meta.get("k_dtype", "float32"), meta.get("v_dtype", "float32")):
+            if tag not in _WIRE_DTYPES:
+                print(f"[quic transport] WARNING: unknown dtype tag '{tag}', "
+                      f"falling back to float32", flush=True)
         k = k.to(_WIRE_DTYPES.get(meta.get("k_dtype", "float32"), torch.float32))
         v = v.to(_WIRE_DTYPES.get(meta.get("v_dtype", "float32"), torch.float32))
 

@@ -177,7 +177,21 @@ start_coordinator() { # phase num_domains
         >"${REPORT_DIR}/coordinator_$1.log" 2>&1 &
     COORD_PID=$!
     echo "Coordinator PID: ${COORD_PID} (phase=$1)"
-    sleep 2
+    # listen 就绪检查：轮询日志确认 QUIC endpoint 已绑定，再启动 worker
+    local elapsed=0
+    while [ "${elapsed}" -lt 30 ]; do
+        if grep -q "QUIC endpoint listening" "${REPORT_DIR}/coordinator_$1.log" 2>/dev/null; then
+            return 0
+        fi
+        if ! kill -0 "${COORD_PID}" 2>/dev/null; then
+            echo "ERROR: coordinator died during startup (phase=$1):" >&2
+            tail -10 "${REPORT_DIR}/coordinator_$1.log" >&2
+            return 1
+        fi
+        sleep 1; elapsed=$((elapsed + 1))
+    done
+    echo "ERROR: coordinator listen timeout (phase=$1)" >&2
+    return 1
 }
 
 finish_phase() { # phase

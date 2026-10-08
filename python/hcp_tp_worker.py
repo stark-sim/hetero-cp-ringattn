@@ -90,6 +90,20 @@ class TPTransformersBackend(HcpWorkerBackend):
             self._capacity_mb = sum(per_rank)
             print(f"[tp backend] capacity: per-rank free MB={per_rank} "
                   f"total={self._capacity_mb}", flush=True)
+            # dtype 启动一致性校验：所有 rank 必须以同一计算 dtype 加载模型，
+            # 否则 collective 会因 dtype/尺寸不匹配而 UB/死锁（fail-fast）
+            _DTYPE_CODES = {"float32": 0, "bfloat16": 1, "float16": 2}
+            code = _DTYPE_CODES[dtype]
+            tc = torch.tensor([code], dtype=torch.int32, device=self.device)
+            outs_c = [torch.empty(1, dtype=torch.int32, device=self.device)
+                      for _ in range(world_size)]
+            dist.all_gather(outs_c, tc)
+            codes = [int(o.item()) for o in outs_c]
+            if len(set(codes)) != 1:
+                raise RuntimeError(
+                    f"TP rank dtype mismatch: per-rank dtype codes={codes} "
+                    f"(0=float32,1=bfloat16,2=float16); all ranks must use the same --dtype"
+                )
         else:
             self._capacity_mb = free
         print(
