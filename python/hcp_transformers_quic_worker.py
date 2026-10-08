@@ -37,14 +37,21 @@ from hcp_worker_sdk.quic_server import QuicWorkerServer
 class TransformersBackend(HcpWorkerBackend):
     """transformers backend for HCP Worker SDK."""
 
-    def __init__(self, model_dir: str, device: str = "cpu"):
+    def __init__(self, model_dir: str, device: str = "cpu", dtype: str = "float32"):
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
+        _dtypes = {
+            "float32": torch.float32,
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+        }
+        if dtype not in _dtypes:
+            raise ValueError(f"unsupported dtype {dtype}")
         self.device = torch.device(device)
-        print(f"[transformers backend] loading model from {model_dir} ...")
+        print(f"[transformers backend] loading model from {model_dir} (dtype={dtype}) ...")
         self.model = AutoModelForCausalLM.from_pretrained(
             model_dir,
-            torch_dtype=torch.float32,
+            torch_dtype=_dtypes[dtype],
             trust_remote_code=True,
         ).to(self.device)
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -386,6 +393,7 @@ async def run_worker(
     tp_master_port: int = 29611,
     tp_collective_timeout: float = 300.0,
     tp_local_rank: int = None,
+    dtype: str = "float32",
 ):
     if tp_size > 1:
         from hcp_tp_worker import TPTransformersBackend
@@ -396,6 +404,7 @@ async def run_worker(
         backend = TPTransformersBackend(
             model_dir, tp_device, tp_backend, 0, tp_size, init_method, num_domains,
             collective_timeout_s=tp_collective_timeout, local_rank=tp_local_rank,
+            dtype=dtype,
         )
         server = QuicWorkerServer(
             backend, domain_id, num_domains, backend.engine.device, ring_mode=ring_mode
@@ -414,7 +423,7 @@ async def run_worker(
             backend.close()
         return
 
-    backend = TransformersBackend(model_dir, device=device)
+    backend = TransformersBackend(model_dir, device=device, dtype=dtype)
     server = QuicWorkerServer(backend, domain_id, num_domains, torch.device(device), ring_mode=ring_mode)
     await server.run(
         coordinator_host, coordinator_port,
@@ -452,6 +461,9 @@ def main():
     parser.add_argument("--tp-local-rank", type=int, default=None,
                         help="本进程在单机内的设备序号；默认=tp-rank（单机多卡）。"
                              "跨机单卡 TP 时各机必须显式传 0")
+    parser.add_argument("--dtype", default="float32",
+                        choices=["float32", "bfloat16", "float16"],
+                        help="模型计算 dtype（默认 float32，既有行为；7B 用 bfloat16）")
     args = parser.parse_args()
 
     if args.tp_size > 1:
@@ -469,6 +481,7 @@ def main():
                 args.tp_rank, args.tp_size, init_method, args.num_domains,
                 collective_timeout_s=args.tp_collective_timeout,
                 local_rank=args.tp_local_rank,
+                dtype=args.dtype,
             )
             return
 
@@ -486,6 +499,7 @@ def main():
         args.tp_master_port,
         args.tp_collective_timeout,
         args.tp_local_rank,
+        args.dtype,
     ))
 
 

@@ -15,6 +15,7 @@ export DYLD_LIBRARY_PATH="/Users/stark_sim/libtorch/lib:${DYLD_LIBRARY_PATH:-}"
 BINARY="${REPO_ROOT}/rust/target/release/hcp-ringattn-rust"
 MODEL_DIR="${REPO_ROOT}/models/Qwen2-0.5B"
 PY="${PROMPT_PY:-/Users/stark_sim/miniconda3/bin/python3.12}"
+DTYPE="${DTYPE:-float32}"
 SEQ_LEN="${SEQ_LEN:-64}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-16}"
 PROMPT_SEED="${PROMPT_SEED:-20261006}"
@@ -64,7 +65,7 @@ PYTHONUNBUFFERED=1 env -u DYLD_LIBRARY_PATH "${PY}" \
     --domain-id 0 --num-domains 1 \
     --peer-listen-host 127.0.0.1 --peer-listen-port ${W1_PORT} \
     --next-peer-host 127.0.0.1 --next-peer-port ${W0_PORT} \
-    --device cpu \
+    --device cpu --dtype "${DTYPE}" \
     >"${REPORT_DIR}/worker_golden.log" 2>&1 &
 PIDS+=($!)
 wait "${COORD_PID}" || true
@@ -79,7 +80,7 @@ PYTHONUNBUFFERED=1 env -u DYLD_LIBRARY_PATH "${PY}" \
     --domain-id 0 --num-domains 2 \
     --peer-listen-host 127.0.0.1 --peer-listen-port ${W0_PORT} \
     --next-peer-host 127.0.0.1 --next-peer-port ${W1_PORT} \
-    --device cpu \
+    --device cpu --dtype "${DTYPE}" \
     --tp-size 2 --tp-backend gloo --tp-rank 0 --tp-master-port ${TP_PORT} \
     >"${REPORT_DIR}/worker0_tp_rank0.log" 2>&1 &
 PIDS+=($!)
@@ -89,7 +90,7 @@ PYTHONUNBUFFERED=1 env -u DYLD_LIBRARY_PATH "${PY}" \
     --domain-id 0 --num-domains 2 \
     --peer-listen-host 127.0.0.1 --peer-listen-port ${W0_PORT} \
     --next-peer-host 127.0.0.1 --next-peer-port ${W1_PORT} \
-    --device cpu \
+    --device cpu --dtype "${DTYPE}" \
     --tp-size 2 --tp-backend gloo --tp-rank 1 --tp-master-port ${TP_PORT} \
     >"${REPORT_DIR}/worker0_tp_rank1.log" 2>&1 &
 PIDS+=($!)
@@ -99,7 +100,7 @@ PYTHONUNBUFFERED=1 env -u DYLD_LIBRARY_PATH "${PY}" \
     --domain-id 1 --num-domains 2 \
     --peer-listen-host 127.0.0.1 --peer-listen-port ${W1_PORT} \
     --next-peer-host 127.0.0.1 --next-peer-port ${W0_PORT} \
-    --device cpu \
+    --device cpu --dtype "${DTYPE}" \
     >"${REPORT_DIR}/worker1-python_ring.log" 2>&1 &
 PIDS+=($!)
 

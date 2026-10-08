@@ -30,6 +30,7 @@ def _worker(rank: int, args: argparse.Namespace, input_ids: list):
         world_size=2,
         backend=args.backend,
         init_method=f"tcp://127.0.0.1:{args.master_port}",
+        dtype=args.dtype,
     )
     ids = torch.tensor([input_ids], dtype=torch.long, device=engine.device)
     logits = engine.forward_logits(ids)
@@ -38,7 +39,7 @@ def _worker(rank: int, args: argparse.Namespace, input_ids: list):
         from transformers import AutoModelForCausalLM
 
         ref = AutoModelForCausalLM.from_pretrained(
-            args.model_dir, torch_dtype=torch.float32, trust_remote_code=True
+            args.model_dir, torch_dtype=engine.compute_dtype, trust_remote_code=True
         ).to(engine.device)
         ref.eval()
         with torch.no_grad():
@@ -77,6 +78,8 @@ def main():
     parser.add_argument("--master-port", type=int, default=29511)
     parser.add_argument("--max-diff-tol", type=float, default=0.0,
                         help=">0 时作为 max_abs_diff 的硬门槛")
+    parser.add_argument("--dtype", default="float32",
+                        choices=["float32", "bfloat16", "float16"])
     args = parser.parse_args()
 
     if args.prompt_file:

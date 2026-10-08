@@ -56,6 +56,7 @@ class TPTransformersBackend(HcpWorkerBackend):
         num_domains: int,
         collective_timeout_s: Optional[float] = None,
         local_rank: Optional[int] = None,
+        dtype: str = "float32",
     ):
         self.engine = TensorParallelQwen2(
             model_dir,
@@ -66,6 +67,7 @@ class TPTransformersBackend(HcpWorkerBackend):
             init_method=init_method,
             timeout_s=collective_timeout_s,
             local_rank=local_rank,
+            dtype=dtype,
         )
         self.num_domains = num_domains
         self.device = self.engine.device
@@ -222,14 +224,15 @@ class TPTransformersBackend(HcpWorkerBackend):
                 remote = self._broadcast_remote(remote)
 
                 # 各 rank 只保留自己 KV head 的全序列切片
-                # （lkv = num_kv_heads / tp_size，整除约束在引擎 init 断言）
+                # （lkv = num_kv_heads / tp_size，整除约束在引擎 init 断言）；
+                # 远端块是 wire dtype（f32），cast 回本地计算 dtype
                 lkv = eng.local_kv_heads
                 kvs = slice(eng.rank * lkv, (eng.rank + 1) * lkv)
                 blocks = [(my_start, k, v)] + [
                     (
                         blk.global_seq_start,
-                        blk.k[:, kvs],
-                        blk.v[:, kvs],
+                        blk.k[:, kvs].to(eng.compute_dtype),
+                        blk.v[:, kvs].to(eng.compute_dtype),
                     )
                     for blk in remote
                 ]
@@ -302,7 +305,11 @@ class TPTransformersBackend(HcpWorkerBackend):
                 blk = remote[r]
                 start, ln = blk.global_seq_start, blk.global_seq_end - blk.global_seq_start
                 hdr = torch.tensor([start, ln], dtype=torch.int32, device=self.device)
-                k, v = blk.k.contiguous(), blk.v.contiguous()
+                # TP 内部 bcast 与 ring wire 同约：payload 一律 f32（follower 侧
+                # 缓冲区按 f32 分配；dtype 不一致的 broadcast 是 UB/死锁）。
+                # 切片使用时再 cast 回 compute_dtype（bf16 经 f32 往返精确）。
+                k = blk.k.to(torch.float32).contiguous()
+                v = blk.v.to(torch.float32).contiguous()
             else:
                 hdr = torch.empty(2, dtype=torch.int32, device=self.device)
                 k = v = None
@@ -463,6 +470,7 @@ def run_tp_follower(
     num_domains: int,
     collective_timeout_s: Optional[float] = None,
     local_rank: Optional[int] = None,
+    dtype: str = "float32",
 ) -> None:
     """TP follower 主循环：不连 coordinator/ring，只跟 collective。
 
@@ -473,7 +481,7 @@ def run_tp_follower(
     """
     backend = TPTransformersBackend(
         model_dir, device, tp_backend, rank, world_size, init_method, num_domains,
-        collective_timeout_s=collective_timeout_s, local_rank=local_rank,
+        collective_timeout_s=collective_timeout_s, local_rank=local_rank, dtype=dtype,
     )
     eng = backend.engine
     print(f"[tp follower rank {rank}] ready, num_domains={num_domains}", flush=True)

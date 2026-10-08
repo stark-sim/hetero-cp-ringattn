@@ -6,7 +6,10 @@ QUIC KV Transport — 基于 aioquic，与 Rust quinn 互通。
 
 metadata 字段：
     layer_idx, global_seq_start, global_seq_end,
-    k_shape, v_shape, k_bytes, v_bytes
+    k_shape, v_shape, k_bytes, v_bytes,
+    k_dtype, v_dtype  （发送方模型 dtype 标签，如 "bfloat16"；payload 始终
+    f32 LE，接收端按标签 cast——与 rust_ring.py 的既有 dtype 标签规则一致；
+    旧版发送方无该字段时按 float32 处理）
 """
 
 import asyncio
@@ -75,6 +78,13 @@ def get_cached_cert():
     return _cert_cache
 
 
+_WIRE_DTYPES = {
+    "float32": torch.float32,
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+}
+
+
 class QuicKvTransport(KvTransport):
     """基于 QUIC stream 的 KV block 传输。
 
@@ -129,6 +139,10 @@ class QuicKvTransport(KvTransport):
             "v_shape": v_shape,
             "k_bytes": len(k_bytes),
             "v_bytes": len(v_bytes),
+            # dtype 标签 = 发送方模型 dtype；payload 始终 f32 LE，接收端按标签
+            # cast（bf16 模型的 KV 经 f32 往返是精确的）
+            "k_dtype": str(block.k.dtype).replace("torch.", ""),
+            "v_dtype": str(block.v.dtype).replace("torch.", ""),
         }).encode()
 
         frame = struct.pack(">I", len(meta)) + meta + k_bytes + v_bytes
@@ -162,6 +176,9 @@ class QuicKvTransport(KvTransport):
 
         k = self._bytes_to_tensor(k_bytes, meta["k_shape"], self.device)
         v = self._bytes_to_tensor(v_bytes, meta["v_shape"], self.device)
+        # 按 dtype 标签 cast 回发送方模型精度（缺标签的旧发送方 = float32，no-op）
+        k = k.to(_WIRE_DTYPES.get(meta.get("k_dtype", "float32"), torch.float32))
+        v = v.to(_WIRE_DTYPES.get(meta.get("v_dtype", "float32"), torch.float32))
 
         return KvBlock(
             layer_idx=meta["layer_idx"],

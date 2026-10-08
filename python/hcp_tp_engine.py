@@ -38,6 +38,7 @@ class TensorParallelQwen2:
         init_method: str = "tcp://127.0.0.1:29511",
         timeout_s: Optional[float] = None,
         local_rank: Optional[int] = None,
+        dtype: str = "float32",
     ):
         # local_rank = 本进程在单机内的设备序号；默认等于全局 rank（单机多卡
         # TP 的常规情形）。跨机 TP（每机单卡）必须显式传 local_rank=0，
@@ -77,8 +78,16 @@ class TensorParallelQwen2:
 
         from transformers import AutoModelForCausalLM
 
+        _DTYPES = {
+            "float32": torch.float32,
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+        }
+        if dtype not in _DTYPES:
+            raise ValueError(f"unsupported dtype {dtype}")
+        self.compute_dtype = _DTYPES[dtype]
         model = AutoModelForCausalLM.from_pretrained(
-            model_dir, torch_dtype=torch.float32, trust_remote_code=True
+            model_dir, torch_dtype=self.compute_dtype, trust_remote_code=True
         )
         model.eval()
         config = model.config
