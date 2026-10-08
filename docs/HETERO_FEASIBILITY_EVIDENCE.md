@@ -217,6 +217,31 @@ logits_ring/logits_1.bin `41f1e00b4d92e412`、coordinator_ring.log
 `4471fb4228339cdb`。复现：`bash scripts/run_pyring_4domain_nccl_abstract.sh`
 （NCCL 对齐 smoke：`scripts/nccl_smoke_2node.py`）。
 
+### 4.9 R8：双逻辑 worker 7B CP（Qwen2.5-7B bf16，`71585a6`）
+
+`reports/pyring2-abstract7b-20261008-134844`：d0 = 容器双芯 910（HCCL TP=2
+抽象 worker），d1 = white 4090 单卡，2-domain ring，512 tokens / 16 decode 步。
+模型体量从 0.5B 升到 7B（bf16，~15GB——white 24GB 是卡点位，fp32 28GB 超界）。
+
+- **主 gate PASS**：ring 与末域（white CUDA）golden 逐 token 一致；
+  golden-npu / golden-cuda / ring 三者文本全同。
+- logits（bf16 容差，ulp≈0.0625@17）：ring vs golden-npu max|Δ|=0.3125，
+  ring vs golden-cuda max|Δ|=0.34375，argmax 全步一致（min_margin 0.125）。
+  隔离证据：NPU 单进程 bf16 引擎 vs HF 参考 bit 级一致（max|Δ|=0.0），
+  TP=2 偏差纯来自 bf16 求和重结合。
+- **抽象 worker capacity 聚合实证**：d0 上报 per-rank [53854, 55145] =
+  108999 MB（all_gather 求和），d1 = 7956 MB。
+- **诚实注记**：本轮 chunk 分配是均分（vanilla ring 路径不做 capacity
+  加权分片；capacity 加权在 continuation/admission 路径）。「聚合显存 →
+  不均分 chunk」的完整展示需走 continuation 路径或补分片策略。
+- 协议演进：wire 帧新增 k_dtype/v_dtype 标签（payload 仍 f32 LE，接收端
+  cast）；无标签帧按 f32 处理，fp32 路径字节级零变化（回归逐位一致）。
+- 模型分发：modelscope（容器 45MB/s，~6min）；hf-mirror 不代理 Xet CAS，
+  该路径对 huggingface_hub≥1.24 已废。
+
+工件 SHA-256：prompt.txt `610fa3dd86634892`、coordinator_ring.log
+`5fc99c49fd733800`。复现：`bash scripts/run_pyring_2domain_abstract7b.sh`。
+
 ## 5. 工件完整性与复现
 
 ### 5.1 关键工件 SHA-256
