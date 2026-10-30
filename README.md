@@ -71,7 +71,7 @@ decode 线已收口：自驱动环已合并为主线默认（`474e9cb`，N=3 WiF
 
 | 仓库 | 内容 | 生命周期 |
 |------|------|----------|
-| [stark-sim/hcp-vllm-plugin](https://github.com/stark-sim/hcp-vllm-plugin) | HCP 的 vLLM 生态插件：ring-attention CUSTOM backend + HcpRingKvConnector（显存切分 CP，KV 瞬时 staging）+ 自研 Triton kernel（LSE 输出，CUDA/ROCm 同一实现） | 跟随功能路线（N>2 ring、kernel hardening） |
+| [stark-sim/hcp-vllm-plugin](https://github.com/stark-sim/hcp-vllm-plugin) | HCP 的 vLLM 生态插件：`HcpFileConnector`（跨引擎 PD 主路线：载入 HCP 导出的 prefill KV 直接 decode，vLLM 0.31）+ ring-attention CUSTOM backend + HcpRingKvConnector（显存切分 CP，KV 瞬时 staging）+ 自研 Triton kernel（LSE 输出，CUDA/ROCm 同一实现） | 跟随功能路线（PD 闭环、N>2 ring、kernel hardening） |
 | [stark-sim/vllm-rocm-gfx1200](https://github.com/stark-sim/vllm-rocm-gfx1200) | RX 9060 XT（gfx1200, RDNA4）适配 vLLM 的补丁与构建/运行脚本（纯补丁仓：vLLM 源码构建时现拉，故仓内只有 patch + shell） | 跟随 ROCm/vLLM 版本 |
 
 本仓保留：Rust/Python 分布式调度核心、transformers 线 worker、跨节点驱动脚本（`scripts/run_cross_node_*.sh`，通过 `*_PLUGIN_REPO` 环境变量指向插件 clone，默认 `/home/stark/hcp-vllm-plugin`）、graph-memory 知识库、docs/reports。
